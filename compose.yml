@@ -1,0 +1,149 @@
+services:
+  router:
+    build:
+      context: .
+    image: unhardcoded:local
+    restart: unless-stopped
+    env_file:
+      - ./.env.secrets
+    environment:
+      LLM_POLICY_DIR: /app
+      # compose runs antseed on its own network; socat re-exposes the
+      # localhost-only buyer proxy on :8378 (k8s leaves this unset -> localhost)
+      ANTSEED_BASE_URL: http://antseed:8378/v1
+      # wallet control server in the sidecar (deposit/withdraw/refresh from the
+      # dashboard). Unset token -> the wallet endpoints return 503. k8s: same pod
+      # -> http://127.0.0.1:8379.
+      ANTSEED_CONTROL_URL: http://antseed:8379
+      ANTSEED_CONTROL_TOKEN: ${ANTSEED_CONTROL_TOKEN:-}
+    command:
+      - python
+      - serve.py
+      - --config
+      - config.live.lua
+      - --metrics
+      - metrics.live.lua
+      - --default-profile
+      - default
+      - --host
+      - 0.0.0.0
+      - --port
+      - "18080"
+      - --timeout-s
+      - "45"
+      - --codex-auth
+      - /codex/auth.json
+    volumes:
+      - ${CODEX_AUTH_PATH:-./codex-auth.json}:/codex/auth.json
+      - antseed-market:/market:ro
+      # operator-added providers (dashboard "Add provider"): read at startup
+      - ./secrets:/run/llm-router/secrets:ro
+    expose:
+      - "18080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys,json; r=urllib.request.urlopen('http://127.0.0.1:18080/healthz', timeout=3); sys.exit(0 if json.load(r).get('ok') else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      llm-router-internal:
+        aliases:
+          - router.internal
+
+  ingress:
+    image: unhardcoded:local
+    restart: unless-stopped
+    depends_on:
+      router:
+        condition: service_healthy
+    env_file:
+      - ./.env.secrets
+    environment:
+      ROUTER_UPSTREAM: http://router:18080
+      RATE_PER_MIN: ${RATE_PER_MIN:-600}
+      BURST: ${BURST:-200}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DASHBOARD_KEY_ENV_PATH: /run/llm-router/.env.secrets
+      DASHBOARD_ISSUED_KEYS_PATH: /run/llm-router/secrets/issued-consumer-keys.json
+      ROUTER_USAGE_HISTORY_PATH: /run/llm-router/secrets/usage-history.jsonl
+      # env_file carries the HOST path; inside the container the file is the
+      # bind mount below (needed by the provider-key reveal endpoint)
+      CODEX_AUTH_PATH: /codex/auth.json
+    volumes:
+      - ./.env.secrets:/run/llm-router/.env.secrets
+      - ./secrets:/run/llm-router/secrets
+      - ${CODEX_AUTH_PATH:-./codex-auth.json}:/codex/auth.json
+    command:
+      - uvicorn
+      - auth_proxy:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --proxy-headers
+    ports:
+      - "127.0.0.1:${LLM_ROUTER_HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys,json; r=urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3); sys.exit(0 if json.load(r).get('ok') else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      llm-router-internal:
+        aliases:
+          - llm-router.internal
+      genlayer-web:
+        aliases:
+          - llm-router-ingress
+
+  # One AntSeed buyer (no tiers). Browse mode (no --peer): it discovers sellers
+  # on the network; the policy sets the per-call price ceiling, so the cap here
+  # is just a wide outer bound. Writes /market/market.json (browse) and
+  # status-antseed.json (buyer status) for sources/antseed.py. Needs a funded
+  # wallet (antseed buyer deposit) to actually transact.
+  antseed:
+    build:
+      context: .
+      dockerfile: Dockerfile.antseed
+    image: unhardcoded-antseed:local
+    profiles: ["antseed"]
+    restart: unless-stopped
+    environment:
+      ANTSEED_DATA_DIR: /data
+      # Durable buyer identity. Unset -> the CLI generates one in the data
+      # volume (lost with the volume). Set to keep a funded wallet across
+      # volume loss. See docs/PROVIDERS.md.
+      ANTSEED_IDENTITY_HEX: ${ANTSEED_IDENTITY_HEX:-}
+      # Buyer spend rails — wide; the real per-call price ceiling is the
+      # caller's Σ_pol policy (and antseed.market_price_cap in config.live.lua).
+      ANTSEED_MAX_INPUT: ${ANTSEED_MAX_INPUT:-1000}
+      ANTSEED_MAX_OUTPUT: ${ANTSEED_MAX_OUTPUT:-1000}
+      # Wallet control server (deposit/withdraw/status from the dashboard).
+      # Shared secret with the router; unset -> control.js does not start.
+      ANTSEED_CONTROL_PORT: ${ANTSEED_CONTROL_PORT:-8379}
+      ANTSEED_CONTROL_TOKEN: ${ANTSEED_CONTROL_TOKEN:-}
+    volumes:
+      - antseed-data:/data
+      - antseed-market:/market
+    depends_on:
+      router:
+        condition: service_healthy
+    # Own network (alias `antseed`, proxy exposed by socat on :8378) — NOT
+    # `network_mode: service:router`, whose orphaned netns silently zeroed
+    # discovery whenever the router was recreated without antseed.
+    networks:
+      llm-router-internal:
+        aliases:
+          - antseed
+
+networks:
+  llm-router-internal:
+    name: llm-router-internal
+  genlayer-web:
+    external: true
+
+volumes:
+  antseed-data:
+  antseed-market:

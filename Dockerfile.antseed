@@ -1,0 +1,19 @@
+# AntSeed buyer sidecar — vendored, not `npm install`-at-runtime.
+# Pinning the CLI in the image makes cold starts independent of the npm
+# registry and freezes the bundled @antseed/node (whose DHT bootstrap nodes
+# rot with the version). socat exposes the localhost-only buyer proxy on the
+# container network. See antseed/entrypoint.sh for the why of each piece.
+FROM node:25-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends socat \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pinned, vendored. Bump deliberately (newer CLIs carry fresher bootstrap nodes).
+RUN npm install -g @antseed/cli@0.1.128
+
+COPY antseed/merge-market.js antseed/control.js antseed/entrypoint.sh /usr/local/lib/antseed/
+RUN chmod +x /usr/local/lib/antseed/entrypoint.sh
+
+ENV ANTSEED_DATA_DIR=/data
+ENTRYPOINT ["/usr/local/lib/antseed/entrypoint.sh"]
