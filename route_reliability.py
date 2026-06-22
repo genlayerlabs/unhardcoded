@@ -26,6 +26,11 @@ _ALPHA = 0.2
 
 _lock = threading.Lock()
 _rates: dict[str, float] = {}
+# Per-route observation count. The engine no longer folds an EMA (reliability is
+# host-owned, #15), so the host owns the "how many calls have we made on this
+# route" count too — surfaced in the market perf view and asserted by the
+# concurrency invariant.
+_counts: dict[str, int] = {}
 
 
 def route_key(provider_id: str, model_family: str, peer_id: str) -> str:
@@ -39,6 +44,7 @@ def observe(key: str, ok: bool) -> None:
     with _lock:
         cur = _rates.get(key)
         _rates[key] = s if cur is None else _ALPHA * s + (1.0 - _ALPHA) * cur
+        _counts[key] = _counts.get(key, 0) + 1
 
 
 def success_rate(key: str) -> float | None:
@@ -46,12 +52,23 @@ def success_rate(key: str) -> float | None:
     return _rates.get(key)
 
 
+def count(key: str) -> int:
+    """How many outcomes have been folded for this route (0 if never observed)."""
+    return _counts.get(key, 0)
+
+
 def snapshot() -> dict[str, float]:
     with _lock:
         return dict(_rates)
+
+
+def snapshot_counts() -> dict[str, int]:
+    with _lock:
+        return dict(_counts)
 
 
 def reset() -> None:
     """Test hook."""
     with _lock:
         _rates.clear()
+        _counts.clear()
