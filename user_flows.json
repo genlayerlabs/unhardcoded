@@ -1,0 +1,726 @@
+{
+  "meta": {
+    "product": "unhardcoded",
+    "description": "OpenAI-compatible LLM policy router. Data-plane 'router' (serve.py/shim.py) behind an 'ingress' auth-proxy (auth_proxy.py) that also serves the operator dashboard. Sigma_pol/Sigma_flow engine vendored at core/ (unhardcoded-engine).",
+    "purpose": "Exhaustive catalogue of user flows in entry order, to be lowered into Gherkin .feature files.",
+    "architecture_note": "Two HTTP layers. Consumers talk to the INGRESS (:8080): it does Bearer caller-auth, route allow-lists (403 caller_route_not_allowed), rate limits (429), usage recording, then proxies to the SHIM (router:18080) which runs the policy and owns /v1/* and operator /x/* (proxy 404s /x/* for consumers). Provider keys live in the host env; callers only ever send their own caller token.",
+    "test_flag_legend": {
+      "real_money": "executing for real spends on-chain funds / provider credits",
+      "real_credentials": "touches a real provider credential or private key",
+      "tos_risk": "uses an unofficial/ToS-risky path (codex)",
+      "mockable": "can be exercised hermetically against the local router with set_mock_response / a stub backend",
+      "priority": "P0 critical happy path, P1 important, P2 edge/advanced"
+    },
+    "phases": [
+      "1-onboarding", "2-auth", "3-providers", "4-consumer-keys",
+      "5-consumer-api", "6-dashboard-ops", "7-money-antseed"
+    ]
+  },
+  "flows": [
+    {
+      "id": "clone-with-submodule", "order": 1, "phase": "1-onboarding",
+      "name": "Clone the repo recursively (vendored Sigma_pol core submodule)",
+      "actor": "new-user", "category": "setup",
+      "entry_point": "git clone --recursive https://github.com/genlayerlabs/unhardcoded.git",
+      "preconditions": ["git installed; network to github.com", "core/ is a submodule -> genlayerlabs/unhardcoded-engine.git (.gitmodules)"],
+      "steps": [
+        {"action": "git clone --recursive <repo>", "expected": "repo + core/ populated; core/router.lua and core/llm_policy.lua exist"}
+      ],
+      "notes": "Without --recursive, core/ is empty and the Docker build fails at Dockerfile:19 (test -f core/router.lua && test -f core/llm_policy.lua) -- surfaces the missing submodule early.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+    {
+      "id": "submodule-update-after-plain-clone", "order": 2, "phase": "1-onboarding",
+      "name": "Populate the core submodule after a plain clone",
+      "actor": "new-user", "category": "setup",
+      "entry_point": "git submodule update --init",
+      "preconditions": ["did a plain git clone (no --recursive); core/ empty"],
+      "steps": [
+        {"action": "git submodule update --init", "expected": "core/ checked out at the pinned commit; core/router.lua + core/llm_policy.lua present"}
+      ],
+      "notes": "Documented in README.md and CONTRIBUTING.md.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "create-env-secrets", "order": 3, "phase": "1-onboarding",
+      "name": "Create .env.secrets from .env.example",
+      "actor": "operator", "category": "setup",
+      "entry_point": "cp .env.example .env.secrets && chmod 600 .env.secrets",
+      "preconditions": [".env, .env.secrets, secrets/ are gitignored -- never commit them"],
+      "steps": [
+        {"action": "cp .env.example .env.secrets && chmod 600 .env.secrets", "expected": "template created, owner-only"},
+        {"action": "fill provider keys + dashboard auth values", "expected": "ready for router+ingress containers (both env_file .env.secrets)"}
+      ],
+      "notes": "Env vars: OPENAI_API_KEY(opt), OPENROUTER_API_KEY, CODEX_AUTH_PATH, CALLER_KEYS_JSON, CALLER_KEYS_SHA256_JSON, DASHBOARD_PASSWORD_SHA256, DASHBOARD_SESSION_SECRET, DASHBOARD_TRUSTED_USER_HEADER/SECRET, DASHBOARD_NO_AUTH, LLM_ROUTER_HOST_PORT, PUBLIC_BASE_URL, RATE_PER_MIN, BURST, LOG_LEVEL.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+    {
+      "id": "generate-dashboard-admin-secrets", "order": 4, "phase": "1-onboarding",
+      "name": "Generate DASHBOARD_PASSWORD_SHA256 and DASHBOARD_SESSION_SECRET",
+      "actor": "operator", "category": "auth",
+      "entry_point": ".env.secrets: DASHBOARD_PASSWORD_SHA256=, DASHBOARD_SESSION_SECRET=",
+      "preconditions": [".env.secrets exists; Python available"],
+      "steps": [
+        {"action": "python - (sha256 of getpass) -> DASHBOARD_PASSWORD_SHA256", "expected": "64-hex digest"},
+        {"action": "python -c 'import secrets;print(secrets.token_urlsafe(32))' -> DASHBOARD_SESSION_SECRET", "expected": "urlsafe secret set"}
+      ],
+      "notes": "_dashboard_password_ok compares sha256(submitted) via hmac.compare_digest. If SESSION_SECRET unset, no session can be minted -> only NO_AUTH or trusted-header SSO work.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "run-via-nix-shell", "order": 5, "phase": "1-onboarding",
+      "name": "Run the data-plane shim directly via nix-shell (dev, no Docker, no auth/dashboard)",
+      "actor": "new-user", "category": "setup",
+      "entry_point": "nix-shell -p 'python3.withPackages(ps: with ps;[lupa httpx fastapi uvicorn pydantic])' --run 'python serve.py --config config.live.lua --default-profile default --host 127.0.0.1 --port 8080'",
+      "preconditions": ["submodule populated; Nix installed; provider keys exported in the shell env"],
+      "steps": [
+        {"action": "enter nix-shell with runtime deps (or shell.nix)", "expected": "lupa/httpx/fastapi/uvicorn/pydantic available"},
+        {"action": "python serve.py ...", "expected": "loads env_secrets, optional model_meta refresh, inits LLMRouterHost, uvicorn serves the RAW shim (no auth_proxy, no dashboard)"}
+      ],
+      "notes": "serve.py = data-plane only. The bearer contract + dashboard exist ONLY in auth_proxy/ingress. Flags: --metrics, --default-max-tokens (0=strict), --timeout-s, --codex-auth. MODEL_META_REFRESH=0 skips the boot refresh.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "docker-compose-up-default", "order": 6, "phase": "1-onboarding",
+      "name": "Start the default 2-service stack (router + ingress)",
+      "actor": "operator", "category": "setup",
+      "entry_point": "docker compose -f compose.yml up -d --build",
+      "preconditions": [".env.secrets filled; submodule populated; external docker network 'genlayer-web' exists"],
+      "steps": [
+        {"action": "docker compose up -d --build", "expected": "builds unhardcoded:local; router (serve.py :18080) + ingress (auth_proxy :8080). ingress depends_on router service_healthy"},
+        {"action": "ingress binds 127.0.0.1:${LLM_ROUTER_HOST_PORT:-8080}", "expected": "only loopback exposed; router never published"}
+      ],
+      "notes": "ingress env: ROUTER_UPSTREAM=http://router:18080, DASHBOARD_KEY_ENV_PATH, DASHBOARD_ISSUED_KEYS_PATH. .env.secrets bind-mounted into ingress at /run/llm-router/.env.secrets. genlayer-web is external:true -> must pre-exist.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+    {
+      "id": "docker-compose-up-antseed", "order": 7, "phase": "1-onboarding",
+      "name": "Start the stack with the AntSeed buyer sidecar (--profile antseed)",
+      "actor": "operator", "category": "setup",
+      "entry_point": "docker compose -f compose.yml --profile antseed up -d --build",
+      "preconditions": ["default stack ok; AntSeed participation desired; a funded identity"],
+      "steps": [
+        {"action": "compose --profile antseed up", "expected": "also starts antseed (browse mode); writes /market/market.json + status-antseed.json into the antseed-market volume"},
+        {"action": "compose exec antseed antseed buyer status; ... network browse --services --top 5", "expected": "sidecar up; sellers discovered"}
+      ],
+      "notes": "antseed gated behind the compose profile (omitted from default up). Wallet self-service needs ANTSEED_CONTROL_TOKEN on both router+sidecar. Needs a FUNDED wallet to transact (real money).",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": true, "mockable": false, "priority": "P2"}
+    },
+    {
+      "id": "healthz-and-smoke", "order": 8, "phase": "1-onboarding",
+      "name": "Health check + smoke test the running stack",
+      "actor": "operator", "category": "setup",
+      "entry_point": "curl -fsS http://127.0.0.1:8080/healthz",
+      "preconditions": ["stack started"],
+      "steps": [
+        {"action": "GET /healthz (no auth)", "expected": "ingress proxies to router /healthz -> {ok:true,initialized:true}"},
+        {"action": "GET /v1/models with Bearer <token>", "expected": "200 model list"},
+        {"action": "POST /v1/chat/completions {model:'',messages:[pong],max_tokens:8}", "expected": "200; x_router shows chosen provider/model"},
+        {"action": "GET /v1/models with NO bearer", "expected": "401 Unauthorized"}
+      ],
+      "notes": "Both services define /healthz healthchecks; ingress depends_on router service_healthy.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+
+    {
+      "id": "dashboard-no-auth-bypass", "order": 9, "phase": "2-auth",
+      "name": "Local-dev: bypass dashboard auth with DASHBOARD_NO_AUTH",
+      "actor": "operator", "category": "auth",
+      "entry_point": ".env.secrets: DASHBOARD_NO_AUTH=1 ; GET http://127.0.0.1:8080/dashboard",
+      "preconditions": ["local-only deployment nobody else can reach"],
+      "steps": [
+        {"action": "set DASHBOARD_NO_AUTH=1 (1/true/yes/on) and restart ingress", "expected": "every dashboard request treated as local admin"},
+        {"action": "open /dashboard", "expected": "loads as admin without login; _require_dashboard_context returns {role:admin,user:'local-dev'}"}
+      ],
+      "notes": "DANGER: bypasses ALL dashboard auth. Checked FIRST, before trusted-header and session cookie. Never on a reachable deployment.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+    {
+      "id": "dashboard-password-login", "order": 10, "phase": "2-auth",
+      "name": "Admin login to the dashboard with the password",
+      "actor": "operator", "category": "auth",
+      "entry_point": "POST /dashboard/login {password}",
+      "preconditions": ["DASHBOARD_PASSWORD_SHA256 + DASHBOARD_SESSION_SECRET set; NO_AUTH unset"],
+      "steps": [
+        {"action": "POST /dashboard/login {password}", "expected": "sha256(password) compared to hash; on ok sets httponly signed cookie router_dashboard_session (role=admin,user='admin'), records login"},
+        {"action": "subsequent /dashboard/api/* carry the cookie", "expected": "admin role -> full access"}
+      ],
+      "notes": "Cookie is secure=True + path=/dashboard -> remote use needs TLS. 401 on bad password.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+    {
+      "id": "dashboard-consumer-key-login", "order": 11, "phase": "2-auth",
+      "name": "Consumer logs into the dashboard with their API key (scoped view)",
+      "actor": "consuming-service", "category": "auth",
+      "entry_point": "POST /dashboard/login {api_key}",
+      "preconditions": ["valid active consumer token; DASHBOARD_SESSION_SECRET set"],
+      "steps": [
+        {"action": "POST /dashboard/login {api_key}", "expected": "_caller_auth validates; mints consumer-role session {role:consumer,consumer,key_sha256}"},
+        {"action": "dashboard renders consumer-scoped view", "expected": "Catalog/Provider-keys/Key-usage hidden; admin ops -> 403 dashboard_admin_required"}
+      ],
+      "notes": "Same endpoint as password login; api_key vs password selects the branch.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "trusted-header-sso-admin", "order": 12, "phase": "2-auth",
+      "name": "Trusted-header SSO admin auth (behind a reverse proxy)",
+      "actor": "operator", "category": "auth",
+      "entry_point": "headers: <DASHBOARD_TRUSTED_USER_HEADER>: <user> + x-dashboard-trusted-secret: <secret>",
+      "preconditions": ["both DASHBOARD_TRUSTED_USER_HEADER and DASHBOARD_TRUSTED_USER_SECRET set; a proxy that strips client copies"],
+      "steps": [
+        {"action": "proxy injects trusted user header + x-dashboard-trusted-secret", "expected": "if secret matches via hmac.compare_digest -> admin session {user:trusted_user}"}
+      ],
+      "notes": "Disabled by default. Evaluated AFTER NO_AUTH, BEFORE the cookie. Secret header name is fixed; only the user header name is configurable.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P2"}
+    },
+    {
+      "id": "dashboard-logout", "order": 13, "phase": "2-auth",
+      "name": "Log out of the dashboard",
+      "actor": "operator", "category": "auth",
+      "entry_point": "POST /dashboard/logout",
+      "preconditions": ["any session"],
+      "steps": [{"action": "POST /dashboard/logout", "expected": "session cookie deleted; login card shown"}],
+      "notes": "",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P2"}
+    },
+    {
+      "id": "caller-bearer-contract", "order": 14, "phase": "2-auth",
+      "name": "Consuming service authenticates to /v1 with its bearer token",
+      "actor": "consuming-service", "category": "auth",
+      "entry_point": "Authorization: Bearer <per-service-token> on any /v1 path (point at ingress :8080, not router)",
+      "preconditions": ["stack running; valid active consumer token"],
+      "steps": [
+        {"action": "client sets LLM_BASE_URL=http://127.0.0.1:8080/v1, LLM_API_KEY=<token>", "expected": "standard OpenAI SDK usage"},
+        {"action": "ingress validates token (_caller_auth)", "expected": "unknown/missing -> 401; inactive/revoked/expired -> 403"},
+        {"action": "ingress strips Authorization, adds x-llm-router-caller, proxies to router", "expected": "router runs policy over the host's keys; caller never sends provider keys"}
+      ],
+      "notes": "Token maps to a caller name for audit. /x/* paths are 404'd for consumers. PUBLIC_BASE_URL shown in the key-handoff blurb.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+
+    {
+      "id": "openrouter-key-config", "order": 15, "phase": "3-providers",
+      "name": "Configure the OpenRouter API key",
+      "actor": "operator", "category": "providers",
+      "entry_point": "env OPENROUTER_API_KEY in .env.secrets (provider openrouter/openrouter_market, auth_env=OPENROUTER_API_KEY); or dashboard provider-keys/update",
+      "preconditions": ["an OpenRouter account+key; .env.secrets mounted into router+ingress"],
+      "steps": [
+        {"action": "set OPENROUTER_API_KEY in .env.secrets, restart router", "expected": "host resolves Authorization: Bearer $OPENROUTER_API_KEY for openrouter calls"},
+        {"action": "optional: read /credits", "expected": "credits_usd balance + runway shown in dashboard"}
+      ],
+      "notes": "/models pricing discovery is keyless; the key is only needed to call and to read /credits. Tier=fallback.",
+      "test_flags": {"real_money": false, "real_credentials": true, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+    {
+      "id": "openrouter-catalog-discovery", "order": 16, "phase": "3-providers",
+      "name": "OpenRouter live whole-catalog discovery",
+      "actor": "operator", "category": "providers",
+      "entry_point": "provider openrouter_market (discovery=marketplace); sources/openrouter.py",
+      "preconditions": ["openrouter_market enabled (default)"],
+      "steps": [
+        {"action": "source polls GET /models every 3600s", "expected": "long-tail exposed as marketplace offers; curated families skipped"},
+        {"action": "each model gets traits inline (benchmarks, modalities, cap_*, ranks)", "expected": "discovered families rank on real benchmark not just price"}
+      ],
+      "notes": "Negative per-token prices (OpenRouter -1 sentinel) dropped so they can't win cost-led policies; $0 free models stay routable.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "refresh-model-meta", "order": 17, "phase": "3-providers",
+      "name": "Regenerate model_meta.lua (registered benchmark/modality/cap traits)",
+      "actor": "operator", "category": "providers",
+      "entry_point": "python scripts/refresh_model_meta.py [--config config.live.lua] [--out model_meta.lua]",
+      "preconditions": ["repo checkout; network to OpenRouter /models (keyless)"],
+      "steps": [
+        {"action": "run script (startup job + periodically)", "expected": "fetches /models; writes per-curated-family traits + ranks to model_meta.lua (GENERATED, do not hand-edit)"}
+      ],
+      "notes": "Only curated families land here (on-chain/deterministic path); discovered families carry traits inline. No money/credentials.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P2"}
+    },
+    {
+      "id": "provider-add", "order": 18, "phase": "3-providers",
+      "name": "Dashboard 'Add provider' (BYO OpenAI-compatible gateway)",
+      "actor": "operator", "category": "providers",
+      "entry_point": "POST /dashboard/api/provider-keys/add -> router /x/providers",
+      "preconditions": ["admin session; secrets/ mounted RW for ingress; .env.secrets writable"],
+      "steps": [
+        {"action": "POST {id, base_url, auth_env, tier, served_models[], key}", "expected": "validate_entry (id regex, http(s) base_url, api_kind=openai_compatible only, UPPER_SNAKE auth_env, known families)"},
+        {"action": "persist + hot-apply", "expected": "key -> .env.secrets under auth_env; provider def -> secrets/providers.local.json (key never stored there); /x/providers re-inits core preserving breaker/EMA; on failure loads next restart"}
+      ],
+      "notes": "Only openai_compatible providers can be added at runtime. Overlay never overwrites a config.live.lua provider. No per-tenant provider keys -- provider keys are global to the router.",
+      "test_flags": {"real_money": false, "real_credentials": true, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "provider-key-update-reveal", "order": 19, "phase": "3-providers",
+      "name": "Update / reveal an existing provider credential",
+      "actor": "operator", "category": "providers",
+      "entry_point": "POST /dashboard/api/provider-keys/update ; GET /dashboard/api/provider-keys/reveal?provider=<id>",
+      "preconditions": ["admin session; provider has an auth_env (NOT the oauth/codex provider)"],
+      "steps": [
+        {"action": "update POST {provider,key}", "expected": "writes .env.secrets, hot-applies via /x/provider-key"},
+        {"action": "reveal GET", "expected": "raw env-key value + 12-char fingerprint; logged dashboard_provider_key_revealed"}
+      ],
+      "notes": "Update rejects providers with no auth_env (codex -> use the Codex flow). Reveal exposes the real key in plaintext to an admin session.",
+      "test_flags": {"real_money": false, "real_credentials": true, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "codex-login-setup", "order": 20, "phase": "3-providers",
+      "name": "Codex (ChatGPT-subscription) provider setup (codex login + mount auth.json)",
+      "actor": "operator", "category": "providers",
+      "entry_point": "codex login; env CODEX_AUTH_PATH (compose mounts host file -> /codex/auth.json); router --codex-auth; provider openai (api_kind=openai_codex, oauth)",
+      "preconditions": ["a paid ChatGPT subscription; codex CLI installed"],
+      "steps": [
+        {"action": "codex login (browser sign-in)", "expected": "writes ~/.codex/auth.json with access/refresh/id tokens + account_id"},
+        {"action": "set CODEX_AUTH_PATH; compose bind-mounts to /codex/auth.json", "expected": "router picks it up lazily on first codex call"},
+        {"action": "a codex-routed request", "expected": "codex_backend POSTs chatgpt.com/backend-api/codex/responses (SSE) with Bearer token + chatgpt-account-id"}
+      ],
+      "notes": "UNOFFICIAL / ToS-risky. access_token JWT expires in hours -> see codex-token-refresh; an expired token + dead refresh_token -> auth_error(401) -> provider disabled. Mount must be writable (token is rewritten on refresh). temperature/max_tokens NOT forwarded.",
+      "test_flags": {"real_money": false, "real_credentials": true, "tos_risk": true, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "codex-token-refresh", "order": 21, "phase": "3-providers",
+      "name": "Codex token auto-refresh (refresh_token -> access_token, written back)",
+      "actor": "operator", "category": "providers",
+      "entry_point": "codex_auth.CodexAuth.access_token() (per codex call)",
+      "preconditions": ["a valid refresh_token in auth.json"],
+      "steps": [
+        {"action": "read JWT exp; if within 300s margin -> refresh", "expected": "_needs_refresh() true"},
+        {"action": "POST auth.openai.com/oauth/token grant_type=refresh_token (public client app_EMoa...)", "expected": "new tokens; _write_back to auth.json preserving layout"}
+      ],
+      "notes": "Refresh failures are swallowed (keep old token; 401 surfaces later). Thread-safe. If refresh_token is dead -> 401 -> provider disabled (the failure we hit). The mounted host file gets rewritten -> bind mount must be writable.",
+      "test_flags": {"real_money": false, "real_credentials": true, "tos_risk": true, "mockable": true, "priority": "P2"}
+    },
+    {
+      "id": "codex-multi-account", "order": 22, "phase": "3-providers",
+      "name": "Manage multiple Codex accounts from the dashboard",
+      "actor": "operator", "category": "providers",
+      "entry_point": "GET/POST /dashboard/api/codex/accounts ; DELETE /dashboard/api/codex/accounts/{name}; CodexAuthStore over CODEX_ACCOUNTS_DIR (default /codex/accounts on the PVC)",
+      "preconditions": ["admin session; auth.json blob(s) to paste"],
+      "steps": [
+        {"action": "POST {name, auth_json}", "expected": "validated (must contain access_token), saved <slug>.json chmod 600, store reloaded, router /x/codex/reload"},
+        {"action": "GET list", "expected": "per-account {name,account_id,fingerprint} (never raw token) + active=sorted(names)[0] + activity (used_percent, recent_429, scarcity_price_in)"},
+        {"action": "DELETE {name}", "expected": "file unlinked, reloaded; 404 if missing"}
+      ],
+      "notes": "GOTCHA: active account = first alphabetically by name (per-call selection is a follow-up). Legacy single /codex/auth.json auto-adopted as account 'default' (which sorts before most names). In compose, /codex/accounts is NOT shared with the router by default -- the router reads only the mounted /codex/auth.json (a real wiring gap).",
+      "test_flags": {"real_money": false, "real_credentials": true, "tos_risk": true, "mockable": true, "priority": "P2"}
+    },
+    {
+      "id": "codex-scarcity-ramp", "order": 23, "phase": "3-providers",
+      "name": "Codex scarcity price ramp (ranking-only; bills $0)",
+      "actor": "operator", "category": "providers",
+      "entry_point": "sources/codex.py ingest()/poll; Config tab knobs (codex.quota_demote_start, imputed_price_in/out, quota_429_window_s, quota_429_shed)",
+      "preconditions": ["codex live and receiving traffic"],
+      "steps": [
+        {"action": "every codex call pushes an observation (status + quota headers) -- never probes", "expected": "_demote_frac() = max(quota used fraction, recent-429 fraction)"},
+        {"action": "imputed ranking price = imputed_price_* x frac via update_metrics", "expected": "paid routes take over before the 429 wall; price decays back as pressure ages out"}
+      ],
+      "notes": "Codex seeded at price ~0 in metrics.live.lua so cost-led policies rank it first; executed/billing cost stays $0. Ranking-only.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": true, "mockable": true, "priority": "P2"}
+    },
+
+    {
+      "id": "register-consumer-key-cli", "order": 24, "phase": "4-consumer-keys",
+      "name": "Register a per-consumer ingress token via CLI (sha256 storage)",
+      "actor": "operator", "category": "consumer-keys",
+      "entry_point": "python scripts/register_consumer_key.py <consumer> [--env .env.secrets] [--token ...] [--plaintext]",
+      "preconditions": ["writable .env.secrets"],
+      "steps": [
+        {"action": "run with a consumer name", "expected": "generates llmr_<token> (rejects <16 chars)"},
+        {"action": "default mode", "expected": "stores sha256(token)->consumer in CALLER_KEYS_SHA256_JSON; raw token printed once, never stored"},
+        {"action": "--plaintext", "expected": "legacy CALLER_KEYS_JSON (raw token, discouraged)"}
+      ],
+      "notes": ".env.secrets rewritten chmod 600. Restart/reload for keys to take effect (caller maps read at module import).",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "issue-consumer-key-dashboard", "order": 25, "phase": "4-consumer-keys",
+      "name": "Issue a consumer key from the dashboard (+ setup blurb)",
+      "actor": "operator", "category": "consumer-keys",
+      "entry_point": "POST /dashboard/api/keys {consumer}",
+      "preconditions": ["admin session; DASHBOARD_ISSUED_KEYS_PATH + .env.secrets writable"],
+      "steps": [
+        {"action": "POST {consumer}", "expected": "mints <prefix>_<token>; sha256->consumer in CALLER_KEYS_SHA256_JSON; appends {sha256_prefix,status:active,created_at} record"},
+        {"action": "response + copy blurb (buildKeyHandoff)", "expected": "raw api_key shown once; blurb has PUBLIC_BASE_URL, profile:default, curl + Python OpenAI-SDK examples, /usage, 403 route hint"}
+      ],
+      "notes": "Only hashed metadata persisted. The new key works immediately on the ingress (in-memory map updated). This is the path we used to mint the local test key.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+    {
+      "id": "rotate-consumer-key", "order": 26, "phase": "4-consumer-keys",
+      "name": "Rotate a consumer key with a grace period",
+      "actor": "operator", "category": "consumer-keys",
+      "entry_point": "POST /dashboard/api/keys {consumer, rotate:true, grace_period_s?}",
+      "preconditions": ["admin session; existing active key(s)"],
+      "steps": [
+        {"action": "POST rotate:true", "expected": "new key minted"},
+        {"action": "existing active non-expiring keys get expires_at=now+grace (clamped 0..90d) + replaced_at", "expected": "old keys work until expiry, then rejected caller_key_expired"}
+      ],
+      "notes": "Lets clients swap keys without downtime; expiry enforced at request time.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "revoke-consumer-key", "order": 27, "phase": "4-consumer-keys",
+      "name": "Revoke a consumer key immediately",
+      "actor": "operator", "category": "consumer-keys",
+      "entry_point": "POST /dashboard/api/keys/revoke {consumer, sha256_prefix}",
+      "preconditions": ["admin session; prefix 8-64 hex"],
+      "steps": [
+        {"action": "POST", "expected": "record status:revoked + revoked_at; hash dropped from CALLER_KEYS_SHA256_JSON (and plaintext); persisted to .env.secrets"},
+        {"action": "subsequent calls", "expected": "404 if prefix not found; revoked key -> caller_key_revoked; takes effect immediately"}
+      ],
+      "notes": "",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "configure-consumer-limits", "order": 28, "phase": "4-consumer-keys",
+      "name": "Configure consumer policy (status / allowed_routes / rate / burst)",
+      "actor": "operator", "category": "consumer-keys",
+      "entry_point": "POST /dashboard/api/consumers/{consumer} {status?, allowed_routes?, rate_per_min?, burst?}",
+      "preconditions": ["admin session"],
+      "steps": [
+        {"action": "set status active/inactive", "expected": "inactive -> all that consumer's keys rejected (caller_inactive)"},
+        {"action": "set allowed_routes (exact, * / all, or prefix*)", "expected": "_route_allowed gates each request by model / profile:<name>; empty=all"},
+        {"action": "set rate_per_min / burst", "expected": "per-caller 60s window; effective = max(rate_per_min, burst), default to global RATE_PER_MIN/BURST"}
+      ],
+      "notes": "Dashboard UI = Consumers tab -> Settings drawer (saveConsumerSettings).",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "reveal-consumer-key", "order": 29, "phase": "4-consumer-keys",
+      "name": "Reveal a recoverable consumer key (legacy plaintext only)",
+      "actor": "operator", "category": "consumer-keys",
+      "entry_point": "GET /dashboard/api/keys/reveal?consumer=<name>",
+      "preconditions": ["admin session"],
+      "steps": [
+        {"action": "GET", "expected": "raw rows only for legacy CALLER_KEYS_JSON entries + hash_only_count"},
+        {"action": "hash-only consumer", "expected": "message: cannot be revealed; generate a replacement"}
+      ],
+      "notes": "Hash-only (default) keys are unrecoverable by design.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P2"}
+    },
+
+    {
+      "id": "chat-default-policy", "order": 30, "phase": "5-consumer-api",
+      "name": "Chat completion with the default policy (empty model)",
+      "actor": "consuming-service", "category": "api",
+      "entry_point": "POST /v1/chat/completions",
+      "preconditions": ["Bearer caller token (active, route allowed, under rate limit)"],
+      "steps": [
+        {"action": "POST {model:'', messages:[...]}", "expected": "contract.profile=default_profile; the single declarative default Sigma_pol policy runs; max_tokens defaulted to 4096 if omitted"},
+        {"action": "router filters->scores->picks over the host keys", "expected": "200 chat.completion + x_router{provider, model_family, served_model_id, price_in/out, cost_usd, policy_fingerprint, decision_trace (ranked trimmed to top 10)}"}
+      ],
+      "notes": "Primary 'let the router decide' path. cost_usd = tokens x chosen price (0 for codex subs, clamped >=0).",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+    {
+      "id": "chat-family-pin", "order": 31, "phase": "5-consumer-api",
+      "name": "Chat completion pinned to a model family (model=family:NAME)",
+      "actor": "consuming-service", "category": "api",
+      "entry_point": "POST /v1/chat/completions",
+      "preconditions": ["Bearer caller token"],
+      "steps": [
+        {"action": "POST model:'family:deepseek-v3'", "expected": "default policy + requirements.model_family; only that family qualifies"},
+        {"action": "router ranks the family's sellers", "expected": "200; x_router.model_family = the pin; route key for allow-lists = 'family:deepseek-v3'"}
+      ],
+      "notes": "Sugar over the default policy.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "chat-provider-pin", "order": 32, "phase": "5-consumer-api",
+      "name": "Chat completion pinned to one (provider, family) (model=pin:PROVIDER/FAMILY)",
+      "actor": "consuming-service", "category": "api",
+      "entry_point": "POST /v1/chat/completions",
+      "preconditions": ["Bearer caller token"],
+      "steps": [
+        {"action": "POST model:'pin:openrouter/deepseek-v3'", "expected": "requirements.pin={provider,model}; only that exact seller qualifies; no cross-provider fallback"},
+        {"action": "router calls the pinned seller", "expected": "200 with x_router.provider==pin; if it errors -> exhausted/no_candidates (nothing to fall back to)"}
+      ],
+      "notes": "Malformed pin (no '/') silently degrades to plain default policy.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "chat-named-profile", "order": 33, "phase": "5-consumer-api",
+      "name": "Chat completion via a named profile (model=profile:NAME or path /NAME/v1/...)",
+      "actor": "consuming-service", "category": "api",
+      "entry_point": "POST /v1/chat/completions  OR  POST /{profile}/v1/chat/completions",
+      "preconditions": ["Bearer caller token"],
+      "steps": [
+        {"action": "POST model:'profile:edge' (or path-addressed)", "expected": "contract.profile='edge'; for the path form the path wins and the model string is ignored"},
+        {"action": "router runs that profile's term", "expected": "200; x_router.policy_fingerprint identifies the profile"}
+      ],
+      "notes": "Only 'default' ships out of the box. Route 'profile:edge' is derived from the path too, so route restriction works for both forms.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "chat-per-call-policy-ir", "order": 34, "phase": "5-consumer-api",
+      "name": "Chat completion with a per-call Sigma_pol policy_ir term",
+      "actor": "consuming-service", "category": "api",
+      "entry_point": "POST /v1/chat/completions",
+      "preconditions": ["Bearer caller token"],
+      "steps": [
+        {"action": "POST body with a policy_ir array term", "expected": "shim forwards it verbatim; the CORE is the single admission boundary (check sorts/arity/depth<=64/nodes<=4096) then AND-composes the host policy_envelope (caller can only narrow)"},
+        {"action": "admission + execution", "expected": "200 with x_router.policy_fingerprint = term identity; admission failure -> 400 invalid_request_error code invalid_policy 'policy_ir rejected at admission: <reason>'"}
+      ],
+      "notes": "The PRIMARY routing path. 5-slot term: filter/score/pick/xform/failplan (core/docs/SIGMA-POL.md).",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+    {
+      "id": "chat-flow-ir", "order": 35, "phase": "5-consumer-api",
+      "name": "Chat completion driving a Sigma_flow DAG (flow_ir term)",
+      "actor": "consuming-service", "category": "api",
+      "entry_point": "POST /v1/chat/completions",
+      "preconditions": ["Bearer caller token"],
+      "steps": [
+        {"action": "POST body with flow_ir = ['flow', {input, llm nodes (each with own policy+system+inputs), output}]", "expected": "flow_ir takes precedence over policy_ir/model; core admits the whole DAG (acyclic, one source/one sink, each node's policy admitted)"},
+        {"action": "execute_flow_async schedules the DAG; each llm node is a normal routed call", "expected": "answer = sink output; x_router.provider='flow', model_family='flow:<fp>', decision_trace.flow_nodes[] per-node trace (provider/model/price/tokens/latency/nested trace)"},
+        {"action": "admission/node failure", "expected": "admission -> 400 invalid_flow; a node failing surfaces the node's REAL error kind (e.g. no_candidates->503), not a blanket 502; failed flow still records provider:'flow' + failed_node"}
+      ],
+      "notes": "Sigma_flow = declarative composition over Sigma_pol (no loops/effects). Tokens ~ Nx input. This is the ensemble/review-MoA path we screenshotted.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+    {
+      "id": "chat-streaming", "order": 36, "phase": "5-consumer-api",
+      "name": "Streaming chat completion (stream:true, SSE)",
+      "actor": "consuming-service", "category": "api",
+      "entry_point": "POST /v1/chat/completions {stream:true}",
+      "preconditions": ["Bearer caller token"],
+      "steps": [
+        {"action": "POST any routing form with stream:true", "expected": "Content-Type text/event-stream; fallback BEFORE the first content delta is still a clean JSON error (not SSE)"},
+        {"action": "receive SSE", "expected": "role chunk, text deltas, final chunk with usage+x_router (cost+trimmed trace), then [DONE]; heartbeat comments keep the line warm under the 60s ALB idle timeout"},
+        {"action": "proxy records AFTER stream ends", "expected": "ingress tees the SSE tail to extract final usage/cost -> real tokens in the usage row"}
+      ],
+      "notes": "A streaming Sigma_flow has no token stream -> first byte + heartbeats while it runs, then the assembled result (or trace+error on failure).",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "chat-tool-calls", "order": 37, "phase": "5-consumer-api",
+      "name": "Chat completion with tool calls",
+      "actor": "consuming-service", "category": "api",
+      "entry_point": "POST /v1/chat/completions {tools:[...]}",
+      "preconditions": ["Bearer caller token"],
+      "steps": [
+        {"action": "POST with tools[]/tool_choice (+ any routing form)", "expected": "shim forwards tools/tool_choice/response_format/temperature/seed; a policy can gate on cap_tools"},
+        {"action": "model returns tool calls", "expected": "200 with choices[0].message.tool_calls, finish_reason 'tool_calls'; in a flow the sink node's tool_calls are emitted"}
+      ],
+      "notes": "flow+tools with no tool-capable candidate fails clean with no_candidates (503), not 502.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "list-models", "order": 38, "phase": "5-consumer-api",
+      "name": "List the routable model catalog",
+      "actor": "consuming-service", "category": "api",
+      "entry_point": "GET /v1/models",
+      "preconditions": ["Bearer caller token"],
+      "steps": [
+        {"action": "GET /v1/models", "expected": "{object:list, data:[{id:'profile:<name>'},{id:'family:<fam>'}...]} = profile names + curated + discovered families; exactly the model-field values a caller can send"}
+      ],
+      "notes": "Auth required (goes through the proxy).",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+    {
+      "id": "consumer-key-usage", "order": 39, "phase": "5-consumer-api",
+      "name": "Per-key usage self-service (consumer)",
+      "actor": "consuming-service", "category": "api",
+      "entry_point": "GET /v1/usage (alias GET /api/usage)",
+      "preconditions": ["Bearer caller token (the exact key whose usage is reported)"],
+      "steps": [
+        {"action": "GET /v1/usage?since&until&limit&offset OR /api/usage?window=24h", "expected": "usage for ONLY that key; window 15m/24h/7d/4w overrides since; limit clamped 1-500"},
+        {"action": "receive snapshot", "expected": "schema_version 3, key_sha256_prefix (first 12 hex only), consumer_settings, totals, cost_estimate, daily/monthly, by_provider/model_family/route/served_model/status, route_health, recent[]"}
+      ],
+      "notes": "Bad window -> 400 invalid_usage_window. Operator equivalent: POST /dashboard/api/key-usage (admin session).",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "route-and-rate-rejections", "order": 40, "phase": "5-consumer-api",
+      "name": "Auth / route-restriction / rate-limit rejections (ingress)",
+      "actor": "consuming-service", "category": "api",
+      "entry_point": "any /v1 or /api path",
+      "preconditions": ["Bearer caller token"],
+      "steps": [
+        {"action": "no/unknown token", "expected": "401 caller_auth"},
+        {"action": "inactive/revoked/expired key", "expected": "403 caller_inactive | caller_key_revoked | caller_key_expired"},
+        {"action": "route not in allowed_routes (route = body.model or profile:<seg> from path)", "expected": "403 caller_route_not_allowed; empty/['all']/['*'] = all; 'prefix*' wildcard"},
+        {"action": "exceed rate_per_min/burst", "expected": "429 caller_rate_limit"}
+      ],
+      "notes": "All enforced in the ingress BEFORE forwarding; rejects recorded (_record_reject).",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+    {
+      "id": "router-cascade-errors", "order": 41, "phase": "5-consumer-api",
+      "name": "Fallback/cascade behavior + router error kinds (in the trace)",
+      "actor": "consuming-service", "category": "api",
+      "entry_point": "POST /v1/chat/completions",
+      "preconditions": ["Bearer caller token"],
+      "steps": [
+        {"action": "a chosen provider errors mid-cascade", "expected": "router tries ranked candidates in order; decision_path records each attempt (provider/family, error_kind, http_status, message). 402->payment_required, 401/403->auth_error, 429->rate_limit, 408/504->timeout, 404->model_unavailable, 400->bad_request/context_overflow, 5xx->server_error, empty content->bad_response"},
+        {"action": "all candidates exhausted / none qualify", "expected": "error body {error{message,type:router_error,code}, x_router{decision_trace}}; mapped: no_candidates->503, auth_error->401, rate_limit->429, bad_request/context_overflow->400, timeout->504, else->502; message appends per-attempt summary"}
+      ],
+      "notes": "This is exactly what we debugged (antseed payment_required/network_error, z-ai/glm-5.2 bad_response, opus bad_request). Same translation on the streaming path.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+
+    {
+      "id": "analytics-view", "order": 42, "phase": "6-dashboard-ops",
+      "name": "View Analytics (spend / traffic / errors with filters)",
+      "actor": "operator", "category": "dashboard",
+      "entry_point": "Analytics tab -> GET /dashboard/api/stats?timeframe&consumer&provider&model",
+      "preconditions": ["session"],
+      "steps": [
+        {"action": "open Analytics", "expected": "metric cards Requests/Spend/Tokens/Success-rate; over-time bars; By provider/model/consumer/status tables; live chat-health banner"},
+        {"action": "change timeframe (all/runtime/1h/24h/7d/30d), consumer, provider, model filters; Refresh", "expected": "snapshot rescoped/refetched; 15s auto-poll"}
+      ],
+      "notes": "",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "activity-trace", "order": 43, "phase": "6-dashboard-ops",
+      "name": "Activity -- per-request trace (policy term, fallback chain, cost, Sigma_flow DAG)",
+      "actor": "operator", "category": "dashboard",
+      "entry_point": "Activity tab -> rows from /dashboard/api/stats recent[]; filter All/Requests/Rejects/Probes",
+      "preconditions": ["session"],
+      "steps": [
+        {"action": "open Activity, filter", "expected": "table Time/Event/Caller/Status/Route/Provider/Cost/Error"},
+        {"action": "expand a row", "expected": "meta pills (policy/flow fingerprint, cost, tokens, latency, served model); Attempts fallback order with per-provider ok/error/skip; copyable Sigma_pol term"},
+        {"action": "expand a Sigma_flow request", "expected": "node DAG view (level-laid nodes, per-node provider/model/latency/tokens + inner attempts)"}
+      ],
+      "notes": "This is the view we used for the flow screenshots.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P0"}
+    },
+    {
+      "id": "builder-policy", "order": 44, "phase": "6-dashboard-ops",
+      "name": "Builder -- compose / review / download / test a Sigma_pol policy",
+      "actor": "operator", "category": "dashboard",
+      "entry_point": "Builder tab (Policy mode); /dashboard/api/policy/{build,preview,normalize,test}, /dashboard/api/fields, /dashboard/api/policies",
+      "preconditions": ["admin session"],
+      "steps": [
+        {"action": "compose filter rows / score terms / selector (rows<->raw term)", "expected": "bBuildTerm assembles ['policy',filter,score,selector,...]; fields data-driven from /x/fields"},
+        {"action": "Review ranking", "expected": "normalize -> fingerprint; preview (/x/rank) -> ranked Provider/Model/Tier/$in/$out/Score; empty survivors -> 'No survivors'"},
+        {"action": "Download policy", "expected": "sigma-pol-<fp>.json {version,fingerprint,policy_ir}"},
+        {"action": "Test call (prompt)", "expected": "runs /v1/chat/completions with policy_ir; result chips + output; recorded in Activity (caller=dashboard-test, not billed)"}
+      ],
+      "notes": "400s render verbatim in the builder error box.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "builder-flow", "order": 45, "phase": "6-dashboard-ops",
+      "name": "Flow Builder -- compose / review / download / test a Sigma_flow DAG",
+      "actor": "operator", "category": "dashboard",
+      "entry_point": "Builder tab (Flow mode); /dashboard/api/flow/{normalize,test}",
+      "preconditions": ["admin session"],
+      "steps": [
+        {"action": "add nodes, per-node system prompt, choose inputs (multi-input=fusion), pick answer node; '↧ use Policy-builder term' or edit raw", "expected": "fBuildIR assembles ['flow',{u:input,n*:llm,out:output}]"},
+        {"action": "Review flow", "expected": "/dashboard/api/flow/normalize -> fingerprint, 'Flow admitted'"},
+        {"action": "Download flow", "expected": "sigma-flow-<fp>.json"},
+        {"action": "Test call", "expected": "/dashboard/api/flow/test runs live; per-node trace chips + output; recorded in Activity"}
+      ],
+      "notes": "Default example = Mixture-of-agents (2 drafts -> synthesize), same shape as our ensemble.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "catalog-view", "order": 46, "phase": "6-dashboard-ops",
+      "name": "Catalog (Market) -- price book + per-seller perf, + SKILL.md download",
+      "actor": "operator", "category": "dashboard",
+      "entry_point": "Catalog tab -> GET /dashboard/api/market (-> /x/market); /dashboard/api/skill",
+      "preconditions": ["admin session"],
+      "steps": [
+        {"action": "open Catalog", "expected": "per-family rows: quality, benchmark badges, modalities, cheapest $in/$out, seller count"},
+        {"action": "expand a family", "expected": "seller table: wire model, $in/$out, status (live/disabled/pinned/over-cap), perf (success%/ms/calls), refreshed time"},
+        {"action": "filter / Tradable-only / Copy / download SKILL.md", "expected": "filtered list; catalog JSON to clipboard; SKILL.md with live catalog + field vocab baked in"}
+      ],
+      "notes": "Wallet cell appears on the AntSeed provider. 502 if router /x/market unavailable.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "consumers-manage", "order": 47, "phase": "6-dashboard-ops",
+      "name": "Consumers tab -- browse / scope / settings / create-rotate-revoke-reveal keys",
+      "actor": "operator", "category": "dashboard",
+      "entry_point": "Consumers tab + Settings group; /dashboard/api/{stats,keys,keys/revoke,keys/reveal,consumers/{c}}",
+      "preconditions": ["admin session"],
+      "steps": [
+        {"action": "browse/search/filter; click a row", "expected": "rows (status, requests/errors/tokens/spend/last-seen/key-status); scope to one consumer -> detail + routes/providers breakdown + recent activity"},
+        {"action": "drawer actions", "expected": "Save settings (configure-consumer-limits); Generate/rotate key (+ handoff blurb); Revoke key; Reveal keys -- see flows 25-29"}
+      ],
+      "notes": "Consumer-role sessions get admin actions hidden.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "key-usage-lookup", "order": 48, "phase": "6-dashboard-ops",
+      "name": "Key usage -- operator per-key lookup",
+      "actor": "operator", "category": "dashboard",
+      "entry_point": "Key usage tab -> POST /dashboard/api/key-usage {api_key, window?, limit?, offset?}",
+      "preconditions": ["admin session"],
+      "steps": [
+        {"action": "paste api_key + window/limit/offset", "expected": "same sanitized router_key_usage snapshot as /v1/usage for that key; 404 key_usage_not_found if unseen; 401 if not admin"}
+      ],
+      "notes": "Consumer bearer does NOT satisfy this -- admin session only.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P2"}
+    },
+    {
+      "id": "provider-keys-tab", "order": 49, "phase": "6-dashboard-ops",
+      "name": "Provider keys tab -- view / reveal / edit / add / manage Codex accounts",
+      "actor": "operator", "category": "dashboard",
+      "entry_point": "Provider keys tab; /dashboard/api/provider-keys[/add|/update|/reveal], /dashboard/api/codex/accounts",
+      "preconditions": ["admin session"],
+      "steps": [
+        {"action": "view + reveal/copy", "expected": "rows: provider, credential (env name+fingerprint) or AntSeed wallet cell, usage stats; reveal -> raw key inline"},
+        {"action": "edit / add provider / manage codex accounts", "expected": "see flows provider-add, provider-key-update-reveal, codex-multi-account"}
+      ],
+      "notes": "Privatized by default (env names + fingerprints).",
+      "test_flags": {"real_money": false, "real_credentials": true, "tos_risk": false, "mockable": true, "priority": "P1"}
+    },
+    {
+      "id": "config-knobs", "order": 50, "phase": "6-dashboard-ops",
+      "name": "Config tab -- per-provider runtime knobs (PVC-backed, hot-apply)",
+      "actor": "operator", "category": "dashboard",
+      "entry_point": "Config tab -> GET /dashboard/api/config ; POST /dashboard/api/config (-> /x/config/reload)",
+      "preconditions": ["admin session"],
+      "steps": [
+        {"action": "open Config", "expected": "knobs grouped by provider (antseed/codex/openrouter): value, default, [min,max], override pill"},
+        {"action": "edit + Save", "expected": "validated vs schema, persisted to PVC, hot-applied; 'Saved · live'; 400 on schema failure"},
+        {"action": "Reset an overridden knob", "expected": "override cleared to default"}
+      ],
+      "notes": "Knobs: antseed top-N/runway, codex scarcity ramp/runway, openrouter credit runway.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P2"}
+    },
+
+    {
+      "id": "antseed-identity-and-fund", "order": 51, "phase": "7-money-antseed",
+      "name": "AntSeed buyer identity + fund the hot-wallet (USDC + ETH gas on Base mainnet)",
+      "actor": "operator", "category": "billing",
+      "entry_point": "env ANTSEED_IDENTITY_HEX (private key) ; on-chain transfer to the wallet address",
+      "preconditions": ["a secp256k1 private key controlling a Base wallet; real USDC + ETH"],
+      "steps": [
+        {"action": "set ANTSEED_IDENTITY_HEX to the funded wallet's private key", "expected": "durable identity across volume loss (unset -> ephemeral key in the volume, lost with it)"},
+        {"action": "send USDC + ETH(gas) to the wallet address", "expected": "raw wallet USDC appears (but is NOT yet spendable -- see escrow)"}
+      ],
+      "notes": "REAL MONEY. Treat ANTSEED_IDENTITY_HEX as a private key -- never commit it. wallet USDC alone does nothing; the buyer spends from escrow.",
+      "test_flags": {"real_money": true, "real_credentials": true, "tos_risk": false, "mockable": false, "priority": "P2"}
+    },
+    {
+      "id": "antseed-deposit-withdraw", "order": 52, "phase": "7-money-antseed",
+      "name": "AntSeed deposit / withdraw / refresh (wallet <-> escrow)",
+      "actor": "operator", "category": "billing",
+      "entry_point": "dashboard Deposit/Withdraw/Refresh -> POST /dashboard/api/wallet/{deposit,withdraw,refresh} -> /x/wallet/* -> sidecar control :8379 -> antseed buyer <cmd>",
+      "preconditions": ["funded wallet; ANTSEED_CONTROL_TOKEN set on router+sidecar (else 503); in k8s ANTSEED_CONTROL_URL=http://127.0.0.1:8379"],
+      "steps": [
+        {"action": "Deposit {amount}", "expected": "amount validated ^\\d+(\\.\\d{1,6})?$ >0; antseed buyer deposit <amt> on-chain (120s tx timeout); mutations serialized"},
+        {"action": "control runs buyer status --json", "expected": "status-antseed.json rewritten; router reads new depositsAvailable on next poll"},
+        {"action": "dashboard refresh", "expected": "new escrow + runway (off available+reserved total; reserved returns as channels settle)"}
+      ],
+      "notes": "REAL on-chain spend. wallet-vs-escrow gotcha: dashboard shows depositsAvailable (escrow), what the buyer spends -- NOT raw wallet USDC. Prod runbook = the antseed-prod-deposit skill (VPN+SSO+kubectl). Propagation lag: sidecar 60s, router poll 300s.",
+      "test_flags": {"real_money": true, "real_credentials": false, "tos_risk": false, "mockable": false, "priority": "P2"}
+    },
+    {
+      "id": "antseed-market-dump", "order": 53, "phase": "7-money-antseed",
+      "name": "AntSeed browse market / regenerate price seeds (no spend)",
+      "actor": "operator", "category": "billing",
+      "entry_point": "antseed network browse --services --json --top 50 ; auto /market/market.json ; dashboard Market via /x/market",
+      "preconditions": ["AntSeed node running"],
+      "steps": [
+        {"action": "browse the network", "expected": "per-peer servicePricing[<model>] input/output USD-per-million, queryable WITHOUT spending"},
+        {"action": "seed metrics.live.lua with the cheapest peer per model", "expected": "a seed only; live EMA becomes source of truth once proxies run"}
+      ],
+      "notes": "Stale dump (>900s) -> degraded (no antseed candidates). Writer validates JSON before writing. Caps enforced by the buyer proxy so a stale seed can't overpay.",
+      "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P2"}
+    }
+  ]
+}

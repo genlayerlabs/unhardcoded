@@ -46,6 +46,20 @@ The host pins the policy-selected peer per request via `x-antseed-pin-peer`
 (the browse-mode buyer disables auto-selection), keeping peer choice inside
 Σ_pol rather than an opaque buyer-side router.
 
+### Local dev wallet (testing)
+
+For local testing use a **dedicated dev wallet**, never your production key.
+`./scripts/gen-dev-wallet.sh` prints a fresh `ANTSEED_IDENTITY_HEX` +
+`ANTSEED_CONTROL_TOKEN` to paste into `.env`; bring the sidecar up
+(`docker compose --profile antseed up -d`), read the derived address with
+`docker compose exec antseed antseed buyer balance --json`, fund it with a little
+USDC + ETH (gas) on Base, then **Deposit** into escrow from the dashboard Catalog
+(wallet cell). Keep dev and prod wallet secrets separate. See `.env.example`.
+
+> Note: the AntSeed deposits contract **locks** deposited funds — an immediate
+> `withdraw` after a `deposit` reverts. Funds are safe in escrow and become
+> withdrawable later, or are spent as the buyer routes paid calls.
+
 ### Running the node (vendored sidecar)
 
 Built from `Dockerfile.antseed` (pinned `@antseed/cli`, `socat`) and run by
