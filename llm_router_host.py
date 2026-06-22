@@ -570,6 +570,29 @@ def _resolve_auth_headers(
     return None, _err("auth_error", 0, 0, f"unknown auth kind {kind!r}")
 
 
+def _resolve_ollama_cloud_auth(
+    env_get: Callable[[str], str | None],
+    url: str,
+    method: str = "POST",
+    body: bytes = b"",
+) -> dict | None:
+    """Resolve auth headers for Ollama Cloud via OLLAMA_API_KEY.
+
+    Args:
+        env_get: Function to read environment variables
+        url: Full URL for the request (unused; kept for call-site symmetry)
+        method: HTTP method (unused; kept for call-site symmetry)
+        body: Request body (unused; kept for call-site symmetry)
+
+    Returns {"Authorization": "Bearer <key>"} if OLLAMA_API_KEY is set,
+    else None (caller maps None to an auth_error).
+    """
+    api_key = env_get("OLLAMA_API_KEY")
+    if api_key:
+        return {"Authorization": f"Bearer {api_key}"}
+    return None
+
+
 def _prepare_openai_call(
     request: dict,
     env_get: Callable[[str], str | None],
@@ -584,6 +607,7 @@ def _prepare_openai_call(
         return None, err
 
     offer = request.get("offer") or {}
+
     body: dict = {
         # marketplace candidates may serve a curated family under a different
         # wire name (service aliasing) — the offer's wire id wins.
@@ -596,6 +620,38 @@ def _prepare_openai_call(
             body[field] = v
 
     url = (request.get("base_url") or "").rstrip("/") + "/chat/completions"
+
+    # Ollama: override auth based on endpoint
+    # Local endpoints (localhost, 127.0.0.1) require no auth
+    # Cloud endpoints (ollama.com) require auth (OLLAMA_API_KEY Bearer)
+    base_url = request.get("base_url") or ""
+    provider_id = request.get("provider_id") or ""
+    seller_endpoint = offer.get("seller_endpoint") or ""
+
+    # Detect Ollama by provider_id, base_url, or seller_endpoint
+    is_ollama = (
+        provider_id == "ollama" or
+        "ollama.com" in base_url or
+        "ollama.com" in seller_endpoint or
+        "localhost:11434" in base_url or
+        "127.0.0.1:11434" in base_url or
+        base_url.rstrip("/").endswith(":11434/v1")
+    )
+
+    if is_ollama:
+        endpoint = seller_endpoint or base_url
+        if endpoint.startswith("https://ollama.com"):
+            # Cloud: API key Bearer (OLLAMA_API_KEY)
+            auth_headers = _resolve_ollama_cloud_auth(
+                env_get, url, method="POST", body=b""
+            )
+            if auth_headers is None:
+                return None, _err("auth_error", 0, 0,
+                    "Ollama Cloud requires OLLAMA_API_KEY")
+        else:
+            # Local: no auth required
+            auth_headers = {}
+
     headers = {"Content-Type": "application/json", **auth_headers, **extra}
     # Marketplace (AntSeed): the buyer proxy runs in browse mode and disables
     # auto-selection, so the host pins the offer's peer per request. The peer is

@@ -122,6 +122,17 @@ return {
             notes     = "ChatGPT subscription via Codex proxy. UNOFFICIAL / ToS-risky — "
                      .. "the backend mimics the Codex CLI. See docs/OPENAI-CODEX.md.",
         },
+        ollama = {
+            discovery = "marketplace",
+            discovery_id = "ollama",
+            base_url = os.getenv("OLLAMA_BASE_URL") or "http://localhost:11434/v1",
+            cloud_url = "https://ollama.com/api/v1",
+            api_kind = "openai_compatible",
+            auth_env = "OLLAMA_API_KEY",
+            tier = "partner",
+            notes = "Local Ollama (no auth) or Ollama Cloud (subscription). "
+                  .. "Set OLLAMA_CLOUD=1 to prefer cloud endpoint.",
+        },
     },
 
     models = {
