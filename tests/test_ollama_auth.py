@@ -119,18 +119,34 @@ class TestAuthHeaderGeneration:
 
     def test_auth_header_varies_by_timestamp(self, mock_key_path):
         """Test that auth headers vary over time (due to timestamp)."""
-        # Generate two headers with a small time gap
-        # Note: This test may be flaky if run within the same second
+        import time
+
+        # Generate first header
         header1 = get_ollama_auth_header(
             method="GET",
             url="https://ollama.com/api/tags",
             key_path=mock_key_path
         )
 
-        # The timestamp is embedded in the challenge
-        # Different seconds should produce different signatures
-        # For this test we just verify the format
+        # Wait for timestamp to change
+        time.sleep(1.1)
+
+        # Generate second header
+        header2 = get_ollama_auth_header(
+            method="GET",
+            url="https://ollama.com/api/tags",
+            key_path=mock_key_path
+        )
+
+        # Both should have valid format
         assert ":" in header1
+        assert ":" in header2
+
+        # Signatures should differ due to different timestamps
+        # Format is pubkey:signature, so compare signatures (second part)
+        sig1 = header1.split(":")[1]
+        sig2 = header2.split(":")[1]
+        assert sig1 != sig2, "Signatures should differ for different timestamps"
 
 
 class TestKeyLoading:

@@ -23,7 +23,8 @@ from sources.ollama_auth import (
 
 
 BASE_URL_LOCAL = "http://localhost:11434"
-BASE_URL_CLOUD = "https://ollama.com"
+BASE_URL_CLOUD_DISCOVERY = "https://ollama.com"  # Discovery: /api/tags
+BASE_URL_CLOUD_API = "https://ollama.com/api/v1"  # Chat completions endpoint
 HTTP_TIMEOUT_S = 15.0
 
 
@@ -103,11 +104,11 @@ class OllamaSource:
             return []
 
         try:
-            headers = self._get_auth_headers(f"{BASE_URL_CLOUD}/api/tags")
+            headers = self._get_auth_headers(f"{BASE_URL_CLOUD_DISCOVERY}/api/tags")
             if not headers:
                 return []
 
-            body = await self._get(BASE_URL_CLOUD, "/api/tags", headers=headers)
+            body = await self._get(BASE_URL_CLOUD_DISCOVERY, "/api/tags", headers=headers)
             return body.get("models") or []
         except Exception:
             return []  # Cloud unavailable, skip silently
@@ -178,7 +179,7 @@ class OllamaSource:
             offer = {
                 "model_family": model_id,
                 "wire_model_id": model_id,
-                "seller_endpoint": BASE_URL_CLOUD,
+                "seller_endpoint": BASE_URL_CLOUD_API,  # Chat completions endpoint
                 "price_in_usd_per_mtok": 0.0,
                 "price_out_usd_per_mtok": 0.0,
                 "capabilities": self._extract_capabilities(m),

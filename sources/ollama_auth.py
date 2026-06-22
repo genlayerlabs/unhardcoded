@@ -51,7 +51,10 @@ def _load_ed25519_key_ssh(key_path: Path) -> tuple[bytes, bytes]:
     if not key_path.exists():
         raise OllamaAuthError(f"Ollama key not found at {key_path}")
 
-    key_data = key_path.read_bytes()
+    try:
+        key_data = key_path.read_bytes()
+    except (PermissionError, OSError) as e:
+        raise OllamaAuthError(f"Cannot read Ollama key at {key_path}: {e}")
 
     if HAS_CRYPTOGRAPHY:
         return _load_with_cryptography(key_data)
@@ -95,11 +98,12 @@ def _load_with_cryptography(key_data: bytes) -> tuple[bytes, bytes]:
 
 
 def _load_with_nacl(key_data: bytes) -> tuple[bytes, bytes]:
-    """Load Ed25519 key using PyNaCl library."""
-    import nacl.bindings
+    """Load Ed25519 key using PyNaCl library.
 
+    Note: This is a fallback parser. The cryptography library is preferred
+    for full OpenSSH format support.
+    """
     # Parse SSH private key format
-    # SSH private keys have a specific format we need to parse
     lines = key_data.decode('utf-8').strip().split('\n')
 
     if not lines[0].startswith('-----BEGIN') or 'PRIVATE KEY' not in lines[0]:
@@ -109,39 +113,27 @@ def _load_with_nacl(key_data: bytes) -> tuple[bytes, bytes]:
     b64_content = ''.join(lines[1:-1])
     key_bytes = base64.b64decode(b64_content)
 
-    # SSH private key format for Ed25519:
-    # The last 32 bytes after the comment are typically the seed
-    # This is a simplified parser - cryptography library is preferred
-
-    # For now, use a workaround: extract from openssh format
-    # The openssh format has the key data after some headers
-    # Ed25519 private key in openssh format has 32-byte seed + 32-byte public key
-
-    # Try to find the key data
-    # Looking for 64 bytes (32 seed + 32 public) in the decoded data
-    import struct
-
     try:
-        # Try to parse as OpenSSH format
-        # See: https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.key
-        pos = 0
+        # Check for OpenSSH v1 format (modern Ed25519 keys)
+        # Magic: "openssh-key-v1\x00"
+        if key_bytes.startswith(b"openssh-key-v1\x00"):
+            # This is the modern OpenSSH format - complex parsing required
+            # Recommend using cryptography library for this
+            raise OllamaAuthError(
+                "OpenSSH v1 key format requires 'cryptography' library. "
+                "Install it with: pip install cryptography"
+            )
 
-        # Skip auth magic
-        if key_bytes.startswith(b"openssh-key-file"):
-            # OpenSSH new format
-            # Parse according to PROTOCOL.key
-            pos = 15  # Skip "openssh-key-file\0"
-            # cipher name, kdf name, kdf options, number of keys
-            # This is complex, use cryptography if available
-            raise OllamaAuthError("Install 'cryptography' library for SSH key parsing")
-
-        # Fall back: try raw 32 bytes
+        # Legacy PEM format - try to extract raw 64 bytes (seed + public)
         if len(key_bytes) >= 64:
-            # Assume last 64 bytes are seed + public
+            # For legacy Ed25519 PEM format, last 64 bytes are seed + public
             seed = key_bytes[-64:][:32]
-            return seed, seed[32:64]
+            public = key_bytes[-32:]  # Last 32 bytes are public key
+            return seed, public
 
         raise OllamaAuthError("Cannot parse SSH key with PyNaCl - install 'cryptography'")
+    except OllamaAuthError:
+        raise
     except Exception as e:
         raise OllamaAuthError(f"Failed to parse SSH key: {e}")
 

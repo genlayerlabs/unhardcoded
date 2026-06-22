@@ -6,6 +6,7 @@ Skips if Ollama not available.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -18,9 +19,7 @@ from sources.ollama import OllamaSource  # noqa: E402
 
 # Skip all tests in this module if Ollama not installed
 pytestmark = pytest.mark.skipif(
-    not os.path.exists("/usr/local/bin/ollama") and
-    not os.path.exists("/opt/homebrew/bin/ollama") and
-    not os.environ.get("OLLAMA_INTEGRATION_TESTS"),
+    shutil.which("ollama") is None and not os.environ.get("OLLAMA_INTEGRATION_TESTS"),
     reason="Ollama not installed or OLLAMA_INTEGRATION_TESTS not set"
 )
 
@@ -32,7 +31,7 @@ async def test_live_local_discovery():
 
     try:
         prices = await source.pricing()
-    except Exception as e:
+    except (ConnectionError, OSError) as e:
         pytest.skip(f"Ollama not reachable: {e}")
 
     # May be 0 if no models pulled, but should not raise
@@ -53,7 +52,7 @@ async def test_live_offers_cached():
 
     try:
         await source.pricing()
-    except Exception as e:
+    except (ConnectionError, OSError) as e:
         pytest.skip(f"Ollama not reachable: {e}")
 
     # offers_sync should return cached results without network
