@@ -44,38 +44,51 @@ docs/PROVIDERS.md      -- per-provider auth + the AntSeed node
 docs/OPENAI-CODEX.md   -- the ChatGPT-subscription provider (unofficial / ToS-risky)
 docs/USAGE_ENDPOINTS.md -- per-key usage stats API endpoints and auth behavior
 live_smoke.py          -- drive real providers end-to-end
-tests/                 -- the full host test suite
+tests/                 -- the full host unit-test suite
+features/              -- BDD user-flow suite (behave); user_flows.json is the spec
+SETUP.md               -- agent/human setup runbook (clone -> running -> first call)
+scripts/gen-dev-wallet.sh -- generate a local AntSeed dev wallet (testing)
 ```
 
-## Clone (with the core submodule)
+## Quickstart
+
+Point a coding agent at **[`SETUP.md`](./SETUP.md)** ("set up unhardcoded by
+following SETUP.md") for a guided, copy-pasteable runbook — or do it yourself:
 
 ```bash
-git clone --recursive https://github.com/genlayerlabs/unhardcoded.git
-# or, after a plain clone:
-git submodule update --init
+git clone --recursive https://github.com/genlayerlabs/unhardcoded.git && cd unhardcoded
+cp .env.example .env.secrets && chmod 600 .env.secrets
+# in .env.secrets: set OPENROUTER_API_KEY, and DASHBOARD_NO_AUTH=1 for local dev
+docker compose up -d --build
+curl -fsS http://127.0.0.1:8080/healthz            # -> {"ok":true,"initialized":true}
 ```
 
-## Run
+Open the dashboard at **http://127.0.0.1:8080/dashboard**, mint a caller key
+(`POST /dashboard/api/keys {"consumer":"my-app"}`, or Consumers → Generate key),
+then call:
 
 ```bash
-nix-shell -p 'python3.withPackages(ps: with ps; [lupa httpx fastapi uvicorn pydantic])' \
-    --run 'python serve.py --config config.live.lua --default-profile default --host 127.0.0.1 --port 8080'
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer <key>" -H "Content-Type: application/json" \
+  -d '{"model":"","messages":[{"role":"user","content":"Reply: pong"}]}'
 ```
 
-Put provider keys in the environment (`OPENROUTER_API_KEY`, `HEURIST_API_KEY`,
-…). For the ChatGPT-subscription (Codex) provider, `codex login` first and pass
-`--codex-auth ~/.codex/auth.json` — see [`docs/OPENAI-CODEX.md`](./docs/OPENAI-CODEX.md)
-(unofficial / ToS-risky).
+Empty `model` runs the `default` policy; or send `family:`/`pin:`/`profile:` or a
+per-call `policy_ir`/`flow_ir` (below). Optional providers (Codex, AntSeed) and
+troubleshooting are in [`SETUP.md`](./SETUP.md).
 
-A client points at the shim and either sends its own policy or lets the
-`default` decide:
+### Develop without Docker (raw shim — no dashboard/auth)
 
-```ini
-endpoint = "http://127.0.0.1:8080/v1/chat/completions"
-api_key  = "dummy"   # required non-empty; the shim ignores client auth
-model    = ""        # empty -> the default policy; or family:/pin:/profile: (below)
-# for a custom policy, POST a `policy_ir` term in the request body instead.
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+python serve.py --config config.live.lua --default-profile default --host 127.0.0.1 --port 8080
 ```
+
+`serve.py` is the data plane only (no ingress auth, no dashboard); provider keys
+come from the process env. The bearer-token contract and the dashboard live in
+the `ingress` service (`docker compose`). *(Nix users: a `nix-shell` with the
+same packages works too.)*
 
 ## Policies (the `model` field + `policy_ir`)
 
@@ -114,11 +127,29 @@ benchmarks/modalities/capabilities (`bench_intelligence`, `in_image`,
 
 ## Tests
 
+Install the test deps once (a virtualenv keeps them off your system Python):
+
 ```bash
-nix-shell -p 'python3.withPackages(ps: with ps; [lupa httpx fastapi uvicorn pydantic pytest pytest-asyncio])' \
-    --run 'python -m pytest tests -q'
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
 ```
 
-The tests boot a real host with mocked provider responses; only the outbound
-HTTP to upstream providers is mocked. The Codex live streaming call is not
-covered (no subscription in CI); everything around it is.
+**Unit** — boots a real host with mocked provider responses (only the outbound
+HTTP to upstream providers is mocked):
+
+```bash
+python -m pytest tests -q
+```
+
+**BDD user-flow suite** (`features/`, behave) — drives the live stack end to end
+the way the dashboard does and asserts the rendered data is correct, including a
+real headless-browser pass (needs Chrome/Chromium installed; Selenium fetches the
+matching driver). Free & repeatable: end-to-end chats route to a $0 path. The
+catalogue of flows it covers is [`user_flows.json`](./user_flows.json):
+
+```bash
+behave
+```
+
+*(Nix users: `nix-shell -p ...` with the same packages — plus `chromium
+chromedriver` for the browser pass — works as before.)*
