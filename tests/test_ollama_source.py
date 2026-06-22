@@ -80,7 +80,7 @@ async def test_cloud_discovery_with_api_key():
     offers = source.offers_sync("ollama")
     assert offers[0]["source"] == "cloud"
     assert offers[0]["seller_endpoint"] == "https://ollama.com/api/v1"
-    assert offers[0]["capabilities"].get("supports_tools") == True
+    assert offers[0]["capabilities"].get("supports_tools") is True
 
 
 @pytest.mark.asyncio
@@ -160,8 +160,8 @@ async def test_capability_extraction():
     offers = source.offers_sync("ollama")
     caps = offers[0]["capabilities"]
     assert caps["context"] == 128000
-    assert caps["supports_tools"] == True
-    assert caps["supports_vision"] == True
+    assert caps["supports_tools"] is True
+    assert caps["supports_vision"] is True
 
 
 @pytest.mark.asyncio

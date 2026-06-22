@@ -31,7 +31,7 @@ async def test_live_local_discovery():
 
     try:
         prices = await source.pricing()
-    except (ConnectionError, OSError) as e:
+    except (ConnectionError, OSError, TimeoutError) as e:
         pytest.skip(f"Ollama not reachable: {e}")
 
     # May be 0 if no models pulled, but should not raise
@@ -52,7 +52,7 @@ async def test_live_offers_cached():
 
     try:
         await source.pricing()
-    except (ConnectionError, OSError) as e:
+    except (ConnectionError, OSError, TimeoutError) as e:
         pytest.skip(f"Ollama not reachable: {e}")
 
     # offers_sync should return cached results without network

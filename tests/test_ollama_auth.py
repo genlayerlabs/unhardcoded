@@ -142,6 +142,9 @@ class TestAuthHeaderGeneration:
         assert ":" in header1
         assert ":" in header2
 
+        # Headers should be different due to different timestamps
+        assert header1 != header2, "Headers should differ for different timestamps"
+
         # Signatures should differ due to different timestamps
         # Format is pubkey:signature, so compare signatures (second part)
         sig1 = header1.split(":")[1]

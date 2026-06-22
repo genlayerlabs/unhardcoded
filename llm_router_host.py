@@ -651,8 +651,20 @@ def _prepare_openai_call(
     # Cloud endpoints (ollama.com) require auth (Ed25519 OAuth or API key)
     base_url = request.get("base_url") or ""
     provider_id = request.get("provider_id") or ""
-    if provider_id == "ollama" or "ollama.com" in base_url:
-        endpoint = offer.get("seller_endpoint") or base_url
+    seller_endpoint = offer.get("seller_endpoint") or ""
+
+    # Detect Ollama by provider_id, base_url, or seller_endpoint
+    is_ollama = (
+        provider_id == "ollama" or
+        "ollama.com" in base_url or
+        "ollama.com" in seller_endpoint or
+        "localhost:11434" in base_url or
+        "127.0.0.1:11434" in base_url or
+        base_url.rstrip("/").endswith(":11434/v1")
+    )
+
+    if is_ollama:
+        endpoint = seller_endpoint or base_url
         if endpoint.startswith("https://ollama.com"):
             # Cloud: try Ed25519 OAuth first, then API key
             # Note: Ed25519 signature includes the request body for POST requests

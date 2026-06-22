@@ -144,11 +144,12 @@ def test_prepare_openai_call_pins_marketplace_peer_per_request():
 # ---- Ollama auth --------------------------------------------------------
 
 def test_ollama_local_no_auth():
-    """Local Ollama requires no authorization header."""
+    """Local Ollama requires no authorization header (even with API key set)."""
     request = {
         "served_model_id": "llama3",
         "base_url": "http://localhost:11434/v1",
         "offer": {"seller_endpoint": "http://localhost:11434"},
+        "auth_env": "OLLAMA_API_KEY",  # Explicitly set auth to verify suppression
         "messages": [{"role": "user", "content": "hi"}],
     }
     prep, err = _prepare_openai_call(
@@ -160,11 +161,12 @@ def test_ollama_local_no_auth():
 
 
 def test_ollama_127_no_auth():
-    """Ollama at 127.0.0.1 requires no authorization header."""
+    """Ollama at 127.0.0.1 requires no authorization header (even with API key set)."""
     request = {
         "served_model_id": "llama3",
         "base_url": "http://127.0.0.1:11434/v1",
         "offer": {"seller_endpoint": "http://127.0.0.1:11434"},
+        "auth_env": "OLLAMA_API_KEY",  # Explicitly set auth to verify suppression
         "messages": [{"role": "user", "content": "hi"}],
     }
     prep, err = _prepare_openai_call(
