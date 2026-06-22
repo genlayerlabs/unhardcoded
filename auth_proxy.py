@@ -39,6 +39,10 @@ DASHBOARD_TRUSTED_USER_HEADER = os.getenv("DASHBOARD_TRUSTED_USER_HEADER", "").s
 DASHBOARD_TRUSTED_USER_SECRET = os.getenv("DASHBOARD_TRUSTED_USER_SECRET", "")
 DASHBOARD_PASSWORD_SHA256 = os.getenv("DASHBOARD_PASSWORD_SHA256", "")
 DASHBOARD_SESSION_SECRET = os.getenv("DASHBOARD_SESSION_SECRET", "")
+# Local-dev escape hatch: when truthy, the dashboard skips auth entirely and every
+# request is treated as a local admin. OFF by default — never enable in a
+# deployment reachable by anyone but you.
+DASHBOARD_NO_AUTH = os.getenv("DASHBOARD_NO_AUTH", "").strip().lower() in ("1", "true", "yes", "on")
 DASHBOARD_COOKIE_NAME = os.getenv("DASHBOARD_COOKIE_NAME", "router_dashboard_session")
 DASHBOARD_COOKIE_MAX_AGE = int(os.getenv("DASHBOARD_COOKIE_MAX_AGE", "2592000"))
 DASHBOARD_COOKIE_PATH = os.getenv("DASHBOARD_COOKIE_PATH", "/dashboard")
@@ -559,6 +563,8 @@ def _dashboard_password_ok(password: str) -> bool:
     return hmac.compare_digest(got, DASHBOARD_PASSWORD_SHA256)
 
 def _require_dashboard_context(request: Request) -> dict[str, Any] | None:
+    if DASHBOARD_NO_AUTH:
+        return {"role": "admin", "user": "local-dev", "viewer": "dashboard:local-dev", "consumer": None, "key_sha256": None}
     if DASHBOARD_TRUSTED_USER_HEADER:
         trusted_user = (request.headers.get(DASHBOARD_TRUSTED_USER_HEADER) or "").strip()
         trusted_secret = (request.headers.get("x-dashboard-trusted-secret") or "").strip()
