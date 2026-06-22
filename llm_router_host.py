@@ -376,8 +376,8 @@ class LLMRouterHost:
         override, then the async hook, then the sync hook as a last resort."""
         key = (request.get("provider_id"), request.get("model_family"))
         if key in self._mock_responses:
-            return self._mock_responses[key]
-        if call_override is not None:
+            result = self._mock_responses[key]
+        elif call_override is not None:
             result = await call_override(request)
         elif self._async_call_hook is not None:
             result = await self._async_call_hook(request)
@@ -385,7 +385,9 @@ class LLMRouterHost:
             result = self._call_hook(request)
         # Fold the outcome here (not in the hook) so the streaming/override path —
         # all of opencode's traffic, and every flow node — feeds route_latency /
-        # reliability / tool_capability too. Mocks return above, unmeasured.
+        # reliability / the call count too, the host-owned perf the algebra reads
+        # and the market view surfaces (#15). Mocks fold as well, so a mocked call
+        # is measured exactly like a live one.
         _fold_route_outcome(request, result)
         return result
 
@@ -714,16 +716,20 @@ def _fold_route_outcome(request: dict, result: dict) -> None:
         return
     peer_id = request.get("peer_id") or offer.get("peer_id")
     ok = bool(result.get("ok"))
+    # One route identity for reliability, latency and the call count: the peer for
+    # marketplace routes, or the provider itself for partner/gateway routes (no
+    # peer_id), so OpenRouter/OpenAI is comparable to a peer's. The engine no
+    # longer folds reliability for ANY route (#15), so the host folds it for all
+    # of them — not just marketplace — and the market perf view reads it back.
+    rkey = _route_reliability.route_key(pid, fam, peer_id or pid)
+    _route_reliability.observe(rkey, ok)
+    _route_latency.observe(rkey, result.get("latency_ms"), ok)
+    # Learned tool capability is a marketplace concern only (static/partner routes
+    # declare their capabilities in config), so keep it peer-scoped.
     if peer_id:
-        rkey = _route_reliability.route_key(pid, fam, peer_id)
-        _route_reliability.observe(rkey, ok)
         _route_tool_capability.observe(
             rkey, bool(request.get("tools")),
             bool((result.get("response") or {}).get("tool_calls")))
-    # Latency is keyed on the peer, or on the provider itself for partner/gateway
-    # routes (no peer_id), so OpenRouter/OpenAI latency is comparable to a peer's.
-    lkey = _route_reliability.route_key(pid, fam, peer_id or pid)
-    _route_latency.observe(lkey, result.get("latency_ms"), ok)
 
 
 def make_async_call_provider(

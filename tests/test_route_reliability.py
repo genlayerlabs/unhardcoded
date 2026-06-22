@@ -29,24 +29,6 @@ def test_ema_seeds_then_decays():
     assert rr.success_rate(k) == pytest.approx(0.36)
 
 
-class _Resp:
-    def __init__(self, content):
-        self.status_code = 200
-        self._c = content
-
-    def json(self):
-        return {"choices": [{"message": {"content": self._c}, "finish_reason": "stop"}],
-                "usage": {}}
-
-
-class _Client:
-    def __init__(self, content):
-        self._content = content
-
-    async def post(self, url, json=None, headers=None, timeout=None):
-        return _Resp(self._content)
-
-
 def _req(peer_id, family="m"):
     return {
         "api_kind": "openai_compatible", "base_url": "http://s/v1",
@@ -56,21 +38,16 @@ def _req(peer_id, family="m"):
     }
 
 
-@pytest.mark.asyncio
-async def test_call_folds_route_reliability_on_success():
+# Folding moved out of the call backend into _fold_route_outcome, which runs once
+# per resolved call (direct + streaming/flow paths) so all traffic feeds the same
+# host-owned EMAs the algebra reads (offer.success_rate). Drive it directly.
+def test_fold_route_outcome_on_success():
     rr.reset()
-    H._PEER_GATES.clear()
-    call = H.make_async_call_provider(client=_Client("hello"))
-    r = await call(_req("peerGood"))
-    assert r["ok"] is True
+    H._fold_route_outcome(_req("peerGood"), {"ok": True, "latency_ms": 10})
     assert rr.success_rate(rr.route_key("antseed", "m", "peerGood")) == 1.0
 
 
-@pytest.mark.asyncio
-async def test_call_folds_route_reliability_on_empty_content():
+def test_fold_route_outcome_on_failure():
     rr.reset()
-    H._PEER_GATES.clear()
-    call = H.make_async_call_provider(client=_Client(""))   # empty -> bad_response
-    r = await call(_req("peerBad"))
-    assert r["ok"] is False and r["error_kind"] == "bad_response"
+    H._fold_route_outcome(_req("peerBad"), {"ok": False, "error_kind": "bad_response"})
     assert rr.success_rate(rr.route_key("antseed", "m", "peerBad")) == 0.0
