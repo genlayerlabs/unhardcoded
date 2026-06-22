@@ -292,12 +292,15 @@ def make_codex_async_call_provider(
             pass
 
     async def call(request: dict) -> dict:
-        token = auth.access_token()
+        # Pick the account ONCE per call (advances round-robin in balanced mode),
+        # so token + account_id come from the same account.
+        acct = auth.select_account() if hasattr(auth, "select_account") else auth
+        token = acct.access_token() if acct else None
         if not token:
             _notify(0)
             return _err("auth_error", 0, 0, "no codex access token (run `codex login`)")
         body = build_codex_body(request)
-        headers = build_codex_headers(token, auth.account_id(), extra_headers)
+        headers = build_codex_headers(token, acct.account_id(), extra_headers)
         url = (request.get("base_url") or base_url).rstrip("/") + "/responses"
         timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
 
