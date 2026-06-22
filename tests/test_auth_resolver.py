@@ -139,3 +139,100 @@ def test_prepare_openai_call_pins_marketplace_peer_per_request():
     prep, err = _prepare_openai_call(request, lambda k: None, {}, 30.0, None)
     assert err is None
     assert "x-antseed-pin-peer" not in prep[2]
+
+
+# ---- Ollama auth --------------------------------------------------------
+
+def test_ollama_local_no_auth():
+    """Local Ollama requires no authorization header."""
+    request = {
+        "served_model_id": "llama3",
+        "base_url": "http://localhost:11434/v1",
+        "offer": {"seller_endpoint": "http://localhost:11434"},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    prep, err = _prepare_openai_call(
+        request, _env({"OLLAMA_API_KEY": "test-key"}), {}, 30.0, None)
+    assert err is None
+    _url, _body, headers, _timeout = prep
+    # Local Ollama should NOT use auth headers even if OLLAMA_API_KEY is set
+    assert "Authorization" not in headers
+
+
+def test_ollama_127_no_auth():
+    """Ollama at 127.0.0.1 requires no authorization header."""
+    request = {
+        "served_model_id": "llama3",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "offer": {"seller_endpoint": "http://127.0.0.1:11434"},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    prep, err = _prepare_openai_call(
+        request, _env({"OLLAMA_API_KEY": "test-key"}), {}, 30.0, None)
+    assert err is None
+    _url, _body, headers, _timeout = prep
+    # Local Ollama should NOT use auth headers
+    assert "Authorization" not in headers
+
+
+def test_ollama_cloud_requires_api_key():
+    """Cloud Ollama requires API key as Bearer token."""
+    request = {
+        "served_model_id": "llama3",
+        "base_url": "https://ollama.com/v1",
+        "offer": {"seller_endpoint": "https://ollama.com"},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    prep, err = _prepare_openai_call(
+        request, _env({"OLLAMA_API_KEY": "sk-test-123"}), {}, 30.0, None)
+    assert err is None
+    _url, _body, headers, _timeout = prep
+    assert headers["Authorization"] == "Bearer sk-test-123"
+
+
+def test_ollama_cloud_missing_api_key_is_error():
+    """Cloud Ollama with missing API key returns auth error."""
+    request = {
+        "served_model_id": "llama3",
+        "base_url": "https://ollama.com/v1",
+        "offer": {"seller_endpoint": "https://ollama.com"},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    prep, err = _prepare_openai_call(
+        request, _env({}), {}, 30.0, None)
+    assert prep is None
+    assert err["error_kind"] == "auth_error"
+    assert "OLLAMA_API_KEY" in err["error_message"]
+
+
+def test_ollama_detected_by_provider_id():
+    """Ollama can be detected by provider_id, not just base_url."""
+    request = {
+        "provider_id": "ollama",
+        "served_model_id": "llama3",
+        "base_url": "http://some-host:11434/v1",
+        "offer": {"seller_endpoint": "http://some-host:11434"},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    prep, err = _prepare_openai_call(
+        request, _env({"OLLAMA_API_KEY": "test-key"}), {}, 30.0, None)
+    assert err is None
+    _url, _body, headers, _timeout = prep
+    # Local endpoint (not ollama.com) should NOT use auth
+    assert "Authorization" not in headers
+
+
+def test_non_ollama_provider_unaffected():
+    """Non-Ollama providers use existing auth logic."""
+    request = {
+        "provider_id": "openai",
+        "served_model_id": "gpt-4",
+        "base_url": "https://api.openai.com/v1",
+        "auth_env": "OPENAI_API_KEY",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    prep, err = _prepare_openai_call(
+        request, _env({"OPENAI_API_KEY": "sk-abc"}), {}, 30.0, None)
+    assert err is None
+    _url, _body, headers, _timeout = prep
+    assert headers["Authorization"] == "Bearer sk-abc"

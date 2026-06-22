@@ -131,4 +131,8 @@ def build_registry(catalog: dict, env_get=os.environ.get) -> list[ProviderSource
             from sources.codex import CodexSource
             registry.append(CodexSource(pid))
             break
+    # Ollama: local + cloud discovery
+    if "ollama" in providers:
+        from sources.ollama import OllamaSource
+        registry.append(OllamaSource(catalog, env_get=env_get))
     return registry

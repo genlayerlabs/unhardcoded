@@ -25,6 +25,17 @@ import route_reliability as _route_reliability
 import route_latency as _route_latency
 import route_tool_capability as _route_tool_capability
 
+# Ollama Ed25519 OAuth support (optional - falls back gracefully)
+try:
+    from sources.ollama_auth import (
+        get_ollama_auth_header,
+        can_use_ed25519_auth,
+        OllamaAuthError,
+    )
+    HAS_OLLAMA_ED25519 = True
+except ImportError:
+    HAS_OLLAMA_ED25519 = False
+
 import lupa
 from lupa import LuaRuntime
 
@@ -570,7 +581,32 @@ def _resolve_auth_headers(
     return None, _err("auth_error", 0, 0, f"unknown auth kind {kind!r}")
 
 
-def _prepare_openai_call(
+def _resolve_ollama_cloud_auth(
+    env_get: Callable[[str], str | None],
+    url: str,
+) -> dict | None:
+    """Resolve auth headers for Ollama Cloud.
+
+    Priority:
+    1. Ed25519 OAuth (if ~/.ollama/id_ed25519 exists) - automatic, no config needed
+    2. API Key (if OLLAMA_API_KEY set)
+
+    Returns auth headers dict, or None if no auth available.
+    """
+    # Try Ed25519 OAuth first (automatic, no config needed)
+    if HAS_OLLAMA_ED25519 and can_use_ed25519_auth():
+        try:
+            auth_token = get_ollama_auth_header(method="GET", url=url)
+            return {"Authorization": auth_token}
+        except OllamaAuthError:
+            pass  # Fall through to API key
+
+    # Fall back to API key
+    api_key = env_get("OLLAMA_API_KEY")
+    if api_key:
+        return {"Authorization": f"Bearer {api_key}"}
+
+    return None
     request: dict,
     env_get: Callable[[str], str | None],
     extra: dict[str, str],
@@ -584,6 +620,24 @@ def _prepare_openai_call(
         return None, err
 
     offer = request.get("offer") or {}
+
+    # Ollama: override auth based on endpoint
+    # Local endpoints (localhost, 127.0.0.1) require no auth
+    # Cloud endpoints (ollama.com) require auth (Ed25519 OAuth or API key)
+    base_url = request.get("base_url") or ""
+    provider_id = request.get("provider_id") or ""
+    if provider_id == "ollama" or "ollama.com" in base_url:
+        endpoint = offer.get("seller_endpoint") or base_url
+        if endpoint.startswith("https://ollama.com"):
+            # Cloud: try Ed25519 OAuth first, then API key
+            auth_headers = _resolve_ollama_cloud_auth(env_get, endpoint)
+            if auth_headers is None:
+                return None, _err("auth_error", 0, 0,
+                    "Ollama Cloud requires OLLAMA_API_KEY or ~/.ollama/id_ed25519 key")
+        else:
+            # Local: no auth required
+            auth_headers = {}
+
     body: dict = {
         # marketplace candidates may serve a curated family under a different
         # wire name (service aliasing) — the offer's wire id wins.
