@@ -1,5 +1,5 @@
 """
-Entrypoint for the llm-policy HTTP host (OpenAI-compatible shim).
+Entrypoint for the unhardcoded HTTP host (OpenAI-compatible shim).
 
     python serve.py \
         --config config.live.lua \
@@ -7,7 +7,7 @@ Entrypoint for the llm-policy HTTP host (OpenAI-compatible shim).
         --default-profile edge \
         --host 127.0.0.1 --port 8080
 
-The llm_policy core is vendored as a git submodule under `core/`. Provider auth
+The unhardcoded-engine core is vendored as a git submodule under `core/`. Provider auth
 lives in the process environment (the core resolves `auth_env` per provider via
 `host.env`). Clients hitting the shim do NOT need provider API keys — they only
 need to reach the shim's URL.
@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CORE = ROOT / "core"                 # the llm_policy core (git submodule)
+CORE = ROOT / "core"                 # the unhardcoded-engine core (git submodule)
 sys.path.insert(0, str(ROOT))
 
 from llm_router_host import (  # noqa: E402

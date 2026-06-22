@@ -8,8 +8,8 @@ provider errors. Every run records which models passed, which were rejected and
 why.
 
 Concretely it's an async FastAPI shim that runs the
-[`llm_policy`](https://github.com/genlayerlabs/unhardcoded-engine) core and
-inherits its provider selection, fallback, retry and per-provider auth. The core
+[`unhardcoded-engine`](https://github.com/genlayerlabs/unhardcoded-engine) core
+and inherits its provider selection, fallback, retry and per-provider auth. The core
 is vendored as a git submodule under `core/`; this repo is the *host* (the I/O,
 auth, providers, the HTTP service) plus an operator **dashboard** to compose,
 test and analyse policies. The policy *algebra* (Σ_pol) lives in the core.
