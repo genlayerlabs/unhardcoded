@@ -1,0 +1,118 @@
+// AntSeed sidecar control server — lets the operator dashboard run wallet ops
+// (deposit / withdraw / status) without `kubectl exec`. The buyer CLI + funded
+// identity live ONLY in this container, so the dashboard reaches them through:
+//
+//   catalog button -> auth_proxy /dashboard/api/wallet/* -> router /x/wallet/*
+//                  -> THIS server (:8379) -> `antseed buyer <cmd>`
+//
+// Guarded by a shared token (ANTSEED_CONTROL_TOKEN); if unset the server does
+// not start (feature disabled, router degrades to 503). Listens on the pod/
+// container network only — never published. Subcommands are whitelisted and run
+// via execFile with array args (no shell); amounts are strictly validated.
+'use strict';
+const http = require('http');
+const { execFile } = require('child_process');
+const fs = require('fs');
+
+const PORT = parseInt(process.env.ANTSEED_CONTROL_PORT || '8379', 10);
+const TOKEN = process.env.ANTSEED_CONTROL_TOKEN || '';
+const MARKET_DIR = process.env.ANTSEED_MARKET_DIR || '/market';
+const STATUS_FILE = MARKET_DIR + '/status-antseed.json';
+const DEPOSIT_TIMEOUT_MS = 120000; // on-chain tx
+const STATUS_TIMEOUT_MS = 30000;
+
+if (!TOKEN) {
+  console.error('[control] ANTSEED_CONTROL_TOKEN unset — control server disabled');
+  return;
+}
+
+// USDC amount: human units, up to 6 decimals, strictly positive.
+const AMOUNT_RE = /^\d+(\.\d{1,6})?$/;
+function validAmount(s) {
+  return typeof s === 'string' && AMOUNT_RE.test(s) && parseFloat(s) > 0;
+}
+
+function run(args, timeout) {
+  return new Promise((resolve) => {
+    execFile('antseed', args, { timeout, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        resolve({ code: err ? (err.code || 1) : 0,
+                  stdout: String(stdout || ''), stderr: String(stderr || '') });
+      });
+  });
+}
+
+// Refresh /market/status-antseed.json from a fresh `buyer status --json`, in the
+// same shape the entrypoint writer uses (fetched_at_ms + atomic rename) so the
+// router's source picks up the new escrow balance on its next read.
+async function refreshStatus() {
+  const r = await run(['buyer', 'status', '--json'], STATUS_TIMEOUT_MS);
+  let data;
+  try { data = JSON.parse(r.stdout); } catch (_) { return null; }
+  if (data === null || typeof data !== 'object') return null;
+  data.fetched_at_ms = Date.now();
+  const tmp = STATUS_FILE + '.' + process.pid + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(data));
+    fs.renameSync(tmp, STATUS_FILE);
+  } catch (_) { try { fs.unlinkSync(tmp); } catch (__) {} }
+  return data;
+}
+
+// Serialize wallet mutations: two concurrent deposits would race the buyer's
+// sqlite store / nonce.
+let chain = Promise.resolve();
+function serialize(fn) {
+  const next = chain.then(fn, fn);
+  chain = next.catch(() => {});
+  return next;
+}
+
+function send(res, status, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, { 'content-type': 'application/json' });
+  res.end(body);
+}
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let b = '';
+    req.on('data', (c) => { b += c; if (b.length > 1e6) req.destroy(); });
+    req.on('end', () => { try { resolve(JSON.parse(b || '{}')); } catch (_) { resolve(null); } });
+    req.on('error', () => resolve(null));
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.headers['x-antseed-control-token'] !== TOKEN) {
+    return send(res, 401, { ok: false, error: 'unauthorized' });
+  }
+  const url = (req.url || '').split('?')[0];
+
+  if (req.method === 'POST' && (url === '/deposit' || url === '/withdraw')) {
+    const verb = url.slice(1);
+    const body = await readBody(req);
+    const amount = body && body.amount != null ? String(body.amount) : '';
+    if (!validAmount(amount)) {
+      return send(res, 400, { ok: false, error: 'amount must be a positive USDC value (<=6 decimals)' });
+    }
+    return serialize(async () => {
+      const r = await run(['buyer', verb, amount], DEPOSIT_TIMEOUT_MS);
+      if (r.code !== 0) {
+        return send(res, 502, { ok: false, error: (r.stderr || r.stdout || 'cli failed').slice(0, 600) });
+      }
+      const status = await refreshStatus();
+      return send(res, 200, { ok: true, action: verb, amount, stdout: r.stdout.slice(0, 600), status });
+    });
+  }
+
+  if (req.method === 'POST' && url === '/status') {
+    const status = await refreshStatus();
+    if (!status) return send(res, 502, { ok: false, error: 'status unavailable' });
+    return send(res, 200, { ok: true, status });
+  }
+
+  return send(res, 404, { ok: false, error: 'not found' });
+});
+
+server.listen(PORT, () => console.error('[control] listening on :' + PORT));

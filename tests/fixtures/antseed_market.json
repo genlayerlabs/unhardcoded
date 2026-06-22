@@ -1,0 +1,35 @@
+{
+  "source": "buyer daemon (pid 1)",
+  "total": 2,
+  "peers": [
+    {
+      "peerId": "0329c5d3920e301740f78d6e17b8d1a11cca9b2c",
+      "lastSeen": 1781091331928,
+      "providers": ["openai"],
+      "providerPricing": {
+        "openai": {
+          "defaults": {"inputUsdPerMillion": 10, "outputUsdPerMillion": 10},
+          "services": {
+            "claude-opus-4-8": {"inputUsdPerMillion": 1, "outputUsdPerMillion": 5},
+            "claude-sonnet-4-6": {"inputUsdPerMillion": 0.6, "outputUsdPerMillion": 3}
+          }
+        }
+      }
+    },
+    {
+      "peerId": "1d90f467689d499dc435e5744b4613c3203eb0aa",
+      "lastSeen": 1781091331928,
+      "providers": ["openai"],
+      "providerPricing": {
+        "openai": {
+          "defaults": {"inputUsdPerMillion": 5, "outputUsdPerMillion": 5},
+          "services": {
+            "qwen3-235b-instruct": {"inputUsdPerMillion": 0, "outputUsdPerMillion": 0},
+            "claude-sonnet-4-6": {"inputUsdPerMillion": 0.5, "outputUsdPerMillion": 2.5},
+            "chainscout": {"inputUsdPerMillion": 4, "outputUsdPerMillion": 24}
+          }
+        }
+      }
+    }
+  ]
+}
