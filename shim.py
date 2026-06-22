@@ -193,6 +193,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             return {"provider": pid, "address": det.get("wallet"),
                     "deposits_available": bal.get("value"),
                     "deposits_reserved": det.get("reserved"),
+                    "wallet_usdc": det.get("wallet_usdc"),
+                    "wallet_eth": det.get("wallet_eth"),
                     "connection": det.get("connection"),
                     "fetched_at": bal.get("fetched_at")}
         return None
@@ -486,6 +488,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 "address": det.get("wallet"),
                 "deposits_available": bal.get("value"),
                 "deposits_reserved": det.get("reserved"),
+                "wallet_usdc": det.get("wallet_usdc"),
+                "wallet_eth": det.get("wallet_eth"),
                 "connection": det.get("connection"),
                 "fetched_at": bal.get("fetched_at"),
             }
