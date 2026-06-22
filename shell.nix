@@ -1,4 +1,4 @@
-# shell.nix — dev/run environment for the llm-policy host.
+# shell.nix — dev/run environment for the unhardcoded host.
 #   nix-shell            # runtime deps
 #   nix-shell --run 'python -m pytest tests -q'   # with test deps
 { pkgs ? import <nixpkgs> {} }:
