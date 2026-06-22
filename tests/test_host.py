@@ -153,21 +153,27 @@ def test_marketplace_discovery_merges_offers_into_pool(host):
 # Per-call ranking is now a raw `policy_ir` scorer (see test_policy_ir.py).
 
 
-def test_min_tok_s_filters_unbenched_candidates(host):
-    # min_tok_s=39 should keep only candidates with observed tok_s >= 39 in metrics.
-    # Per metrics.example: hermes@comput3=42.1, llama@io_net=40.0 → both pass.
-    # deepseek@comput3=38.0 fails. Others have no metrics → fail.
+def test_min_tok_s_filters_on_stamped_throughput(host):
+    # Engine #15: throughput is host-measured and stamped per candidate (like
+    # price); the engine reads cand.tok_s and no longer seeds it from metrics.
+    # A candidate stamped above the floor passes; one below it, or one with no
+    # measured throughput at all, is rejected with reason min_tok_s.
+    base = {"model_family": "fam", "served_model_id": "fam", "capabilities": {},
+            "tier": "fallback", "api_kind": "openai_compatible", "discovery": "static"}
+    fast = {**base, "provider_id": "p_fast", "tok_s": 50.0}
+    slow = {**base, "provider_id": "p_slow", "tok_s": 10.0}
+    unstamped = {**base, "provider_id": "p_unstamped"}  # no tok_s -> default 0
     ranked, rejected = host.rank({
         "prompt": "x",
         "profile": "default",
         "requirements": {"min_tok_s": 39},
+        "extra_candidates": [fast, slow, unstamped],
     })
-    surviving = {(r["candidate"]["provider_id"], r["candidate"]["model_family"])
-                 for r in ranked}
-    assert ("comput3", "hermes-3-405b") in surviving
-    assert ("io_net", "llama-3.3-70b") in surviving
-    assert ("comput3", "deepseek-v3") not in surviving
-    # at least one rejection with reason min_tok_s
+    surviving = {r["candidate"]["provider_id"] for r in ranked}
+    assert "p_fast" in surviving
+    assert "p_slow" not in surviving
+    assert "p_unstamped" not in surviving
+    # static catalog candidates carry no measured tok_s either, so they too fail
     reasons = {r["reason"] for r in rejected}
     assert "min_tok_s" in reasons
 
@@ -266,12 +272,13 @@ def test_streaming_override_path_folds_route_metrics(host):
     assert rl.latency_ms(k) == 12000           # latency folded from the streamed call
     assert rr.success_rate(k) == 1.0
 
-    # a mock short-circuits BEFORE the fold, so test measurements stay pure
+    # A mock folds too now (#15: the host owns perf, so a mocked call is measured
+    # exactly like a live one — the engine no longer folds a separate EMA).
     rr.reset(); rl.reset()
     host.set_mock_response("antseed", "glm-5.2",
                            {"ok": True, "latency_ms": 5, "response": {}})
     asyncio.run(host._resolve_call_async(req))
-    assert rl.latency_ms(k) is None
+    assert rl.latency_ms(k) == 5
 
 
 def test_fold_uses_top_level_route_identity(host):
