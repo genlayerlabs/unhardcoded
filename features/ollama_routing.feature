@@ -20,7 +20,7 @@ Feature: Ollama Provider Routing
     And the cloud model "gpt-oss:120b" is available
     When I send a chat completion request with model "gpt-oss:120b"
     Then the request is routed to provider "ollama"
-    And the Authorization header contains "Bearer"
+    And the Authorization header is set for Ollama Cloud
     And the endpoint is "https://ollama.com"
 
   @ollama

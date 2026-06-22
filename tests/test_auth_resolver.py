@@ -176,33 +176,43 @@ def test_ollama_127_no_auth():
 
 
 def test_ollama_cloud_requires_api_key():
-    """Cloud Ollama requires API key as Bearer token."""
+    """Cloud Ollama requires API key as Bearer token (when Ed25519 not available)."""
+    from unittest.mock import patch
+
     request = {
         "served_model_id": "llama3",
         "base_url": "https://ollama.com/v1",
         "offer": {"seller_endpoint": "https://ollama.com"},
         "messages": [{"role": "user", "content": "hi"}],
     }
-    prep, err = _prepare_openai_call(
-        request, _env({"OLLAMA_API_KEY": "sk-test-123"}), {}, 30.0, None)
-    assert err is None
-    _url, _body, headers, _timeout = prep
-    assert headers["Authorization"] == "Bearer sk-test-123"
+
+    # Mock Ed25519 as unavailable to test API key fallback
+    with patch("llm_router_host.can_use_ed25519_auth", return_value=False):
+        prep, err = _prepare_openai_call(
+            request, _env({"OLLAMA_API_KEY": "sk-test-123"}), {}, 30.0, None)
+        assert err is None
+        _url, _body, headers, _timeout = prep
+        assert headers["Authorization"] == "Bearer sk-test-123"
 
 
 def test_ollama_cloud_missing_api_key_is_error():
-    """Cloud Ollama with missing API key returns auth error."""
+    """Cloud Ollama with missing API key returns auth error (when Ed25519 not available)."""
+    from unittest.mock import patch
+
     request = {
         "served_model_id": "llama3",
         "base_url": "https://ollama.com/v1",
         "offer": {"seller_endpoint": "https://ollama.com"},
         "messages": [{"role": "user", "content": "hi"}],
     }
-    prep, err = _prepare_openai_call(
-        request, _env({}), {}, 30.0, None)
-    assert prep is None
-    assert err["error_kind"] == "auth_error"
-    assert "OLLAMA_API_KEY" in err["error_message"]
+
+    # Mock Ed25519 as unavailable to test API key error path
+    with patch("llm_router_host.can_use_ed25519_auth", return_value=False):
+        prep, err = _prepare_openai_call(
+            request, _env({}), {}, 30.0, None)
+        assert prep is None
+        assert err["error_kind"] == "auth_error"
+        assert "OLLAMA_API_KEY" in err["error_message"]
 
 
 def test_ollama_detected_by_provider_id():
@@ -236,3 +246,94 @@ def test_non_ollama_provider_unaffected():
     assert err is None
     _url, _body, headers, _timeout = prep
     assert headers["Authorization"] == "Bearer sk-abc"
+
+
+def test_ollama_cloud_ed25519_auth_preferred():
+    """Cloud Ollama uses Ed25519 auth when key is available."""
+    from unittest.mock import patch
+
+    request = {
+        "served_model_id": "llama3",
+        "base_url": "https://ollama.com/v1",
+        "offer": {"seller_endpoint": "https://ollama.com"},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    # Mock Ed25519 auth as available
+    with patch("llm_router_host.HAS_OLLAMA_ED25519", True):
+        with patch("llm_router_host.can_use_ed25519_auth", return_value=True):
+            with patch("llm_router_host.get_ollama_auth_header") as mock_auth:
+                mock_auth.return_value = "dGVzdHB1YmtleTp0ZXN0c2lnbmF0dXJl"  # base64 pubkey:signature
+
+                prep, err = _prepare_openai_call(
+                    request, _env({"OLLAMA_API_KEY": "fallback-key"}), {}, 30.0, None)
+
+                assert err is None
+                _url, _body, headers, _timeout = prep
+
+                # Ed25519 auth header format: base64(pubkey):base64(signature)
+                # Not "Bearer" format
+                assert "Authorization" in headers
+                assert headers["Authorization"] != "Bearer fallback-key"
+                # Should be called with POST method and the request URL
+                mock_auth.assert_called_once()
+                call_kwargs = mock_auth.call_args[1]
+                assert call_kwargs["method"] == "POST"
+                assert "ollama.com" in call_kwargs["url"]
+
+
+def test_ollama_cloud_ed25519_fallback_to_api_key():
+    """Cloud Ollama falls back to API key when Ed25519 is not available."""
+    from unittest.mock import patch
+
+    request = {
+        "served_model_id": "llama3",
+        "base_url": "https://ollama.com/v1",
+        "offer": {"seller_endpoint": "https://ollama.com"},
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    # Mock Ed25519 auth as unavailable
+    with patch("llm_router_host.HAS_OLLAMA_ED25519", True):
+        with patch("llm_router_host.can_use_ed25519_auth", return_value=False):
+            prep, err = _prepare_openai_call(
+                request, _env({"OLLAMA_API_KEY": "test-api-key"}), {}, 30.0, None)
+
+            assert err is None
+            _url, _body, headers, _timeout = prep
+            # Should fall back to Bearer token
+            assert headers["Authorization"] == "Bearer test-api-key"
+
+
+def test_ollama_cloud_ed25519_signature_includes_body():
+    """Ed25519 signature for chat completions includes the request body."""
+    from unittest.mock import patch
+
+    request = {
+        "served_model_id": "llama3",
+        "base_url": "https://ollama.com/v1",
+        "offer": {"seller_endpoint": "https://ollama.com"},
+        "messages": [{"role": "user", "content": "test message"}],
+        "temperature": 0.7,
+    }
+
+    with patch("llm_router_host.HAS_OLLAMA_ED25519", True):
+        with patch("llm_router_host.can_use_ed25519_auth", return_value=True):
+            with patch("llm_router_host.get_ollama_auth_header") as mock_auth:
+                mock_auth.return_value = "c2lnbmVk"
+
+                prep, err = _prepare_openai_call(
+                    request, _env({}), {}, 30.0, None)
+
+                assert err is None
+                # Verify get_ollama_auth_header was called with body
+                call_kwargs = mock_auth.call_args[1]
+                assert "body" in call_kwargs
+                # Body should be JSON-encoded request
+                import json
+                expected_body = json.dumps({
+                    "model": "llama3",
+                    "messages": [{"role": "user", "content": "test message"}],
+                    "temperature": 0.7,
+                }).encode("utf-8")
+                assert call_kwargs["body"] == expected_body

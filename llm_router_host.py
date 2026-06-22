@@ -584,6 +584,8 @@ def _resolve_auth_headers(
 def _resolve_ollama_cloud_auth(
     env_get: Callable[[str], str | None],
     url: str,
+    method: str = "POST",
+    body: bytes = b"",
 ) -> dict | None:
     """Resolve auth headers for Ollama Cloud.
 
@@ -591,12 +593,18 @@ def _resolve_ollama_cloud_auth(
     1. Ed25519 OAuth (if ~/.ollama/id_ed25519 exists) - automatic, no config needed
     2. API Key (if OLLAMA_API_KEY set)
 
+    Args:
+        env_get: Function to read environment variables
+        url: Full URL for the request (e.g., https://ollama.com/api/v1/chat/completions)
+        method: HTTP method (POST for chat completions, GET for discovery)
+        body: Request body for POST requests (used in signature)
+
     Returns auth headers dict, or None if no auth available.
     """
     # Try Ed25519 OAuth first (automatic, no config needed)
     if HAS_OLLAMA_ED25519 and can_use_ed25519_auth():
         try:
-            auth_token = get_ollama_auth_header(method="GET", url=url)
+            auth_token = get_ollama_auth_header(method=method, url=url, body=body)
             return {"Authorization": auth_token}
         except OllamaAuthError:
             pass  # Fall through to API key
@@ -607,6 +615,9 @@ def _resolve_ollama_cloud_auth(
         return {"Authorization": f"Bearer {api_key}"}
 
     return None
+
+
+def _prepare_openai_call(
     request: dict,
     env_get: Callable[[str], str | None],
     extra: dict[str, str],
@@ -621,23 +632,7 @@ def _resolve_ollama_cloud_auth(
 
     offer = request.get("offer") or {}
 
-    # Ollama: override auth based on endpoint
-    # Local endpoints (localhost, 127.0.0.1) require no auth
-    # Cloud endpoints (ollama.com) require auth (Ed25519 OAuth or API key)
-    base_url = request.get("base_url") or ""
-    provider_id = request.get("provider_id") or ""
-    if provider_id == "ollama" or "ollama.com" in base_url:
-        endpoint = offer.get("seller_endpoint") or base_url
-        if endpoint.startswith("https://ollama.com"):
-            # Cloud: try Ed25519 OAuth first, then API key
-            auth_headers = _resolve_ollama_cloud_auth(env_get, endpoint)
-            if auth_headers is None:
-                return None, _err("auth_error", 0, 0,
-                    "Ollama Cloud requires OLLAMA_API_KEY or ~/.ollama/id_ed25519 key")
-        else:
-            # Local: no auth required
-            auth_headers = {}
-
+    # Build request body first (needed for Ed25519 signature in Ollama auth)
     body: dict = {
         # marketplace candidates may serve a curated family under a different
         # wire name (service aliasing) — the offer's wire id wins.
@@ -650,6 +645,29 @@ def _resolve_ollama_cloud_auth(
             body[field] = v
 
     url = (request.get("base_url") or "").rstrip("/") + "/chat/completions"
+
+    # Ollama: override auth based on endpoint
+    # Local endpoints (localhost, 127.0.0.1) require no auth
+    # Cloud endpoints (ollama.com) require auth (Ed25519 OAuth or API key)
+    base_url = request.get("base_url") or ""
+    provider_id = request.get("provider_id") or ""
+    if provider_id == "ollama" or "ollama.com" in base_url:
+        endpoint = offer.get("seller_endpoint") or base_url
+        if endpoint.startswith("https://ollama.com"):
+            # Cloud: try Ed25519 OAuth first, then API key
+            # Note: Ed25519 signature includes the request body for POST requests
+            import json
+            body_bytes = json.dumps(body).encode("utf-8")
+            auth_headers = _resolve_ollama_cloud_auth(
+                env_get, url, method="POST", body=body_bytes
+            )
+            if auth_headers is None:
+                return None, _err("auth_error", 0, 0,
+                    "Ollama Cloud requires OLLAMA_API_KEY or ~/.ollama/id_ed25519 key")
+        else:
+            # Local: no auth required
+            auth_headers = {}
+
     headers = {"Content-Type": "application/json", **auth_headers, **extra}
     # Marketplace (AntSeed): the buyer proxy runs in browse mode and disables
     # auto-selection, so the host pins the offer's peer per request. The peer is
