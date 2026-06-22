@@ -84,3 +84,54 @@ def test_reload_picks_up_external_writes(tmp_path):
     (d / "new.json").write_text(json.dumps(_auth("n")))
     assert store.reload() == ["new"]
     assert store.account_id() == "n"
+
+
+def _store_abc(tmp_path):
+    d = tmp_path / "accounts"
+    d.mkdir()
+    for n in ("a", "b", "c"):
+        (d / f"{n}.json").write_text(json.dumps(_auth(f"acct-{n}", f"tok-{n}")))
+    return CodexAuthStore(d), d
+
+
+def test_selection_defaults_to_auto_first(tmp_path):
+    store, _ = _store_abc(tmp_path)
+    assert store.selection() == {"mode": "auto", "account": None}
+    assert store.active_label() == "a"
+    assert store.select_account().account_id() == "acct-a"
+
+
+def test_selection_account_mode_pins_one(tmp_path):
+    store, d = _store_abc(tmp_path)
+    assert store.set_selection("account", "b") == {"mode": "account", "account": "b"}
+    assert (d / "_selection.json").exists()
+    assert store.active_label() == "b"
+    # stable across calls — account mode never round-robins
+    assert [store.select_account().account_id() for _ in range(3)] == ["acct-b"] * 3
+    # the selection file is NOT scanned as an account
+    assert store.names() == ["a", "b", "c"]
+
+
+def test_selection_account_mode_rejects_unknown(tmp_path):
+    store, _ = _store_abc(tmp_path)
+    with pytest.raises(ValueError):
+        store.set_selection("account", "nope")
+    with pytest.raises(ValueError):
+        store.set_selection("bogus")
+
+
+def test_selection_balanced_is_round_robin(tmp_path):
+    store, _ = _store_abc(tmp_path)
+    store.set_selection("balanced")
+    assert store.active_label() == "balanced"
+    # select_account advances the cursor; account_id()/access_token() do not.
+    ids = [store.select_account().account_id() for _ in range(6)]
+    assert ids == ["acct-a", "acct-b", "acct-c", "acct-a", "acct-b", "acct-c"]
+
+
+def test_selection_persists_across_store_instances(tmp_path):
+    store, d = _store_abc(tmp_path)
+    store.set_selection("account", "c")
+    reopened = CodexAuthStore(d)
+    assert reopened.selection() == {"mode": "account", "account": "c"}
+    assert reopened.account_id() == "acct-c"

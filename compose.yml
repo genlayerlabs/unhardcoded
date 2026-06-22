@@ -35,6 +35,9 @@ services:
       - /codex/auth.json
     volumes:
       - ${CODEX_AUTH_PATH:-./codex-auth.json}:/codex/auth.json
+      # dashboard-added Codex accounts + the account selection, shared with
+      # ingress so accounts added in the dashboard actually reach the router.
+      - codex-accounts:/codex/accounts
       - antseed-market:/market:ro
       # operator-added providers (dashboard "Add provider"): read at startup
       - ./secrets:/run/llm-router/secrets:ro
@@ -74,6 +77,7 @@ services:
       - ./.env.secrets:/run/llm-router/.env.secrets
       - ./secrets:/run/llm-router/secrets
       - ${CODEX_AUTH_PATH:-./codex-auth.json}:/codex/auth.json
+      - codex-accounts:/codex/accounts
     command:
       - uvicorn
       - auth_proxy:app
@@ -145,5 +149,6 @@ networks:
     external: true
 
 volumes:
+  codex-accounts:
   antseed-data:
   antseed-market:

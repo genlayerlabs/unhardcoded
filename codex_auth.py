@@ -200,6 +200,7 @@ class CodexAuthStore:
         self._now = now
         self._lock = threading.Lock()
         self._accounts: "dict[str, CodexAuth]" = {}
+        self._rr = 0  # round-robin cursor for balanced selection
         self.reload()
 
     # ---- discovery -----------------------------------------------------
@@ -210,6 +211,8 @@ class CodexAuthStore:
         try:
             if self._dir.is_dir():
                 for f in sorted(self._dir.glob("*.json")):
+                    if f.name.startswith("_"):
+                        continue  # reserved (e.g. _selection.json), not an account
                     found[f.stem] = CodexAuth(f, http_post=self._http_post, now=self._now)
         except OSError:
             pass
@@ -219,21 +222,80 @@ class CodexAuthStore:
             self._accounts = found
         return sorted(found)
 
-    # ---- selection (drop-in CodexAuth surface) -------------------------
+    # ---- selection -----------------------------------------------------
+    # The active account is chosen by a persisted selection (shared with the
+    # dashboard via the accounts dir): mode "auto" (first by name), "account"
+    # (a named one), or "balanced" (round-robin across accounts per call).
 
-    def _select(self) -> "CodexAuth | None":
+    def _selection_path(self) -> Path:
+        return self._dir / "_selection.json"
+
+    def selection(self) -> dict:
+        """{'mode': 'auto'|'balanced'|'account', 'account': <name>|None}."""
+        try:
+            raw = json.loads(self._selection_path().read_text())
+            mode = raw.get("mode")
+            if mode not in ("auto", "balanced", "account"):
+                mode = "auto"
+            return {"mode": mode, "account": raw.get("account")}
+        except (OSError, ValueError):
+            return {"mode": "auto", "account": None}
+
+    def set_selection(self, mode: str, account: str | None = None) -> dict:
+        if mode not in ("auto", "balanced", "account"):
+            raise ValueError("mode must be 'auto', 'balanced' or 'account'")
+        if mode == "account":
+            account = _safe_account_name(account or "")
+            if account not in self.names():
+                raise ValueError(f"unknown codex account: {account!r}")
+        else:
+            account = None
+        self._dir.mkdir(parents=True, exist_ok=True)
+        self._selection_path().write_text(json.dumps({"mode": mode, "account": account}))
+        return {"mode": mode, "account": account}
+
+    def _current(self) -> "CodexAuth | None":
+        """The selected account WITHOUT advancing round-robin — so the token and
+        account_id of a single call come from the same account."""
+        sel = self.selection()
         with self._lock:
-            for _name in sorted(self._accounts):
-                return self._accounts[_name]
-        return None
+            names = sorted(self._accounts)
+            if not names:
+                return None
+            if sel["mode"] == "account" and sel["account"] in self._accounts:
+                return self._accounts[sel["account"]]
+            if sel["mode"] == "balanced":
+                return self._accounts[names[self._rr % len(names)]]
+            return self._accounts[names[0]]  # auto, or a deleted named account
 
+    def select_account(self) -> "CodexAuth | None":
+        """Pick the account for ONE call; advances the round-robin cursor in
+        balanced mode. Call this once per request, then use the returned
+        account's access_token()/account_id()."""
+        acct = self._current()
+        if self.selection()["mode"] == "balanced":
+            with self._lock:
+                self._rr += 1
+        return acct
+
+    # Drop-in single-account surface (no round-robin advance).
     def access_token(self) -> str | None:
-        acct = self._select()
+        acct = self._current()
         return acct.access_token() if acct else None
 
     def account_id(self) -> str | None:
-        acct = self._select()
+        acct = self._current()
         return acct.account_id() if acct else None
+
+    def active_label(self) -> str | None:
+        """What the dashboard shows as 'active': the account name, or 'balanced'."""
+        sel = self.selection()
+        if sel["mode"] == "balanced":
+            return "balanced"
+        if sel["mode"] == "account" and sel["account"] in self.names():
+            return sel["account"]
+        names = self.names()
+        return names[0] if names else None
 
     # ---- management ----------------------------------------------------
 
