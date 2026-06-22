@@ -15,7 +15,10 @@ Model field convention (explicit prefixes, no magic):
     model = "pin:<provider>/<family>"   -> contract.requirements.pin
     model = anything else               -> default_profile (logged)
 
-Streaming is not supported. Requests with `stream: true` get a 400.
+Streaming is supported. With a `streaming_call` dispatcher, `stream: true`
+streams token-by-token (with fallback before the first byte); without one — and
+for flows, which have no token stream — the finished result is pseudo-streamed
+as SSE. Either way the client gets a valid `text/event-stream`.
 
 Concurrency note: lupa serializes Lua execution. FastAPI's threadpool will
 queue concurrent /v1/chat/completions calls behind the single LuaRuntime.
