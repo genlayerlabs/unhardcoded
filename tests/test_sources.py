@@ -498,6 +498,73 @@ def test_antseed_balances_from_status_files(tmp_path):
     assert asyncio.run(s_nofiles.balances()) == {}   # no status files -> absent
 
 
+def test_wallet_rpc_url_default_and_disable(monkeypatch):
+    from sources import antseed as a
+    monkeypatch.delenv("ANTSEED_WALLET_RPC_URL", raising=False)
+    assert a._wallet_rpc_url() == a._DEFAULT_BASE_RPC
+    monkeypatch.setenv("ANTSEED_WALLET_RPC_URL", "")  # copied template -> still default
+    assert a._wallet_rpc_url() == a._DEFAULT_BASE_RPC
+    for off in ("off", "none", "disabled"):
+        monkeypatch.setenv("ANTSEED_WALLET_RPC_URL", off)
+        assert a._wallet_rpc_url() is None
+    monkeypatch.setenv("ANTSEED_WALLET_RPC_URL", "https://my.rpc")
+    assert a._wallet_rpc_url() == "https://my.rpc"
+
+
+def test_fetch_chain_balances_rejects_bad_address():
+    from sources import antseed as a
+    # a short/non-0x address never triggers a network call (returns {} offline).
+    assert asyncio.run(a._fetch_chain_balances(a._DEFAULT_BASE_RPC, "0x7C39")) == {}
+    assert asyncio.run(a._fetch_chain_balances(a._DEFAULT_BASE_RPC, "")) == {}
+
+
+def test_fetch_chain_balances_parses_eth_and_usdc(monkeypatch):
+    from sources import antseed as a
+    addr = "0x" + "ab" * 20  # valid 42-char address
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            # 1 ETH (1e18 wei) and 12.5 USDC (12_500_000 at 6 decimals).
+            return [{"id": 1, "result": hex(10 ** 18)},
+                    {"id": 2, "result": hex(12_500_000)}]
+
+    class _Client:
+        def __init__(self, *a_, **k_): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a_): return False
+        async def post(self, url, json=None): return _Resp()
+
+    import httpx as _httpx  # the helper does its own `import httpx`; patch the module
+    monkeypatch.setattr(_httpx, "AsyncClient", _Client)
+    out = asyncio.run(a._fetch_chain_balances("https://rpc", addr))
+    assert out == {"wallet_eth": 1.0, "wallet_usdc": 12.5}
+
+
+def test_balances_enriched_with_wallet_chain(tmp_path, monkeypatch):
+    import json as _json
+    from sources import antseed as a
+    s = _antseed_source(tmp_path)
+    (tmp_path / "status-antseed_free.json").write_text(_json.dumps({
+        "depositsAvailable": "1.5", "depositsReserved": "0.0",
+        "walletAddress": "0x" + "cd" * 20,
+    }))
+
+    async def _fake(rpc, address):
+        return {"wallet_usdc": 7.0, "wallet_eth": 0.0}
+    monkeypatch.setattr(a, "_fetch_chain_balances", _fake)
+    monkeypatch.setenv("ANTSEED_WALLET_RPC_URL", a._DEFAULT_BASE_RPC)
+
+    b = asyncio.run(s.balances())["antseed_free"]
+    assert b["detail"]["wallet_usdc"] == 7.0
+    assert b["detail"]["wallet_eth"] == 0.0
+
+    # disabled RPC -> no on-chain fields, escrow still present
+    monkeypatch.setenv("ANTSEED_WALLET_RPC_URL", "off")
+    b2 = asyncio.run(s.balances())["antseed_free"]
+    assert "wallet_usdc" not in b2["detail"] and b2["value"] == 1.5
+
+
 def test_served_pairs_includes_marketplace_families():
     pairs = src._served_pairs(ANTSEED_CATALOG)
     assert ("antseed_free", "qwen3-235b-a22b") in pairs

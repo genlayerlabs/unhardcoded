@@ -25,6 +25,61 @@ from sources import Balance, Price
 MARKET_DIR = Path(os.getenv("ANTSEED_MARKET_DIR", "/market"))
 STALE_AFTER_S = 900
 
+# Buyer hot-wallet on-chain reads. The marketplace spends from ESCROW
+# (depositsAvailable); the raw wallet balance — USDC sitting in the wallet, plus
+# ETH for gas — is what tells you whether you can deposit more or pay for a tx at
+# all. The buyer CLI/status file expose neither, so we read them straight from
+# Base. Native (Circle) USDC on Base mainnet, 6 decimals.
+_BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+_USDC_DECIMALS = 6
+_DEFAULT_BASE_RPC = "https://mainnet.base.org"
+
+
+def _wallet_rpc_url() -> str | None:
+    """Base RPC for the wallet balance read. Defaults to a public endpoint;
+    set ANTSEED_WALLET_RPC_URL to override, or to ""/off/none to disable the
+    on-chain read entirely (then the dashboard shows escrow only)."""
+    raw = os.getenv("ANTSEED_WALLET_RPC_URL")
+    if raw is None or not raw.strip():
+        return _DEFAULT_BASE_RPC  # unset / empty (copied template) -> default on
+    raw = raw.strip()
+    if raw.lower() in ("off", "none", "disabled"):
+        return None
+    return raw
+
+
+async def _fetch_chain_balances(rpc_url: str, address: str) -> dict:
+    """Best-effort on-chain read of the wallet's native ETH and USDC balances on
+    Base, via a batched JSON-RPC call. Returns {} (never raises) on any failure —
+    bad address, network error, RPC error — so a flaky RPC never wedges the poll."""
+    if not address or not address.startswith("0x") or len(address) != 42:
+        return {}
+    addr = address.lower()
+    # USDC balanceOf(addr): selector 0x70a08231 + the 32-byte left-padded address.
+    call_data = "0x70a08231" + "0" * 24 + addr[2:]
+    batch = [
+        {"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance", "params": [addr, "latest"]},
+        {"jsonrpc": "2.0", "id": 2, "method": "eth_call",
+         "params": [{"to": _BASE_USDC, "data": call_data}, "latest"]},
+    ]
+    out: dict = {}
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=6.0) as c:
+            resp = await c.post(rpc_url, json=batch)
+            resp.raise_for_status()
+            results = resp.json()
+        by_id = {r.get("id"): r.get("result") for r in results
+                 if isinstance(r, dict)} if isinstance(results, list) else {}
+        eth_hex, usdc_hex = by_id.get(1), by_id.get(2)
+        if isinstance(eth_hex, str) and eth_hex.startswith("0x"):
+            out["wallet_eth"] = int(eth_hex, 16) / 1e18
+        if isinstance(usdc_hex, str) and usdc_hex.startswith("0x") and usdc_hex != "0x":
+            out["wallet_usdc"] = int(usdc_hex, 16) / (10 ** _USDC_DECIMALS)
+    except Exception:  # noqa: BLE001 — on-chain read is best-effort
+        return out
+    return out
+
 
 def _as_pos_int(v: Any) -> int | None:
     """maxConcurrency as a positive int, or None when absent/garbage (ungated)."""
@@ -299,12 +354,17 @@ class AntSeedSource:
                 available = float(data.get("depositsAvailable"))
             except (TypeError, ValueError):
                 continue
+            detail = {"reserved": data.get("depositsReserved"),
+                      "wallet": data.get("walletAddress"),
+                      "connection": data.get("connectionState")}
+            rpc = _wallet_rpc_url()
+            addr = data.get("walletAddress")
+            if rpc and addr:
+                detail.update(await _fetch_chain_balances(rpc, addr))
             out[pid] = {
                 "kind": "deposits_usdc",
                 "value": available,
-                "detail": {"reserved": data.get("depositsReserved"),
-                           "wallet": data.get("walletAddress"),
-                           "connection": data.get("connectionState")},
+                "detail": detail,
                 "fetched_at": int(time.time()),
             }
         return out

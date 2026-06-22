@@ -83,7 +83,11 @@ docker compose --profile antseed up -d --build antseed
   into the AntSeed **deposits contract (escrow)**, which is what the buyer spends
   — NOT raw wallet USDC. Funding the wallet is not enough; you must `deposit`
   into escrow. (`reserved` is escrow locked in active payment channels — in use,
-  not lost; it returns to available as channels settle.)
+  not lost; it returns to available as channels settle.) The catalog wallet cell
+  also shows the **raw wallet balance** — USDC sitting in the wallet, plus ETH for
+  gas — read on-chain from Base, so you can tell at a glance whether you have funds
+  to deposit and gas to move them. The RPC defaults to a public Base endpoint;
+  override with `ANTSEED_WALLET_RPC_URL`, or set it to `off` to show escrow only.
 - **Self-service (no kubectl):** set `ANTSEED_CONTROL_TOKEN` (shared by the
   `router` and `antseed` services) to enable the sidecar wallet control server;
   the catalog then offers **Deposit / Withdraw / Refresh** buttons. Unset → those
