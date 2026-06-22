@@ -1,0 +1,37 @@
+{
+  "model": "",
+  "max_tokens": 1200,
+  "messages": [{"role": "user", "content": "Propose the next step to implement an in-memory LRU cache in Python."}],
+  "flow_ir": ["flow", {
+    "q": { "kind": "input" },
+    "gpt": {
+      "kind": "llm",
+      "system": "You are a coding agent. Given the task and context, propose the single best NEXT STEP — concrete and short.",
+      "policy": ["policy",
+        ["and", ["meets_req"], ["not", ["is", "disabled"]], ["family_eq", "gpt-5.5"]],
+        ["neg", ["normalize", ["field", "price_in"]]],
+        ["argmax"], ["id"], ["always", { "action": "next_candidate" }]],
+      "inputs": ["q"]
+    },
+    "glm": {
+      "kind": "llm",
+      "system": "You are a coding agent. Given the task and context, propose the single best NEXT STEP — concrete and short.",
+      "policy": ["policy",
+        ["and", ["meets_req"], ["not", ["is", "disabled"]], ["family_eq", "z-ai/glm-5.2"]],
+        ["add", ["scale", 3, ["neg", ["normalize", ["field", "latency_ms"]]]], ["neg", ["normalize", ["field", "price_in"]]]],
+        ["argmax"], ["id"], ["always", { "action": "next_candidate" }]],
+      "inputs": ["q"]
+    },
+    "merge": {
+      "kind": "llm",
+      "system": "You are a coding agent. Two approaches for the next step are below (A and B). Pick the strongest, merge the best of each, and give the single best next step. Be concise.",
+      "policy": ["policy",
+        ["and", ["meets_req"], ["not", ["is", "disabled"]], ["family_eq", "z-ai/glm-5.2"]],
+        ["add", ["scale", 3, ["neg", ["normalize", ["field", "latency_ms"]]]], ["neg", ["normalize", ["field", "price_in"]]]],
+        ["argmax"], ["id"], ["always", { "action": "next_candidate" }]],
+      "inputs": ["gpt", "glm"],
+      "template": "Approach A (GPT-5.5):\n$1\n\nApproach B (GLM-5.2):\n$2\n\nDecide and give the single best next step now."
+    },
+    "out": { "kind": "output", "inputs": ["merge"] }
+  }]
+}
