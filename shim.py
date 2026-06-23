@@ -36,6 +36,8 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
+import route_cache
+
 
 # Profile name used when nothing else can be inferred. Replaced via
 # create_app(default_profile=...).
@@ -79,6 +81,12 @@ class ChatRequest(BaseModel):
     # policy). When present it takes precedence over policy_ir/model. Admission
     # failure -> 400 invalid_flow.
     flow_ir: list | None = None
+    # Conversation/session id (optional). When present the host learns which peer
+    # served this session (route_cache) and, next turn, marks that peer's offer
+    # cache_hot so a cache-aware policy keeps the prompt-cache-hot peer sticky.
+    # Pure host state — never enters the algebra's signature; clients without a
+    # session simply get no affinity. Additive to OpenAI-compat.
+    session: str | None = None
 
 
 class PolicyRankRequest(BaseModel):
@@ -940,6 +948,17 @@ def _request_to_contract(
         # The shim never interprets or pre-validates the term (one admission,
         # one place); it only translates the core's refusal to a 400.
         contract["policy_ir"] = req.policy_ir
+
+    if req.session:
+        # The session rides into the contract so the fold can attribute the call
+        # to it; and the host resolves the session's hot route NOW (snapshot,
+        # before eval) into cache_hot_route, which the cache_hot field getter
+        # reads off ctx.request. A brand-new session has no hot route -> the key
+        # is simply absent -> cache_hot is false for everyone (no phantom pin).
+        contract["session"] = req.session
+        hot = route_cache.hot_route(req.session)
+        if hot is not None:
+            contract["cache_hot_route"] = hot
 
     return contract
 

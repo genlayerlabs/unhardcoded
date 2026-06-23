@@ -214,3 +214,126 @@ def step_every_has(context, path, key):
 @then('the response text contains "{sub}"')
 def step_text_contains(context, sub):
     assert sub in context.resp_text, f'response text missing {sub!r}'
+
+
+# ---- agent cache-affinity steps (10_agent_cache.feature) -------------------
+
+# A simple, stable family the agent loop runs on (codex gpt-5.3-codex-spark,
+# a $0 subscription route). Kept fixed and boring on purpose — the test is about
+# cache stickiness, not model choice.
+AGENT_FAMILY = "gpt-5.3-codex-spark"
+
+# Seed policy: cheapest within the agent's family. Routes to the $0 codex peer
+# when healthy; the override failplan rolls to the next peer of the same family
+# on a transient flake, so the seeding turn can SUCCEED and fold route_cache.
+_SEED_POLICY = [
+    "policy",
+    ["and", ["meets_req"], ["not", ["is", "disabled"]], ["family_eq", AGENT_FAMILY]],
+    ["neg", ["normalize", ["field", "price_in"]]],
+    ["argmax"], ["id"],
+    ["override", ["always", {"action": "next_candidate"}],
+                 "provider_down", {"action": "next_candidate"}],
+]
+
+
+def _cache_aware_policy(family):
+    # cheapest WITHIN the agent's family + a decisive cache_hot affinity bonus.
+    # family_eq (a filter predicate) keeps the scorer running on the survivors,
+    # so each candidate's row carries a real score (unlike a requirements pin).
+    return ["policy",
+            ["and", ["meets_req"], ["not", ["is", "disabled"]],
+                    ["family_eq", family]],
+            ["add", ["neg", ["normalize", ["field", "price_in"]]],
+                    ["scale", 10, ["gate", ["is", "cache_hot"], ["lit", 1]]]],
+            ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
+
+
+@when('an agent establishes session "{sid}" with a free turn')
+def step_agent_seed(context, sid):
+    # A real agent turn on the session, on the fixed AGENT_FAMILY. Retry a
+    # transient provider flake (a 429) until the call SUCCEEDS — that success is
+    # what folds the session's hot route into route_cache.
+    body = {"model": "", "max_tokens": 8, "session": sid,
+            "messages": [{"role": "user", "content": "hi"}],
+            "policy_ir": _SEED_POLICY}
+    chosen = None
+    for _ in range(6):
+        _do(context, "POST", "/v1/chat/completions", auth="consumer", body=body)
+        xr = (context.json or {}).get("x_router") or {}
+        if context.resp.status_code == 200 and xr.get("served_model_id"):
+            chosen = xr
+            break
+    assert chosen, (f"the {AGENT_FAMILY} route did not succeed to seed the session "
+                    f"in 6 tries; last status {context.resp.status_code}: "
+                    f"{context.resp_text[:200]}")
+    context.agent = {"sid": sid, "provider": chosen.get("provider"),
+                     "family": AGENT_FAMILY,
+                     "served": chosen.get("served_model_id")}
+    context.ranks = {}
+
+
+@then('the agent\'s turn routed to a concrete peer')
+def step_agent_routed(context):
+    a = getattr(context, "agent", None)
+    assert a and a.get("served") and a.get("family"), f"no route captured: {a}"
+
+
+def _rerank(context, sid):
+    # Re-issue the agent's turn with a cache-aware policy pinned to its family.
+    # We read the RANKING from x_router.decision_trace (present even if execution
+    # later exhausts), so the assertion is independent of provider health.
+    body = {"model": "", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+            "policy_ir": _cache_aware_policy(context.agent["family"])}
+    if sid is not None:
+        body["session"] = sid
+    _do(context, "POST", "/v1/chat/completions", auth="consumer", body=body)
+    tr = jpath(context.json or {}, "x_router.decision_trace")
+    ranked = tr.get("ranked") if isinstance(tr, dict) else None
+    assert ranked, f"no ranked candidates in trace (status {context.resp.status_code}): {context.resp_text[:200]}"
+    return ranked
+
+
+@when('the agent re-ranks its turn with the same session as "{label}"')
+def step_rerank_session(context, label):
+    context.ranks[label] = _rerank(context, context.agent["sid"])
+
+
+@when('the agent re-ranks the same turn with no session as "{label}"')
+def step_rerank_nosession(context, label):
+    context.ranks[label] = _rerank(context, None)
+
+
+@when('the agent re-ranks the same turn with unknown session "{sid}" as "{label}"')
+def step_rerank_unknown(context, sid, label):
+    context.ranks[label] = _rerank(context, sid)
+
+
+def _max_score(ranked):
+    # The /v1 decision-trace rows carry model_family + score (the candidate's
+    # provider/served_model_id are not echoed there), and family_eq has isolated
+    # the agent's family — so the family's top score is the right discriminator:
+    # without affinity every row is a price score in [0,1]; the cache_hot bonus
+    # lifts the session's route well above that, so only a real bonus makes the
+    # "hot" top exceed the "cold" top.
+    scores = [r.get("score") for r in ranked if r.get("score") is not None]
+    return max(scores) if scores else None
+
+
+@then('the agent\'s route scores higher in "{hot}" than in "{cold}"')
+def step_scores_higher(context, hot, cold):
+    sh = _max_score(context.ranks[hot])
+    sc = _max_score(context.ranks[cold])
+    assert sh is not None and sc is not None, \
+        f"missing scores: {hot}={sh} {cold}={sc}"
+    assert sh > sc, (f"cache affinity did not lift the agent's route: "
+                     f"top score {hot}={sh} is not > {cold}={sc} "
+                     f"(family {context.agent['family']!r})")
+
+
+@then('the rankings "{a}" and "{b}" are identical')
+def step_rankings_identical(context, a, b):
+    def key(rows):
+        return [(r.get("served_model_id"), r.get("score")) for r in rows]
+    ka, kb = key(context.ranks[a]), key(context.ranks[b])
+    assert ka == kb, f"rankings differ:\n  {a}={ka}\n  {b}={kb}"
