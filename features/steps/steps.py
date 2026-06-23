@@ -458,3 +458,57 @@ def step_rankings_identical(context, a, b):
         return [(r.get("served_model_id"), r.get("score")) for r in rows]
     ka, kb = key(context.ranks[a]), key(context.ranks[b])
     assert ka == kb, f"rankings differ:\n  {a}={ka}\n  {b}={kb}"
+
+
+# ---- agent compaction steps (11_agent_compact.feature) --------------------
+
+def _seal_via_ollama_policy():
+    # route the summary to the local ollama model: free, reliable, no rate-limit
+    return ["policy",
+            ["and", ["meets_req"], ["not", ["is", "disabled"]],
+                    ["family_eq", OLLAMA_LOCAL_MODEL]],
+            ["neg", ["normalize", ["field", "price_in"]]],
+            ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
+
+
+@given('a long agent conversation sealable by the local model')
+def step_long_convo(context):
+    # skip unless the local ollama route is actually serving (sidecar up + model)
+    _chat_family(context, OLLAMA_LOCAL_MODEL)
+    if _no_ollama_route(context):
+        context.scenario.skip("local Ollama not serving (needed as the seal model)")
+    sys0 = {"role": "system", "content": "You are a coding agent. <skill + tools + rules>"}
+    convo = []
+    for i in range(10):
+        convo.append({"role": "user", "content": f"step {i}: please continue the task"})
+        convo.append({"role": "assistant", "content": f"did step {i}"})
+    context.compact_input = [sys0] + convo
+
+
+@when('the agent compacts its context keeping the last {keep:d} turns')
+def step_compact(context, keep):
+    context.compact_keep = keep
+    _do(context, "POST", "/v1/compact", auth="consumer", body={
+        "messages": context.compact_input,
+        "keep_recent": keep,
+        "policy_ir": _seal_via_ollama_policy(),
+    })
+    assert context.resp.status_code == 200, context.resp_text[:300]
+
+
+@then('the context is compacted')
+def step_is_compacted(context):
+    j = context.json or {}
+    assert j.get("compacted") is True, f"not compacted: {context.resp_text[:300]}"
+    assert len(j["messages"]) < len(context.compact_input), "no length reduction"
+
+
+@then('the system prefix is preserved')
+def step_prefix_preserved(context):
+    assert context.json["messages"][0] == context.compact_input[0], "prefix changed"
+
+
+@then('the last {keep:d} turns are preserved verbatim')
+def step_tail_preserved(context, keep):
+    assert context.json["messages"][-keep:] == context.compact_input[-keep:], \
+        "recent tail not verbatim"

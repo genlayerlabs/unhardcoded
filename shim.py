@@ -96,6 +96,20 @@ class PolicyRankRequest(BaseModel):
     requirements: dict | None = None
 
 
+class CompactRequest(BaseModel):
+    """Body of POST /v1/compact — append-only context sealing.
+
+    A STATELESS transform: the caller sends the whole message array, the host
+    seals the aged middle into one summary (routed cheaply by `policy_ir`) and
+    returns the spliced array. The host holds NO conversation state — the agent
+    stays sovereign over its context (the cache_hot peer also stays hot because
+    the frozen prefix is never rewritten)."""
+    messages: list[dict]
+    keep_recent: int = 6          # verbatim tail kept after the seal
+    policy_ir: list | None = None  # cheap routing for the summarizer
+    max_tokens: int | None = 512
+
+
 class FlowNormalizeRequest(BaseModel):
     """Body of POST /x/flow/normalize — admit + identify a Σ_flow term."""
     flow_ir: list
@@ -128,6 +142,33 @@ def _rank_rows(ranked: list) -> list[dict]:
             "score": r.get("score"),
         })
     return rows
+
+
+# ---- context compaction (POST /v1/compact) --------------------------------
+
+_SEAL_SYSTEM = (
+    "Summarize the conversation below, preserving decisions, open threads, file "
+    "paths, and key identifiers. Be dense and concrete.")
+_SEAL_PREFIX = "[Earlier conversation, sealed summary]\n"
+
+# Cheapest healthy route — a seal is auxiliary work, never the main model.
+_DEFAULT_COMPACT_POLICY = [
+    "policy",
+    ["and", ["meets_req"], ["not", ["is", "disabled"]]],
+    ["neg", ["normalize", ["field", "price_in"]]],
+    ["argmax"], ["id"], ["always", {"action": "next_candidate"}],
+]
+
+
+def _render_messages(msgs: list[dict]) -> str:
+    out = []
+    for m in msgs:
+        content = m.get("content")
+        if isinstance(content, list):  # multimodal parts -> text only
+            content = " ".join(p.get("text", "") for p in content
+                               if isinstance(p, dict))
+        out.append(f"{m.get('role', '?')}: {content}")
+    return "\n".join(out)
 
 
 def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
@@ -661,6 +702,48 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             return _invalid_policy_response(admission)
         return {"rank_source": "router", "ranked": _rank_rows(ranked),
                 "rejected": rejected, "ts": int(time.time())}
+
+    @app.post("/v1/compact")
+    async def compact(req: CompactRequest):
+        """Append-only context sealing (stateless). Seal the aged middle of the
+        message array into one cheaply-routed summary and splice it back so the
+        frozen prefix and the recent tail are byte-identical — keeping everything
+        upstream cache-hot. Returns {messages, compacted}. The agent owns its
+        context; the host stores nothing."""
+        msgs = req.messages or []
+        keep = max(1, req.keep_recent)
+        # frozen prefix = a leading system message (the skill/tools/rules), if any
+        frozen = msgs[:1] if (msgs and msgs[0].get("role") == "system") else []
+        head = len(frozen)
+        if len(msgs) - head <= keep:        # nothing worth sealing
+            return {"messages": msgs, "compacted": False}
+        recent = msgs[len(msgs) - keep:]
+        aged = msgs[head:len(msgs) - keep]
+        # Anti-orphan (the API-400 trap): a leading `tool` message in `recent`
+        # answers an assistant tool_call that lives in `aged` and is about to be
+        # dropped. Drop those orphaned tool turns at the seam.
+        while recent and recent[0].get("role") == "tool":
+            recent = recent[1:]
+        if not aged:
+            return {"messages": msgs, "compacted": False}
+        contract = {
+            "messages": [{"role": "system", "content": _SEAL_SYSTEM},
+                         {"role": "user", "content": _render_messages(aged)}],
+            "policy_ir": req.policy_ir or _DEFAULT_COMPACT_POLICY,
+            "max_tokens": req.max_tokens or 512,
+        }
+        try:
+            res = await host.execute_async(contract)
+        except Exception as exc:
+            admission = _policy_admission_error(exc)
+            if admission is not None:
+                return _invalid_policy_response(admission)
+            raise
+        summary = ((res.get("response") or {}).get("text") or "").strip()
+        if not summary:                     # seal failed -> never lose content
+            return {"messages": msgs, "compacted": False}
+        sealed = {"role": "system", "content": _SEAL_PREFIX + summary}
+        return {"messages": frozen + [sealed] + recent, "compacted": True}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest):
