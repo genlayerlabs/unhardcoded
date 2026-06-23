@@ -24,6 +24,7 @@ from typing import Any, Awaitable, Callable
 import route_reliability as _route_reliability
 import route_latency as _route_latency
 import route_tool_capability as _route_tool_capability
+import route_cache as _route_cache
 
 import lupa
 from lupa import LuaRuntime
@@ -89,6 +90,39 @@ class LLMRouterHost:
         self.router = self._dofile(Path(router_path))
         self.config = self._dofile(Path(config_path))
         self.metrics = self._dofile(Path(metrics_path)) if metrics_path else None
+        self._inject_host_fields()
+
+    def _inject_host_fields(self) -> None:
+        """Declare host-universal observation fields that every catalog gets for
+        free because they denote a HOST measurement, not catalog data — currently
+        the per-session cache-affinity Bool `cache_hot`. Done here (once, after the
+        config loads, before router.init and the flow schema read cfg.fields) so no
+        catalog .lua repeats the getter and the field exists for example/live/any
+        config alike.
+
+        Zero engine change: this is the fields.lua extension seam
+        (`schema{ extensions }`). The getter reconstructs each candidate's route
+        key exactly as `_fold_route_outcome` does (`provider|family|peer`, peer
+        falling back to provider for peerless routes) and compares it to the hot
+        route the host resolved into `ctx.request.cache_hot_route` per request
+        (see `route_cache.hot_route`). The algebra observes only the Bool; the
+        route key never enters the signature."""
+        self.lua.eval("""
+function(cfg)
+    cfg.fields = cfg.fields or {}
+    cfg.fields.cache_hot = {
+        sort = "Bool", default = false, group = "route",
+        get = function(c, ctx)
+            local hot = ctx and ctx.request and ctx.request.cache_hot_route
+            if hot == nil then return false end
+            local pid, fam = c.provider_id, c.model_family
+            if pid == nil or fam == nil then return false end
+            local peer = (c.offer and c.offer.peer_id) or pid
+            return (pid .. "|" .. fam .. "|" .. peer) == hot
+        end,
+    }
+end
+""")(self.config)
 
     # ---- public API -----------------------------------------------------
 
@@ -195,7 +229,8 @@ class LLMRouterHost:
         input_text = _last_user_text(base_contract.get("messages") or [])
         carry = {k: base_contract[k] for k in
                  ("max_tokens", "tools", "tool_choice", "response_format",
-                  "temperature", "seed") if k in base_contract}
+                  "temperature", "seed", "session", "cache_hot_route")
+                 if k in base_contract}
 
         async def run_node(nid, node, prompt):
             # Give the node the FULL conversation (system, history, tool results)
@@ -350,6 +385,10 @@ class LLMRouterHost:
         (the streaming path uses it to thread a per-request delta channel);
         mock responses still take precedence per (provider, family) pair.
         """
+        # Session id (if the caller named one) rides host-side from here to the
+        # fold so route_cache learns which peer served this conversation. It is a
+        # local of this coroutine, so concurrent executes never share it.
+        session = contract.get("session")
         step = self.router.execute_step(None, _to_lua(self.lua, contract), None)
         while True:
             status = step["status"]
@@ -359,7 +398,7 @@ class LLMRouterHost:
             handle = step["state_handle"]
             if status == "call":
                 req = _to_py(step["request"]) or {}
-                resp = await self._resolve_call_async(req, call_override)
+                resp = await self._resolve_call_async(req, call_override, session=session)
                 step = self.router.execute_step(handle, None, _to_lua(self.lua, resp))
             elif status == "wait":
                 until_ms = step["until_ms"] or 0
@@ -370,7 +409,8 @@ class LLMRouterHost:
             else:
                 return {"ok": False, "error": f"internal: bad step status {status}", "trace": {}}
 
-    async def _resolve_call_async(self, request: dict, call_override=None) -> dict:
+    async def _resolve_call_async(self, request: dict, call_override=None,
+                                  session: "str | None" = None) -> dict:
         """Resolve one provider call for the async driver: mock first (so the
         same set_mock_response works for sync and async), then a per-run
         override, then the async hook, then the sync hook as a last resort."""
@@ -388,7 +428,7 @@ class LLMRouterHost:
         # reliability / the call count too, the host-owned perf the algebra reads
         # and the market view surfaces (#15). Mocks fold as well, so a mocked call
         # is measured exactly like a live one.
-        _fold_route_outcome(request, result)
+        _fold_route_outcome(request, result, session=session)
         return result
 
     def dump_state(self) -> dict:
@@ -750,7 +790,8 @@ def _peer_gate(peer_id: str, cap: int) -> asyncio.Semaphore:
     return sem
 
 
-def _fold_route_outcome(request: dict, result: dict) -> None:
+def _fold_route_outcome(request: dict, result: dict,
+                        session: "str | None" = None) -> None:
     """Fold ONE call outcome into the host-side per-route measurements:
     reliability (success EMA), latency (EMA), and learned tool capability. Called
     from _resolve_call_async for BOTH the direct hook and the streaming/override
@@ -780,6 +821,11 @@ def _fold_route_outcome(request: dict, result: dict) -> None:
     rkey = _route_reliability.route_key(pid, fam, peer_id or pid)
     _route_reliability.observe(rkey, ok)
     _route_latency.observe(rkey, result.get("latency_ms"), ok)
+    # Per-session cache affinity: a successful call makes this route the session's
+    # hot route (it now holds the prompt-cache prefix), so the next turn's
+    # cache_hot field marks it and a cache-aware policy keeps it sticky. Same one
+    # route identity as reliability/latency; no-op when the caller named no session.
+    _route_cache.observe(session, rkey, ok)
     # Learned tool capability is a marketplace concern only (static/partner routes
     # declare their capabilities in config), so keep it peer-scoped.
     if peer_id:
