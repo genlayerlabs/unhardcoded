@@ -34,6 +34,11 @@ def _i(env: str, d: int) -> int:
 
 # key -> declarative knob. `provider` groups it in the UI; type/min/max validate.
 SCHEMA: dict[str, dict[str, Any]] = {
+    "compaction.at_tokens": {
+        "provider": "compaction", "type": "int", "default": _i("COMPACT_AT_TOKENS", 24000),
+        "min": 1000, "max": 2000000, "label": "Suggest compaction at (input tokens)",
+        "help": "When a call's input exceeds this, the response carries "
+                "x_router.compact=true so the agent knows to POST /v1/compact."},
     "antseed.offers_top_n": {
         "provider": "antseed", "type": "int", "default": _i("ANTSEED_OFFERS_TOP_N", 3),
         "min": 1, "max": 10, "label": "Offers per family (top-N peers)",
