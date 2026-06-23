@@ -55,7 +55,7 @@ async def test_local_discovery_no_auth():
     offers = source.offers_sync("ollama")
     assert len(offers) == 1
     assert offers[0]["source"] == "local"
-    assert offers[0]["seller_endpoint"] == "http://localhost:11434"
+    assert offers[0]["seller_endpoint"] == "http://localhost:11434/v1"
 
 
 @pytest.mark.asyncio
@@ -255,7 +255,7 @@ async def test_custom_local_base_url():
     await source.pricing()
 
     offers = source.offers_sync("ollama")
-    assert offers[0]["seller_endpoint"] == "http://custom:8080"
+    assert offers[0]["seller_endpoint"] == "http://custom:8080/v1"
 
 
 @pytest.mark.asyncio

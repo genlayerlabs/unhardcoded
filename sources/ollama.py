@@ -124,7 +124,10 @@ class OllamaSource:
             offer = {
                 "model_family": model_id,
                 "wire_model_id": model_id,
-                "seller_endpoint": self._local_base,
+                # local Ollama serves the OpenAI-compatible API under /v1
+                # (the host appends /chat/completions); discovery above uses the
+                # bare base for /api/tags, so add /v1 only here.
+                "seller_endpoint": self._local_base.rstrip("/") + "/v1",
                 "price_in_usd_per_mtok": 0.0,
                 "price_out_usd_per_mtok": 0.0,
                 "capabilities": self._extract_capabilities(m),
