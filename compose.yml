@@ -8,6 +8,15 @@ services:
       - ./.env.secrets
     environment:
       LLM_POLICY_DIR: /app
+      # local Ollama sidecar (compose service `ollama`); discovery hits
+      # $OLLAMA_BASE_URL/api/tags, chat the OpenAI-compat endpoint. Unset in k8s
+      # -> the source falls back to localhost and simply finds nothing.
+      OLLAMA_BASE_URL: http://ollama:11434
+      # the provider declares auth_env=OLLAMA_API_KEY (for Ollama Cloud); LOCAL
+      # ollama needs no auth but the host's auth resolver still wants the var, so
+      # give it a dummy the local server ignores. Override with a real key (and
+      # OLLAMA_CLOUD=1) to use Ollama Cloud instead.
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY:-ollama-local}
       # compose runs antseed on its own network; socat re-exposes the
       # localhost-only buyer proxy on :8378 (k8s leaves this unset -> localhost)
       ANTSEED_BASE_URL: http://antseed:8378/v1
@@ -142,6 +151,20 @@ services:
         aliases:
           - antseed
 
+  # Local Ollama, for exercising the ollama provider end to end (the @ollama
+  # BDD flow). Kept deliberately tiny — pull a small model after `up`, e.g.
+  #   docker compose exec ollama ollama pull qwen2.5:0.5b
+  # The router discovers it via OLLAMA_BASE_URL=http://ollama:11434.
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      llm-router-internal:
+        aliases:
+          - ollama
+
 networks:
   llm-router-internal:
     name: llm-router-internal
@@ -152,3 +175,4 @@ volumes:
   codex-accounts:
   antseed-data:
   antseed-market:
+  ollama-data:
