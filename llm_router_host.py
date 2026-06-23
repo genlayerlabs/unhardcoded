@@ -101,12 +101,19 @@ class LLMRouterHost:
         config alike.
 
         Zero engine change: this is the fields.lua extension seam
-        (`schema{ extensions }`). The getter reconstructs each candidate's route
-        key exactly as `_fold_route_outcome` does (`provider|family|peer`, peer
-        falling back to provider for peerless routes) and compares it to the hot
-        route the host resolved into `ctx.request.cache_hot_route` per request
-        (see `route_cache.hot_route`). The algebra observes only the Bool; the
-        route key never enters the signature."""
+        (`schema{ extensions }`). The getter builds each candidate's route key
+        through the SAME `route_reliability.route_key` that `_fold_route_outcome`
+        uses — bridged into Lua as the `host_route_key` global, so the
+        serialization (`provider|family|peer`, peer falling back to provider for
+        peerless routes) has exactly one source and cannot drift across the
+        Python/Lua boundary. It compares that key to the hot route the host
+        resolved into `ctx.request.cache_hot_route` per request (see
+        `route_cache.hot_route`). The algebra observes only the Bool; the route
+        key never enters the signature."""
+        # One source of truth for the route-key serialization: the getter must
+        # build a candidate's key identically to the fold, or affinity is silently
+        # lost. Bridge the host's route_key into Lua instead of re-serializing.
+        self.lua.globals().host_route_key = _route_reliability.route_key
         self.lua.eval("""
 function(cfg)
     cfg.fields = cfg.fields or {}
@@ -118,7 +125,7 @@ function(cfg)
             local pid, fam = c.provider_id, c.model_family
             if pid == nil or fam == nil then return false end
             local peer = (c.offer and c.offer.peer_id) or pid
-            return (pid .. "|" .. fam .. "|" .. peer) == hot
+            return host_route_key(pid, fam, peer) == hot
         end,
     }
 end
