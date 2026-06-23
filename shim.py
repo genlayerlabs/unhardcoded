@@ -171,6 +171,21 @@ def _render_messages(msgs: list[dict]) -> str:
     return "\n".join(out)
 
 
+def _compact_suggested(resp: dict) -> bool:
+    """Context-pressure hint: True once a call's INPUT crosses the operator
+    threshold (settings `compaction.at_tokens`). Surfaced on x_router so an agent
+    knows to POST /v1/compact — it owns the threshold decision, not the agent.
+    Measured on the real prompt_tokens the call reported, so it costs nothing."""
+    import settings as _settings
+    n = resp.get("tokens_in")
+    if not n:
+        return False
+    try:
+        return int(n) >= int(_settings.get("compaction.at_tokens"))
+    except (TypeError, ValueError):
+        return False
+
+
 def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                streaming_call=None,
                default_max_tokens: int | None = DEFAULT_MAX_TOKENS_FALLBACK,
@@ -889,6 +904,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             "cost_usd": _executed_cost_usd(result, subscription_providers),
             "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
             "decision_trace": _trim_trace(result.get("trace")),
+            "compact": _compact_suggested(resp),
         }
         return resp, usage or None, x_router
 
@@ -1219,6 +1235,7 @@ def _router_response_to_openai(result: dict, requested_model: str,
         "cost_usd": _executed_cost_usd(result, subscription_providers),
         "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
         "decision_trace": _trim_trace(result.get("trace")),
+        "compact": _compact_suggested(response),
     }
     return out
 

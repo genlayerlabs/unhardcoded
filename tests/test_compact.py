@@ -109,3 +109,30 @@ def test_compact_drops_orphan_tool_at_seam(client, host):
     roles = [x["role"] for x in out]
     seal_idx = roles.index("system", 1)        # the sealed block
     assert out[seal_idx + 1]["role"] != "tool", f"orphan tool after seal: {roles}"
+
+
+# ---- the compaction trigger flag (x_router.compact) -----------------------
+
+def _ok_tokens(n_in):
+    return {"ok": True, "latency_ms": 5,
+            "response": {"text": "ok", "tokens_in": n_in, "tokens_out": 2}}
+
+
+def test_compact_flag_set_when_input_large(client, host):
+    # tokens_in over the default threshold (24000) -> the response tells the
+    # agent to seal.
+    host.set_mock_response("comput3", "hermes-3-405b", _ok_tokens(30000))
+    r = client.post("/v1/chat/completions", json={
+        "model": "", "messages": [{"role": "user", "content": "hi"}],
+        "policy_ir": _PIN})
+    assert r.status_code == 200, r.text
+    assert r.json()["x_router"]["compact"] is True
+
+
+def test_compact_flag_unset_when_input_small(client, host):
+    host.set_mock_response("comput3", "hermes-3-405b", _ok_tokens(100))
+    r = client.post("/v1/chat/completions", json={
+        "model": "", "messages": [{"role": "user", "content": "hi"}],
+        "policy_ir": _PIN})
+    assert r.status_code == 200, r.text
+    assert r.json()["x_router"]["compact"] is False
