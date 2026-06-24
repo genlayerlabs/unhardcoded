@@ -25,6 +25,7 @@ import route_reliability as _route_reliability
 import route_latency as _route_latency
 import route_tool_capability as _route_tool_capability
 import route_cache as _route_cache
+import route_session_meter as _route_session_meter
 
 
 def _cached_tokens(usage: dict) -> "int | None":
@@ -293,6 +294,8 @@ end
                     "price_out": chosen.get("price_out"),
                     "tokens_in": resp.get("tokens_in"),
                     "tokens_out": resp.get("tokens_out"),
+                    "tokens_cached": resp.get("tokens_cached"),
+                    "cost_reported": resp.get("cost_reported"),
                     # this node's own latency, so the dashboard shows WHICH node is
                     # the slow one in a flow (e.g. a 12s antseed glm-5.2 node vs a
                     # 0.9s gpt-5.5 node).
@@ -305,6 +308,27 @@ end
         nodes = fr.get("trace") or []
         tok_in = sum((n.get("tokens_in") or 0) for n in nodes) or None
         tok_out = sum((n.get("tokens_out") or 0) for n in nodes) or None
+        tok_cached = sum((n.get("tokens_cached") or 0) for n in nodes) or None
+        # The flow's synthetic chosen ("flow") has no price, so the shim can't
+        # compute cost — aggregate it here, per node, the same way shim's
+        # _executed_cost_usd does: prefer the provider-reported cost, else compute
+        # from the node's ranked price discounting cache-read tokens (~10x). Sum
+        # is surfaced as the flow's cost_reported so the shim uses it verbatim.
+        def _node_cost(n):
+            rep = n.get("cost_reported")
+            if isinstance(rep, (int, float)) and not isinstance(rep, bool) and rep >= 0:
+                return float(rep)
+            pin, pout = n.get("price_in"), n.get("price_out")
+            if pin is None and pout is None:
+                return None
+            tin = n.get("tokens_in") or 0
+            cached = n.get("tokens_cached") or 0
+            uncached = max(0, tin - cached)
+            return (uncached / 1e6 * (pin or 0)
+                    + cached / 1e6 * (pin or 0) * 0.1
+                    + (n.get("tokens_out") or 0) / 1e6 * (pout or 0))
+        _costs = [c for c in (_node_cost(n) for n in nodes) if c is not None]
+        flow_cost = round(sum(_costs), 6) if _costs else None
         base_trace = {"policy_fingerprint": None, "flow_fingerprint": fp,
                       "flow_nodes": nodes}
         if not fr.get("ok"):
@@ -331,7 +355,8 @@ end
             "response": {"text": fr.get("text") or "",
                          "tool_calls": final_tool_calls or None,
                          "finish_reason": "tool_calls" if final_tool_calls else "stop",
-                         "tokens_in": tok_in, "tokens_out": tok_out},
+                         "tokens_in": tok_in, "tokens_out": tok_out,
+                         "tokens_cached": tok_cached, "cost_reported": flow_cost},
             "chosen": {"provider_id": "flow", "model_family": "flow:" + fp,
                        "served_model_id": "flow:" + fp},
             "trace": base_trace,
@@ -848,6 +873,11 @@ def _fold_route_outcome(request: dict, result: dict,
     # cache_hot field marks it and a cache-aware policy keeps it sticky. Same one
     # route identity as reliability/latency; no-op when the caller named no session.
     _route_cache.observe(session, rkey, ok)
+    # Record the warm route for the per-session display panel (which family is
+    # warm, on which provider, via which peer/backend). Success only, like the
+    # affinity fold. Display-only; the routing decision stays in route_cache.
+    if ok and session:
+        _route_session_meter.observe_route(session, pid, fam, peer_id or pid)
     # Learned tool capability is a marketplace concern only (static/partner routes
     # declare their capabilities in config), so keep it peer-scoped.
     if peer_id:

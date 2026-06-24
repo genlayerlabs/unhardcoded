@@ -32,7 +32,7 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -88,6 +88,11 @@ class ChatRequest(BaseModel):
     # Pure host state — never enters the algebra's signature; clients without a
     # session simply get no affinity. Additive to OpenAI-compat.
     session: str | None = None
+    # The authed consumer key behind this request, set by the ingress proxy via
+    # the x-llm-router-caller header (consumers cannot set it — the proxy strips
+    # and re-injects it). Never sent to the core; used only to bind sid->owner in
+    # the session meter so the consumer-facing session view stays per-consumer.
+    caller: str | None = None
 
 
 class PolicyRankRequest(BaseModel):
@@ -237,13 +242,32 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         return {"ok": True, "overrides": _settings.reload()}
 
     @app.get("/x/session/{sid}")
-    def session_meter(sid: str):
+    def session_meter(sid: str, request: Request):
         """Accumulated usage for a session: calls, tokens_in/out, tokens_cached,
-        cost_usd — the running total the per-call x_router.session_acc reflects.
-        Internal (/x/* hidden from consumers)."""
-        return route_session_meter.get(sid) or {
+        cost_usd — the running total the per-call x_router.session_acc reflects —
+        plus `warm`: the routes (family/provider/served_by) currently holding the
+        session's prompt-cache prefix. Internal (/x/* hidden from consumers).
+
+        Cross-consumer isolation: a session's economics + warm peers belong to the
+        consumer that first wrote the sid (bound in observe(owner=...)). When the
+        ingress proxy forwards a consumer's authed key as x-llm-router-caller (the
+        consumer-facing /v1/session/{sid} view), only that owner may read it —
+        anyone else gets 404 (NOT 403: confirming the sid exists would itself leak
+        that consumer A holds it). Operator callers (dashboard /x/*, no caller
+        header) are unscoped, as before. The in-process meter resets on restart,
+        so an unknown owner also means there is simply nothing to show — 404 is
+        consistent either way."""
+        caller = request.headers.get("x-llm-router-caller")
+        if caller:
+            owner = route_session_meter.owner(sid)
+            if owner is None or owner != caller:
+                return JSONResponse(status_code=404, content={"error": {
+                    "message": "session not found", "type": "not_found",
+                    "code": "session_not_found"}})
+        acc = route_session_meter.get(sid) or {
             "calls": 0, "tokens_in": 0, "tokens_out": 0,
             "tokens_cached": 0, "cost_usd": 0.0}
+        return {**acc, "warm": route_session_meter.warm(sid)}
 
     @app.get("/x/sessions")
     def session_meters():
@@ -776,11 +800,12 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         return {"messages": frozen + [sealed] + recent, "compacted": True}
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(req: ChatRequest):
+    async def chat_completions(req: ChatRequest, request: Request):
+        _session_from_header(req, request)
         return await _handle_chat(req)
 
     @app.post("/{profile_name}/v1/chat/completions")
-    async def chat_completions_profiled(profile_name: str, req: ChatRequest):
+    async def chat_completions_profiled(profile_name: str, req: ChatRequest, request: Request):
         """Path-addressed policy endpoint.
 
         POST /edge/v1/chat/completions always runs the `edge` profile, ignoring
@@ -788,7 +813,25 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         base_url (…/edge, …/medium, …/dummy) so a client picks a policy by URL
         instead of a `profile:` model prefix.
         """
+        _session_from_header(req, request)
         return await _handle_chat(req, profile_name=profile_name)
+
+    def _session_from_header(req: ChatRequest, request: Request) -> None:
+        """Fallback the conversation id from the X-Unhardcoded-Session header when
+        the body carries none. Clients (e.g. the opencode plugin) that can set
+        request headers but not extra body fields use this to get cache affinity +
+        per-session metering. An explicit body `session` always wins.
+
+        Also capture the authed consumer key the ingress proxy injects as
+        x-llm-router-caller, so the per-session meter can bind sid->owner (a body
+        field can't be trusted for this; only the proxy sets this header)."""
+        if not req.session:
+            hdr = request.headers.get("x-unhardcoded-session")
+            if hdr:
+                req.session = hdr
+        caller = request.headers.get("x-llm-router-caller")
+        if caller:
+            req.caller = caller
 
     async def _handle_chat(req: ChatRequest, profile_name: str | None = None):
         contract = _request_to_contract(req, default_profile, default_max_tokens)
@@ -813,7 +856,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                     return _openai_error_from_router(result)
                 return _router_response_to_openai(result, req.model,
                                                   subscription_providers,
-                                                  session=req.session)
+                                                  session=req.session,
+                                                  owner=req.caller)
             # Streaming flow: run as a task and wait briefly for a fast failure
             # (admission 400, or a node failing instantly) so it stays a clean
             # JSON error. Anything slower commits to SSE and HEARTBEATs while the
@@ -850,7 +894,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             if result.get("ok"):
                 return _router_response_to_openai(result, req.model,
                                                   subscription_providers,
-                                                  session=req.session)
+                                                  session=req.session,
+                                                  owner=req.caller)
             return _openai_error_from_router(result)
         return await _handle_stream(contract, req)
 
@@ -903,7 +948,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         return StreamingResponse(_pseudo_stream(result, req),
                                  media_type="text/event-stream")
 
-    def _final_chunk_parts(result: dict):
+    def _final_chunk_parts(result: dict, session: str | None = None,
+                           owner: str | None = None):
         resp = result.get("response") or {}
         chosen = result.get("chosen") or {}
         usage = {}
@@ -912,6 +958,9 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                                  ("tokens_total", "total_tokens")):
             if resp.get(src_key) is not None:
                 usage[dst_key] = resp[src_key]
+        # Standard OpenAI cache field so clients parse cache reads natively.
+        if resp.get("tokens_cached"):
+            usage["prompt_tokens_details"] = {"cached_tokens": resp["tokens_cached"]}
         x_router = {
             "provider": chosen.get("provider_id"),
             "model_family": chosen.get("model_family"),
@@ -924,10 +973,23 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             "decision_trace": _trim_trace(result.get("trace")),
             "compact": _compact_suggested(resp),
         }
+        # Per-session meter on the STREAMING path too (mirrors the non-streaming
+        # _router_response_to_openai). Streaming clients (e.g. opencode, stream:true)
+        # otherwise never fold into the session total. Idempotent per request: this
+        # runs once per final chunk.
+        if session:
+            acc = route_session_meter.observe(
+                session,
+                tokens_in=resp.get("tokens_in") or 0,
+                tokens_out=resp.get("tokens_out") or 0,
+                tokens_cached=resp.get("tokens_cached") or 0,
+                cost_usd=x_router["cost_usd"] or 0.0,
+                owner=owner)
+            x_router["session_acc"] = acc
         return resp, usage or None, x_router
 
     async def _pseudo_stream(result: dict, req: ChatRequest):
-        resp, usage, x_router = _final_chunk_parts(result)
+        resp, usage, x_router = _final_chunk_parts(result, req.session, req.caller)
         stream_id = _streaming.new_stream_id()
         model = resp.get("raw_model") or req.model or ""
         yield _streaming.encode_role_chunk(stream_id, model)
@@ -961,7 +1023,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 "invalid_flow" if admission else "flow_error")
             yield _streaming.DONE_EVENT
             return
-        resp, usage, x_router = _final_chunk_parts(result)
+        resp, usage, x_router = _final_chunk_parts(result, req.session, req.caller)
         fmodel = resp.get("raw_model") or model
         if result.get("ok"):
             if resp.get("text"):
@@ -994,7 +1056,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             yield _streaming.HEARTBEAT  # 'beat' — keep the line warm
         result = task.result()
         if result.get("ok"):
-            resp, usage, x_router = _final_chunk_parts(result)
+            resp, usage, x_router = _final_chunk_parts(result, req.session, req.caller)
             fmodel = resp.get("raw_model") or model
             # A flow that never committed a delta (its result was assembled, not
             # streamed) still owes the client its text before the final chunk.
@@ -1009,7 +1071,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             # is VISIBLE in Activity (provider + trace recorded) instead of an
             # empty 200 with no trace, THEN surface the error to the client so
             # opencode sees a reason rather than silently nothing.
-            _resp, usage, x_router = _final_chunk_parts(result)
+            _resp, usage, x_router = _final_chunk_parts(result, req.session, req.caller)
             err = str(result.get("error") or "stream failed")
             yield _streaming.encode_final_chunk(stream_id, model, "error", None,
                                                 usage, x_router)
@@ -1224,7 +1286,8 @@ def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> floa
 
 def _router_response_to_openai(result: dict, requested_model: str,
                                subscription_providers=frozenset(),
-                               session: str | None = None) -> dict:
+                               session: str | None = None,
+                               owner: str | None = None) -> dict:
     response = result.get("response") or {}
     chosen = result.get("chosen") or {}
 
@@ -1256,6 +1319,10 @@ def _router_response_to_openai(result: dict, requested_model: str,
         usage["completion_tokens"] = response["tokens_out"]
     if response.get("tokens_total") is not None:
         usage["total_tokens"] = response["tokens_total"]
+    # Standard OpenAI cache field so clients (opencode, etc.) parse cache reads
+    # natively — not just our x_router. Mirrors usage.prompt_tokens_details.
+    if response.get("tokens_cached"):
+        usage["prompt_tokens_details"] = {"cached_tokens": response["tokens_cached"]}
     if usage:
         out["usage"] = usage
 
@@ -1280,7 +1347,8 @@ def _router_response_to_openai(result: dict, requested_model: str,
             tokens_in=response.get("tokens_in") or 0,
             tokens_out=response.get("tokens_out") or 0,
             tokens_cached=response.get("tokens_cached") or 0,
-            cost_usd=out["x_router"]["cost_usd"] or 0.0)
+            cost_usd=out["x_router"]["cost_usd"] or 0.0,
+            owner=owner)
         out["x_router"]["session_acc"] = acc
     return out
 

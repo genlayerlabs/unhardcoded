@@ -1945,6 +1945,35 @@ async def key_usage(request: Request) -> Response:
     return JSONResponse(content=_key_usage_snapshot(viewer=f"consumer:{caller}", key_sha256=str(auth.get("digest")), caller=caller, options=options))
 
 
+@app.get("/v1/session/{sid}")
+async def session_view(sid: str, request: Request) -> Response:
+    """Consumer-facing per-session economics: accumulated cost / tokens / cache,
+    plus `warm` — the routes (family / provider / served_by, i.e. the real peer
+    or backend behind a marketplace) currently holding the session's prompt-cache
+    prefix. Authed by the caller's consumer key; `sid` is the opaque id the client
+    itself sends as X-Unhardcoded-Session. Lets a harness (e.g. the opencode
+    plugin) show live router economics without operator access to /x/*."""
+    token = _extract_token(request)
+    auth = _caller_auth(token)
+    if not auth.get("ok"):
+        code = auth.get("error_code") or "caller_auth"
+        status_code = 403 if code in {"caller_inactive", "caller_key_revoked", "caller_key_expired"} else 401
+        return JSONResponse(status_code=status_code, content={"error": {"message": "caller not authorized", "type": "auth_error", "code": code}})
+    assert _client is not None
+    # Forward the authed consumer key so the upstream meter scopes the read to
+    # the session's OWNER (bound when the sid was first metered). A consumer must
+    # not read another consumer's session economics / warm peers; the upstream
+    # answers 404 (not 403) for a sid this caller does not own, so the endpoint
+    # never confirms that someone else's sid exists.
+    caller = str(auth.get("caller") or "")
+    try:
+        r = await _client.get(f"{UPSTREAM}/x/session/{sid}", timeout=5.0,
+                              headers={"x-llm-router-caller": caller})
+        return JSONResponse(status_code=r.status_code, content=r.json())
+    except Exception as exc:
+        return JSONResponse(status_code=502, content={"error": {"message": f"upstream: {exc}", "type": "api_error", "code": "upstream_error"}})
+
+
 @app.post("/dashboard/api/consumers/{consumer}")
 async def dashboard_update_consumer(consumer: str, request: Request) -> Response:
     ctx, error = _require_admin_dashboard_auth(request)
