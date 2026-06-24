@@ -37,6 +37,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 import route_cache
+import route_session_meter
 
 
 # Profile name used when nothing else can be inferred. Replaced via
@@ -234,6 +235,20 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         enough. Internal — /x/* is hidden from consumers."""
         import settings as _settings
         return {"ok": True, "overrides": _settings.reload()}
+
+    @app.get("/x/session/{sid}")
+    def session_meter(sid: str):
+        """Accumulated usage for a session: calls, tokens_in/out, tokens_cached,
+        cost_usd — the running total the per-call x_router.session_acc reflects.
+        Internal (/x/* hidden from consumers)."""
+        return route_session_meter.get(sid) or {
+            "calls": 0, "tokens_in": 0, "tokens_out": 0,
+            "tokens_cached": 0, "cost_usd": 0.0}
+
+    @app.get("/x/sessions")
+    def session_meters():
+        """All session meters (operator view of per-session spend/cache)."""
+        return {"sessions": route_session_meter.snapshot()}
 
     # ---- AntSeed buyer hot-wallet control (dashboard self-service) -----------
     # Proxy deposit/withdraw/refresh to the sidecar control server, then refresh
@@ -797,7 +812,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 if not result.get("ok"):
                     return _openai_error_from_router(result)
                 return _router_response_to_openai(result, req.model,
-                                                  subscription_providers)
+                                                  subscription_providers,
+                                                  session=req.session)
             # Streaming flow: run as a task and wait briefly for a fast failure
             # (admission 400, or a node failing instantly) so it stays a clean
             # JSON error. Anything slower commits to SSE and HEARTBEATs while the
@@ -833,7 +849,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 return _invalid_policy_response(admission)
             if result.get("ok"):
                 return _router_response_to_openai(result, req.model,
-                                                  subscription_providers)
+                                                  subscription_providers,
+                                                  session=req.session)
             return _openai_error_from_router(result)
         return await _handle_stream(contract, req)
 
@@ -902,6 +919,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             "price_in": chosen.get("price_in"),
             "price_out": chosen.get("price_out"),
             "cost_usd": _executed_cost_usd(result, subscription_providers),
+            "tokens_cached": resp.get("tokens_cached"),
             "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
             "decision_trace": _trim_trace(result.get("trace")),
             "compact": _compact_suggested(resp),
@@ -1167,30 +1185,46 @@ def _trim_trace(trace):
     return out
 
 
+# Fraction of the input price billed for prompt-cache-READ tokens, used ONLY in
+# the computed fallback (providers that report no cost). Most caching providers
+# discount cache reads ~10x; this is the conservative typical factor.
+_CACHE_READ_FACTOR = 0.1
+
+
 def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> float | None:
-    """Cost of THIS request at the price the ranker actually used for the
-    chosen candidate. Subscription backends (codex) cost $0 regardless of
-    their ranking price (the scarcity ramp is a shadow price, not a bill).
-    None when the candidate had no price (then the dashboard's read-time
-    estimator is the fallback)."""
+    """Dollars actually spent on THIS request, accurate across providers.
+    Order: (1) subscription backends (codex) cost $0; (2) the provider's OWN
+    reported cost when present (e.g. OpenRouter `usage.cost`) — authoritative and
+    already net of prompt-cache discounts; (3) computed from the ranked price,
+    billing cache-read tokens at a fraction so a cache hit is not charged at full
+    input price. None when uncomputable (read-time estimator is the fallback)."""
     chosen = result.get("chosen") or {}
+    resp = result.get("response") or {}
     if chosen.get("provider_id") in subscription_providers:
         return 0.0
+    # (2) authoritative provider-reported cost — works for ANY provider that gives it
+    reported = resp.get("cost_reported")
+    if isinstance(reported, (int, float)) and not isinstance(reported, bool) and reported >= 0:
+        return round(float(reported), 6)
+    # (3) compute from the ranker price, discounting cache-read input tokens
     pin, pout = chosen.get("price_in"), chosen.get("price_out")
     if pin is None and pout is None:
         return None
-    resp = result.get("response") or {}
-    cost = round((resp.get("tokens_in") or 0) / 1e6 * (pin or 0)
-                 + (resp.get("tokens_out") or 0) / 1e6 * (pout or 0), 6)
-    # A negative price (an "unpriced"/sentinel value, or a shadow scarcity price)
-    # must never bill a negative cost — a call's cost is >= 0 by definition. Clamp
-    # at the source so no negative spend is recorded (we once saw a large
-    # negative-spend row that was exactly this: tokens × a negative chosen price).
-    return max(0.0, cost)
+    tin = resp.get("tokens_in") or 0
+    cached = resp.get("tokens_cached") or 0
+    uncached = max(0, tin - cached)
+    cost = (uncached / 1e6 * (pin or 0)
+            + cached / 1e6 * (pin or 0) * _CACHE_READ_FACTOR
+            + (resp.get("tokens_out") or 0) / 1e6 * (pout or 0))
+    # A negative price (unpriced sentinel / shadow scarcity price) must never bill
+    # negative — clamp at the source (we once saw a large negative-spend row that
+    # was exactly tokens × a negative chosen price).
+    return max(0.0, round(cost, 6))
 
 
 def _router_response_to_openai(result: dict, requested_model: str,
-                               subscription_providers=frozenset()) -> dict:
+                               subscription_providers=frozenset(),
+                               session: str | None = None) -> dict:
     response = result.get("response") or {}
     chosen = result.get("chosen") or {}
 
@@ -1233,10 +1267,21 @@ def _router_response_to_openai(result: dict, requested_model: str,
         "price_in": chosen.get("price_in"),
         "price_out": chosen.get("price_out"),
         "cost_usd": _executed_cost_usd(result, subscription_providers),
+        "tokens_cached": response.get("tokens_cached"),
         "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
         "decision_trace": _trim_trace(result.get("trace")),
         "compact": _compact_suggested(response),
     }
+    # Per-session meter: fold this call into the session's running total and put
+    # BOTH on the response — per-call (above) and accumulated (session_acc).
+    if session:
+        acc = route_session_meter.observe(
+            session,
+            tokens_in=response.get("tokens_in") or 0,
+            tokens_out=response.get("tokens_out") or 0,
+            tokens_cached=response.get("tokens_cached") or 0,
+            cost_usd=out["x_router"]["cost_usd"] or 0.0)
+        out["x_router"]["session_acc"] = acc
     return out
 
 
