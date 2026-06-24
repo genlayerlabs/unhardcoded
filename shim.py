@@ -924,6 +924,9 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                                  ("tokens_total", "total_tokens")):
             if resp.get(src_key) is not None:
                 usage[dst_key] = resp[src_key]
+        # Standard OpenAI cache field so clients parse cache reads natively.
+        if resp.get("tokens_cached"):
+            usage["prompt_tokens_details"] = {"cached_tokens": resp["tokens_cached"]}
         x_router = {
             "provider": chosen.get("provider_id"),
             "model_family": chosen.get("model_family"),
@@ -1280,6 +1283,10 @@ def _router_response_to_openai(result: dict, requested_model: str,
         usage["completion_tokens"] = response["tokens_out"]
     if response.get("tokens_total") is not None:
         usage["total_tokens"] = response["tokens_total"]
+    # Standard OpenAI cache field so clients (opencode, etc.) parse cache reads
+    # natively — not just our x_router. Mirrors usage.prompt_tokens_details.
+    if response.get("tokens_cached"):
+        usage["prompt_tokens_details"] = {"cached_tokens": response["tokens_cached"]}
     if usage:
         out["usage"] = usage
 
