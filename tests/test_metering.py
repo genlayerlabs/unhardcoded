@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 from shim import _executed_cost_usd, _CACHE_READ_FACTOR  # noqa: E402
 from llm_router_host import _cached_tokens                # noqa: E402
+import route_session_meter                                # noqa: E402
 
 
 def _result(resp, chosen):
@@ -67,3 +68,24 @@ def test_cached_tokens_across_usage_shapes():
     assert _cached_tokens({"cache_read_input_tokens": 42}) == 42
     assert _cached_tokens({"prompt_tokens": 10}) is None
     assert _cached_tokens(None) is None
+
+
+def test_session_owner_binds_first_writer_wins():
+    # Cross-consumer isolation: the FIRST consumer to meter a sid owns it. A
+    # second consumer reusing the same opaque sid must NOT steal or overwrite the
+    # ownership — otherwise B could hijack A's session economics / warm peers.
+    route_session_meter.reset()
+    assert route_session_meter.owner("sidA") is None        # unknown -> None
+    route_session_meter.observe("sidA", owner="keyA", tokens_in=10, cost_usd=0.001)
+    assert route_session_meter.owner("sidA") == "keyA"
+    # B reuses the same sid: data folds in (it's the same session key) but the
+    # owner is sticky.
+    route_session_meter.observe("sidA", owner="keyB")
+    assert route_session_meter.owner("sidA") == "keyA"
+    # observe without an owner never clears or changes the binding either.
+    route_session_meter.observe("sidA", tokens_in=5)
+    assert route_session_meter.owner("sidA") == "keyA"
+    # no session / no owner -> None, never raises.
+    assert route_session_meter.owner(None) is None
+    route_session_meter.reset()
+    assert route_session_meter.owner("sidA") is None        # reset clears owners

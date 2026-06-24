@@ -502,3 +502,42 @@ def test_x_router_carries_executed_cost(client, host):
     xr = r.json()["x_router"]
     assert "price_in" in xr and "price_out" in xr
     assert xr["cost_usd"] is not None       # example metrics price every pair
+
+
+def test_session_view_scoped_to_owning_consumer(client, host):
+    """Cross-consumer isolation at the endpoint the consumer-facing /v1/session
+    proxies to: a chat carrying the proxy-injected x-llm-router-caller binds the
+    sid to that consumer; only that consumer (forwarded as the same header) may
+    read the session — anyone else gets 404 (not 403, which would confirm the sid
+    exists). An operator caller (no header) stays unscoped."""
+    import route_session_meter
+    route_session_meter.reset()
+    for prov, fam in _all_pairs(host):
+        host.set_mock_response(prov, fam, _ok_response("ok"))
+    # consumer A meters sidA (the proxy injects the authed caller as this header).
+    r = client.post("/v1/chat/completions",
+                    headers={"x-llm-router-caller": "consumerA"},
+                    json={"model": "", "session": "sidA",
+                          "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    assert route_session_meter.owner("sidA") == "consumerA"
+
+    # A reads its own session -> 200 with the accumulated economics.
+    r = client.get("/x/session/sidA", headers={"x-llm-router-caller": "consumerA"})
+    assert r.status_code == 200
+    assert r.json()["calls"] == 1
+
+    # consumer B reading A's sid -> 404 (no disclosure that sidA exists).
+    r = client.get("/x/session/sidA", headers={"x-llm-router-caller": "consumerB"})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "session_not_found"
+
+    # B reading an entirely unknown sid -> also 404, indistinguishable from above.
+    r = client.get("/x/session/sidUnknown", headers={"x-llm-router-caller": "consumerB"})
+    assert r.status_code == 404
+
+    # operator view (no caller header, e.g. dashboard /x/*) is unscoped.
+    r = client.get("/x/session/sidA")
+    assert r.status_code == 200
+    assert r.json()["calls"] == 1
+    route_session_meter.reset()
