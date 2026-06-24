@@ -1,0 +1,39 @@
+name: notify-ci
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    environment: PRD
+    permissions: {}
+    concurrency:
+      group: notify-ci-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Mint token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.CI_DISPATCH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_DISPATCH_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ secrets.CI_REPO_NAME }}
+          permission-contents: write
+
+      - name: Dispatch
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          OWNER: ${{ github.repository_owner }}
+          CI_REPO_NAME: ${{ secrets.CI_REPO_NAME }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${OWNER}/${CI_REPO_NAME}/dispatches" \
+            -d "$(printf '{"event_type":"source-push","client_payload":{"sha":"%s"}}' "${SHA}")"
