@@ -37,6 +37,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 import route_cache
+import route_session_meter
 
 
 # Profile name used when nothing else can be inferred. Replaced via
@@ -234,6 +235,20 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         enough. Internal — /x/* is hidden from consumers."""
         import settings as _settings
         return {"ok": True, "overrides": _settings.reload()}
+
+    @app.get("/x/session/{sid}")
+    def session_meter(sid: str):
+        """Accumulated usage for a session: calls, tokens_in/out, tokens_cached,
+        cost_usd — the running total the per-call x_router.session_acc reflects.
+        Internal (/x/* hidden from consumers)."""
+        return route_session_meter.get(sid) or {
+            "calls": 0, "tokens_in": 0, "tokens_out": 0,
+            "tokens_cached": 0, "cost_usd": 0.0}
+
+    @app.get("/x/sessions")
+    def session_meters():
+        """All session meters (operator view of per-session spend/cache)."""
+        return {"sessions": route_session_meter.snapshot()}
 
     # ---- AntSeed buyer hot-wallet control (dashboard self-service) -----------
     # Proxy deposit/withdraw/refresh to the sidecar control server, then refresh
@@ -797,7 +812,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 if not result.get("ok"):
                     return _openai_error_from_router(result)
                 return _router_response_to_openai(result, req.model,
-                                                  subscription_providers)
+                                                  subscription_providers,
+                                                  session=req.session)
             # Streaming flow: run as a task and wait briefly for a fast failure
             # (admission 400, or a node failing instantly) so it stays a clean
             # JSON error. Anything slower commits to SSE and HEARTBEATs while the
@@ -833,7 +849,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 return _invalid_policy_response(admission)
             if result.get("ok"):
                 return _router_response_to_openai(result, req.model,
-                                                  subscription_providers)
+                                                  subscription_providers,
+                                                  session=req.session)
             return _openai_error_from_router(result)
         return await _handle_stream(contract, req)
 
@@ -1206,7 +1223,8 @@ def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> floa
 
 
 def _router_response_to_openai(result: dict, requested_model: str,
-                               subscription_providers=frozenset()) -> dict:
+                               subscription_providers=frozenset(),
+                               session: str | None = None) -> dict:
     response = result.get("response") or {}
     chosen = result.get("chosen") or {}
 
@@ -1254,6 +1272,16 @@ def _router_response_to_openai(result: dict, requested_model: str,
         "decision_trace": _trim_trace(result.get("trace")),
         "compact": _compact_suggested(response),
     }
+    # Per-session meter: fold this call into the session's running total and put
+    # BOTH on the response — per-call (above) and accumulated (session_acc).
+    if session:
+        acc = route_session_meter.observe(
+            session,
+            tokens_in=response.get("tokens_in") or 0,
+            tokens_out=response.get("tokens_out") or 0,
+            tokens_cached=response.get("tokens_cached") or 0,
+            cost_usd=out["x_router"]["cost_usd"] or 0.0)
+        out["x_router"]["session_acc"] = acc
     return out
 
 
