@@ -153,3 +153,5 @@ behave
 
 *(Nix users: `nix-shell -p ...` with the same packages — plus `chromium
 chromedriver` for the browser pass — works as before.)*
+
+<!-- ci pipeline smoke test -->
