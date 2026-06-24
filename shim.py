@@ -239,11 +239,13 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     @app.get("/x/session/{sid}")
     def session_meter(sid: str):
         """Accumulated usage for a session: calls, tokens_in/out, tokens_cached,
-        cost_usd — the running total the per-call x_router.session_acc reflects.
-        Internal (/x/* hidden from consumers)."""
-        return route_session_meter.get(sid) or {
+        cost_usd — the running total the per-call x_router.session_acc reflects —
+        plus `warm`: the routes (family/provider/served_by) currently holding the
+        session's prompt-cache prefix. Internal (/x/* hidden from consumers)."""
+        acc = route_session_meter.get(sid) or {
             "calls": 0, "tokens_in": 0, "tokens_out": 0,
             "tokens_cached": 0, "cost_usd": 0.0}
+        return {**acc, "warm": route_session_meter.warm(sid)}
 
     @app.get("/x/sessions")
     def session_meters():

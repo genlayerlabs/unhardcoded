@@ -25,6 +25,7 @@ import route_reliability as _route_reliability
 import route_latency as _route_latency
 import route_tool_capability as _route_tool_capability
 import route_cache as _route_cache
+import route_session_meter as _route_session_meter
 
 
 def _cached_tokens(usage: dict) -> "int | None":
@@ -872,6 +873,11 @@ def _fold_route_outcome(request: dict, result: dict,
     # cache_hot field marks it and a cache-aware policy keeps it sticky. Same one
     # route identity as reliability/latency; no-op when the caller named no session.
     _route_cache.observe(session, rkey, ok)
+    # Record the warm route for the per-session display panel (which family is
+    # warm, on which provider, via which peer/backend). Success only, like the
+    # affinity fold. Display-only; the routing decision stays in route_cache.
+    if ok and session:
+        _route_session_meter.observe_route(session, pid, fam, peer_id or pid)
     # Learned tool capability is a marketplace concern only (static/partner routes
     # declare their capabilities in config), so keep it peer-scoped.
     if peer_id:
