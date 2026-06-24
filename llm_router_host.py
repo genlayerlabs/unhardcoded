@@ -26,6 +26,21 @@ import route_latency as _route_latency
 import route_tool_capability as _route_tool_capability
 import route_cache as _route_cache
 
+
+def _cached_tokens(usage: dict) -> "int | None":
+    """Prompt-cache READ tokens the provider reports, across shapes — the metric
+    that proves cache_hot is paying off (same prompt_tokens, but this fraction is
+    billed at the cache-read rate, ~10x cheaper). OpenAI-compat:
+    prompt_tokens_details.cached_tokens; Codex Responses:
+    input_tokens_details.cached_tokens; Anthropic: cache_read_input_tokens."""
+    if not isinstance(usage, dict):
+        return None
+    for parent in ("prompt_tokens_details", "input_tokens_details"):
+        d = usage.get(parent)
+        if isinstance(d, dict) and d.get("cached_tokens") is not None:
+            return d.get("cached_tokens")
+    return usage.get("cache_read_input_tokens")
+
 import lupa
 from lupa import LuaRuntime
 
@@ -963,6 +978,8 @@ def _parse_openai_response(resp: "Any", latency: int, error_map: dict | None = N
                 "tokens_in":     usage.get("prompt_tokens"),
                 "tokens_out":    usage.get("completion_tokens"),
                 "tokens_total":  usage.get("total_tokens"),
+                "tokens_cached": _cached_tokens(usage),
+                "cost_reported": usage.get("cost"),
                 "raw_model":     data.get("model"),
             },
         }

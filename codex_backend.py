@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable
 
+from llm_router_host import _cached_tokens
+
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 
@@ -258,6 +260,8 @@ def aggregate_codex_sse(lines: Iterable[str], latency_ms: int) -> dict:
             "tokens_in":     usage.get("input_tokens"),
             "tokens_out":    usage.get("output_tokens"),
             "tokens_total":  usage.get("total_tokens"),
+            "tokens_cached": _cached_tokens(usage),
+            "cost_reported": usage.get("cost"),
             "raw_model":     None,
         },
     }

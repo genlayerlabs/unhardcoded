@@ -13,6 +13,8 @@ falls through to the next candidate exactly as in non-streaming mode.
 """
 from __future__ import annotations
 
+from llm_router_host import _cached_tokens
+
 import json
 import re
 import time
@@ -133,6 +135,8 @@ async def stream_openai_compatible(
             "tokens_in": usage.get("prompt_tokens"),
             "tokens_out": usage.get("completion_tokens"),
             "tokens_total": usage.get("total_tokens"),
+            "tokens_cached": _cached_tokens(usage),
+            "cost_reported": usage.get("cost"),
             "raw_model": raw_model,
         },
     }
