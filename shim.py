@@ -32,7 +32,7 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -776,11 +776,12 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         return {"messages": frozen + [sealed] + recent, "compacted": True}
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(req: ChatRequest):
+    async def chat_completions(req: ChatRequest, request: Request):
+        _session_from_header(req, request)
         return await _handle_chat(req)
 
     @app.post("/{profile_name}/v1/chat/completions")
-    async def chat_completions_profiled(profile_name: str, req: ChatRequest):
+    async def chat_completions_profiled(profile_name: str, req: ChatRequest, request: Request):
         """Path-addressed policy endpoint.
 
         POST /edge/v1/chat/completions always runs the `edge` profile, ignoring
@@ -788,7 +789,18 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         base_url (…/edge, …/medium, …/dummy) so a client picks a policy by URL
         instead of a `profile:` model prefix.
         """
+        _session_from_header(req, request)
         return await _handle_chat(req, profile_name=profile_name)
+
+    def _session_from_header(req: ChatRequest, request: Request) -> None:
+        """Fallback the conversation id from the X-Unhardcoded-Session header when
+        the body carries none. Clients (e.g. the opencode plugin) that can set
+        request headers but not extra body fields use this to get cache affinity +
+        per-session metering. An explicit body `session` always wins."""
+        if not req.session:
+            hdr = request.headers.get("x-unhardcoded-session")
+            if hdr:
+                req.session = hdr
 
     async def _handle_chat(req: ChatRequest, profile_name: str | None = None):
         contract = _request_to_contract(req, default_profile, default_max_tokens)
@@ -903,7 +915,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         return StreamingResponse(_pseudo_stream(result, req),
                                  media_type="text/event-stream")
 
-    def _final_chunk_parts(result: dict):
+    def _final_chunk_parts(result: dict, session: str | None = None):
         resp = result.get("response") or {}
         chosen = result.get("chosen") or {}
         usage = {}
@@ -924,10 +936,22 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             "decision_trace": _trim_trace(result.get("trace")),
             "compact": _compact_suggested(resp),
         }
+        # Per-session meter on the STREAMING path too (mirrors the non-streaming
+        # _router_response_to_openai). Streaming clients (e.g. opencode, stream:true)
+        # otherwise never fold into the session total. Idempotent per request: this
+        # runs once per final chunk.
+        if session:
+            acc = route_session_meter.observe(
+                session,
+                tokens_in=resp.get("tokens_in") or 0,
+                tokens_out=resp.get("tokens_out") or 0,
+                tokens_cached=resp.get("tokens_cached") or 0,
+                cost_usd=x_router["cost_usd"] or 0.0)
+            x_router["session_acc"] = acc
         return resp, usage or None, x_router
 
     async def _pseudo_stream(result: dict, req: ChatRequest):
-        resp, usage, x_router = _final_chunk_parts(result)
+        resp, usage, x_router = _final_chunk_parts(result, req.session)
         stream_id = _streaming.new_stream_id()
         model = resp.get("raw_model") or req.model or ""
         yield _streaming.encode_role_chunk(stream_id, model)
@@ -961,7 +985,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 "invalid_flow" if admission else "flow_error")
             yield _streaming.DONE_EVENT
             return
-        resp, usage, x_router = _final_chunk_parts(result)
+        resp, usage, x_router = _final_chunk_parts(result, req.session)
         fmodel = resp.get("raw_model") or model
         if result.get("ok"):
             if resp.get("text"):
@@ -994,7 +1018,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             yield _streaming.HEARTBEAT  # 'beat' — keep the line warm
         result = task.result()
         if result.get("ok"):
-            resp, usage, x_router = _final_chunk_parts(result)
+            resp, usage, x_router = _final_chunk_parts(result, req.session)
             fmodel = resp.get("raw_model") or model
             # A flow that never committed a delta (its result was assembled, not
             # streamed) still owes the client its text before the final chunk.
@@ -1009,7 +1033,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             # is VISIBLE in Activity (provider + trace recorded) instead of an
             # empty 200 with no trace, THEN surface the error to the client so
             # opencode sees a reason rather than silently nothing.
-            _resp, usage, x_router = _final_chunk_parts(result)
+            _resp, usage, x_router = _final_chunk_parts(result, req.session)
             err = str(result.get("error") or "stream failed")
             yield _streaming.encode_final_chunk(stream_id, model, "error", None,
                                                 usage, x_router)
