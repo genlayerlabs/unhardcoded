@@ -8,6 +8,10 @@ jobs:
   notify:
     runs-on: ubuntu-latest
     environment: PRD
+    permissions: {}
+    concurrency:
+      group: notify-ci-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - name: Mint token
         id: app
@@ -17,6 +21,7 @@ jobs:
           private-key: ${{ secrets.CI_DISPATCH_APP_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ secrets.CI_REPO_NAME }}
+          permission-contents: write
 
       - name: Dispatch
         env:
