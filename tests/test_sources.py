@@ -643,32 +643,32 @@ def test_discover_hook_serves_antseed_offers(tmp_path):
 def test_codex_source_aggregates_signals_into_quota_balance():
     from sources.codex import CodexSource
     src.SOURCE_STATE.clear()
-    s = CodexSource("openai")
+    s = CodexSource("openai_codex")
     now = int(time.time())
-    s.ingest("openai", {"status": 200, "headers": {"x-codex-primary-used-percent": "37.5"}, "ts": now})
-    s.ingest("openai", {"status": 429, "headers": {}, "ts": now})
+    s.ingest("openai_codex", {"status": 200, "headers": {"x-codex-primary-used-percent": "37.5"}, "ts": now})
+    s.ingest("openai_codex", {"status": 429, "headers": {}, "ts": now})
     balances = asyncio.run(s.balances())
-    b = balances["openai"]
+    b = balances["openai_codex"]
     assert b["kind"] == "quota_window"
     assert b["value"] == 0.375                      # parsed *used-percent header / 100
     assert b["detail"]["recent_429_count"] == 1     # 429 within the recent window
     assert b["detail"]["last_429_at"] == now
     # passive sources publish synchronously — no refresh task exists for them
-    assert src.SOURCE_STATE["codex"]["balances"]["openai"]["kind"] == "quota_window"
+    assert src.SOURCE_STATE["codex"]["balances"]["openai_codex"]["kind"] == "quota_window"
 
 
 def test_codex_source_without_parseable_headers_has_none_value():
     from sources.codex import CodexSource
     src.SOURCE_STATE.clear()
-    s = CodexSource("openai")
-    s.ingest("openai", {"status": 200, "headers": {}, "ts": 1})
-    b = asyncio.run(s.balances())["openai"]
+    s = CodexSource("openai_codex")
+    s.ingest("openai_codex", {"status": 200, "headers": {}, "ts": 1})
+    b = asyncio.run(s.balances())["openai_codex"]
     assert b["value"] is None                       # honest: unknown fraction
     assert b["detail"]["recent_429_count"] == 0
 
 
 def test_build_registry_adds_codex_for_openai_codex_api_kind():
-    cat = {"providers": {"openai": {"api_kind": "openai_codex"}}, "models": {}}
+    cat = {"providers": {"openai_codex": {"api_kind": "openai_codex"}}, "models": {}}
     reg = src.build_registry(cat)
     assert [s.name for s in reg] == ["codex"]
     assert reg[0].poll_interval_s == 30             # local self-refresh tick (no endpoint probe)
@@ -678,7 +678,7 @@ def test_codex_scarcity_prices_ramp():
     from sources.codex import CodexSource
     src.SOURCE_STATE.clear()
     host = FakeHost()
-    s = CodexSource("openai")
+    s = CodexSource("openai_codex")
     s.bind(host, ["gpt-5.5", "gpt-5.3-codex-spark"])
 
     def last_prices():
@@ -689,23 +689,23 @@ def test_codex_scarcity_prices_ramp():
 
     now = int(time.time())
     # 0% used (below demote start): price stays 0
-    s.ingest("openai", {"status": 200, "headers": {"x-codex-primary-used-percent": "0"}, "ts": now})
+    s.ingest("openai_codex", {"status": 200, "headers": {"x-codex-primary-used-percent": "0"}, "ts": now})
     assert last_prices() == {"gpt-5.5": (0.0, 0.0),
                               "gpt-5.3-codex-spark": (0.0, 0.0)}
 
     # 75% used with start=0.5: halfway up the ramp -> 2.5 / 12.5
     host.pushed.clear()
-    s.ingest("openai", {"status": 200, "headers": {"x-codex-primary-used-percent": "75"}, "ts": now})
+    s.ingest("openai_codex", {"status": 200, "headers": {"x-codex-primary-used-percent": "75"}, "ts": now})
     assert last_prices()["gpt-5.5"] == (2.5, 12.5)
 
     # 100%: full imputed price 5 / 25
     host.pushed.clear()
-    s.ingest("openai", {"status": 200, "headers": {"x-codex-primary-used-percent": "100"}, "ts": now})
+    s.ingest("openai_codex", {"status": 200, "headers": {"x-codex-primary-used-percent": "100"}, "ts": now})
     assert last_prices()["gpt-5.5"] == (5.0, 25.0)
 
     # header back to 0 (and no recent 429s): price decays back DOWN to 0
     host.pushed.clear()
-    s.ingest("openai", {"status": 200, "headers": {"x-codex-primary-used-percent": "0"}, "ts": now})
+    s.ingest("openai_codex", {"status": 200, "headers": {"x-codex-primary-used-percent": "0"}, "ts": now})
     assert last_prices()["gpt-5.5"] == (0.0, 0.0)
 
 
@@ -732,13 +732,13 @@ def test_quota_demotion_sheds_codex_from_cheap_bands():
         ranked, _ = host.rank({"policy_ir": policy(cap), "requirements": {"context": 8000}})
         return [(r["candidate"]["provider_id"], r["candidate"]["model_family"]) for r in ranked]
 
-    assert ("openai", "gpt-5.3-codex-spark") in pairs(5)   # free quota: under a $5 ceiling
+    assert ("openai_codex", "gpt-5.3-codex-spark") in pairs(5)   # free quota: under a $5 ceiling
     # quota exhausted: imputed full price on every codex family (gpt-5.5 is the
     # codex ROUTE of the unified family; spark is its own family)
     for fam in ("gpt-5.5", "gpt-5.3-codex-spark"):
-        host.update_metrics("openai", fam, {"price_in": 5.0, "price_out": 25.0})
-    assert ("openai", "gpt-5.3-codex-spark") not in pairs(5)   # $25 out > $5 ceiling
-    assert ("openai", "gpt-5.5") in pairs(25)                  # admitted under a $25 ceiling
+        host.update_metrics("openai_codex", fam, {"price_in": 5.0, "price_out": 25.0})
+    assert ("openai_codex", "gpt-5.3-codex-spark") not in pairs(5)   # $25 out > $5 ceiling
+    assert ("openai_codex", "gpt-5.5") in pairs(25)                  # admitted under a $25 ceiling
 
 
 # ---- full-market book (dashboard) -----------------------------------------

@@ -55,14 +55,13 @@ return {
             tier      = "fallback",
             notes     = "Last-resort gateway",
         },
-        openai_api = {
+        openai = {
             discovery = "static",
             base_url  = "https://api.openai.com/v1",
             api_kind  = "openai_compatible",
             auth_env  = "OPENAI_API_KEY",
             tier      = "partner",
-            notes     = "Native OpenAI API. Kept separate from provider `openai`, "
-                     .. "which is the Codex/ChatGPT-subscription route.",
+            notes     = "Native OpenAI API.",
         },
         anthropic = {
             discovery = "static",
@@ -156,7 +155,7 @@ return {
                 ["outside your buyer routing policy"] = "model_unavailable",
             },
         },
-        openai = {
+        openai_codex = {
             discovery = "static",
             base_url  = "https://chatgpt.com/backend-api/codex",
             api_kind  = "openai_codex",
@@ -215,8 +214,8 @@ return {
         -- path, so they cascade antseed_edge → openrouter.
         ["gpt-5.5"] = {
             served_by = {
+                { provider = "openai_codex", provider_model_id = "gpt-5.5" },
                 { provider = "openai",       provider_model_id = "gpt-5.5" },
-                { provider = "openai_api",   provider_model_id = "gpt-5.5" },
                 { provider = "openrouter",   provider_model_id = "openai/gpt-5.5" },
             },
             capabilities = { context = 400000, supports_tools = true, supports_json_mode = true },
@@ -224,7 +223,7 @@ return {
         },
         ["gpt-5.4"] = {
             served_by = {
-                { provider = "openai_api",   provider_model_id = "gpt-5.4" },
+                { provider = "openai",       provider_model_id = "gpt-5.4" },
                 { provider = "openrouter",   provider_model_id = "openai/gpt-5.4" },
             },
             capabilities = { context = 400000, supports_tools = true, supports_json_mode = true },
@@ -263,7 +262,7 @@ return {
         -- ranks just below gpt-5.5-codex and above every paid candidate.
         ["gpt-5.3-codex-spark"] = {
             served_by = {
-                { provider = "openai", provider_model_id = "gpt-5.3-codex-spark" },
+                { provider = "openai_codex", provider_model_id = "gpt-5.3-codex-spark" },
             },
             capabilities = { context = 400000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.90,

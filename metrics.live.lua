@@ -21,10 +21,10 @@ return {
     generated_at_iso = "2026-06-04T09:35:54Z",
 
     providers = {
-        openai        = { last_seen_ok = "2026-06-04T09:35:54Z" },  -- codex (subscription)
+        openai_codex  = { last_seen_ok = "2026-06-04T09:35:54Z" },  -- codex (subscription)
         heurist       = { last_seen_ok = "2026-06-04T09:35:54Z" },
         io_net        = { last_seen_ok = "2026-06-04T09:35:54Z" },
-        openai_api    = { last_seen_ok = "2026-06-04T09:35:54Z" },
+        openai        = { last_seen_ok = "2026-06-04T09:35:54Z" },
         anthropic     = { last_seen_ok = "2026-06-04T09:35:54Z" },
         gemini        = { last_seen_ok = "2026-06-04T09:35:54Z" },
         bedrock_mantle = { last_seen_ok = "2026-06-04T09:35:54Z" },
@@ -35,15 +35,15 @@ return {
 
     models = {
         -- codex: sunk cost → 0 marginal (the pivot that puts it first).
-        ["gpt-5.5@openai"]                  = { price_in_usd_per_mtok = 0.0,  price_out_usd_per_mtok = 0.0,  success_rate_24h = 0.99, last_quality_eval = 0.95 },
-        ["gpt-5.3-codex-spark@openai"]      = { price_in_usd_per_mtok = 0.0,  price_out_usd_per_mtok = 0.0,  success_rate_24h = 0.99, last_quality_eval = 0.90 },
+        ["gpt-5.5@openai_codex"]            = { price_in_usd_per_mtok = 0.0,  price_out_usd_per_mtok = 0.0,  success_rate_24h = 0.99, last_quality_eval = 0.95 },
+        ["gpt-5.3-codex-spark@openai_codex"] = { price_in_usd_per_mtok = 0.0,  price_out_usd_per_mtok = 0.0,  success_rate_24h = 0.99, last_quality_eval = 0.90 },
 
         -- gpt-5.5
-        ["gpt-5.5@openai_api"]              = { price_in_usd_per_mtok = 1.25, price_out_usd_per_mtok = 10.0, success_rate_24h = 0.99, last_quality_eval = 0.95 },
+        ["gpt-5.5@openai"]                  = { price_in_usd_per_mtok = 1.25, price_out_usd_per_mtok = 10.0, success_rate_24h = 0.99, last_quality_eval = 0.95 },
         ["gpt-5.5@openrouter"]              = { price_in_usd_per_mtok = 1.25, price_out_usd_per_mtok = 10.0, success_rate_24h = 0.99, last_quality_eval = 0.95 },
 
         -- gpt-5.4
-        ["gpt-5.4@openai_api"]              = { price_in_usd_per_mtok = 0.80, price_out_usd_per_mtok = 6.0,  success_rate_24h = 0.99, last_quality_eval = 0.90 },
+        ["gpt-5.4@openai"]                  = { price_in_usd_per_mtok = 0.80, price_out_usd_per_mtok = 6.0,  success_rate_24h = 0.99, last_quality_eval = 0.90 },
         ["gpt-5.4@openrouter"]              = { price_in_usd_per_mtok = 0.80, price_out_usd_per_mtok = 6.0,  success_rate_24h = 0.99, last_quality_eval = 0.90 },
 
         -- claude-opus-4-8 (no codex path; antseed/openrouter only)

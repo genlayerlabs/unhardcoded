@@ -44,12 +44,34 @@ def test_pin_routes_codex_through_dispatcher():
 
     client = _build_client(default, codex)
     r = client.post("/v1/chat/completions", json={
-        "model": "pin:openai/gpt-5.5",
+        "model": "pin:openai_codex/gpt-5.5",
         "messages": [{"role": "user", "content": "hi"}],
     })
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["choices"][0]["message"]["content"] == "from-codex"
+    assert body["x_router"]["provider"] == "openai_codex"
+
+
+def test_pin_openai_routes_native_api_not_codex():
+    async def default(req):
+        assert req["api_kind"] == "openai_compatible"
+        assert req["provider_id"] == "openai"
+        assert req["served_model_id"] == "gpt-5.5"
+        return {"ok": True, "latency_ms": 5,
+                "response": {"text": "from-openai", "finish_reason": "stop"}}
+
+    async def codex(req):
+        return {"ok": False, "error_kind": "server_error"}
+
+    client = _build_client(default, codex)
+    r = client.post("/v1/chat/completions", json={
+        "model": "pin:openai/gpt-5.5",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["choices"][0]["message"]["content"] == "from-openai"
     assert body["x_router"]["provider"] == "openai"
 
 
@@ -71,7 +93,8 @@ def test_default_profile_cascades_off_a_failing_provider():
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["choices"][0]["message"]["content"].startswith("served-by-")
-    assert body["x_router"]["provider"] != "openai", "cascaded off the failing codex provider"
+    assert body["x_router"]["provider"] != "openai_codex", \
+        "cascaded off the failing codex provider"
 
 
 def test_antseed_is_marketplace_with_no_static_rows():
@@ -107,7 +130,8 @@ def test_live_config_includes_provider_local_native_examples():
     cat = host.catalog()
 
     providers = cat["providers"]
-    assert providers["openai_api"]["api_kind"] == "openai_compatible"
+    assert providers["openai"]["api_kind"] == "openai_compatible"
+    assert providers["openai_codex"]["api_kind"] == "openai_codex"
     assert providers["anthropic"]["api_kind"] == "anthropic"
     assert providers["gemini"]["api_kind"] == "google"
     assert providers["bedrock_mantle"]["api_kind"] == "openai_compatible"
@@ -119,7 +143,8 @@ def test_live_config_includes_provider_local_native_examples():
             for row in cat["models"][family]["served_by"]
         }
 
-    assert served_by("gpt-5.5")["openai_api"] == "gpt-5.5"
+    assert served_by("gpt-5.5")["openai"] == "gpt-5.5"
+    assert served_by("gpt-5.5")["openai_codex"] == "gpt-5.5"
     assert served_by("claude-opus-4-8")["anthropic"] == "claude-opus-4-8"
     assert served_by("gemini-3.1-pro-preview")["gemini"] == \
         "gemini-3.1-pro-preview"
