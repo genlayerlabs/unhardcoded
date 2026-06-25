@@ -28,7 +28,6 @@ CATALOG = {
     },
 }
 
-
 class FakeHost:
     def __init__(self):
         self.pushed = []
