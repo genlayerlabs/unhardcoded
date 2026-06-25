@@ -240,6 +240,51 @@ def test_openrouter_discovery_offers_carry_full_live_traits():
     assert offers["acme/cheap-7b"]["traits"]["bench_intelligence_rank"] == 2
 
 
+def test_openrouter_discovery_aliases_raw_model_ids_to_policy_families():
+    from sources.openrouter import OpenRouterSource
+
+    catalog = {
+        "providers": {
+            "openrouter": {"auth_env": "OPENROUTER_API_KEY"},
+            "openrouter_market": {
+                "discovery": "marketplace",
+                "discovery_id": "openrouter_market",
+                "service_aliases": {
+                    "openai/gpt-5.5": "gpt-5.5",
+                    "openai/gpt-5-mini": "gpt-5-mini",
+                    "meta-llama/llama-4-maverick": "llama-4-maverick",
+                },
+            },
+        },
+        "models": {
+            "gpt-5.5": {"served_by": [
+                {"provider": "openrouter", "provider_model_id": "openai/gpt-5.5"},
+            ]},
+        },
+    }
+    body = {"data": [
+        {"id": "openai/gpt-5.5", "pricing": {
+            "prompt": "0.000005", "completion": "0.00003"}},
+        {"id": "openai/gpt-5-mini", "pricing": {
+            "prompt": "0.00000025", "completion": "0.000002"}},
+        {"id": "meta-llama/llama-4-maverick", "pricing": {
+            "prompt": "0.0000002", "completion": "0.0000006"}},
+        {"id": "unknown/raw-family", "pricing": {
+            "prompt": "0.0000001", "completion": "0.0000001"}},
+    ]}
+    s = OpenRouterSource(catalog, env_get={"OPENROUTER_API_KEY": "sk-test"}.get,
+                         client=FakeClient({"/models": FakeResponse(200, body)}))
+
+    asyncio.run(s.pricing())
+
+    offers = {o["model_family"]: o for o in s.offers_sync("openrouter_market")}
+    assert set(offers) == {"gpt-5-mini", "llama-4-maverick", "unknown/raw-family"}
+    assert offers["gpt-5-mini"]["wire_model_id"] == "openai/gpt-5-mini"
+    assert offers["llama-4-maverick"]["wire_model_id"] == "meta-llama/llama-4-maverick"
+    assert "openai/gpt-5-mini" not in offers
+    assert "gpt-5.5" not in offers  # curated static OpenRouter route stays deduped
+
+
 def test_openrouter_market_book_exposes_meta_for_dashboard():
     s = _or_source({"/models": FakeResponse(200, OR_DISCOVERY_BODY)})
     asyncio.run(s.pricing())

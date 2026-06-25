@@ -74,6 +74,20 @@ return {
             auth_env         = "OPENROUTER_API_KEY",
             tier             = "marketplace",
             market_price_cap = { input = 1000, output = 1000 },
+            -- Raw OpenRouter ids can differ from the canonical families callers
+            -- use in per-request policies. Keep those translations local to the
+            -- OpenRouter marketplace integration: model_family is the policy
+            -- name, wire_model_id stays the exact OpenRouter slug.
+            service_aliases  = {
+                ["anthropic/claude-opus-4.8"]      = "claude-opus-4-8",
+                ["anthropic/claude-sonnet-4.6"]    = "claude-sonnet-4.6",
+                ["deepseek/deepseek-v3.2"]         = "deepseek-v3.2",
+                ["google/gemini-2.5-flash"]        = "gemini-2.5-flash",
+                ["google/gemini-3-flash-preview"] = "gemini-3-flash-preview",
+                ["meta-llama/llama-4-maverick"]    = "llama-4-maverick",
+                ["openai/gpt-5-mini"]              = "gpt-5-mini",
+                ["qwen/qwen3-235b-a22b-2507"]      = "qwen3-235b-a22b",
+            },
         },
         -- AntSeed buyer proxies: candidates and prices come from the live
         -- peer market (sources/antseed.py reads the /market dump and feeds

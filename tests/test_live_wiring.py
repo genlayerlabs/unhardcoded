@@ -151,3 +151,39 @@ def test_discovered_family_ranks_on_inline_offer_traits():
                   if r["candidate"]["provider_id"] == "openrouter_market"]
     assert discovered[:2] == ["z-ai/glm-5.2", "acme/weak-7b"], \
         "higher inline bench_intelligence must outrank the weaker one at equal price"
+
+
+def test_discovered_alias_family_is_policy_addressable():
+    """OpenRouter marketplace aliases let policies target canonical families
+    while the provider call still uses the raw OpenRouter slug."""
+    host = LLMRouterHost(
+        router_path=ROOT / "core" / "router.lua",
+        config_path=ROOT / "config.live.lua",
+        metrics_path=ROOT / "metrics.live.lua",
+        now_ms=lambda: 1,
+    )
+    host.set_discover_hook(lambda did: {
+        "ok": True, "fetched_at_ms": 1,
+        "offers": [
+            {"model_family": "gpt-5-mini", "wire_model_id": "openai/gpt-5-mini",
+             "seller_endpoint": "https://openrouter.ai/api/v1",
+             "price_in_usd_per_mtok": 0.25, "price_out_usd_per_mtok": 2.0,
+             "capabilities": {"context": 400000, "supports_tools": True,
+                              "supports_json_mode": True},
+             "traits": {"bench_intelligence": 0.80}},
+        ],
+    } if did == "openrouter_market" else {"ok": False, "error": "x"})
+    host.init()
+    term = ["policy",
+            ["and", ["meets_req"], ["not", ["is", "disabled"]],
+             ["family_eq", "gpt-5-mini"]],
+            ["neg", ["normalize", ["field", "price_in"]]],
+            ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
+
+    ranked, _ = host.rank({"policy_ir": term, "requirements": {"context": 8000}})
+
+    assert len(ranked) == 1
+    candidate = ranked[0]["candidate"]
+    assert candidate["provider_id"] == "openrouter_market"
+    assert candidate["model_family"] == "gpt-5-mini"
+    assert candidate["offer"]["wire_model_id"] == "openai/gpt-5-mini"
