@@ -224,8 +224,8 @@ def test_openrouter_discovery_offers_carry_full_live_traits():
     asyncio.run(s.pricing())  # populates the snapshot + live traits
     offers = {o["model_family"]: o for o in s.offers_sync("openrouter_market")}
     # curated family skipped (no dup); non-numeric pricing skipped
-    assert set(offers) == {"z-ai/glm-5.2", "acme/cheap-7b"}
-    glm = offers["z-ai/glm-5.2"]
+    assert set(offers) == {"glm-5.2", "cheap-7b"}
+    glm = offers["glm-5.2"]
     assert glm["wire_model_id"] == "z-ai/glm-5.2"
     assert glm["seller_endpoint"].endswith("openrouter.ai/api/v1")
     assert round(glm["price_in_usd_per_mtok"], 4) == 0.4
@@ -237,10 +237,10 @@ def test_openrouter_discovery_offers_carry_full_live_traits():
     assert t["cap_tools"] is True and t["cap_reasoning"] is True
     # ranks are dynamic, across the live catalog (glm beats the weaker cheap-7b)
     assert t["bench_intelligence_rank"] == 1
-    assert offers["acme/cheap-7b"]["traits"]["bench_intelligence_rank"] == 2
+    assert offers["cheap-7b"]["traits"]["bench_intelligence_rank"] == 2
 
 
-def test_openrouter_discovery_aliases_raw_model_ids_to_policy_families():
+def test_openrouter_discovery_derives_policy_families_from_raw_model_ids():
     from sources.openrouter import OpenRouterSource
 
     catalog = {
@@ -250,9 +250,7 @@ def test_openrouter_discovery_aliases_raw_model_ids_to_policy_families():
                 "discovery": "marketplace",
                 "discovery_id": "openrouter_market",
                 "service_aliases": {
-                    "openai/gpt-5.5": "gpt-5.5",
-                    "openai/gpt-5-mini": "gpt-5-mini",
-                    "meta-llama/llama-4-maverick": "llama-4-maverick",
+                    "qwen/qwen3-235b-a22b-2507": "qwen3-235b-a22b",
                 },
             },
         },
@@ -271,6 +269,8 @@ def test_openrouter_discovery_aliases_raw_model_ids_to_policy_families():
             "prompt": "0.0000002", "completion": "0.0000006"}},
         {"id": "unknown/raw-family", "pricing": {
             "prompt": "0.0000001", "completion": "0.0000001"}},
+        {"id": "qwen/qwen3-235b-a22b-2507", "pricing": {
+            "prompt": "0.0000005", "completion": "0.000001"}},
     ]}
     s = OpenRouterSource(catalog, env_get={"OPENROUTER_API_KEY": "sk-test"}.get,
                          client=FakeClient({"/models": FakeResponse(200, body)}))
@@ -278,9 +278,12 @@ def test_openrouter_discovery_aliases_raw_model_ids_to_policy_families():
     asyncio.run(s.pricing())
 
     offers = {o["model_family"]: o for o in s.offers_sync("openrouter_market")}
-    assert set(offers) == {"gpt-5-mini", "llama-4-maverick", "unknown/raw-family"}
+    assert set(offers) == {
+        "gpt-5-mini", "llama-4-maverick", "raw-family", "qwen3-235b-a22b"}
     assert offers["gpt-5-mini"]["wire_model_id"] == "openai/gpt-5-mini"
     assert offers["llama-4-maverick"]["wire_model_id"] == "meta-llama/llama-4-maverick"
+    assert offers["raw-family"]["wire_model_id"] == "unknown/raw-family"
+    assert offers["qwen3-235b-a22b"]["wire_model_id"] == "qwen/qwen3-235b-a22b-2507"
     assert "openai/gpt-5-mini" not in offers
     assert "gpt-5.5" not in offers  # curated static OpenRouter route stays deduped
 
@@ -290,9 +293,9 @@ def test_openrouter_market_book_exposes_meta_for_dashboard():
     asyncio.run(s.pricing())
     book = s.market_book()
     fams = {r["model_family"]: r for r in book["rows"]}
-    assert set(fams) == {"z-ai/glm-5.2", "acme/cheap-7b"}
-    assert fams["z-ai/glm-5.2"]["source"] == "openrouter"
-    assert book["families"]["z-ai/glm-5.2"]["meta"]["bench_intelligence"] == 0.6
+    assert set(fams) == {"glm-5.2", "cheap-7b"}
+    assert fams["glm-5.2"]["source"] == "openrouter"
+    assert book["families"]["glm-5.2"]["meta"]["bench_intelligence"] == 0.6
 
 
 def test_openrouter_model_meta_still_keyed_by_curated_family():
@@ -308,7 +311,7 @@ def test_openrouter_discovery_rejects_negative_priced_models():
     # negative = "cheapest") and bill a NEGATIVE cost. Free ($0) models stay.
     body = {"data": [
         {"id": "z-ai/glm-5.2", "pricing": {"prompt": "0.0000004", "completion": "0.0000016"}},
-        {"id": "free/model", "pricing": {"prompt": "0", "completion": "0"}},
+        {"id": "free/free-model", "pricing": {"prompt": "0", "completion": "0"}},
         {"id": "junk/sentinel", "pricing": {"prompt": "-1", "completion": "-1"}},
         {"id": "junk/neg-out", "pricing": {"prompt": "0.000001", "completion": "-0.5"}},
     ]}
@@ -316,11 +319,11 @@ def test_openrouter_discovery_rejects_negative_priced_models():
     prices = asyncio.run(s.pricing())  # populates the snapshot + offers cache
     # discovery offers: negatives gone, the $0 free model kept
     assert {o["model_family"] for o in s.offers_sync("openrouter_market")} == \
-        {"z-ai/glm-5.2", "free/model"}
+        {"glm-5.2", "free-model"}
     # the curated price-enrichment list (pricing()) also drops negatives
     served = {p["served_model_id"] for p in prices}
     assert "junk/sentinel" not in served and "junk/neg-out" not in served
-    assert {"z-ai/glm-5.2", "free/model"} <= served
+    assert {"z-ai/glm-5.2", "free/free-model"} <= served
 
 
 def test_openrouter_discovery_stamps_capability_flags_for_meets_req():
@@ -339,13 +342,13 @@ def test_openrouter_discovery_stamps_capability_flags_for_meets_req():
     s = _or_source({"/models": FakeResponse(200, body)})
     asyncio.run(s.pricing())
     offers = {o["model_family"]: o for o in s.offers_sync("openrouter_market")}
-    caps = offers["z-ai/glm-5.2"]["capabilities"]
+    caps = offers["glm-5.2"]["capabilities"]
     assert caps.get("supports_tools") is True
     assert caps.get("supports_json_mode") is True
     assert caps.get("supports_seed") is True
     assert caps.get("supports_vision") is True
     # a model that does not declare tools must NOT claim the capability
-    assert "supports_tools" not in offers["plain/text-only"]["capabilities"]
+    assert "supports_tools" not in offers["text-only"]["capabilities"]
 
 
 def test_pushed_price_lands_in_dump_state():

@@ -55,6 +55,41 @@ return {
             tier      = "fallback",
             notes     = "Last-resort gateway",
         },
+        openai_api = {
+            discovery = "static",
+            base_url  = "https://api.openai.com/v1",
+            api_kind  = "openai_compatible",
+            auth_env  = "OPENAI_API_KEY",
+            tier      = "partner",
+            notes     = "Native OpenAI API. Kept separate from provider `openai`, "
+                     .. "which is the Codex/ChatGPT-subscription route.",
+        },
+        anthropic = {
+            discovery = "static",
+            base_url  = "https://api.anthropic.com/v1",
+            api_kind  = "anthropic",
+            auth_env  = "ANTHROPIC_API_KEY",
+            tier      = "partner",
+            notes     = "Native Anthropic Messages API.",
+        },
+        gemini = {
+            discovery = "static",
+            base_url  = "https://generativelanguage.googleapis.com/v1beta",
+            api_kind  = "google",
+            auth_env  = "GEMINI_API_KEY",
+            tier      = "partner",
+            notes     = "Native Gemini generateContent API.",
+        },
+        bedrock_mantle = {
+            discovery = "static",
+            base_url  = os.getenv("BEDROCK_MANTLE_BASE_URL")
+                     or "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+            api_kind  = "openai_compatible",
+            auth_env  = "AWS_BEARER_TOKEN_BEDROCK",
+            tier      = "partner",
+            notes     = "Amazon Bedrock Mantle OpenAI-compatible endpoint. "
+                     .. "Use BEDROCK_MANTLE_BASE_URL to select region/path.",
+        },
         -- Live discovery of the WHOLE OpenRouter catalog (every model it serves,
         -- straight from /models — no hand curation). Candidates/prices come from
         -- the discover hook (sources/openrouter.py offers_sync); the curated
@@ -74,18 +109,12 @@ return {
             auth_env         = "OPENROUTER_API_KEY",
             tier             = "marketplace",
             market_price_cap = { input = 1000, output = 1000 },
-            -- Raw OpenRouter ids can differ from the canonical families callers
-            -- use in per-request policies. Keep those translations local to the
-            -- OpenRouter marketplace integration: model_family is the policy
-            -- name, wire_model_id stays the exact OpenRouter slug.
+            -- OpenRouter marketplace rows default `vendor/model` to model_family
+            -- `model`, while wire_model_id stays the exact OpenRouter slug.
+            -- Keep this map only for exact canonicalization exceptions.
             service_aliases  = {
                 ["anthropic/claude-opus-4.8"]      = "claude-opus-4-8",
-                ["anthropic/claude-sonnet-4.6"]    = "claude-sonnet-4.6",
-                ["deepseek/deepseek-v3.2"]         = "deepseek-v3.2",
-                ["google/gemini-2.5-flash"]        = "gemini-2.5-flash",
-                ["google/gemini-3-flash-preview"] = "gemini-3-flash-preview",
-                ["meta-llama/llama-4-maverick"]    = "llama-4-maverick",
-                ["openai/gpt-5-mini"]              = "gpt-5-mini",
+                ["google/gemma-3-27b-it"]          = "gemma-3-27b",
                 ["qwen/qwen3-235b-a22b-2507"]      = "qwen3-235b-a22b",
             },
         },
@@ -187,6 +216,7 @@ return {
         ["gpt-5.5"] = {
             served_by = {
                 { provider = "openai",       provider_model_id = "gpt-5.5" },
+                { provider = "openai_api",   provider_model_id = "gpt-5.5" },
                 { provider = "openrouter",   provider_model_id = "openai/gpt-5.5" },
             },
             capabilities = { context = 400000, supports_tools = true, supports_json_mode = true },
@@ -194,6 +224,7 @@ return {
         },
         ["gpt-5.4"] = {
             served_by = {
+                { provider = "openai_api",   provider_model_id = "gpt-5.4" },
                 { provider = "openrouter",   provider_model_id = "openai/gpt-5.4" },
             },
             capabilities = { context = 400000, supports_tools = true, supports_json_mode = true },
@@ -201,6 +232,7 @@ return {
         },
         ["claude-opus-4-8"] = {
             served_by = {
+                { provider = "anthropic",    provider_model_id = "claude-opus-4-8" },
                 { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4-8" },
             },
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
@@ -208,6 +240,7 @@ return {
         },
         ["gemini-3.1-pro-preview"] = {
             served_by = {
+                { provider = "gemini",       provider_model_id = "gemini-3.1-pro-preview" },
                 { provider = "openrouter",   provider_model_id = "google/gemini-3.1-pro-preview" },
             },
             capabilities = { context = 1000000, supports_tools = true, supports_json_mode = true },
@@ -219,6 +252,7 @@ return {
         -- while this Qwen route returned valid content/tool-call responses.
         ["qwen3-235b-a22b"] = {
             served_by = {
+                { provider = "bedrock_mantle", provider_model_id = "qwen.qwen3-235b-a22b-2507" },
                 { provider = "openrouter", provider_model_id = "qwen/qwen3-235b-a22b-2507" },
             },
             capabilities = { context = 262000, supports_tools = true, supports_json_mode = true },
@@ -242,6 +276,7 @@ return {
         -- not a forked model.)
         ["claude-sonnet-4-6"] = {
             served_by = {
+                { provider = "anthropic",     provider_model_id = "claude-sonnet-4-6" },
                 { provider = "openrouter",    provider_model_id = "anthropic/claude-sonnet-4-6" },
             },
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },

@@ -24,6 +24,10 @@ return {
         openai        = { last_seen_ok = "2026-06-04T09:35:54Z" },  -- codex (subscription)
         heurist       = { last_seen_ok = "2026-06-04T09:35:54Z" },
         io_net        = { last_seen_ok = "2026-06-04T09:35:54Z" },
+        openai_api    = { last_seen_ok = "2026-06-04T09:35:54Z" },
+        anthropic     = { last_seen_ok = "2026-06-04T09:35:54Z" },
+        gemini        = { last_seen_ok = "2026-06-04T09:35:54Z" },
+        bedrock_mantle = { last_seen_ok = "2026-06-04T09:35:54Z" },
         -- antseed prices/availability come from live marketplace offers
         -- (sources/antseed.py), not this seed.
         openrouter    = { last_seen_ok = "2026-06-04T09:35:54Z" },
@@ -35,21 +39,27 @@ return {
         ["gpt-5.3-codex-spark@openai"]      = { price_in_usd_per_mtok = 0.0,  price_out_usd_per_mtok = 0.0,  success_rate_24h = 0.99, last_quality_eval = 0.90 },
 
         -- gpt-5.5
+        ["gpt-5.5@openai_api"]              = { price_in_usd_per_mtok = 1.25, price_out_usd_per_mtok = 10.0, success_rate_24h = 0.99, last_quality_eval = 0.95 },
         ["gpt-5.5@openrouter"]              = { price_in_usd_per_mtok = 1.25, price_out_usd_per_mtok = 10.0, success_rate_24h = 0.99, last_quality_eval = 0.95 },
 
         -- gpt-5.4
+        ["gpt-5.4@openai_api"]              = { price_in_usd_per_mtok = 0.80, price_out_usd_per_mtok = 6.0,  success_rate_24h = 0.99, last_quality_eval = 0.90 },
         ["gpt-5.4@openrouter"]              = { price_in_usd_per_mtok = 0.80, price_out_usd_per_mtok = 6.0,  success_rate_24h = 0.99, last_quality_eval = 0.90 },
 
         -- claude-opus-4-8 (no codex path; antseed/openrouter only)
+        ["claude-opus-4-8@anthropic"]       = { price_in_usd_per_mtok = 5.0,  price_out_usd_per_mtok = 25.0, success_rate_24h = 0.99, last_quality_eval = 0.93 },
         ["claude-opus-4-8@openrouter"]      = { price_in_usd_per_mtok = 5.0,  price_out_usd_per_mtok = 25.0, success_rate_24h = 0.99, last_quality_eval = 0.93 },
 
         -- gemini-3.1-pro-preview (no codex path)
+        ["gemini-3.1-pro-preview@gemini"]   = { price_in_usd_per_mtok = 1.25, price_out_usd_per_mtok = 5.0,  success_rate_24h = 0.99, last_quality_eval = 0.92 },
         ["gemini-3.1-pro-preview@openrouter"]   = { price_in_usd_per_mtok = 1.25, price_out_usd_per_mtok = 5.0,  success_rate_24h = 0.99, last_quality_eval = 0.92 },
 
         -- affordable edge fallback verified against the current OpenRouter credit ceiling
+        ["qwen3-235b-a22b@bedrock_mantle"]  = { price_in_usd_per_mtok = 0.20, price_out_usd_per_mtok = 0.60, success_rate_24h = 0.99, last_quality_eval = 0.90 },
         ["qwen3-235b-a22b@openrouter"]      = { price_in_usd_per_mtok = 0.20, price_out_usd_per_mtok = 0.60, success_rate_24h = 0.99, last_quality_eval = 0.90 },
 
         -- medium tier (free AntSeed only where the network browse showed $0 peers)
+        ["claude-sonnet-4-6@anthropic"]     = { price_in_usd_per_mtok = 3.0,  price_out_usd_per_mtok = 15.0, success_rate_24h = 0.99, last_quality_eval = 0.88 },
         ["claude-sonnet-4-6@openrouter"]    = { price_in_usd_per_mtok = 3.0,  price_out_usd_per_mtok = 15.0, success_rate_24h = 0.99, last_quality_eval = 0.88 },
         ["deepseek-v4-pro@openrouter"]      = { price_in_usd_per_mtok = 0.50, price_out_usd_per_mtok = 1.5,  success_rate_24h = 0.99, last_quality_eval = 0.85 },
         ["glm-5.1@openrouter"]              = { price_in_usd_per_mtok = 0.60, price_out_usd_per_mtok = 2.0,  success_rate_24h = 0.99, last_quality_eval = 0.84 },

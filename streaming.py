@@ -241,6 +241,17 @@ def make_streaming_dispatcher(default, handlers: dict | None = None):
     return dispatch
 
 
+async def stream_unsupported_api_kind(request: dict, emit: Emit) -> dict:
+    """Pre-delta fallback for native providers without streaming support yet.
+
+    Returning bad_request lets the normal retry policy move to the next
+    candidate instead of accidentally sending Anthropic/Gemini native requests
+    through the OpenAI-compatible streaming endpoint.
+    """
+    return _err("bad_request", 0, 0,
+                f"streaming unsupported for api_kind={request.get('api_kind')!r}")
+
+
 # ---- OpenAI chat.completion.chunk encoding --------------------------------------
 
 DONE_EVENT = "data: [DONE]\n\n"

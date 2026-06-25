@@ -222,3 +222,16 @@ def test_streaming_dispatcher_routes_by_api_kind():
 
     assert _collect(dispatch({"api_kind": "openai_codex"}, emit))["via"] == "codex"
     assert _collect(dispatch({"api_kind": "openai_compatible"}, emit))["via"] == "default"
+
+
+def test_stream_unsupported_api_kind_returns_pre_delta_error():
+    deltas = []
+
+    async def emit(d):
+        deltas.append(d)
+
+    resp = _collect(streaming.stream_unsupported_api_kind({"api_kind": "anthropic"}, emit))
+    assert deltas == []
+    assert resp["ok"] is False
+    assert resp["error_kind"] == "bad_request"
+    assert "anthropic" in resp["error_message"]

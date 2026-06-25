@@ -1,8 +1,7 @@
 """
 End-to-end wiring against the real config.live.lua catalog: the async shim +
-api_kind dispatcher route the openai_codex provider to the Codex backend and
-everything else to the OpenAI-compatible backend. Mirrors __main__'s wiring,
-with both backends faked so no network is touched.
+api_kind dispatcher route provider-specific protocols to their own backends.
+Mirrors __main__'s wiring, with backends faked so no network is touched.
 """
 from __future__ import annotations
 
@@ -95,6 +94,37 @@ def test_antseed_is_marketplace_with_no_static_rows():
         for served in model["served_by"]:
             assert not str(served["provider"]).startswith("antseed"), \
                 f"static antseed row left on {family}"
+
+
+def test_live_config_includes_provider_local_native_examples():
+    host = LLMRouterHost(
+        router_path=ROOT / "core" / "router.lua",
+        config_path=ROOT / "config.live.lua",
+        metrics_path=ROOT / "metrics.live.lua",
+        now_ms=lambda: 1,
+    )
+    host.init()
+    cat = host.catalog()
+
+    providers = cat["providers"]
+    assert providers["openai_api"]["api_kind"] == "openai_compatible"
+    assert providers["anthropic"]["api_kind"] == "anthropic"
+    assert providers["gemini"]["api_kind"] == "google"
+    assert providers["bedrock_mantle"]["api_kind"] == "openai_compatible"
+    assert providers["bedrock_mantle"]["base_url"].endswith("/openai/v1")
+
+    def served_by(family):
+        return {
+            row["provider"]: row["provider_model_id"]
+            for row in cat["models"][family]["served_by"]
+        }
+
+    assert served_by("gpt-5.5")["openai_api"] == "gpt-5.5"
+    assert served_by("claude-opus-4-8")["anthropic"] == "claude-opus-4-8"
+    assert served_by("gemini-3.1-pro-preview")["gemini"] == \
+        "gemini-3.1-pro-preview"
+    assert served_by("qwen3-235b-a22b")["bedrock_mantle"] == \
+        "qwen.qwen3-235b-a22b-2507"
 
 
 def test_marketplace_offers_rank_with_offer_prices():

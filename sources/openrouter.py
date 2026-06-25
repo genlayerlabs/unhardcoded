@@ -139,11 +139,12 @@ class OpenRouterSource:
             caps["supports_seed"] = True
         if traits.get("in_image"):
             caps["supports_vision"] = True
-        family = self._market_aliases.get(mid, mid)
+        family = self._market_family_for(mid)
         return {
-            # By default the raw OpenRouter id IS the family. Provider-local
-            # aliases let policies use canonical families such as `gpt-5-mini`
-            # while the host still calls OpenRouter with `openai/gpt-5-mini`.
+            # The policy-facing family is provider-agnostic by default:
+            # `openai/gpt-5-mini` -> `gpt-5-mini`. Exact provider-local aliases
+            # handle cases where the OpenRouter tail is not the canonical family
+            # we want, while wire_model_id preserves the actual provider slug.
             # Either way this is not a second-class "uncurated" row: it carries
             # full live model_meta inline as `traits`, so it ranks on real
             # benchmark just like a curated family.
@@ -157,6 +158,19 @@ class OpenRouterSource:
             "est_tok_s": None,
             "quality_hint": None,
         }
+
+    def _market_family_for(self, model_id: str) -> str:
+        """Policy-facing family for an OpenRouter marketplace model.
+
+        OpenRouter ids are provider-scoped (`vendor/model`). Router policies are
+        provider-agnostic, so the default family is the model part. Exact aliases
+        override this only for canonicalization exceptions such as dated or
+        provider-specific suffixes.
+        """
+        alias = self._market_aliases.get(model_id)
+        if alias:
+            return alias
+        return model_id.rsplit("/", 1)[-1]
 
     def offers_sync(self, provider_id: str) -> list[dict]:
         """Whole live OpenRouter catalog as marketplace offers (the long tail
