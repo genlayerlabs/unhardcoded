@@ -13,7 +13,8 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from llm_router_host import LLMRouterHost, make_api_kind_dispatcher  # noqa: E402
+from llm_router_host import LLMRouterHost  # noqa: E402
+from provider_adapters.dispatcher import make_api_kind_dispatcher  # noqa: E402
 from shim import create_app  # noqa: E402
 
 

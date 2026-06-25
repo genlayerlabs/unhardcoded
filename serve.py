@@ -22,13 +22,15 @@ ROOT = Path(__file__).resolve().parent
 CORE = ROOT / "core"                 # the unhardcoded-engine core (git submodule)
 sys.path.insert(0, str(ROOT))
 
-from llm_router_host import (  # noqa: E402
-    LLMRouterHost,
+from llm_router_host import LLMRouterHost  # noqa: E402
+from provider_adapters.anthropic import (  # noqa: E402
     make_anthropic_async_call_provider,
-    make_async_call_provider,
-    make_api_kind_dispatcher,
+)
+from provider_adapters.dispatcher import make_api_kind_dispatcher  # noqa: E402
+from provider_adapters.google import (  # noqa: E402
     make_google_async_call_provider,
 )
+from provider_adapters.openai_compatible import make_async_call_provider  # noqa: E402
 
 
 def main() -> None:

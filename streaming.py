@@ -13,7 +13,7 @@ falls through to the next candidate exactly as in non-streaming mode.
 """
 from __future__ import annotations
 
-from llm_router_host import _cached_tokens
+from provider_adapters.common import _cached_tokens
 
 import json
 import re
@@ -21,10 +21,12 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable
 
-from llm_router_host import (
-    _classify_from_map,
+from provider_adapters.common import (
     _classify_status,
     _err,
+)
+from provider_adapters.openai_compatible import (
+    _classify_from_map,
     _prepare_openai_call,
 )
 

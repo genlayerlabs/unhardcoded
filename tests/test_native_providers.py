@@ -13,10 +13,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from llm_router_host import (  # noqa: E402
-    make_anthropic_async_call_provider,
-    make_google_async_call_provider,
-)
+from provider_adapters.anthropic import make_anthropic_async_call_provider  # noqa: E402
+from provider_adapters.google import make_google_async_call_provider  # noqa: E402
 
 
 class FakeResponse:
