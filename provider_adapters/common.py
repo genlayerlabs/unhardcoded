@@ -1,6 +1,7 @@
 """Shared provider-adapter primitives."""
 from __future__ import annotations
 
+import json
 import time
 from typing import Awaitable, Callable, Any
 
@@ -42,6 +43,19 @@ def text_from_content(content: Any) -> str:
             if isinstance(part, dict) and part.get("type") in (None, "text")
         )
     return ""
+
+
+def json_args(arguments: Any) -> dict:
+    """OpenAI tool_call arguments (a JSON *string*) -> the object the native
+    provider APIs want. Malformed/non-object args degrade to ``{}`` rather
+    than aborting the turn."""
+    if isinstance(arguments, dict):
+        return arguments
+    try:
+        parsed = json.loads(arguments)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def classify_status(status: int, err_msg: str) -> str:

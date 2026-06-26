@@ -9,6 +9,7 @@ from typing import Any, Callable
 from provider_adapters.common import (
     AsyncCallProviderHook,
     auth_token,
+    json_args,
     text_from_content,
     _classify_status,
     _elapsed_ms,
@@ -23,14 +24,44 @@ def _openai_messages_to_anthropic(
     for msg in messages or []:
         role = msg.get("role")
         text = text_from_content(msg.get("content"))
-        if not text:
-            continue
         if role == "system":
-            system_parts.append(text)
-        elif role in ("user", "assistant"):
-            out.append({"role": role, "content": text})
+            if text:
+                system_parts.append(text)
         elif role == "tool":
-            out.append({"role": "user", "content": text})
+            # An OpenAI tool result -> an Anthropic tool_result block, keyed
+            # by the originating tool_use id. Dropping it (the prior bug)
+            # broke every multi-turn tool conversation.
+            out.append({"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": msg.get("tool_call_id"),
+                "content": text,
+            }]})
+        elif role == "assistant":
+            # An assistant turn may be text, tool_use, or both. A tool-call-only
+            # turn has no text and must NOT be dropped, or the following
+            # tool_result references a tool_use that was never sent (API 400).
+            blocks: list[dict] = []
+            if text:
+                blocks.append({"type": "text", "text": text})
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": tc.get("id"),
+                    "name": fn.get("name") or "",
+                    "input": json_args(fn.get("arguments")),
+                })
+            if not blocks:
+                continue
+            # Keep the plain-string shape when it is text-only (what the
+            # existing tests pin); use content blocks once tool_use appears.
+            if len(blocks) == 1 and blocks[0]["type"] == "text":
+                out.append({"role": "assistant", "content": text})
+            else:
+                out.append({"role": "assistant", "content": blocks})
+        elif role == "user":
+            if text:
+                out.append({"role": "user", "content": text})
     return out, "\n\n".join(system_parts) if system_parts else None
 
 

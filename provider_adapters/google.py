@@ -10,6 +10,7 @@ from urllib.parse import quote
 from provider_adapters.common import (
     AsyncCallProviderHook,
     auth_token,
+    json_args,
     text_from_content,
     _classify_status,
     _elapsed_ms,
@@ -17,20 +18,66 @@ from provider_adapters.common import (
 )
 
 
+def _tool_name_by_id(messages: list[dict]) -> dict:
+    """Map each assistant tool_call id to its function name. A later OpenAI
+    `tool` result carries only the id, but Gemini's functionResponse keys by
+    name, so the name must be recovered from the call that produced the id."""
+    out = {}
+    for msg in messages or []:
+        for tc in msg.get("tool_calls") or []:
+            tid, name = tc.get("id"), (tc.get("function") or {}).get("name")
+            if tid and name:
+                out[tid] = name
+    return out
+
+
+def _tool_response_payload(text: str) -> dict:
+    """Gemini functionResponse.response must be an object; wrap a non-object
+    result string as {"result": ...}."""
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        parsed = None
+    return parsed if isinstance(parsed, dict) else {"result": text}
+
+
 def _openai_messages_to_gemini(messages: list[dict]) -> tuple[list[dict], dict | None]:
     contents, system_parts = [], []
+    name_by_id = _tool_name_by_id(messages)
     for msg in messages or []:
         role = msg.get("role")
         text = text_from_content(msg.get("content"))
-        if not text:
-            continue
         if role == "system":
-            system_parts.append(text)
+            if text:
+                system_parts.append(text)
             continue
-        contents.append({
-            "role": "model" if role == "assistant" else "user",
-            "parts": [{"text": text}],
-        })
+        if role == "tool":
+            # An OpenAI tool result -> a Gemini functionResponse part. Flattening
+            # it to plain user text (the prior bug) lost the call linkage and
+            # broke multi-turn tool conversations.
+            name = name_by_id.get(msg.get("tool_call_id")) or msg.get("name") or "tool"
+            contents.append({"role": "user", "parts": [{"functionResponse": {
+                "name": name,
+                "response": _tool_response_payload(text),
+            }}]})
+            continue
+        if role == "assistant":
+            # Carry tool_calls as functionCall parts; a tool-call-only turn has
+            # no text and must NOT be dropped.
+            parts: list[dict] = []
+            if text:
+                parts.append({"text": text})
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                parts.append({"functionCall": {
+                    "name": fn.get("name") or "",
+                    "args": json_args(fn.get("arguments")),
+                }})
+            if parts:
+                contents.append({"role": "model", "parts": parts})
+            continue
+        if text:  # user (and any other producer role)
+            contents.append({"role": "user", "parts": [{"text": text}]})
     system = {"parts": [{"text": "\n\n".join(system_parts)}]} if system_parts else None
     return contents, system
 
@@ -134,11 +181,15 @@ def make_google_async_call_provider(
             request.get("base_url")
             or "https://generativelanguage.googleapis.com/v1beta"
         ).rstrip("/")
-        url = (
-            f"{base}/{quote(model_path, safe='/')}:generateContent"
-            f"?key={quote(token, safe='')}"
-        )
-        headers = {"Content-Type": "application/json", **_extra}
+        # The API key rides the x-goog-api-key header, never the URL query —
+        # a `?key=<secret>` URL leaks into error_message/logs/traces on
+        # timeout/network errors (§3: keys are never logged or echoed).
+        url = f"{base}/{quote(model_path, safe='/')}:generateContent"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": token,
+            **_extra,
+        }
         timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
         t0 = time.monotonic()
         try:
