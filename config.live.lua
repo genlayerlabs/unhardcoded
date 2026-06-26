@@ -74,6 +74,16 @@ return {
             auth_env         = "OPENROUTER_API_KEY",
             tier             = "marketplace",
             market_price_cap = { input = 1000, output = 1000 },
+            -- OpenRouter marketplace rows default `vendor/model` to the
+            -- provider-neutral family `model`, while wire_model_id keeps the
+            -- exact OpenRouter slug. Keep this map only for the canonicalization
+            -- exceptions where stripping the vendor isn't the right family
+            -- (dated or suffixed slugs).
+            service_aliases  = {
+                ["anthropic/claude-opus-4.8"]      = "claude-opus-4-8",
+                ["google/gemma-3-27b-it"]          = "gemma-3-27b",
+                ["qwen/qwen3-235b-a22b-2507"]      = "qwen3-235b-a22b",
+            },
         },
         -- AntSeed buyer proxies: candidates and prices come from the live
         -- peer market (sources/antseed.py reads the /market dump and feeds
