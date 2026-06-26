@@ -684,13 +684,13 @@ def test_quota_demotion_sheds_codex_from_cheap_bands():
         ranked, _ = host.rank({"policy_ir": policy(cap), "requirements": {"context": 8000}})
         return [(r["candidate"]["provider_id"], r["candidate"]["model_family"]) for r in ranked]
 
-    assert ("openai", "gpt-5.3-codex-spark") in pairs(5)   # free quota: under a $5 ceiling
+    assert ("openai_codex", "gpt-5.3-codex-spark") in pairs(5)   # free quota: under a $5 ceiling
     # quota exhausted: imputed full price on every codex family (gpt-5.5 is the
     # codex ROUTE of the unified family; spark is its own family)
     for fam in ("gpt-5.5", "gpt-5.3-codex-spark"):
-        host.update_metrics("openai", fam, {"price_in": 5.0, "price_out": 25.0})
-    assert ("openai", "gpt-5.3-codex-spark") not in pairs(5)   # $25 out > $5 ceiling
-    assert ("openai", "gpt-5.5") in pairs(25)                  # admitted under a $25 ceiling
+        host.update_metrics("openai_codex", fam, {"price_in": 5.0, "price_out": 25.0})
+    assert ("openai_codex", "gpt-5.3-codex-spark") not in pairs(5)   # $25 out > $5 ceiling
+    assert ("openai_codex", "gpt-5.5") in pairs(25)                  # admitted under a $25 ceiling
 
 
 # ---- full-market book (dashboard) -----------------------------------------

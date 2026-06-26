@@ -13,7 +13,7 @@ falls through to the next candidate exactly as in non-streaming mode.
 """
 from __future__ import annotations
 
-from llm_router_host import _cached_tokens
+from provider_adapters.common import _cached_tokens
 
 import json
 import re
@@ -21,10 +21,12 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable
 
-from llm_router_host import (
-    _classify_from_map,
+from provider_adapters.common import (
     _classify_status,
     _err,
+)
+from provider_adapters.openai_compatible import (
+    _classify_from_map,
     _prepare_openai_call,
 )
 
@@ -239,6 +241,17 @@ def make_streaming_dispatcher(default, handlers: dict | None = None):
         return await handler(request, emit)
 
     return dispatch
+
+
+async def stream_unsupported_api_kind(request: dict, emit: Emit) -> dict:
+    """Pre-delta fallback for native providers without streaming support yet.
+
+    Returning bad_request lets the normal retry policy move to the next
+    candidate instead of accidentally sending Anthropic/Gemini native requests
+    through the OpenAI-compatible streaming endpoint.
+    """
+    return _err("bad_request", 0, 0,
+                f"streaming unsupported for api_kind={request.get('api_kind')!r}")
 
 
 # ---- OpenAI chat.completion.chunk encoding --------------------------------------
