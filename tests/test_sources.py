@@ -580,6 +580,53 @@ def test_antseed_drops_offer_when_cached_input_exceeds_input(tmp_path):
     assert s.snapshot_stats()["rejected_by_buyer"] == 1
 
 
+def _rep_peer(pid, rep, service="qwen3-235b-instruct"):
+    d = {"peerId": pid, "providers": ["openai"], "lastSeen": 1,
+         "providerPricing": {"openai": {"services": {
+             service: {"inputUsdPerMillion": 1.0, "outputUsdPerMillion": 2.0}}}}}
+    if rep is not None:
+        d["onChainReputationScore"] = rep
+    return d
+
+
+def test_antseed_offer_carries_onchain_reputation(tmp_path):
+    peer = "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44"
+    s = _antseed_source(tmp_path, market_body={"peers": [_rep_peer(peer, 73.5)]},
+                        pins={"antseed_cheap": peer})
+    offer = s.offers_sync("antseed_cheap")[0]
+    assert offer["model_family"] == "qwen3-235b-a22b"   # alias-mapped
+    assert offer["reputation_score"] == 73.5            # carried from the dump
+
+
+def test_antseed_reputation_absent_is_none_not_zero(tmp_path):
+    # cold-start: an unreported reputation must stay None (never coerced to 0,
+    # which a `>= floor` gate would wrongly exclude).
+    peer = "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44"
+    s = _antseed_source(tmp_path, market_body={"peers": [_rep_peer(peer, None)]},
+                        pins={"antseed_cheap": peer})
+    assert s.offers_sync("antseed_cheap")[0]["reputation_score"] is None
+
+
+def test_antseed_reputation_min_drops_low_keeps_unrated(tmp_path, monkeypatch):
+    import settings
+    monkeypatch.setattr(settings, "_overrides", {"antseed.reputation_min": 50.0})
+    lo, hi, nul = "11" * 20, "22" * 20, "33" * 20
+    body = {"peers": [_rep_peer(lo, 30), _rep_peer(hi, 80), _rep_peer(nul, None)]}
+    s = _antseed_source(tmp_path, market_body=body, pins={})  # unpinned -> all peers
+    peers = {o["peer_id"] for o in s.offers_sync("antseed_cheap")}
+    assert lo not in peers            # known-and-below-floor -> dropped
+    assert hi in peers                # above floor -> kept
+    assert nul in peers               # unrated -> kept (cold-start safe)
+    assert s.snapshot_stats()["rejected_by_reputation"] == 1
+
+
+def test_reputation_min_knob_registered_under_antseed():
+    import settings
+    knobs = {k["key"]: k for k in settings.current()}
+    k = knobs.get("antseed.reputation_min")
+    assert k is not None and k["provider"] == "antseed" and k["default"] == 0
+
+
 def test_antseed_stale_market_returns_no_offers(tmp_path):
     import os as _os
     s = _antseed_source(tmp_path)

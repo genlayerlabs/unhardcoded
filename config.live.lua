@@ -420,6 +420,17 @@ return {
         cap_reasoning          = mfield("cap_reasoning",          "Bool", false),
         cap_seed               = mfield("cap_seed",               "Bool", false),
         cap_logprobs           = mfield("cap_logprobs",           "Bool", false),
+        -- Per-route on-chain reputation (0-100), stamped on the offer by
+        -- sources/antseed.py (the buyer's own admission signal). Gate with
+        -- cmp(reputation_score, ge, N) or weight with field(reputation_score).
+        -- Default 0: a route with no reported reputation scores neutral-low,
+        -- never NaN; the default `default` profile does not use it.
+        reputation_score = { sort = "Num", default = 0, group = "route",
+            get = function(c)
+                local o = c.offer
+                if o ~= nil and o.reputation_score ~= nil then return o.reputation_score end
+                return nil
+            end },
     },
 
     -- Σ_pol host envelope: ∧-ed by the core onto every per-call `policy_ir`,
