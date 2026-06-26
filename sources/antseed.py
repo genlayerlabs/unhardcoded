@@ -90,6 +90,15 @@ def _as_pos_int(v: Any) -> int | None:
     return n if n > 0 else None
 
 
+def _as_score(v: Any) -> float | None:
+    """On-chain reputation as a float, or None when absent/garbage. None means
+    'no reported reputation' — kept (cold-start safe), never coerced to 0."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 class AntSeedSource:
     name = "antseed"
     poll_interval_s = 300
@@ -150,6 +159,11 @@ class AntSeedSource:
                         # 429 "Max concurrency reached"; the host gates per peer
                         # to this (None = ungated). See llm_router_host.
                         "max_concurrency": _as_pos_int(peer.get("maxConcurrency")),
+                        # peer's on-chain reputation (0-100), the buyer's own
+                        # admission signal. None when the peer reports none
+                        # (cold-start). Carried onto the offer + gateable via
+                        # the antseed.reputation_min knob. See offers_sync.
+                        "reputation": _as_score(peer.get("onChainReputationScore")),
                         # peer announcement freshness (ms epoch) — the only
                         # live signal discovery gives us per peer; dropped from
                         # offers/ranking, surfaced in the dashboard book.
@@ -187,12 +201,22 @@ class AntSeedSource:
         cap_in = float(cap.get("input", float("inf")))
         cap_out = float(cap.get("output", float("inf")))
         pinned = self._pinned_peer(provider_id)
+        rep_min = float(settings.get("antseed.reputation_min"))
         uncurated = 0
         rejected_by_buyer = 0
+        rejected_by_reputation = 0
         # family -> rows, one per advertising peer
         by_family: dict[str, list[dict]] = {}
         for row in self._load_market():
             if pinned and row["peer_id"] != pinned:
+                continue
+            if rep_min > 0 and row.get("reputation") is not None \
+                    and row["reputation"] < rep_min:
+                # Operator-set floor on the peer's on-chain reputation. A peer
+                # that reports NO reputation is kept (cold-start safe); only a
+                # known-and-below-floor score is dropped. reputation_min = 0
+                # (default) is off → no behaviour change.
+                rejected_by_reputation += 1
                 continue
             if row["price_in"] < 0 or row["price_out"] < 0:
                 # A negative advertised price is bogus (a buggy/hostile peer or a
@@ -236,6 +260,7 @@ class AntSeedSource:
         self._stats["dropped_unmapped"] = 0
         self._stats["uncurated"] = uncurated
         self._stats["rejected_by_buyer"] = rejected_by_buyer
+        self._stats["rejected_by_reputation"] = rejected_by_reputation
         self._stats["offers"] = len(kept_rows)
         offers = []
         for row in kept_rows:
@@ -271,6 +296,10 @@ class AntSeedSource:
                 "peer_id": row["peer_id"],
                 # seller in-flight cap, gated host-side per peer to avoid 429s.
                 "max_concurrency": row.get("max_concurrency"),
+                # peer's on-chain reputation (0-100), stamped on the offer and
+                # read pointwise by the algebra as `field reputation_score`
+                # (config.live.lua). None when unreported -> field default.
+                "reputation_score": row.get("reputation"),
                 # host-measured reliability for THIS route, stamped like price and
                 # read pointwise by the algebra (offer.success_rate, llm-router
                 # #14). None until observed -> algebra default/engine fallback.

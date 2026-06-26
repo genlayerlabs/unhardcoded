@@ -43,6 +43,11 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "provider": "antseed", "type": "int", "default": _i("ANTSEED_OFFERS_TOP_N", 3),
         "min": 1, "max": 10, "label": "Offers per family (top-N peers)",
         "help": "Cheapest distinct seller peers surfaced per family to rotate between on failure."},
+    "antseed.reputation_min": {
+        "provider": "antseed", "type": "float", "default": _f("ANTSEED_REPUTATION_MIN", 0),
+        "min": 0, "max": 100, "label": "Min peer on-chain reputation",
+        "help": "Drop AntSeed peers whose on-chain reputation score (0-100) is below "
+                "this. 0 = off. Peers that report no reputation are kept (cold-start safe)."},
     "antseed.runway_deposits_low_usdc": {
         "provider": "antseed", "type": "float", "default": _f("RUNWAY_DEPOSITS_LOW_USDC", 2),
         "min": 0, "max": 100000, "label": "Wallet runway: low (USDC)",
