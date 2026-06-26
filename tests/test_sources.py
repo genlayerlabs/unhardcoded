@@ -547,6 +547,39 @@ def test_antseed_pricing_rows_match_offers(tmp_path):
     assert ("antseed_cheap", "claude-sonnet-4-6") in rows
 
 
+def test_antseed_drops_offer_when_cached_input_exceeds_input(tmp_path):
+    # The buyer's @antseed/router-local rejects an offer whose cached-input price
+    # exceeds its input price (cachedInput must be <= input) as malformed — the
+    # proxy answers 502 "…outside your buyer routing policy". The router must not
+    # advertise such a peer-service: it would pin a candidate the buyer refuses to
+    # route to (and, for a single-seller family, make the family unavailable).
+    # This is the exact prod shape that made `family:claude-fable-5` (one seller,
+    # cachedInput 1.2 > input 0.54) look like "antseed is broken".
+    peer = "aa11bb22cc33dd44ee55ff66aa11bb22cc33dd44"
+    body = {
+        "peers": [{
+            "peerId": peer,
+            "providers": ["openai"],
+            "maxConcurrency": 4,
+            "lastSeen": 1,
+            "providerPricing": {"openai": {"services": {
+                # valid: no cached price → admissible (under antseed_cheap cap)
+                "qwen3-235b-instruct": {"inputUsdPerMillion": 1.0,
+                                        "outputUsdPerMillion": 2.0},
+                # malformed: cachedInput 1.2 > input 0.54 → buyer rejects it
+                "claude-sonnet-4-6": {"inputUsdPerMillion": 0.54,
+                                      "outputUsdPerMillion": 2.7,
+                                      "cachedInputUsdPerMillion": 1.2},
+            }}},
+        }],
+    }
+    s = _antseed_source(tmp_path, market_body=body, pins={"antseed_cheap": peer})
+    fams = {o["model_family"] for o in s.offers_sync("antseed_cheap")}
+    assert "qwen3-235b-a22b" in fams           # valid offer kept (alias-mapped)
+    assert "claude-sonnet-4-6" not in fams     # malformed cached price → dropped
+    assert s.snapshot_stats()["rejected_by_buyer"] == 1
+
+
 def test_antseed_stale_market_returns_no_offers(tmp_path):
     import os as _os
     s = _antseed_source(tmp_path)

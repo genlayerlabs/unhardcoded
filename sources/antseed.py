@@ -138,6 +138,14 @@ class AntSeedSource:
                         "service": service,
                         "price_in": float(sp.get("inputUsdPerMillion") or 0),
                         "price_out": float(sp.get("outputUsdPerMillion") or 0),
+                        # Seller-advertised cached-input price, when present. The
+                        # buyer's @antseed/router-local rejects an offer whose
+                        # cached price exceeds its input price as malformed
+                        # (see offers_sync); we need it to mirror that gate.
+                        "price_cached_in": (
+                            float(sp["cachedInputUsdPerMillion"])
+                            if sp.get("cachedInputUsdPerMillion") is not None
+                            else None),
                         # seller-advertised in-flight cap. Exceeding it earns a
                         # 429 "Max concurrency reached"; the host gates per peer
                         # to this (None = ungated). See llm_router_host.
@@ -180,6 +188,7 @@ class AntSeedSource:
         cap_out = float(cap.get("output", float("inf")))
         pinned = self._pinned_peer(provider_id)
         uncurated = 0
+        rejected_by_buyer = 0
         # family -> rows, one per advertising peer
         by_family: dict[str, list[dict]] = {}
         for row in self._load_market():
@@ -191,6 +200,17 @@ class AntSeedSource:
                 # Free ($0) services stay routable.
                 continue
             if row["price_in"] > cap_in or row["price_out"] > cap_out:
+                continue
+            ci = row.get("price_cached_in")
+            if ci is not None and ci > row["price_in"]:
+                # The buyer's @antseed/router-local treats an offer whose
+                # cached-input price exceeds its input price as malformed
+                # (_isValidOffer requires cachedInput <= input) and refuses to
+                # route to it — the proxy then answers 502 "…is outside your
+                # buyer routing policy". Advertising it anyway pins a candidate
+                # the buyer rejects, wasting a route (and, for a single-seller
+                # family, killing it). Drop it to mirror the buyer's admission.
+                rejected_by_buyer += 1
                 continue
             family = self._family_for(cfg, row["service"])
             if family is None:
@@ -215,6 +235,7 @@ class AntSeedSource:
                     break
         self._stats["dropped_unmapped"] = 0
         self._stats["uncurated"] = uncurated
+        self._stats["rejected_by_buyer"] = rejected_by_buyer
         self._stats["offers"] = len(kept_rows)
         offers = []
         for row in kept_rows:
