@@ -153,6 +153,34 @@ def test_live_config_includes_provider_local_native_examples():
         "qwen.qwen3-235b-a22b-2507"
 
 
+def test_context_overflow_falls_through_to_the_next_candidate():
+    # A context overflow on ONE route must not abort the whole request: a
+    # provider-neutral family (gpt-5.4 is served by openai AND openrouter) spans
+    # candidates with different context windows, so the router must try the next
+    # one. Pre-fix, retry_policies.balanced.context_overflow = "abort" stopped
+    # dead on the first candidate. Here every candidate overflows, so the request
+    # still exhausts — but only AFTER more than one route was tried.
+    calls = []
+
+    async def default(req):
+        calls.append(req["provider_id"])
+        return {"ok": False, "error_kind": "context_overflow",
+                "error_message": "maximum context length is 400000 tokens",
+                "latency_ms": 1}
+
+    async def codex(req):
+        calls.append(req["provider_id"])
+        return {"ok": False, "error_kind": "context_overflow", "latency_ms": 1}
+
+    client = _build_client(default, codex)
+    r = client.post("/v1/chat/completions", json={
+        "model": "family:gpt-5.4",   # >= 2 routes (openai + openrouter)
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert len(calls) >= 2, f"expected fall-through across candidates, got {calls}"
+    assert "exhausted" in r.text, r.text   # multi-candidate terminal, not a lone abort
+
+
 def test_marketplace_offers_rank_with_offer_prices():
     host = LLMRouterHost(
         router_path=ROOT / "core" / "router.lua",
