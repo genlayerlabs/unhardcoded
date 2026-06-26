@@ -627,6 +627,55 @@ def test_reputation_min_knob_registered_under_antseed():
     assert k is not None and k["provider"] == "antseed" and k["default"] == 0
 
 
+def test_antseed_denylist_excludes_peer(tmp_path, monkeypatch):
+    import settings
+    a, b = "11" * 20, "22" * 20
+    monkeypatch.setattr(settings, "_overrides", {"antseed.peer_denylist": [a]})
+    s = _antseed_source(tmp_path, pins={},
+                        market_body={"peers": [_rep_peer(a, None), _rep_peer(b, None)]})
+    peers = {o["peer_id"] for o in s.offers_sync("antseed_cheap")}
+    assert a not in peers and b in peers
+    assert s.snapshot_stats()["denied"] == 1
+
+
+def test_antseed_allowlist_restricts_to_members(tmp_path, monkeypatch):
+    import settings
+    a, b = "11" * 20, "22" * 20
+    monkeypatch.setattr(settings, "_overrides", {"antseed.peer_allowlist": [a]})
+    s = _antseed_source(tmp_path, pins={},
+                        market_body={"peers": [_rep_peer(a, None), _rep_peer(b, None)]})
+    peers = {o["peer_id"] for o in s.offers_sync("antseed_cheap")}
+    assert a in peers and b not in peers
+
+
+def test_antseed_empty_allow_deny_is_noop(tmp_path):
+    a, b = "11" * 20, "22" * 20
+    s = _antseed_source(tmp_path, pins={},
+                        market_body={"peers": [_rep_peer(a, None), _rep_peer(b, None)]})
+    assert {a, b} <= {o["peer_id"] for o in s.offers_sync("antseed_cheap")}
+
+
+def test_settings_list_knob_coerces_csv_dedupes_and_validates():
+    import settings
+    assert settings._coerce("antseed.peer_denylist", "a, b ,a,, c") == ["a", "b", "c"]
+    assert settings._coerce("antseed.peer_denylist", ["x", "x", "y"]) == ["x", "y"]
+    assert settings._coerce("antseed.peer_denylist", 5) is None      # wrong shape
+    knobs = {k["key"]: k for k in settings.current()}
+    assert knobs["antseed.peer_allowlist"]["type"] == "list"
+    assert knobs["antseed.peer_allowlist"]["default"] == []
+
+
+def test_settings_validate_and_write_list_roundtrip(tmp_path, monkeypatch):
+    import settings
+    monkeypatch.setattr(settings, "OVERRIDES_PATH", str(tmp_path / "ov.json"))
+    monkeypatch.setattr(settings, "_overrides", {})
+    new, errs = settings.validate_and_write({"antseed.peer_denylist": "p1, p2, p1"})
+    assert errs == [] and new["antseed.peer_denylist"] == ["p1", "p2"]
+    assert settings.get("antseed.peer_denylist") == ["p1", "p2"]
+    new, errs = settings.validate_and_write({"antseed.peer_denylist": None})  # clear
+    assert errs == [] and "antseed.peer_denylist" not in new
+
+
 def test_antseed_stale_market_returns_no_offers(tmp_path):
     import os as _os
     s = _antseed_source(tmp_path)
