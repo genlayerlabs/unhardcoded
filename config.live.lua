@@ -55,6 +55,40 @@ return {
             tier      = "fallback",
             notes     = "Last-resort gateway",
         },
+        openai = {
+            discovery = "static",
+            base_url  = "https://api.openai.com/v1",
+            api_kind  = "openai_compatible",
+            auth_env  = "OPENAI_API_KEY",
+            tier      = "partner",
+            notes     = "Native OpenAI API.",
+        },
+        anthropic = {
+            discovery = "static",
+            base_url  = "https://api.anthropic.com/v1",
+            api_kind  = "anthropic",
+            auth_env  = "ANTHROPIC_API_KEY",
+            tier      = "partner",
+            notes     = "Native Anthropic Messages API.",
+        },
+        gemini = {
+            discovery = "static",
+            base_url  = "https://generativelanguage.googleapis.com/v1beta",
+            api_kind  = "google",
+            auth_env  = "GEMINI_API_KEY",
+            tier      = "partner",
+            notes     = "Native Gemini generateContent API.",
+        },
+        bedrock_mantle = {
+            discovery = "static",
+            base_url  = os.getenv("BEDROCK_MANTLE_BASE_URL")
+                     or "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+            api_kind  = "openai_compatible",
+            auth_env  = "AWS_BEARER_TOKEN_BEDROCK",
+            tier      = "partner",
+            notes     = "Amazon Bedrock Mantle OpenAI-compatible endpoint. "
+                     .. "Use BEDROCK_MANTLE_BASE_URL to select region/path.",
+        },
         -- Live discovery of the WHOLE OpenRouter catalog (every model it serves,
         -- straight from /models — no hand curation). Candidates/prices come from
         -- the discover hook (sources/openrouter.py offers_sync); the curated
@@ -113,7 +147,7 @@ return {
                 ["outside your buyer routing policy"] = "model_unavailable",
             },
         },
-        openai = {
+        openai_codex = {
             discovery = "static",
             base_url  = "https://chatgpt.com/backend-api/codex",
             api_kind  = "openai_codex",
@@ -172,6 +206,7 @@ return {
         -- path, so they cascade antseed_edge → openrouter.
         ["gpt-5.5"] = {
             served_by = {
+                { provider = "openai_codex", provider_model_id = "gpt-5.5" },
                 { provider = "openai",       provider_model_id = "gpt-5.5" },
                 { provider = "openrouter",   provider_model_id = "openai/gpt-5.5" },
             },
@@ -180,6 +215,7 @@ return {
         },
         ["gpt-5.4"] = {
             served_by = {
+                { provider = "openai",       provider_model_id = "gpt-5.4" },
                 { provider = "openrouter",   provider_model_id = "openai/gpt-5.4" },
             },
             capabilities = { context = 400000, supports_tools = true, supports_json_mode = true },
@@ -187,6 +223,7 @@ return {
         },
         ["claude-opus-4-8"] = {
             served_by = {
+                { provider = "anthropic",    provider_model_id = "claude-opus-4-8" },
                 { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4-8" },
             },
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
@@ -194,6 +231,7 @@ return {
         },
         ["gemini-3.1-pro-preview"] = {
             served_by = {
+                { provider = "gemini",       provider_model_id = "gemini-3.1-pro-preview" },
                 { provider = "openrouter",   provider_model_id = "google/gemini-3.1-pro-preview" },
             },
             capabilities = { context = 1000000, supports_tools = true, supports_json_mode = true },
@@ -205,6 +243,7 @@ return {
         -- while this Qwen route returned valid content/tool-call responses.
         ["qwen3-235b-a22b"] = {
             served_by = {
+                { provider = "bedrock_mantle", provider_model_id = "qwen.qwen3-235b-a22b-2507" },
                 { provider = "openrouter", provider_model_id = "qwen/qwen3-235b-a22b-2507" },
             },
             capabilities = { context = 262000, supports_tools = true, supports_json_mode = true },
@@ -215,7 +254,7 @@ return {
         -- ranks just below gpt-5.5-codex and above every paid candidate.
         ["gpt-5.3-codex-spark"] = {
             served_by = {
-                { provider = "openai", provider_model_id = "gpt-5.3-codex-spark" },
+                { provider = "openai_codex", provider_model_id = "gpt-5.3-codex-spark" },
             },
             capabilities = { context = 400000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.90,
@@ -228,6 +267,7 @@ return {
         -- not a forked model.)
         ["claude-sonnet-4-6"] = {
             served_by = {
+                { provider = "anthropic",     provider_model_id = "claude-sonnet-4-6" },
                 { provider = "openrouter",    provider_model_id = "anthropic/claude-sonnet-4-6" },
             },
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },

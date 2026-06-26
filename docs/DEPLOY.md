@@ -71,9 +71,9 @@ docker compose -f compose.yml --profile antseed up -d --build
 
 ## Provider modes in this local stack
 
-- `codex`: ChatGPT/Codex OAuth via `CODEX_AUTH_PATH`, mounted into the router as `/codex/auth.json`. This is unofficial and should stay single-replica because the auth file can be refreshed/written by the backend.
+- `openai_codex`: ChatGPT/Codex OAuth via `CODEX_AUTH_PATH`, mounted into the router as `/codex/auth.json`. This is unofficial and should stay single-replica because the auth file can be refreshed/written by the backend.
+- `openai`: normal OpenAI API using `OPENAI_API_KEY`; currently optional because the local key may be absent/stale.
 - `openrouter`: normal OpenAI-compatible gateway using `OPENROUTER_API_KEY`.
-- `openai_api`: normal OpenAI API using `OPENAI_API_KEY`; currently optional because the local key may be absent/stale.
 - `antseed`: a single AntSeed buyer proxy in browse mode (no pinned peer — it discovers sellers on the network). The sidecar shares the router network namespace so its localhost-only proxy port is reachable by the router but not published to the host. The per-call price ceiling comes from the policy (`cmp(price_out, le, X)`); the proxy's `--max-*-usd-per-million` is just a wide outer bound.
 
 Routing model:

@@ -29,18 +29,18 @@ class FakeHost:
 
 def _src(families=("gpt-5.5",)):
     h = FakeHost()
-    s = CodexSource("openai")
+    s = CodexSource("openai_codex")
     s.bind(h, list(families))
     return s, h
 
 
 def _price_in(h):
-    return h.metrics[("openai", "gpt-5.5")]["price_in"]
+    return h.metrics[("openai_codex", "gpt-5.5")]["price_in"]
 
 
 def test_healthy_codex_priced_zero():
     s, h = _src()
-    s.ingest("openai", {"status": 200, "headers": {}, "ts": int(time.time())})
+    s.ingest("openai_codex", {"status": 200, "headers": {}, "ts": int(time.time())})
     assert _price_in(h) == 0.0  # free → wins cost-led ranking
 
 
@@ -48,7 +48,7 @@ def test_recent_429s_ramp_to_full_demote():
     s, h = _src()
     now = int(time.time())
     for _ in range(3):
-        s.ingest("openai", {"status": 429, "headers": {}, "ts": now})
+        s.ingest("openai_codex", {"status": 429, "headers": {}, "ts": now})
     assert _price_in(h) == 5.0  # SHED recent 429s → frac 1
 
 
@@ -56,15 +56,17 @@ def test_old_429s_age_out_of_window():
     s, h = _src()
     old = int(time.time()) - 120 - 10
     for _ in range(5):
-        s.ingest("openai", {"status": 429, "headers": {}, "ts": old})
+        s.ingest("openai_codex", {"status": 429, "headers": {}, "ts": old})
     assert _price_in(h) == 0.0  # outside the window → not counted → recovered
 
 
 def test_quota_header_drives_ramp():
     s, h = _src()
-    s.ingest("openai", {"status": 200,
-                        "headers": {"x-codex-primary-used-percent": "75"},
-                        "ts": int(time.time())})
+    s.ingest("openai_codex", {
+        "status": 200,
+        "headers": {"x-codex-primary-used-percent": "75"},
+        "ts": int(time.time()),
+    })
     # used 0.75 with START 0.5 → frac (0.75-0.5)/0.5 = 0.5
     assert _price_in(h) == pytest.approx(5.0 * 0.5)
 
@@ -74,7 +76,7 @@ async def test_pricing_returns_scarcity_for_each_family():
     s, _ = _src(("gpt-5.5", "gpt-5.3-codex-spark"))
     now = int(time.time())
     for _ in range(3):
-        s.ingest("openai", {"status": 429, "headers": {}, "ts": now})
+        s.ingest("openai_codex", {"status": 429, "headers": {}, "ts": now})
     prices = await s.pricing()
     fams = {p["model_family"]: p for p in prices}
     assert set(fams) == {"gpt-5.5", "gpt-5.3-codex-spark"}

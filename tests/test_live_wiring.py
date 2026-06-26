@@ -1,8 +1,7 @@
 """
 End-to-end wiring against the real config.live.lua catalog: the async shim +
-api_kind dispatcher route the openai_codex provider to the Codex backend and
-everything else to the OpenAI-compatible backend. Mirrors __main__'s wiring,
-with both backends faked so no network is touched.
+api_kind dispatcher route provider-specific protocols to their own backends.
+Mirrors __main__'s wiring, with backends faked so no network is touched.
 """
 from __future__ import annotations
 
@@ -14,7 +13,8 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from llm_router_host import LLMRouterHost, make_api_kind_dispatcher  # noqa: E402
+from llm_router_host import LLMRouterHost  # noqa: E402
+from provider_adapters.dispatcher import make_api_kind_dispatcher  # noqa: E402
 from shim import create_app  # noqa: E402
 
 
@@ -45,12 +45,34 @@ def test_pin_routes_codex_through_dispatcher():
 
     client = _build_client(default, codex)
     r = client.post("/v1/chat/completions", json={
-        "model": "pin:openai/gpt-5.5",
+        "model": "pin:openai_codex/gpt-5.5",
         "messages": [{"role": "user", "content": "hi"}],
     })
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["choices"][0]["message"]["content"] == "from-codex"
+    assert body["x_router"]["provider"] == "openai_codex"
+
+
+def test_pin_openai_routes_native_api_not_codex():
+    async def default(req):
+        assert req["api_kind"] == "openai_compatible"
+        assert req["provider_id"] == "openai"
+        assert req["served_model_id"] == "gpt-5.5"
+        return {"ok": True, "latency_ms": 5,
+                "response": {"text": "from-openai", "finish_reason": "stop"}}
+
+    async def codex(req):
+        return {"ok": False, "error_kind": "server_error"}
+
+    client = _build_client(default, codex)
+    r = client.post("/v1/chat/completions", json={
+        "model": "pin:openai/gpt-5.5",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["choices"][0]["message"]["content"] == "from-openai"
     assert body["x_router"]["provider"] == "openai"
 
 
@@ -72,7 +94,8 @@ def test_default_profile_cascades_off_a_failing_provider():
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["choices"][0]["message"]["content"].startswith("served-by-")
-    assert body["x_router"]["provider"] != "openai", "cascaded off the failing codex provider"
+    assert body["x_router"]["provider"] != "openai_codex", \
+        "cascaded off the failing codex provider"
 
 
 def test_antseed_is_marketplace_with_no_static_rows():
@@ -95,6 +118,39 @@ def test_antseed_is_marketplace_with_no_static_rows():
         for served in model["served_by"]:
             assert not str(served["provider"]).startswith("antseed"), \
                 f"static antseed row left on {family}"
+
+
+def test_live_config_includes_provider_local_native_examples():
+    host = LLMRouterHost(
+        router_path=ROOT / "core" / "router.lua",
+        config_path=ROOT / "config.live.lua",
+        metrics_path=ROOT / "metrics.live.lua",
+        now_ms=lambda: 1,
+    )
+    host.init()
+    cat = host.catalog()
+
+    providers = cat["providers"]
+    assert providers["openai"]["api_kind"] == "openai_compatible"
+    assert providers["openai_codex"]["api_kind"] == "openai_codex"
+    assert providers["anthropic"]["api_kind"] == "anthropic"
+    assert providers["gemini"]["api_kind"] == "google"
+    assert providers["bedrock_mantle"]["api_kind"] == "openai_compatible"
+    assert providers["bedrock_mantle"]["base_url"].endswith("/openai/v1")
+
+    def served_by(family):
+        return {
+            row["provider"]: row["provider_model_id"]
+            for row in cat["models"][family]["served_by"]
+        }
+
+    assert served_by("gpt-5.5")["openai"] == "gpt-5.5"
+    assert served_by("gpt-5.5")["openai_codex"] == "gpt-5.5"
+    assert served_by("claude-opus-4-8")["anthropic"] == "claude-opus-4-8"
+    assert served_by("gemini-3.1-pro-preview")["gemini"] == \
+        "gemini-3.1-pro-preview"
+    assert served_by("qwen3-235b-a22b")["bedrock_mantle"] == \
+        "qwen.qwen3-235b-a22b-2507"
 
 
 def test_marketplace_offers_rank_with_offer_prices():
@@ -151,3 +207,39 @@ def test_discovered_family_ranks_on_inline_offer_traits():
                   if r["candidate"]["provider_id"] == "openrouter_market"]
     assert discovered[:2] == ["z-ai/glm-5.2", "acme/weak-7b"], \
         "higher inline bench_intelligence must outrank the weaker one at equal price"
+
+
+def test_discovered_alias_family_is_policy_addressable():
+    """OpenRouter marketplace aliases let policies target canonical families
+    while the provider call still uses the raw OpenRouter slug."""
+    host = LLMRouterHost(
+        router_path=ROOT / "core" / "router.lua",
+        config_path=ROOT / "config.live.lua",
+        metrics_path=ROOT / "metrics.live.lua",
+        now_ms=lambda: 1,
+    )
+    host.set_discover_hook(lambda did: {
+        "ok": True, "fetched_at_ms": 1,
+        "offers": [
+            {"model_family": "gpt-5-mini", "wire_model_id": "openai/gpt-5-mini",
+             "seller_endpoint": "https://openrouter.ai/api/v1",
+             "price_in_usd_per_mtok": 0.25, "price_out_usd_per_mtok": 2.0,
+             "capabilities": {"context": 400000, "supports_tools": True,
+                              "supports_json_mode": True},
+             "traits": {"bench_intelligence": 0.80}},
+        ],
+    } if did == "openrouter_market" else {"ok": False, "error": "x"})
+    host.init()
+    term = ["policy",
+            ["and", ["meets_req"], ["not", ["is", "disabled"]],
+             ["family_eq", "gpt-5-mini"]],
+            ["neg", ["normalize", ["field", "price_in"]]],
+            ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
+
+    ranked, _ = host.rank({"policy_ir": term, "requirements": {"context": 8000}})
+
+    assert len(ranked) == 1
+    candidate = ranked[0]["candidate"]
+    assert candidate["provider_id"] == "openrouter_market"
+    assert candidate["model_family"] == "gpt-5-mini"
+    assert candidate["offer"]["wire_model_id"] == "openai/gpt-5-mini"

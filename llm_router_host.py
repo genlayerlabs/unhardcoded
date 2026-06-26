@@ -19,34 +19,63 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Callable
 
 import route_reliability as _route_reliability
 import route_latency as _route_latency
 import route_tool_capability as _route_tool_capability
 import route_cache as _route_cache
 import route_session_meter as _route_session_meter
-
-
-def _cached_tokens(usage: dict) -> "int | None":
-    """Prompt-cache READ tokens the provider reports, across shapes — the metric
-    that proves cache_hot is paying off (same prompt_tokens, but this fraction is
-    billed at the cache-read rate, ~10x cheaper). OpenAI-compat:
-    prompt_tokens_details.cached_tokens; Codex Responses:
-    input_tokens_details.cached_tokens; Anthropic: cache_read_input_tokens."""
-    if not isinstance(usage, dict):
-        return None
-    for parent in ("prompt_tokens_details", "input_tokens_details"):
-        d = usage.get(parent)
-        if isinstance(d, dict) and d.get("cached_tokens") is not None:
-            return d.get("cached_tokens")
-    return usage.get("cache_read_input_tokens")
+from provider_adapters.anthropic import make_anthropic_async_call_provider
+from provider_adapters.common import (
+    AsyncCallProviderHook,
+    CallProviderHook,
+    TokenProvider,
+    _cached_tokens,
+    _classify_status,
+    _elapsed_ms,
+    _err,
+)
+from provider_adapters.dispatcher import make_api_kind_dispatcher
+from provider_adapters.google import make_google_async_call_provider
+from provider_adapters.openai_compatible import (
+    _PEER_GATES,
+    _classify_from_map,
+    _parse_openai_response,
+    _prepare_openai_call,
+    _resolve_auth_headers,
+    make_async_call_provider,
+    make_http_call_provider,
+)
 
 import lupa
 from lupa import LuaRuntime
 
-CallProviderHook = Callable[[dict], dict]
-AsyncCallProviderHook = Callable[[dict], Awaitable[dict]]
+__all__ = [
+    "LLMRouterHost",
+    "FlowAdmissionError",
+    "CallProviderHook",
+    "AsyncCallProviderHook",
+    "DiscoverHook",
+    "Logger",
+    "Clock",
+    "TokenProvider",
+    "make_api_kind_dispatcher",
+    "make_async_call_provider",
+    "make_http_call_provider",
+    "make_anthropic_async_call_provider",
+    "make_google_async_call_provider",
+    "_PEER_GATES",
+    "_cached_tokens",
+    "_classify_from_map",
+    "_classify_status",
+    "_elapsed_ms",
+    "_err",
+    "_parse_openai_response",
+    "_prepare_openai_call",
+    "_resolve_auth_headers",
+]
+
 DiscoverHook = Callable[[str], dict]
 Logger = Callable[[str, str, dict], None]
 Clock = Callable[[], int]
@@ -612,231 +641,6 @@ def _noop_logger(level, event, fields):
     pass
 
 
-# ---- credential resolution + request prep (shared by sync/async HTTP) ---
-
-TokenProvider = Callable[[], "str | None"]
-
-
-def _resolve_auth_headers(
-    request: dict,
-    env_get: Callable[[str], str | None],
-    token_providers: dict[str, TokenProvider] | None = None,
-) -> tuple[dict | None, dict | None]:
-    """Map a provider's auth descriptor to request headers.
-
-    Supports `auth.kind` in {"none", "bearer", "oauth"}. For back-compat, a
-    bare `auth_env` (no `auth` block) is treated as bearer. Returns
-    (headers, error): on success `error` is None; on failure `headers` is None
-    and `error` is a router error dict.
-    """
-    auth = request.get("auth")
-    auth = auth if isinstance(auth, dict) else None
-    kind = auth.get("kind") if auth else None
-    if kind is None and request.get("auth_env"):
-        kind, auth = "bearer", {"kind": "bearer", "env": request.get("auth_env")}
-
-    if kind in (None, "none"):
-        return {}, None
-    if kind == "bearer":
-        env = (auth or {}).get("env") or request.get("auth_env")
-        token = env_get(env) if env else None
-        if not token:
-            return None, _err("auth_error", 0, 0, f"env var {env!r} unset")
-        return {"Authorization": f"Bearer {token}"}, None
-    if kind == "oauth":
-        provider = (auth or {}).get("provider")
-        getter = (token_providers or {}).get(provider)
-        if getter is None:
-            return None, _err("auth_error", 0, 0,
-                              f"no oauth token provider for {provider!r}")
-        token = getter()
-        if not token:
-            return None, _err("auth_error", 0, 0,
-                              f"oauth token provider {provider!r} returned nothing")
-        return {"Authorization": f"Bearer {token}"}, None
-    return None, _err("auth_error", 0, 0, f"unknown auth kind {kind!r}")
-
-
-def _resolve_ollama_cloud_auth(
-    env_get: Callable[[str], str | None],
-    url: str,
-    method: str = "POST",
-    body: bytes = b"",
-) -> dict | None:
-    """Resolve auth headers for Ollama Cloud via OLLAMA_API_KEY.
-
-    Args:
-        env_get: Function to read environment variables
-        url: Full URL for the request (unused; kept for call-site symmetry)
-        method: HTTP method (unused; kept for call-site symmetry)
-        body: Request body (unused; kept for call-site symmetry)
-
-    Returns {"Authorization": "Bearer <key>"} if OLLAMA_API_KEY is set,
-    else None (caller maps None to an auth_error).
-    """
-    api_key = env_get("OLLAMA_API_KEY")
-    if api_key:
-        return {"Authorization": f"Bearer {api_key}"}
-    return None
-
-
-def _prepare_openai_call(
-    request: dict,
-    env_get: Callable[[str], str | None],
-    extra: dict[str, str],
-    timeout_s: float,
-    token_providers: dict[str, TokenProvider] | None = None,
-) -> tuple[tuple | None, dict | None]:
-    """Build (url, body, headers, timeout_s) for an OpenAI-compatible call, or
-    return (None, error). Shared by the sync and async HTTP backends."""
-    auth_headers, err = _resolve_auth_headers(request, env_get, token_providers)
-    if err is not None:
-        return None, err
-
-    offer = request.get("offer") or {}
-
-    body: dict = {
-        # marketplace candidates may serve a curated family under a different
-        # wire name (service aliasing) — the offer's wire id wins.
-        "model":    offer.get("wire_model_id") or request["served_model_id"],
-        "messages": request.get("messages") or [],
-    }
-    for field in ("tools", "response_format", "temperature", "seed", "max_tokens"):
-        v = request.get(field)
-        if v is not None:
-            body[field] = v
-
-    url = (request.get("base_url") or "").rstrip("/") + "/chat/completions"
-
-    # Ollama: override auth based on endpoint
-    # Local endpoints (localhost, 127.0.0.1) require no auth
-    # Cloud endpoints (ollama.com) require auth (OLLAMA_API_KEY Bearer)
-    base_url = request.get("base_url") or ""
-    provider_id = request.get("provider_id") or ""
-    seller_endpoint = offer.get("seller_endpoint") or ""
-
-    # Detect Ollama by provider_id, base_url, or seller_endpoint
-    is_ollama = (
-        provider_id == "ollama" or
-        "ollama.com" in base_url or
-        "ollama.com" in seller_endpoint or
-        "localhost:11434" in base_url or
-        "127.0.0.1:11434" in base_url or
-        base_url.rstrip("/").endswith(":11434/v1")
-    )
-
-    if is_ollama:
-        endpoint = seller_endpoint or base_url
-        if endpoint.startswith("https://ollama.com"):
-            # Cloud: API key Bearer (OLLAMA_API_KEY)
-            auth_headers = _resolve_ollama_cloud_auth(
-                env_get, url, method="POST", body=b""
-            )
-            if auth_headers is None:
-                return None, _err("auth_error", 0, 0,
-                    "Ollama Cloud requires OLLAMA_API_KEY")
-        else:
-            # Local: no auth required
-            auth_headers = {}
-
-    headers = {"Content-Type": "application/json", **auth_headers, **extra}
-    # Marketplace (AntSeed): the buyer proxy runs in browse mode and disables
-    # auto-selection, so the host pins the offer's peer per request. The peer is
-    # the one the policy actually priced/selected — keeping peer choice in Σ_pol
-    # (deterministic) rather than an opaque buyer-side router.
-    peer_id = offer.get("peer_id")
-    if peer_id:
-        headers["x-antseed-pin-peer"] = peer_id
-    timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
-    return (url, body, headers, timeout), None
-
-
-def make_api_kind_dispatcher(
-    default: AsyncCallProviderHook,
-    handlers: dict[str, AsyncCallProviderHook] | None = None,
-) -> AsyncCallProviderHook:
-    """Route each call to a per-api_kind async handler, falling back to
-    `default` (the OpenAI-compatible backend). Lets one host serve providers
-    with different wire protocols (e.g. openai_codex) behind one router."""
-    _handlers = dict(handlers or {})
-
-    async def call(request: dict) -> dict:
-        handler = _handlers.get(request.get("api_kind"), default)
-        return await handler(request)
-
-    return call
-
-
-# ---- HTTP-real call_provider (OpenAI-compatible) ------------------------
-
-def make_http_call_provider(
-    env_get: Callable[[str], str | None] | None = None,
-    timeout_s: float = 30.0,
-    extra_headers: dict[str, str] | None = None,
-    token_providers: dict[str, TokenProvider] | None = None,
-    provider_rules: dict[str, dict] | None = None,
-) -> CallProviderHook:
-    """
-    Return a call_provider that translates the router's request to an
-    OpenAI-compatible /chat/completions POST, classifies the HTTP outcome
-    to a canonical error_kind, and returns the shape router.lua expects.
-
-    Auth is resolved from the provider's `auth` descriptor (kind none/bearer/
-    oauth); a bare `auth_env` is treated as bearer. `env_get` reads bearer
-    tokens (default `os.environ.get`); `token_providers` maps an oauth
-    provider name to a token getter.
-
-    Requires `httpx` (pip install httpx).
-    """
-    import time as _time
-    import httpx
-
-    _env_get = env_get or os.environ.get
-    _extra = dict(extra_headers or {})
-
-    def call(request: dict) -> dict:
-        api_kind = request.get("api_kind", "openai_compatible")
-        if api_kind != "openai_compatible":
-            return _err("unsupported_api_kind", 0, 0,
-                        f"api_kind={api_kind!r} not supported by HTTP backend")
-
-        prep, err = _prepare_openai_call(request, _env_get, _extra, timeout_s, token_providers)
-        if err is not None:
-            return err
-        url, body, headers, timeout = prep
-
-        t0 = _time.monotonic()
-        try:
-            resp = httpx.post(url, json=body, headers=headers, timeout=timeout)
-        except httpx.TimeoutException:
-            return _err("timeout", 0, _elapsed_ms(t0), f"POST {url} timed out")
-        except (httpx.NetworkError, httpx.RequestError) as e:
-            return _err("network_error", 0, _elapsed_ms(t0), str(e))
-
-        rules = (provider_rules or {}).get(request.get("provider_id")) or {}
-        return _parse_openai_response(resp, _elapsed_ms(t0), error_map=rules.get("error_map"))
-
-    return call
-
-
-# Per-peer in-flight gate for marketplace sellers. Each AntSeed peer advertises
-# `maxConcurrency`; exceeding it earns a 429 "Max concurrency reached" that the
-# router would (wastefully) treat as a failure and fall away from antseed. We cap
-# in-flight calls per peer to its advertised limit — a bounded wait, then yield to
-# the next candidate — so the router never trips the seller's own limiter.
-_PEER_GATES: dict[str, asyncio.Semaphore] = {}
-
-
-def _peer_gate(peer_id: str, cap: int) -> asyncio.Semaphore:
-    """The per-peer semaphore (create-once; first advertised cap wins — caps are
-    stable per seller and resizing a live semaphore races held slots)."""
-    sem = _PEER_GATES.get(peer_id)
-    if sem is None:
-        sem = asyncio.Semaphore(cap)
-        _PEER_GATES[peer_id] = sem
-    return sem
-
-
 def _fold_route_outcome(request: dict, result: dict,
                         session: "str | None" = None) -> None:
     """Fold ONE call outcome into the host-side per-route measurements:
@@ -884,176 +688,3 @@ def _fold_route_outcome(request: dict, result: dict,
         _route_tool_capability.observe(
             rkey, bool(request.get("tools")),
             bool((result.get("response") or {}).get("tool_calls")))
-
-
-def make_async_call_provider(
-    env_get: Callable[[str], str | None] | None = None,
-    timeout_s: float = 30.0,
-    extra_headers: dict[str, str] | None = None,
-    client: "Any" = None,
-    token_providers: dict[str, TokenProvider] | None = None,
-    provider_rules: dict[str, dict] | None = None,
-) -> AsyncCallProviderHook:
-    """Async twin of make_http_call_provider: same request translation, auth
-    resolution and error classification, but non-blocking (httpx.AsyncClient)
-    so the async shim can overlap many upstream calls on one event loop.
-
-    Pass a shared `httpx.AsyncClient` to reuse connections; otherwise one is
-    created per call. Requires `httpx`.
-    """
-    import httpx
-
-    _env_get = env_get or os.environ.get
-    _extra = dict(extra_headers or {})
-
-    async def call(request: dict) -> dict:
-        api_kind = request.get("api_kind", "openai_compatible")
-        if api_kind != "openai_compatible":
-            return _err("unsupported_api_kind", 0, 0,
-                        f"api_kind={api_kind!r} not supported by HTTP backend")
-
-        prep, err = _prepare_openai_call(request, _env_get, _extra, timeout_s, token_providers)
-        if err is not None:
-            return err
-        url, body, headers, timeout = prep
-
-        t0 = time.monotonic()
-
-        # Per-seller concurrency gate (marketplace offers carry peer_id +
-        # max_concurrency). Wait up to the call's own timeout for a slot; if the
-        # peer stays saturated, yield to the next candidate as a rate_limit
-        # rather than forcing the seller's 429.
-        offer = request.get("offer") or {}
-        peer_id = offer.get("peer_id")
-        cap = offer.get("max_concurrency")
-        gate = _peer_gate(peer_id, cap) if (peer_id and isinstance(cap, int) and cap > 0) else None
-        if gate is not None:
-            try:
-                await asyncio.wait_for(gate.acquire(), timeout=timeout)
-            except (asyncio.TimeoutError, TimeoutError):
-                # our own backpressure, not the seller failing -> don't fold it
-                # into the route's reliability.
-                return _err("rate_limit", 0, _elapsed_ms(t0),
-                            f"antseed peer {peer_id[:10]} in-flight cap {cap} saturated")
-        try:
-            try:
-                if client is not None:
-                    resp = await client.post(url, json=body, headers=headers, timeout=timeout)
-                else:
-                    async with httpx.AsyncClient() as c:
-                        resp = await c.post(url, json=body, headers=headers, timeout=timeout)
-            except httpx.TimeoutException:
-                result = _err("timeout", 0, _elapsed_ms(t0), f"POST {url} timed out")
-            except (httpx.NetworkError, httpx.RequestError) as e:
-                result = _err("network_error", 0, _elapsed_ms(t0), str(e))
-            else:
-                rules = (provider_rules or {}).get(request.get("provider_id")) or {}
-                result = _parse_openai_response(resp, _elapsed_ms(t0), error_map=rules.get("error_map"))
-            # Per-route outcome (reliability / latency / learned tool capability)
-            # is folded centrally in _resolve_call_async, so the streaming/override
-            # path feeds the SAME EMAs as this direct hook — not just non-streaming
-            # calls. (Was here; moved up so streamed traffic and flow nodes count.)
-            return result
-        finally:
-            if gate is not None:
-                gate.release()
-
-    return call
-
-
-def _classify_from_map(err_msg: str, error_map: dict | None) -> str | None:
-    """Provider-declared body-substring -> canonical kind. First hit wins,
-    case-insensitive, checked before the status-code fallback."""
-    if not error_map:
-        return None
-    msg = (err_msg or "").lower()
-    for needle, kind in error_map.items():
-        if needle.lower() in msg:
-            return str(kind)
-    return None
-
-
-def _parse_openai_response(resp: "Any", latency: int, error_map: dict | None = None) -> dict:
-    """Translate an OpenAI-compatible HTTP response into the router's response
-    shape. Shared by the sync and async HTTP backends."""
-    status = resp.status_code
-    if 200 <= status < 300:
-        try:
-            data = resp.json()
-        except Exception as e:
-            return _err("bad_response", status, latency, f"json parse: {e}")
-
-        choices = data.get("choices") or []
-        if not choices:
-            return _err("bad_response", status, latency, "no choices in response")
-
-        choice = choices[0]
-        finish = choice.get("finish_reason")
-        if finish == "content_filter":
-            return _err("content_filter", status, latency, "blocked by provider filter")
-
-        msg   = choice.get("message") or {}
-        usage = data.get("usage") or {}
-        text = msg.get("content") or ""
-        tool_calls = msg.get("tool_calls")
-        if not str(text).strip() and not tool_calls:
-            return _err("bad_response", status, latency, "empty assistant content")
-        return {
-            "ok":         True,
-            "latency_ms": latency,
-            "response": {
-                "text":          text,
-                "tool_calls":    tool_calls,
-                "finish_reason": finish,
-                "tokens_in":     usage.get("prompt_tokens"),
-                "tokens_out":    usage.get("completion_tokens"),
-                "tokens_total":  usage.get("total_tokens"),
-                "tokens_cached": _cached_tokens(usage),
-                "cost_reported": usage.get("cost"),
-                "raw_model":     data.get("model"),
-            },
-        }
-
-    try:
-        err_body = resp.json()
-        err_msg  = str(err_body)
-    except Exception:
-        err_msg = (resp.text or "")[:500]
-    kind = _classify_from_map(err_msg, error_map) or _classify_status(status, err_msg)
-    return _err(kind, status, latency, err_msg[:500])
-
-
-def _classify_status(status: int, err_msg: str) -> str:
-    if status in (401, 403):
-        return "auth_error"
-    if status == 429:
-        return "rate_limit"
-    if status == 402:
-        return "payment_required"
-    if status in (408, 504):
-        return "timeout"
-    if status == 404:
-        return "model_unavailable"
-    if status == 400:
-        m = (err_msg or "").lower()
-        if "context" in m or "token" in m or "length" in m or "maximum" in m:
-            return "context_overflow"
-        return "bad_request"
-    if 500 <= status < 600:
-        return "server_error"
-    return "unknown"
-
-
-def _err(kind: str, status: int, latency_ms: int, message: str) -> dict:
-    return {
-        "ok":            False,
-        "error_kind":    kind,
-        "http_status":   status,
-        "latency_ms":    latency_ms,
-        "error_message": message,
-    }
-
-
-def _elapsed_ms(t0: float) -> int:
-    import time as _t
-    return int((_t.monotonic() - t0) * 1000)

@@ -22,11 +22,15 @@ ROOT = Path(__file__).resolve().parent
 CORE = ROOT / "core"                 # the unhardcoded-engine core (git submodule)
 sys.path.insert(0, str(ROOT))
 
-from llm_router_host import (  # noqa: E402
-    LLMRouterHost,
-    make_async_call_provider,
-    make_api_kind_dispatcher,
+from llm_router_host import LLMRouterHost  # noqa: E402
+from provider_adapters.anthropic import (  # noqa: E402
+    make_anthropic_async_call_provider,
 )
+from provider_adapters.dispatcher import make_api_kind_dispatcher  # noqa: E402
+from provider_adapters.google import (  # noqa: E402
+    make_google_async_call_provider,
+)
+from provider_adapters.openai_compatible import make_async_call_provider  # noqa: E402
 
 
 def main() -> None:
@@ -128,7 +132,11 @@ def main() -> None:
     call_async = make_api_kind_dispatcher(
         default=make_async_call_provider(timeout_s=args.timeout_s,
                                          provider_rules=provider_rules),
-        handlers={"openai_codex": make_codex_async_call_provider(codex_auth, observe=observe)},
+        handlers={
+            "openai_codex": make_codex_async_call_provider(codex_auth, observe=observe),
+            "anthropic": make_anthropic_async_call_provider(timeout_s=args.timeout_s),
+            "google": make_google_async_call_provider(timeout_s=args.timeout_s),
+        },
     )
     host.set_async_call_hook(call_async)
 
@@ -139,14 +147,19 @@ def main() -> None:
         make_streaming_dispatcher,
         stream_codex,
         stream_openai_compatible,
+        stream_unsupported_api_kind,
     )
     streaming_call = make_streaming_dispatcher(
         default=functools.partial(stream_openai_compatible,
                                   timeout_s=args.timeout_s,
                                   provider_rules=provider_rules),
-        handlers={"openai_codex": functools.partial(stream_codex,
-                                                    auth=codex_auth,
-                                                    observe=observe)},
+        handlers={
+            "openai_codex": functools.partial(stream_codex,
+                                              auth=codex_auth,
+                                              observe=observe),
+            "anthropic": stream_unsupported_api_kind,
+            "google": stream_unsupported_api_kind,
+        },
     )
 
     from shim import create_app  # local import: keeps argparse errors fast
