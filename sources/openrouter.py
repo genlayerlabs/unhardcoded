@@ -11,6 +11,7 @@ from typing import Any
 import route_reliability as _route_reliability
 import route_latency as _route_latency
 from sources import Balance, Price
+from sources.pricing import effective_price
 
 BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -37,6 +38,7 @@ class OpenRouterSource:
         # whole catalog per call. Empty until the first refresh populates it.
         self._offers: list[dict] = []
         providers = catalog.get("providers") or {}
+        self._providers = providers
         market_cfg = providers.get("openrouter_market") or {}
         self._market_aliases: dict[str, str] = {
             str(raw): str(family)
@@ -121,6 +123,11 @@ class OpenRouterSource:
             # the candidate WIN every cost-led policy (most-negative = "cheapest")
             # and bill a negative cost. Free models ($0) stay routable.
             return None
+        price_in, price_out = effective_price(
+            self._providers.get("openrouter_market") or {},
+            price_in,
+            price_out,
+        )
         ctx = m.get("context_length") or (m.get("top_provider") or {}).get("context_length")
         caps = {"context": int(ctx)} if isinstance(ctx, (int, float)) and ctx else {}
         # Project the model's capability TRAITS onto the flags the core's

@@ -59,6 +59,61 @@ def test_push_prices_only_pushes_cataloged_pairs():
     assert isinstance(delta["price_refreshed_at"], int)
 
 
+def test_push_prices_applies_provider_effective_multiplier():
+    catalog = {
+        "providers": {"openrouter": {"effective_price_multiplier": 1.055}},
+        "models": {"gpt-5.5": {"served_by": [
+            {"provider": "openrouter", "provider_model_id": "openai/gpt-5.5"},
+        ]}},
+    }
+    host = FakeHost()
+    pushed = src.push_prices(host, catalog, [{
+        "provider_id": "openrouter",
+        "served_model_id": "openai/gpt-5.5",
+        "model_family": "gpt-5.5",
+        "price_in_usd_per_mtok": 5.0,
+        "price_out_usd_per_mtok": 30.0,
+    }])
+    assert pushed == 1
+    (_provider, _family, delta), = host.pushed
+    assert delta["price_in"] == pytest.approx(5.275)
+    assert delta["price_out"] == pytest.approx(31.65)
+
+
+def test_static_price_source_owns_direct_provider_prices():
+    from sources.static_prices import StaticPriceSource
+
+    catalog = {
+        "providers": {
+            "openai": {},
+            "anthropic": {},
+            "gemini": {},
+            "bedrock_mantle": {},
+        },
+        "models": {
+            "gpt-5.4": {"served_by": [
+                {"provider": "openai", "provider_model_id": "gpt-5.4"},
+            ]},
+            "claude-sonnet-4-6": {"served_by": [
+                {"provider": "anthropic", "provider_model_id": "claude-sonnet-4-6"},
+            ]},
+            "gemini-3.1-pro-preview": {"served_by": [
+                {"provider": "gemini", "provider_model_id": "gemini-3.1-pro-preview"},
+            ]},
+            "qwen3-235b-a22b": {"served_by": [
+                {"provider": "bedrock_mantle", "provider_model_id": "qwen.qwen3-235b-a22b-2507"},
+            ]},
+        },
+    }
+    prices = asyncio.run(StaticPriceSource(catalog).pricing())
+    by_pair = {(p["provider_id"], p["model_family"]): p for p in prices}
+    assert by_pair[("openai", "gpt-5.4")]["price_in_usd_per_mtok"] == 2.5
+    assert by_pair[("openai", "gpt-5.4")]["price_out_usd_per_mtok"] == 15.0
+    assert by_pair[("anthropic", "claude-sonnet-4-6")]["price_in_usd_per_mtok"] == 3.0
+    assert by_pair[("gemini", "gemini-3.1-pro-preview")]["price_out_usd_per_mtok"] == 12.0
+    assert by_pair[("bedrock_mantle", "qwen3-235b-a22b")]["price_out_usd_per_mtok"] == 0.10
+
+
 class FakeSource:
     name = "fake"
     provider_ids = ["openrouter"]
@@ -107,6 +162,16 @@ def test_build_registry_includes_openrouter_only_when_configured():
     reg = src.build_registry(CATALOG)
     assert [s.name for s in reg] == ["openrouter"]
     assert src.build_registry({"providers": {"antseed": {}}}) == []
+
+
+def test_build_registry_includes_static_prices_for_native_providers():
+    reg = src.build_registry({
+        "providers": {"openai": {}},
+        "models": {"gpt-5.4": {"served_by": [
+            {"provider": "openai", "provider_model_id": "gpt-5.4"},
+        ]}},
+    })
+    assert [s.name for s in reg] == ["static_prices"]
 
 
 # ---- openrouter source ----------------------------------------------------
@@ -237,6 +302,35 @@ def test_openrouter_discovery_offers_carry_full_live_traits():
     # ranks are dynamic, across the live catalog (glm beats the weaker cheap-7b)
     assert t["bench_intelligence_rank"] == 1
     assert offers["cheap-7b"]["traits"]["bench_intelligence_rank"] == 2
+
+
+def test_openrouter_marketplace_offers_apply_effective_multiplier():
+    from sources.openrouter import OpenRouterSource
+
+    catalog = {
+        "providers": {
+            "openrouter": {"auth_env": "OPENROUTER_API_KEY"},
+            "openrouter_market": {
+                "discovery": "marketplace",
+                "discovery_id": "openrouter_market",
+                "effective_price_multiplier": 1.055,
+            },
+        },
+        "models": {
+            "gpt-5.5": {"served_by": [
+                {"provider": "openrouter", "provider_model_id": "openai/gpt-5.5"},
+            ]},
+        },
+    }
+    s = OpenRouterSource(
+        catalog,
+        env_get={"OPENROUTER_API_KEY": "sk-test"}.get,
+        client=FakeClient({"/models": FakeResponse(200, OR_DISCOVERY_BODY)}),
+    )
+    asyncio.run(s.pricing())
+    offers = {o["model_family"]: o for o in s.offers_sync("openrouter_market")}
+    assert offers["glm-5.2"]["price_in_usd_per_mtok"] == pytest.approx(0.422)
+    assert offers["glm-5.2"]["price_out_usd_per_mtok"] == pytest.approx(1.688)
 
 
 def test_openrouter_discovery_derives_policy_families_from_raw_model_ids():

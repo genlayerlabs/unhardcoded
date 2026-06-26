@@ -53,6 +53,8 @@ return {
             api_kind  = "openai_compatible",
             auth_env  = "OPENROUTER_API_KEY",
             tier      = "fallback",
+            effective_price_multiplier = tonumber(
+                os.getenv("OPENROUTER_EFFECTIVE_PRICE_MULTIPLIER") or "1.055"),
             notes     = "Last-resort gateway",
         },
         openai = {
@@ -61,6 +63,8 @@ return {
             api_kind  = "openai_compatible",
             auth_env  = "OPENAI_API_KEY",
             tier      = "partner",
+            effective_price_multiplier = tonumber(
+                os.getenv("OPENAI_EFFECTIVE_PRICE_MULTIPLIER") or "1.0"),
             notes     = "Native OpenAI API.",
         },
         anthropic = {
@@ -69,6 +73,8 @@ return {
             api_kind  = "anthropic",
             auth_env  = "ANTHROPIC_API_KEY",
             tier      = "partner",
+            effective_price_multiplier = tonumber(
+                os.getenv("ANTHROPIC_EFFECTIVE_PRICE_MULTIPLIER") or "1.0"),
             notes     = "Native Anthropic Messages API.",
         },
         gemini = {
@@ -77,6 +83,8 @@ return {
             api_kind  = "google",
             auth_env  = "GEMINI_API_KEY",
             tier      = "partner",
+            effective_price_multiplier = tonumber(
+                os.getenv("GEMINI_EFFECTIVE_PRICE_MULTIPLIER") or "1.0"),
             notes     = "Native Gemini generateContent API.",
         },
         bedrock_mantle = {
@@ -86,6 +94,8 @@ return {
             api_kind  = "openai_compatible",
             auth_env  = "AWS_BEARER_TOKEN_BEDROCK",
             tier      = "partner",
+            effective_price_multiplier = tonumber(
+                os.getenv("BEDROCK_EFFECTIVE_PRICE_MULTIPLIER") or "1.0"),
             notes     = "Amazon Bedrock Mantle OpenAI-compatible endpoint. "
                      .. "Use BEDROCK_MANTLE_BASE_URL to select region/path.",
         },
@@ -107,6 +117,8 @@ return {
             api_kind         = "openai_compatible",
             auth_env         = "OPENROUTER_API_KEY",
             tier             = "marketplace",
+            effective_price_multiplier = tonumber(
+                os.getenv("OPENROUTER_EFFECTIVE_PRICE_MULTIPLIER") or "1.055"),
             market_price_cap = { input = 1000, output = 1000 },
             -- OpenRouter marketplace rows default `vendor/model` to the
             -- provider-neutral family `model`, while wire_model_id keeps the

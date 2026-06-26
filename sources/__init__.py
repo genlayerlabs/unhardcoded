@@ -13,6 +13,8 @@ import random
 import time
 from typing import Any, Literal, Protocol, TypedDict
 
+from sources.pricing import effective_price
+
 
 class Price(TypedDict):
     provider_id: str
@@ -72,9 +74,15 @@ def push_prices(host: Any, catalog: dict, prices: list[Price]) -> int:
         provider = p.get("provider_id")
         if not family or (provider, family) not in pairs:
             continue
+        provider_cfg = (catalog.get("providers") or {}).get(provider) or {}
+        price_in, price_out = effective_price(
+            provider_cfg,
+            p["price_in_usd_per_mtok"],
+            p["price_out_usd_per_mtok"],
+        )
         host.update_metrics(provider, family, {
-            "price_in": p["price_in_usd_per_mtok"],
-            "price_out": p["price_out_usd_per_mtok"],
+            "price_in": price_in,
+            "price_out": price_out,
             "price_refreshed_at": now,
         })
         pushed += 1
@@ -117,6 +125,10 @@ def start_refresh_tasks(host: Any, catalog: dict,
 def build_registry(catalog: dict, env_get=os.environ.get) -> list[ProviderSource]:
     registry: list[ProviderSource] = []
     providers = catalog.get("providers") or {}
+    from sources.static_prices import StaticPriceSource
+    static_prices = StaticPriceSource(catalog)
+    if static_prices.provider_ids:
+        registry.append(static_prices)
     if "openrouter" in providers:
         from sources.openrouter import OpenRouterSource
         registry.append(OpenRouterSource(catalog, env_get=env_get))
