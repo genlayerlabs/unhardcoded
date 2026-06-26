@@ -372,7 +372,13 @@ return {
             model_unavailable = { action = "next_provider_same_model", mark_unavailable_ms = 300000 },
             network_error     = { action = "retry_same", attempts = 2, backoff_ms = { 200, 600 },
                                   then_action = "next_candidate" },
-            context_overflow  = { action = "abort" },
+            -- A context overflow on ONE route says nothing about the others:
+            -- a provider-neutral family (e.g. family:gpt-5.4) spans candidates
+            -- with heterogeneous context windows, so the next one may well fit.
+            -- retry_same would be futile (same model, same window) but
+            -- next_candidate is not — fall through. If every candidate overflows
+            -- the request still ends cleanly in `exhausted: context_overflow`.
+            context_overflow  = { action = "next_candidate" },
             -- A stream that died AFTER content reached the client cannot
             -- fall through (the next candidate would append a second answer
             -- to a half-delivered one): abort, the shim reports in-stream.
