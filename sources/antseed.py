@@ -202,13 +202,21 @@ class AntSeedSource:
         cap_out = float(cap.get("output", float("inf")))
         pinned = self._pinned_peer(provider_id)
         rep_min = float(settings.get("antseed.reputation_min"))
+        allowlist = set(settings.get("antseed.peer_allowlist") or [])
+        denylist = set(settings.get("antseed.peer_denylist") or [])
         uncurated = 0
         rejected_by_buyer = 0
         rejected_by_reputation = 0
+        denied = 0
         # family -> rows, one per advertising peer
         by_family: dict[str, list[dict]] = {}
         for row in self._load_market():
             if pinned and row["peer_id"] != pinned:
+                continue
+            # Operator allow/deny by peer id. Deny wins; a non-empty allowlist
+            # restricts to its members. Empty/empty (default) = no change.
+            if row["peer_id"] in denylist or (allowlist and row["peer_id"] not in allowlist):
+                denied += 1
                 continue
             if rep_min > 0 and row.get("reputation") is not None \
                     and row["reputation"] < rep_min:
@@ -261,6 +269,7 @@ class AntSeedSource:
         self._stats["uncurated"] = uncurated
         self._stats["rejected_by_buyer"] = rejected_by_buyer
         self._stats["rejected_by_reputation"] = rejected_by_reputation
+        self._stats["denied"] = denied
         self._stats["offers"] = len(kept_rows)
         offers = []
         for row in kept_rows:
