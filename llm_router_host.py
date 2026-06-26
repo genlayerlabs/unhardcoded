@@ -35,6 +35,7 @@ from provider_adapters.common import (
     _classify_status,
     _elapsed_ms,
     _err,
+    _provider_error_message,
 )
 from provider_adapters.dispatcher import make_api_kind_dispatcher
 from provider_adapters.google import make_google_async_call_provider
@@ -73,6 +74,7 @@ __all__ = [
     "_err",
     "_parse_openai_response",
     "_prepare_openai_call",
+    "_provider_error_message",
     "_resolve_auth_headers",
 ]
 

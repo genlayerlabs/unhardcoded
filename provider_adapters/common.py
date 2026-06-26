@@ -58,6 +58,63 @@ def json_args(arguments: Any) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+# Substrings that genuinely mean "the model's context window was exceeded",
+# across OpenAI ("maximum context length is N tokens ... reduce the length of
+# the messages"), OpenRouter ("This endpoint's maximum context length is N")
+# and the OpenAI error code. Deliberately narrow: matching "token"/"maximum"
+# alone misreads max_tokens/parameter errors as overflow (see classify_status).
+_OVERFLOW_400_SIGNATURES = (
+    "context length",            # "(maximum) context length is N tokens"
+    "context window",
+    "context_length_exceeded",   # OpenAI error code
+    "reduce the length of the messages",
+)
+
+
+def provider_error_message(err_body: Any) -> str:
+    """The most specific human-readable reason from a parsed provider error body.
+
+    OpenAI-compatible providers put the reason in ``error.message``. OpenRouter
+    relays an upstream failure as a generic envelope —
+    ``{"error": {"message": "Provider returned error",
+    "metadata": {"raw": "<json string of the UPSTREAM error>"}}}`` — where the
+    real reason (e.g. "Invalid 'max_output_tokens': ... >= 16") lives in
+    ``metadata.raw``, not the outer message. Dig it out so both classification
+    and the caller-facing error carry the truth instead of "Provider returned
+    error". Falls back to the stringified body for unknown shapes."""
+    if not isinstance(err_body, dict):
+        return str(err_body)
+    error = err_body.get("error")
+    if isinstance(error, str):
+        return error
+    if not isinstance(error, dict):
+        return str(err_body)
+    inner = _openrouter_relayed_message(error.get("metadata"))
+    if inner:
+        return inner
+    outer = str(error.get("message") or "").strip()
+    return outer or str(err_body)
+
+
+def _openrouter_relayed_message(metadata: Any) -> "str | None":
+    """The upstream ``error.message`` OpenRouter stashes in ``metadata.raw``."""
+    if not isinstance(metadata, dict):
+        return None
+    raw = metadata.get("raw")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return raw.strip() or None
+    if isinstance(raw, dict):
+        inner = raw.get("error")
+        if isinstance(inner, dict):
+            return str(inner.get("message") or "").strip() or None
+        if isinstance(inner, str):
+            return inner.strip() or None
+    return None
+
+
 def classify_status(status: int, err_msg: str) -> str:
     if status in (401, 403):
         return "auth_error"
@@ -71,7 +128,16 @@ def classify_status(status: int, err_msg: str) -> str:
         return "model_unavailable"
     if status == 400:
         m = (err_msg or "").lower()
-        if "context" in m or "token" in m or "length" in m or "maximum" in m:
+        # Only a genuine "the context window was exceeded" signature is a
+        # context_overflow. The previous catch-all (any of "context"/"token"/
+        # "length"/"maximum" anywhere in the body) mislabelled unrelated 400s as
+        # overflow — most perversely "Invalid 'max_output_tokens': integer below
+        # minimum value. Expected a value >= 16, but got 4" (max_tokens too
+        # SMALL) tripped on the "token" inside "max_output_tokens" and was
+        # reported as the context being too BIG, then aborted. Everything that
+        # is not an overflow is a bad_request: it falls through to the next
+        # candidate and carries the real provider message to the caller.
+        if any(sig in m for sig in _OVERFLOW_400_SIGNATURES):
             return "context_overflow"
         return "bad_request"
     if 500 <= status < 600:
@@ -99,3 +165,4 @@ _cached_tokens = cached_tokens
 _classify_status = classify_status
 _err = err
 _elapsed_ms = elapsed_ms
+_provider_error_message = provider_error_message

@@ -13,6 +13,7 @@ from provider_adapters.common import (
     _classify_status,
     _elapsed_ms,
     _err,
+    _provider_error_message,
 )
 
 
@@ -294,7 +295,7 @@ def _parse_openai_response(
 
     try:
         err_body = resp.json()
-        err_msg = str(err_body)
+        err_msg = _provider_error_message(err_body)
     except Exception:
         err_msg = (resp.text or "")[:500]
     kind = _classify_from_map(err_msg, error_map) or _classify_status(status, err_msg)

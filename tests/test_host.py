@@ -216,6 +216,29 @@ def test_classify_status_maps_payment_and_common_codes():
     assert _classify_status(302, "") == "unknown"
 
 
+def test_classify_status_400_only_real_overflow_is_context_overflow():
+    # A 400 is context_overflow ONLY when the provider actually says the context
+    # window was exceeded — not whenever "token"/"length"/"maximum" appears.
+    from llm_router_host import _classify_status
+
+    # Genuine overflow signatures (OpenAI / OpenRouter wording + error code).
+    assert _classify_status(
+        400, "This endpoint's maximum context length is 400000 tokens. However, "
+             "you requested about 9000001 tokens.") == "context_overflow"
+    assert _classify_status(400, "context_length_exceeded") == "context_overflow"
+
+    # max_output_tokens too SMALL is the OPPOSITE of an overflow. The "token" in
+    # "max_output_tokens" must not drag it into context_overflow (that aborts).
+    assert _classify_status(
+        400, "Invalid 'max_output_tokens': integer below minimum value. "
+             "Expected a value >= 16, but got 4 instead.") == "bad_request"
+    # Other unrelated 400s are plain bad_request too.
+    assert _classify_status(400, "Unsupported parameter: 'temperature'") == "bad_request"
+    assert _classify_status(
+        400, "Response input messages must contain the word 'json' in some form "
+             "to use 'text.format' of type 'json_object'.") == "bad_request"
+
+
 def test_catalog_returns_python_config(host):
     cat = host.catalog()
     assert "openrouter" not in cat.get("providers", {})  # example config has no openrouter

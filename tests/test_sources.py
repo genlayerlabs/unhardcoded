@@ -428,6 +428,32 @@ def test_error_map_overrides_status_classification():
     assert mapped["error_kind"] == "model_unavailable"     # substring map wins
 
 
+def test_parse_surfaces_real_upstream_message_from_openrouter_envelope():
+    # OpenRouter relays an upstream failure as a generic "Provider returned
+    # error" envelope, stashing the real reason in metadata.raw. The adapter
+    # must surface THAT reason (so the caller learns max_tokens was too small),
+    # and classify on it — a max_output_tokens floor is a bad_request that falls
+    # through, never a context_overflow that aborts.
+    from llm_router_host import _parse_openai_response
+
+    upstream = ('{"error": {"message": "Invalid \'max_output_tokens\': integer '
+                'below minimum value. Expected a value >= 16, but got 4 '
+                'instead.", "type": "invalid_request_error", "param": '
+                '"max_output_tokens", "code": "integer_below_min_value"}}')
+
+    class Resp:
+        status_code = 400
+        text = ""
+        def json(self):
+            return {"error": {"message": "Provider returned error", "code": 400,
+                              "metadata": {"raw": upstream, "provider_name": "Azure"}}}
+
+    r = _parse_openai_response(Resp(), 10)
+    assert "max_output_tokens" in r["error_message"]        # real reason surfaced
+    assert "Provider returned error" not in r["error_message"]  # not the envelope
+    assert r["error_kind"] == "bad_request"                 # falls through, not abort
+
+
 # ---- antseed source ---------------------------------------------------------
 
 ANTSEED_CATALOG = {
