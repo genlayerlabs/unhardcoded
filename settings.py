@@ -48,6 +48,16 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "min": 0, "max": 100, "label": "Min peer on-chain reputation",
         "help": "Drop AntSeed peers whose on-chain reputation score (0-100) is below "
                 "this. 0 = off. Peers that report no reputation are kept (cold-start safe)."},
+    "antseed.peer_allowlist": {
+        "provider": "antseed", "type": "list", "default": [],
+        "min": 0, "max": 500, "label": "Peer allowlist (peer IDs)",
+        "help": "If non-empty, ONLY these AntSeed peer IDs are offered. "
+                "Comma-separated. Empty (default) = every peer is eligible."},
+    "antseed.peer_denylist": {
+        "provider": "antseed", "type": "list", "default": [],
+        "min": 0, "max": 500, "label": "Peer denylist (peer IDs)",
+        "help": "AntSeed peer IDs that are never offered. Comma-separated. "
+                "Takes precedence over the allowlist. Empty (default) = none denied."},
     "antseed.runway_deposits_low_usdc": {
         "provider": "antseed", "type": "float", "default": _f("RUNWAY_DEPOSITS_LOW_USDC", 2),
         "min": 0, "max": 100000, "label": "Wallet runway: low (USDC)",
@@ -110,8 +120,27 @@ def reload() -> dict[str, Any]:
     return kept
 
 
-def _coerce(key: str, value: Any) -> float | int | None:
+def _coerce_list(value: Any, d: dict[str, Any]) -> list[str] | None:
+    """A CSV string or a JSON array -> a clean, de-duplicated list of tokens
+    (order preserved). None when the shape is wrong or it overflows `max` items."""
+    if isinstance(value, str):
+        items: Any = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        return None
+    out: list[str] = []
+    for it in items:
+        s = str(it).strip()
+        if s and s not in out:
+            out.append(s)
+    return out if d["min"] <= len(out) <= d["max"] else None
+
+
+def _coerce(key: str, value: Any) -> Any:
     d = SCHEMA[key]
+    if d["type"] == "list":
+        return _coerce_list(value, d)
     try:
         v = int(value) if d["type"] == "int" else float(value)
     except (TypeError, ValueError):
@@ -157,7 +186,9 @@ def validate_and_write(updates: dict[str, Any]) -> tuple[dict[str, Any], list[st
         c = _coerce(key, value)
         if c is None:
             d = SCHEMA[key]
-            errors.append(f"{key}: must be {d['type']} in [{d['min']}, {d['max']}]")
+            errors.append(
+                f"{key}: must be a list of <= {d['max']} items" if d["type"] == "list"
+                else f"{key}: must be {d['type']} in [{d['min']}, {d['max']}]")
             continue
         new[key] = c
     if errors:
