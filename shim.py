@@ -95,6 +95,26 @@ class ChatRequest(BaseModel):
     caller: str | None = None
 
 
+class ResponsesRequest(BaseModel):
+    """Permissive OpenAI /v1/responses body. Unknown fields are kept
+    (extra="allow") so Responses params the shim does not read (reasoning,
+    include, store, parallel_tool_calls, prompt_cache_key, text,
+    previous_response_id, …) never break the request."""
+    model_config = ConfigDict(extra="allow")
+
+    model: str = ""
+    input: Any = None             # str | list[item]
+    instructions: str | None = None
+    tools: list[dict] | None = None
+    tool_choice: Any = None
+    stream: bool = False
+    max_output_tokens: int | None = None
+    temperature: float | None = None
+    policy_ir: list | None = None
+    session: str | None = None
+    caller: str | None = None
+
+
 class PolicyRankRequest(BaseModel):
     """Body of POST /x/rank — dry-run a per-call policy term."""
     policy_ir: list
@@ -832,6 +852,129 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         caller = request.headers.get("x-llm-router-caller")
         if caller:
             req.caller = caller
+
+    # ---- OpenAI Responses API surface (POST /v1/responses) ----------------
+    # The inbound mirror of codex_backend.py: translate a Responses request to
+    # the SAME chat contract the chat path builds, run the SAME engine, and
+    # translate the result back to a Responses object / SSE. Lets Responses-only
+    # clients (the Codex CLI) drive the router with all routing/policy/metering.
+
+    @app.post("/v1/responses")
+    async def responses(req: ResponsesRequest, request: Request):
+        _session_from_header(req, request)
+        return await _handle_responses(req)
+
+    @app.post("/{profile_name}/v1/responses")
+    async def responses_profiled(profile_name: str, req: ResponsesRequest,
+                                 request: Request):
+        _session_from_header(req, request)
+        return await _handle_responses(req, profile_name=profile_name)
+
+    def _responses_object_with_router(result: dict, req: ResponsesRequest,
+                                      response_id: str | None = None) -> dict:
+        import responses_api as _rapi
+        obj = _rapi.result_to_responses_object(result, req.model or "",
+                                               response_id=response_id)
+        resp = result.get("response") or {}
+        chosen = result.get("chosen") or {}
+        obj["x_router"] = {
+            "provider": chosen.get("provider_id"),
+            "model_family": chosen.get("model_family"),
+            "served_model_id": chosen.get("served_model_id"),
+            "price_in": chosen.get("price_in"),
+            "price_out": chosen.get("price_out"),
+            "cost_usd": _executed_cost_usd(result, subscription_providers),
+            "tokens_cached": resp.get("tokens_cached"),
+            "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
+            "decision_trace": _trim_trace(result.get("trace")),
+            "compact": _compact_suggested(resp),
+        }
+        if req.session:
+            acc = route_session_meter.observe(
+                req.session,
+                tokens_in=resp.get("tokens_in") or 0,
+                tokens_out=resp.get("tokens_out") or 0,
+                tokens_cached=resp.get("tokens_cached") or 0,
+                cost_usd=obj["x_router"]["cost_usd"] or 0.0,
+                owner=req.caller)
+            obj["x_router"]["session_acc"] = acc
+        return obj
+
+    async def _handle_responses(req: ResponsesRequest, profile_name: str | None = None):
+        import responses_api as _rapi
+        chatreq = ChatRequest(
+            model=req.model or "",
+            messages=_rapi.input_to_messages(req.input, req.instructions),
+            tools=_rapi.tools_to_chat(req.tools),
+            tool_choice=_rapi.tool_choice_to_chat(req.tool_choice),
+            temperature=req.temperature,
+            max_tokens=req.max_output_tokens,
+            policy_ir=req.policy_ir,
+            session=req.session,
+        )
+        contract = _request_to_contract(chatreq, default_profile, default_max_tokens)
+        if profile_name is not None:
+            contract["profile"] = profile_name
+
+        if not req.stream:
+            try:
+                result = await host.execute_async(contract)
+            except Exception as exc:
+                admission = _policy_admission_error(exc)
+                if admission is None:
+                    raise
+                return _invalid_policy_response(admission)
+            if not result.get("ok"):
+                return _openai_error_from_router(result)
+            return _responses_object_with_router(result, req)
+        return await _handle_responses_stream(contract, req)
+
+    async def _handle_responses_stream(contract: dict, req: ResponsesRequest):
+        import responses_api as _rapi
+        task = asyncio.create_task(host.execute_async(contract))
+        done, _ = await asyncio.wait({task}, timeout=_EARLY_FAIL_S,
+                                     return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            try:
+                result = task.result()
+            except Exception as exc:
+                admission = _policy_admission_error(exc)
+                if admission is None:
+                    raise
+                return _invalid_policy_response(admission)
+            if not result.get("ok"):
+                return _openai_error_from_router(result)
+            obj = _responses_object_with_router(result, req)
+
+            async def gen_ready():
+                yield _rapi.responses_created_event(obj)
+                for ev in _rapi.responses_sse_events(obj):
+                    yield ev
+            return StreamingResponse(gen_ready(), media_type="text/event-stream")
+
+        async def gen_running():
+            rid = _rapi._new_id("resp")
+            yield _rapi.responses_created_event({"id": rid, "model": req.model or ""})
+            while not task.done():
+                await asyncio.wait({task}, timeout=_HEARTBEAT_S)
+                if not task.done():
+                    yield _streaming.HEARTBEAT
+            try:
+                result = task.result()
+            except Exception as exc:
+                admission = _policy_admission_error(exc)
+                yield _rapi.responses_failed_event(
+                    rid, admission or f"responses error: {exc}",
+                    "invalid_policy" if admission else "internal_error")
+                return
+            if not result.get("ok"):
+                err = str(result.get("error") or "router error")
+                yield _rapi.responses_failed_event(rid, err, str(result.get("error") or "error"))
+                return
+            obj = _responses_object_with_router(result, req, response_id=rid)
+            for ev in _rapi.responses_sse_events(obj):
+                yield ev
+        return StreamingResponse(gen_running(), media_type="text/event-stream")
 
     async def _handle_chat(req: ChatRequest, profile_name: str | None = None):
         contract = _request_to_contract(req, default_profile, default_max_tokens)

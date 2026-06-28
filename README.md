@@ -32,7 +32,8 @@ declarative `default` policy (balanced quality/cost) is the fallback — itself 
 ```
 core/                  -- git submodule -> genlayerlabs/unhardcoded-engine (the pure Σ_pol core)
 llm_router_host.py     -- embeds the core via lupa; sync/async backends; auth resolver
-shim.py                -- OpenAI-compatible app: /v1/chat/completions (+ per-call policy_ir) and /x/* operator endpoints
+shim.py                -- OpenAI-compatible app: /v1/chat/completions and /v1/responses (+ per-call policy_ir) and /x/* operator endpoints
+responses_api.py       -- inbound OpenAI *Responses* API translation (mirror of codex_backend.py) for /v1/responses
 auth_proxy.py          -- ingress + operator dashboard (Analytics · Builder · Activity · Market · Settings)
 serve.py               -- entry point: wires the api_kind dispatcher + runs uvicorn
 config.live.lua        -- catalog (providers + models), the `default` policy, and the observation fields (incl. OpenRouter benchmark/modality/capability fields)
@@ -76,6 +77,13 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 Empty `model` runs the `default` policy; or send `family:`/`pin:`/`profile:` or a
 per-call `policy_ir`/`flow_ir` (below). Optional providers (Codex, AntSeed) and
 troubleshooting are in [`SETUP.md`](./SETUP.md).
+
+**Responses-only clients (e.g. the Codex CLI):** `POST /v1/responses` (and
+`POST /{profile}/v1/responses`) speak the OpenAI *Responses* API — translated to
+the same routing/policy/metering as chat-completions, streaming Responses SSE.
+Point Codex at the router with `base_url=…/v1`, `wire_api = "responses"`, and the
+router key; use a `/{profile}/v1/responses` base_url to pin a policy by URL (Codex
+can't put `policy_ir` in its body).
 
 ### Develop without Docker (raw shim — no dashboard/auth)
 
