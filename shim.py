@@ -440,6 +440,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         import sources as _sources
         import route_reliability as _rr
         import route_latency as _rl
+        import route_economics as _re
         catalog = host.catalog() or {}
         models = catalog.get("models") or {}
         state = host.dump_state() or {}
@@ -451,11 +452,13 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
 
         # Live perf is host-owned now (#15): the engine no longer folds an EMA, so
         # build it from the host's per-route measurements (route_reliability /
-        # route_latency / the call count), aggregated across the peers/route ids
-        # that serve a given provider|family. None until the router has called it.
+        # route_latency / route_economics / the call count), aggregated across the
+        # peers/route ids that serve a given provider|family. None until the
+        # router has called it.
         _rates = _rr.snapshot()
         _counts = _rr.snapshot_counts()
         _lats = _rl.snapshot()
+        _costs = _re.snapshot()
 
         def _perf(provider, family):
             prefix = f"{provider}|{family}|"
@@ -467,8 +470,11 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             sr_calls = sum(_counts[k] for k in keys if k in _rates)
             lt = sum(_lats[k] * _counts[k] for k in keys if k in _lats)
             lt_calls = sum(_counts[k] for k in keys if k in _lats)
+            ct = sum(_costs[k] * _counts[k] for k in keys if k in _costs)
+            ct_calls = sum(_counts[k] for k in keys if k in _costs)
             return {"success_rate": (sr / sr_calls) if sr_calls else None,
                     "latency_ms": round(lt / lt_calls) if lt_calls else None,
+                    "measured_usd_per_mtok": round(ct / ct_calls, 4) if ct_calls else None,
                     "calls": total}
 
         def _antseed_row(r, family, book):

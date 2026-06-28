@@ -23,6 +23,7 @@ from typing import Callable
 
 import route_reliability as _route_reliability
 import route_latency as _route_latency
+import route_economics as _route_economics
 import route_tool_capability as _route_tool_capability
 import route_cache as _route_cache
 import route_session_meter as _route_session_meter
@@ -674,6 +675,14 @@ def _fold_route_outcome(request: dict, result: dict,
     rkey = _route_reliability.route_key(pid, fam, peer_id or pid)
     _route_reliability.observe(rkey, ok)
     _route_latency.observe(rkey, result.get("latency_ms"), ok)
+    # Measured effective cost: fold the provider-reported cost of this call over
+    # its token count into a per-route $/Mtok EMA. None cost (provider reports
+    # tokens only) leaves the route unmeasured. Observability only for now — it
+    # does not yet feed ranking. Same one route identity as reliability/latency.
+    _resp = result.get("response") or {}
+    _route_economics.observe(
+        rkey, _resp.get("cost_reported"),
+        (_resp.get("tokens_in") or 0) + (_resp.get("tokens_out") or 0), ok)
     # Per-session cache affinity: a successful call makes this route the session's
     # hot route (it now holds the prompt-cache prefix), so the next turn's
     # cache_hot field marks it and a cache-aware policy keeps it sticky. Same one
