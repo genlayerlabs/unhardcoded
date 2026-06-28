@@ -2839,9 +2839,9 @@ def _rotate_usage_history(path: Path) -> None:
 
 
 def _append_usage_history(row: dict[str, Any]) -> None:
-    # Dual-write the call into the SQLite ledger (the emerging source of truth),
+    # Dual-write the call into the host-store ledger (the emerging source of truth),
     # alongside and independent of the usage-history file. OFFLOADED to the host
-    # store's background writer so the SQLite write never sits on the request's
+    # store's background writer so the DB write never sits on the request's
     # latency path. (DEBT: the usage-history file append below is still synchronous
     # blocking IO on the event loop — pre-existing, to offload when its reader
     # migrates onto the ledger.)

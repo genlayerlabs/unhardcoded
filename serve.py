@@ -58,7 +58,7 @@ def main() -> None:
                         "subscription provider — unofficial, ToS-risky.")
     args = p.parse_args()
 
-    # One-shot backfill: seed the SQLite host store from any legacy JSON state
+    # One-shot backfill: seed the host store from any legacy JSON state
     # on the PVC (settings overrides, provider overlay, issued consumer keys),
     # before anything reads it. Idempotent (guard-on-empty) — a no-op on every
     # boot after the first. Then refresh settings, whose import-time reload saw

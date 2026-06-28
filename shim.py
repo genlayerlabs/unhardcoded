@@ -299,8 +299,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
 
     @app.get("/x/calls")
     def recent_calls(limit: int = 100):
-        """Recent rows from the SQLite call ledger (operator view / verification
-        of the emerging source of truth). Read-only."""
+        """Recent rows from the host-store call ledger (operator view /
+        verification of the emerging source of truth). Read-only."""
         import host_store
         return {"calls": host_store.recent_calls(min(max(int(limit), 1), 1000)),
                 "total": host_store.count()}
