@@ -149,13 +149,13 @@ def insert_call(row: dict[str, Any]) -> None:
         )
         with _lock:
             c = _connect()
-            c.execute(
-                "INSERT INTO calls (ts, usage_event_id, session_id, consumer_sha,"
-                " caller, route_key, provider_id, model_family, served_model_id,"
-                " requested_model, status, error_type, latency_ms, tokens_in,"
-                " tokens_out, tokens_total, cost_usd)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
-            c.commit()
+            with c:                          # atomic: commit on success, ROLLBACK
+                c.execute(                   # on exception — never leave a pending
+                    "INSERT INTO calls (ts, usage_event_id, session_id, consumer_sha,"
+                    " caller, route_key, provider_id, model_family, served_model_id,"
+                    " requested_model, status, error_type, latency_ms, tokens_in,"
+                    " tokens_out, tokens_total, cost_usd)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
             _inserts_since_prune += 1
             if _inserts_since_prune >= _PRUNE_EVERY:
                 _inserts_since_prune = 0
@@ -166,8 +166,8 @@ def insert_call(row: dict[str, Any]) -> None:
 
 def _prune_locked(c: sqlite3.Connection) -> None:
     cutoff = int(time.time()) - _RETENTION_DAYS * 86400
-    c.execute("DELETE FROM calls WHERE ts < ?", (cutoff,))
-    c.commit()
+    with c:
+        c.execute("DELETE FROM calls WHERE ts < ?", (cutoff,))
 
 
 def recent_calls(limit: int = 100) -> list[dict[str, Any]]:
@@ -222,11 +222,11 @@ def set_overrides(overrides: dict[str, Any]) -> None:
         rows = [(k, json.dumps(v), now) for k, v in (overrides or {}).items()]
         with _lock:
             c = _connect()
-            c.execute("DELETE FROM settings_overrides")
-            c.executemany(
-                "INSERT INTO settings_overrides(key, value, updated_at)"
-                " VALUES (?,?,?)", rows)
-            c.commit()
+            with c:                          # atomic: rollback on failure, never
+                c.execute("DELETE FROM settings_overrides")   # leave a pending DELETE
+                c.executemany(               # for the next committer to flush
+                    "INSERT INTO settings_overrides(key, value, updated_at)"
+                    " VALUES (?,?,?)", rows)
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store set_overrides failed: %s", exc)
 
@@ -261,11 +261,11 @@ def set_provider_overlays(providers: dict[str, Any]) -> None:
                 for pid, entry in (providers or {}).items()]
         with _lock:
             c = _connect()
-            c.execute("DELETE FROM provider_overlays")
-            c.executemany(
-                "INSERT INTO provider_overlays(provider_id, entry, added_at)"
-                " VALUES (?,?,?)", rows)
-            c.commit()
+            with c:                          # atomic: rollback on failure
+                c.execute("DELETE FROM provider_overlays")
+                c.executemany(
+                    "INSERT INTO provider_overlays(provider_id, entry, added_at)"
+                    " VALUES (?,?,?)", rows)
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store set_provider_overlays failed: %s", exc)
 
@@ -300,11 +300,11 @@ def set_consumer_keys(records: dict[str, Any]) -> None:
                 for consumer, rec in (records or {}).items()]
         with _lock:
             c = _connect()
-            c.execute("DELETE FROM consumer_keys")
-            c.executemany(
-                "INSERT INTO consumer_keys(consumer, record, updated_at)"
-                " VALUES (?,?,?)", rows)
-            c.commit()
+            with c:                          # atomic: rollback on failure — a
+                c.execute("DELETE FROM consumer_keys")   # half-done write must not
+                c.executemany(               # leave a pending DELETE that the next
+                    "INSERT INTO consumer_keys(consumer, record, updated_at)"  # commit
+                    " VALUES (?,?,?)", rows)  # would flush, silently wiping credentials
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store set_consumer_keys failed: %s", exc)
 

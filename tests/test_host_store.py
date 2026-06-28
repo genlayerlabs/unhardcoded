@@ -4,6 +4,7 @@ Fail-soft writes, time-bounded retention."""
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -143,3 +144,38 @@ def test_backfill_failsoft_on_corrupt_file(store, tmp_path, monkeypatch):
     _legacy_files(tmp_path, monkeypatch, ov="not json{")
     hs.migrate_legacy_json()                              # must not raise
     assert hs.get_overrides() == {}                       # corrupt -> empty, not fatal
+
+
+def test_failed_write_rolls_back_and_does_not_poison_next_commit(store, monkeypatch):
+    # A set_* that fails AFTER its DELETE (e.g. an IO error mid-INSERT) must roll
+    # back — never leave a pending DELETE on the SHARED connection that the next
+    # committer (insert_call on the next request) would flush, silently wiping the
+    # table, credentials included. Guard verified by the rejection: a write that
+    # must fail leaves the prior data intact and cannot be flushed later.
+    hs.set_consumer_keys({"crm": {"status": "active"}})
+    assert hs.get_consumer_keys()[0] == {"crm": {"status": "active"}}
+
+    real = hs._connect()
+
+    class _ExecManyFails:                    # DELETE runs, executemany blows up
+        def execute(self, *a, **k):
+            return real.execute(*a, **k)
+        def executemany(self, *a, **k):
+            raise sqlite3.OperationalError("disk I/O error")
+        def __enter__(self):
+            return real.__enter__()
+        def __exit__(self, *a):
+            return real.__exit__(*a)
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    orig_connect = hs._connect
+    monkeypatch.setattr(hs, "_connect", lambda: _ExecManyFails())
+    hs.set_consumer_keys({"crm2": {"status": "x"}})       # fails mid-write, fail-soft
+    monkeypatch.setattr(hs, "_connect", orig_connect)     # restore (not undo: keeps DB path)
+
+    # the failed write rolled back its DELETE -> the credentials are intact ...
+    assert hs.get_consumer_keys()[0] == {"crm": {"status": "active"}}
+    # ... and the next real commit does NOT surface a phantom DELETE.
+    hs.insert_call({"ts": 1, "status": 200, "provider": "p", "model_family": "f"})
+    assert hs.get_consumer_keys()[0] == {"crm": {"status": "active"}}   # NOT wiped
