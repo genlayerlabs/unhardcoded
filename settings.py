@@ -185,7 +185,8 @@ def validate_and_write(updates: dict[str, Any]) -> tuple[dict[str, Any], list[st
         new[key] = c
     if errors:
         return {}, errors
-    host_store.set_overrides(new)
+    if not host_store.set_overrides(new):
+        return {}, ["failed to persist config overrides"]
     reload()
     return new, []
 

@@ -313,14 +313,17 @@ def _issued_consumer_records() -> dict[str, dict[str, Any]]:
     return {name: _normalize_consumer_record(name, issued.get(name)) for name in consumers}
 
 
-def _write_issued_consumer_records(records: dict[str, dict[str, Any]]) -> None:
+def _write_issued_consumer_records(records: dict[str, dict[str, Any]]) -> bool:
+    """Persist the consumer records; returns True on success, False on a
+    persistence failure — a swallowed failure would let a key rotation/revocation
+    be reported as saved while still working after a restart (a security hole)."""
     compact = {}
     for consumer, record in sorted(records.items()):
         normalized = _normalize_consumer_record(consumer, record)
         if normalized["status"] == "active" and not normalized["allowed_routes"] and normalized["rate_per_min"] is None and normalized["burst"] is None and not normalized["keys"]:
             continue
         compact[consumer] = normalized
-    host_store.set_consumer_keys(compact)
+    return host_store.set_consumer_keys(compact)
 
 
 def _consumer_meta(consumer: str) -> dict[str, Any]:
@@ -896,6 +899,11 @@ def _login_connections_snapshot(*, timeframe: str = "all", consumer: str | None 
 @app.on_event("startup")
 async def startup() -> None:
     global _client, _probe_task
+    # The ingress is the owner of the operational store (consumer keys, the ledger,
+    # operator-config writes). Run the one-shot legacy-JSON backfill here too —
+    # idempotent (advisory lock + guard-on-empty), so it is safe whether the router
+    # or the ingress reaches the shared DB first (k8s starts both in parallel).
+    host_store.migrate_legacy_json()
     _client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0))
     if SYNTHETIC_PROBES_ENABLED and ROUTE_HEALTH_ROUTES:
         _probe_task = asyncio.create_task(_synthetic_probe_loop())
@@ -1994,7 +2002,8 @@ async def dashboard_update_consumer(consumer: str, request: Request) -> Response
         meta["burst"] = _optional_int(data.get("burst"), min_value=1)
     meta["updated_at"] = int(time.time())
     records[consumer] = meta
-    _write_issued_consumer_records(records)
+    if not _write_issued_consumer_records(records):
+        return JSONResponse(status_code=500, content={"ok": False, "error": "failed to persist consumer settings"})
     _log({"event": "dashboard_consumer_updated", "consumer": consumer, "viewer": caller, "status": meta.get("status")})
     return JSONResponse(content={"ok": True, "consumer": consumer, "settings": _normalize_consumer_record(consumer, meta)})
 
@@ -2044,7 +2053,8 @@ async def dashboard_revoke_key(request: Request) -> Response:
         return JSONResponse(status_code=404, content={"error": {"message": "key prefix not found for consumer", "type": "not_found", "code": "key_not_found"}})
     meta["updated_at"] = now
     records[consumer] = meta
-    _write_issued_consumer_records(records)
+    if not _write_issued_consumer_records(records):
+        return JSONResponse(status_code=500, content={"ok": False, "error": "failed to persist key revocation"})
     _log({"event": "dashboard_key_revoked", "consumer": consumer, "viewer": caller, "sha256_prefix": prefix, "removed_hashes": removed, "removed_plaintext": removed_plaintext})
     return JSONResponse(content={"ok": True, "consumer": consumer, "sha256_prefix": prefix, "removed_hashes": removed, "removed_plaintext": removed_plaintext})
 
@@ -2084,7 +2094,8 @@ async def dashboard_add_provider(request: Request) -> Response:
         _upsert_env_line(Path(DASHBOARD_KEY_ENV_PATH), auth_env, key)
         overlay = load_overlay()
         overlay.setdefault("providers", {})[pid] = entry
-        save_overlay(overlay)
+        if not save_overlay(overlay):
+            return JSONResponse(status_code=500, content={"error": {"message": "failed to persist provider overlay", "type": "provider_add_error", "code": "provider_add"}})
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": {"message": str(exc), "type": "provider_add_error", "code": "provider_add"}})
     # hot-apply on the running router; on failure the provider still applies
@@ -2498,7 +2509,8 @@ async def dashboard_create_key(request: Request) -> Response:
     meta["status"] = meta.get("status") or "active"
     meta["updated_at"] = now
     records[consumer] = meta
-    _write_issued_consumer_records(records)
+    if not _write_issued_consumer_records(records):
+        return JSONResponse(status_code=500, content={"ok": False, "error": "failed to persist the issued key"})
     _log({"event": "dashboard_key_created", "consumer": consumer, "viewer": caller, "rotate": rotate})
     return JSONResponse(content={"ok": True, "consumer": consumer, "api_key": token, "sha256_prefix": token_hash[:12], "rotate": rotate, "grace_period_s": None if not rotate else (DEFAULT_ROTATION_GRACE_S if grace_period_s is None else grace_period_s), "warning": "Copy now. The raw key is shown once and only hashed key metadata is persisted."})
 

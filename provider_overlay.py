@@ -28,7 +28,7 @@ import re
 
 import host_store
 
-_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,40}$")
+_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,39}$")   # 2-40 chars (1 + up to 39)
 _ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,60}$")
 
 
@@ -38,10 +38,11 @@ def load_overlay() -> dict:
     return host_store.get_provider_overlays()
 
 
-def save_overlay(overlay: dict) -> None:
-    """Persist the full overlay to the host store. Keys are never stored here
-    (they live in .env.secrets via the auth_env indirection)."""
-    host_store.set_provider_overlays((overlay or {}).get("providers") or {})
+def save_overlay(overlay: dict) -> bool:
+    """Persist the full overlay to the host store; returns True on success, False
+    on a persistence failure (so the caller doesn't report a provider added when it
+    wasn't durable). Keys are never stored here (they live in .env.secrets)."""
+    return host_store.set_provider_overlays((overlay or {}).get("providers") or {})
 
 
 def validate_entry(pid: str, entry: dict, catalog: dict) -> list[str]:
