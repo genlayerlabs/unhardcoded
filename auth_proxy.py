@@ -1007,8 +1007,8 @@ def _load_policy_config() -> dict[str, Any]:
 
 
 def _merge_provider_overlay(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Fold operator-added providers (providers.local.json) into the parsed
-    catalog so the dashboard lists them like hand-configured ones."""
+    """Fold operator-added providers (the provider_overlays store) into the
+    parsed catalog so the dashboard lists them like hand-configured ones."""
     try:
         from provider_overlay import load_overlay
         overlay = load_overlay()
@@ -2052,8 +2052,8 @@ async def dashboard_revoke_key(request: Request) -> Response:
 @app.post("/dashboard/api/provider-keys/add")
 async def dashboard_add_provider(request: Request) -> Response:
     """Add a provider + its API key from the dashboard. Persists the key to
-    .env.secrets (auth_env indirection) and the provider definition to
-    providers.local.json, then hot-applies it via the router's /x/providers
+    .env.secrets (auth_env indirection) and the provider definition to the host
+    store (provider_overlays), then hot-applies it via the router's /x/providers
     so it serves without a restart. Admin-only, like key reveal."""
     caller, error = _require_admin_dashboard_caller(request)
     if error:
@@ -3756,7 +3756,7 @@ def _dashboard_html() -> str:
 
     <section class='grid hidden page' id='providerKeysPage'>
       <div class='card span12'><div class='toolbar'><div><div class='label'>LLM provider credentials</div><div class='muted small'>Privatized view: env names and 12-char key fingerprints only. No raw provider keys or full hashes.</div></div><div class='toolbarRight'><button class='btn primary' id='toggleAddProvider'>Add provider</button></div></div><div id='providerKeys'></div></div>
-      <div class='card span12' id='addProviderCard' style='display:none'><div class='toolbar'><div><div class='label'>Add provider</div><div class='muted small'>OpenAI-compatible endpoints only. The key is stored in .env.secrets under the env var; the provider definition persists in providers.local.json and goes live immediately.</div></div></div><div class='cardPad'><div class='formGrid'><label>Provider id<input id='addProvId' placeholder='groq' /></label><label>Base URL<input id='addProvBaseUrl' placeholder='https://api.groq.com/openai/v1' /></label><label>Tier<select id='addProvTier' class='select'><option value='partner'>partner</option><option value='fallback'>fallback</option></select></label><label>Key env var<input id='addProvEnv' placeholder='GROQ_API_KEY' /></label><label>API key<input id='addProvKey' type='password' placeholder='sk-…' autocomplete='off' /></label><label>Served models (one per line: family or family=provider_model_id)<textarea id='addProvModels' rows='3' placeholder='llama-3.3-70b=llama-3.3-70b-versatile'></textarea></label></div><div class='actions' style='margin-top:10px'><button class='btn primary' id='addProvSubmit'>Add provider</button><button class='btn' id='addProvCancel'>Cancel</button></div><div id='addProvResult' class='muted small' style='margin-top:8px'></div></div></div>
+      <div class='card span12' id='addProviderCard' style='display:none'><div class='toolbar'><div><div class='label'>Add provider</div><div class='muted small'>OpenAI-compatible endpoints only. The key is stored in .env.secrets under the env var; the provider definition persists in the host store and goes live immediately.</div></div></div><div class='cardPad'><div class='formGrid'><label>Provider id<input id='addProvId' placeholder='groq' /></label><label>Base URL<input id='addProvBaseUrl' placeholder='https://api.groq.com/openai/v1' /></label><label>Tier<select id='addProvTier' class='select'><option value='partner'>partner</option><option value='fallback'>fallback</option></select></label><label>Key env var<input id='addProvEnv' placeholder='GROQ_API_KEY' /></label><label>API key<input id='addProvKey' type='password' placeholder='sk-…' autocomplete='off' /></label><label>Served models (one per line: family or family=provider_model_id)<textarea id='addProvModels' rows='3' placeholder='llama-3.3-70b=llama-3.3-70b-versatile'></textarea></label></div><div class='actions' style='margin-top:10px'><button class='btn primary' id='addProvSubmit'>Add provider</button><button class='btn' id='addProvCancel'>Cancel</button></div><div id='addProvResult' class='muted small' style='margin-top:8px'></div></div></div>
       <div class='card span12'><div class='toolbar'><div><div class='label'>Codex accounts</div><div class='muted small'>ChatGPT-subscription auth.json accounts (paste the output of `codex login`). Stored on the PVC, applied live. Token fingerprints only — never the raw token.</div></div><div class='toolbarRight'><button class='btn primary' id='toggleAddCodex'>Add codex account</button></div></div><div id='codexAccounts'></div></div>
       <div class='card span12' id='addCodexCard' style='display:none'><div class='cardPad'><div class='formGrid'><label>Account name<input id='addCodexName' placeholder='team-1' /></label><label>auth.json<textarea id='addCodexJson' rows='6' placeholder='{&quot;tokens&quot;:{&quot;access_token&quot;:&quot;...&quot;,&quot;refresh_token&quot;:&quot;...&quot;,&quot;account_id&quot;:&quot;...&quot;}}'></textarea></label></div><div class='actions' style='margin-top:10px'><button class='btn primary' id='addCodexSubmit'>Save account</button><button class='btn' id='addCodexCancel'>Cancel</button></div><div id='addCodexResult' class='muted small' style='margin-top:8px'></div></div></div>
     </section>

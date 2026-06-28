@@ -636,8 +636,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         only). Validates against the live catalog, injects the key into the
         process env, merges the provider into the Lua config and re-inits the
         core with breakers/EMA state preserved. Persistence is the ingress's
-        job (providers.local.json + .env.secrets); this endpoint only makes
-        it live. Internal — /x/* is hidden from consumers."""
+        job (the provider_overlays store + .env.secrets); this endpoint only
+        makes it live. Internal — /x/* is hidden from consumers."""
         import os
 
         from provider_overlay import apply_to_host, validate_entry
