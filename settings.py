@@ -1,21 +1,19 @@
 """Operator-tunable runtime knobs, overridable from the dashboard Config tab.
 
-Each knob has an ENV default (back-compat) plus an optional override persisted to
-a JSON file on the PVC. Reads go through get() so an override applies live: the
-writer (ingress dashboard) and the readers (router sources, ingress runway) share
-the PVC file; the ingress writes it, the router re-reads it on /x/config/reload.
-Unknown keys and out-of-range values are ignored — the default always wins, so a
-bad override can never break ranking.
+Each knob has an ENV default (back-compat) plus an optional override persisted in
+the host store (`settings_overrides` table). Reads go through get() so an override
+applies live: the writer (ingress dashboard) and the readers (router sources,
+ingress runway) share the store; the ingress writes it, the router re-reads it on
+/x/config/reload. Unknown keys and out-of-range values are ignored — the default
+always wins, so a bad override can never break ranking.
 """
 from __future__ import annotations
 
-import json
 import os
 import threading
 from typing import Any
 
-OVERRIDES_PATH = os.getenv("LLM_ROUTER_CONFIG_OVERRIDES",
-                           "/run/llm-router/secrets/config-overrides.json")
+import host_store
 
 
 def _f(env: str, d: float) -> float:
@@ -105,15 +103,9 @@ _overrides: dict[str, Any] = {}
 
 
 def reload() -> dict[str, Any]:
-    """Re-read the override file; keep only schema-known keys."""
+    """Re-read the overrides from the host store; keep only schema-known keys."""
     global _overrides
-    try:
-        with open(OVERRIDES_PATH) as f:
-            raw = json.load(f)
-        if not isinstance(raw, dict):
-            raw = {}
-    except (OSError, ValueError):
-        raw = {}
+    raw = host_store.get_overrides()
     kept = {k: v for k, v in raw.items() if k in SCHEMA}
     with _lock:
         _overrides = kept
@@ -193,14 +185,7 @@ def validate_and_write(updates: dict[str, Any]) -> tuple[dict[str, Any], list[st
         new[key] = c
     if errors:
         return {}, errors
-    tmp = OVERRIDES_PATH + ".tmp"
-    try:
-        os.makedirs(os.path.dirname(OVERRIDES_PATH), exist_ok=True)
-        with open(tmp, "w") as f:
-            json.dump(new, f)
-        os.replace(tmp, OVERRIDES_PATH)
-    except OSError as exc:
-        return {}, [str(exc)]
+    host_store.set_overrides(new)
     reload()
     return new, []
 

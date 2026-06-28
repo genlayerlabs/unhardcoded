@@ -666,9 +666,11 @@ def test_settings_list_knob_coerces_csv_dedupes_and_validates():
 
 
 def test_settings_validate_and_write_list_roundtrip(tmp_path, monkeypatch):
+    import host_store
     import settings
-    monkeypatch.setattr(settings, "OVERRIDES_PATH", str(tmp_path / "ov.json"))
-    monkeypatch.setattr(settings, "_overrides", {})
+    monkeypatch.setenv("ROUTER_DB_PATH", str(tmp_path / "host-store.db"))
+    host_store.reset()
+    settings.reload()
     new, errs = settings.validate_and_write({"antseed.peer_denylist": "p1, p2, p1"})
     assert errs == [] and new["antseed.peer_denylist"] == ["p1", "p2"]
     assert settings.get("antseed.peer_denylist") == ["p1", "p2"]

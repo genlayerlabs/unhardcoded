@@ -23,6 +23,7 @@ a later, separate concern — a shared store with TTL/eviction).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -64,6 +65,12 @@ CREATE INDEX IF NOT EXISTS idx_calls_ts       ON calls(ts);
 CREATE INDEX IF NOT EXISTS idx_calls_route    ON calls(route_key, ts);
 CREATE INDEX IF NOT EXISTS idx_calls_session  ON calls(session_id);
 CREATE INDEX IF NOT EXISTS idx_calls_consumer ON calls(consumer_sha, ts);
+
+CREATE TABLE IF NOT EXISTS settings_overrides (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,   -- JSON-encoded knob value
+    updated_at INTEGER NOT NULL
+);
 """
 
 _lock = threading.Lock()
@@ -172,6 +179,44 @@ def count() -> int:
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store count failed: %s", exc)
         return 0
+
+
+# ---- settings_overrides (operator knob overrides; replaces overrides.json) -----
+
+def get_overrides() -> dict[str, Any]:
+    """All operator knob overrides, key -> decoded value. Empty (defaults win)
+    on any error."""
+    try:
+        with _lock:
+            c = _connect()
+            cur = c.execute("SELECT key, value FROM settings_overrides")
+            out: dict[str, Any] = {}
+            for k, v in cur.fetchall():
+                try:
+                    out[k] = json.loads(v)
+                except (TypeError, ValueError):
+                    continue
+            return out
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store get_overrides failed: %s", exc)
+        return {}
+
+
+def set_overrides(overrides: dict[str, Any]) -> None:
+    """Replace the FULL override set (mirrors the old whole-file write). A key
+    absent from `overrides` is cleared back to its default."""
+    try:
+        now = int(time.time())
+        rows = [(k, json.dumps(v), now) for k, v in (overrides or {}).items()]
+        with _lock:
+            c = _connect()
+            c.execute("DELETE FROM settings_overrides")
+            c.executemany(
+                "INSERT INTO settings_overrides(key, value, updated_at)"
+                " VALUES (?,?,?)", rows)
+            c.commit()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store set_overrides failed: %s", exc)
 
 
 def reset() -> None:
