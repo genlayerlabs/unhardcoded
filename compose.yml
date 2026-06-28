@@ -25,6 +25,11 @@ services:
       # -> http://127.0.0.1:8379.
       ANTSEED_CONTROL_URL: http://antseed:8379
       ANTSEED_CONTROL_TOKEN: ${ANTSEED_CONTROL_TOKEN:-}
+      # Operational store (router reads operator config from it). Prod = RDS.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://hoststore:hoststore@postgres:5432/hoststore}
+    depends_on:
+      postgres:
+        condition: service_healthy
     command:
       - python
       - serve.py
@@ -69,10 +74,15 @@ services:
     depends_on:
       router:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     env_file:
       - ./.env.secrets
     environment:
       ROUTER_UPSTREAM: http://router:18080
+      # Operational store: the ingress is the writer (consumer keys, the ledger,
+      # operator-config writes) + runs the one-shot legacy backfill. Prod = RDS.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://hoststore:hoststore@postgres:5432/hoststore}
       RATE_PER_MIN: ${RATE_PER_MIN:-600}
       BURST: ${BURST:-200}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -165,6 +175,27 @@ services:
         aliases:
           - ollama
 
+  # Operational store shared by router + ingress (dev). Prod = RDS via DATABASE_URL.
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: hoststore
+      POSTGRES_PASSWORD: hoststore
+      POSTGRES_DB: hoststore
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hoststore -d hoststore"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      llm-router-internal:
+        aliases:
+          - postgres
+
 networks:
   llm-router-internal:
     name: llm-router-internal
@@ -176,3 +207,4 @@ volumes:
   antseed-data:
   antseed-market:
   ollama-data:
+  postgres-data:
