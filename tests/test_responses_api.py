@@ -151,3 +151,70 @@ def test_tool_choice_to_chat_is_inverse_of_to_responses():
     nested = {"type": "function", "function": {"name": "shell"}}
     flat = cb._to_responses_tool_choice(nested)
     assert ra.tool_choice_to_chat(flat) == nested
+
+
+# ---- result_to_responses_object ----------------------------------------
+
+def _result(text="", tool_calls=None, finish="stop",
+            tin=7, tout=3, ttot=10, raw_model="mock-model"):
+    return {"ok": True, "response": {
+        "text": text, "tool_calls": tool_calls, "finish_reason": finish,
+        "tokens_in": tin, "tokens_out": tout, "tokens_total": ttot,
+        "raw_model": raw_model}, "chosen": {"served_model_id": "srv"}}
+
+
+def test_object_text_only():
+    obj = ra.result_to_responses_object(_result(text="hello"), "policy:auto",
+                                        response_id="resp_x", created_at=111,
+                                        msg_id="msg_x")
+    assert obj["id"] == "resp_x"
+    assert obj["object"] == "response"
+    assert obj["created_at"] == 111
+    assert obj["status"] == "completed"
+    assert obj["model"] == "mock-model"
+    assert obj["output"] == [{
+        "type": "message", "id": "msg_x", "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "hello", "annotations": []}]}]
+    assert obj["usage"] == {"input_tokens": 7, "output_tokens": 3,
+                            "total_tokens": 10}
+
+
+def test_object_tool_calls_only_has_no_message_item():
+    tcs = [{"id": "call_1", "type": "function",
+            "function": {"name": "shell", "arguments": '{"command":"ls"}'}}]
+    obj = ra.result_to_responses_object(_result(text="", tool_calls=tcs),
+                                        response_id="r", created_at=1)
+    types = [o["type"] for o in obj["output"]]
+    assert types == ["function_call"]
+    fc = obj["output"][0]
+    assert fc["call_id"] == "call_1" and fc["name"] == "shell"
+    assert fc["arguments"] == '{"command":"ls"}'
+    assert fc["status"] == "completed" and fc["id"].startswith("fc_")
+
+
+def test_object_text_and_tool_calls():
+    tcs = [{"id": "c1", "type": "function",
+            "function": {"name": "f", "arguments": "{}"}}]
+    obj = ra.result_to_responses_object(_result(text="ok", tool_calls=tcs),
+                                        response_id="r", created_at=1)
+    assert [o["type"] for o in obj["output"]] == ["message", "function_call"]
+
+
+def test_object_length_finish_is_incomplete():
+    obj = ra.result_to_responses_object(_result(text="x", finish="length"),
+                                        response_id="r", created_at=1)
+    assert obj["status"] == "incomplete"
+
+
+def test_object_omits_usage_when_unknown():
+    obj = ra.result_to_responses_object(
+        _result(text="x", tin=None, tout=None, ttot=None),
+        response_id="r", created_at=1)
+    assert "usage" not in obj
+
+
+def test_object_uses_now_when_created_at_absent():
+    obj = ra.result_to_responses_object(_result(text="x"), response_id="r",
+                                        now=lambda: 555)
+    assert obj["created_at"] == 555

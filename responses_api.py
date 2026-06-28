@@ -147,3 +147,69 @@ def tool_choice_to_chat(tc: Any) -> Any:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:24]}"
+
+
+# ---- response out: router result -> Responses object ----------------------
+
+def result_to_responses_object(
+    result: dict,
+    requested_model: str = "",
+    *,
+    response_id: str | None = None,
+    created_at: int | None = None,
+    msg_id: str | None = None,
+    now=None,
+) -> dict:
+    """Router result -> a complete Responses `response` object.
+
+    The single source both the non-stream JSON return and the SSE replay use, so
+    they carry identical ids. Pure: x_router + per-session metering are attached
+    by the shim. Deterministic when ids/created_at/now are supplied (tests)."""
+    resp = result.get("response") or {}
+    chosen = result.get("chosen") or {}
+    text = resp.get("text") or ""
+    tool_calls = resp.get("tool_calls") or []
+    finish = resp.get("finish_reason") or "stop"
+
+    model = (resp.get("raw_model") or chosen.get("served_model_id")
+             or requested_model or "")
+    ts = created_at if created_at is not None else int((now or time.time)())
+
+    output: list[dict] = []
+    if text:
+        output.append({
+            "type": "message",
+            "id": msg_id or _new_id("msg"),
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        })
+    for tc in tool_calls:
+        fn = tc.get("function") or {}
+        output.append({
+            "type": "function_call",
+            "id": _new_id("fc"),
+            "call_id": tc.get("id") or _new_id("call"),
+            "name": fn.get("name") or "",
+            "arguments": fn.get("arguments") or "{}",
+            "status": "completed",
+        })
+
+    obj: dict = {
+        "id": response_id or _new_id("resp"),
+        "object": "response",
+        "created_at": ts,
+        "status": "incomplete" if finish == "length" else "completed",
+        "model": model,
+        "output": output,
+    }
+    usage = {}
+    if resp.get("tokens_in") is not None:
+        usage["input_tokens"] = resp["tokens_in"]
+    if resp.get("tokens_out") is not None:
+        usage["output_tokens"] = resp["tokens_out"]
+    if resp.get("tokens_total") is not None:
+        usage["total_tokens"] = resp["tokens_total"]
+    if usage:
+        obj["usage"] = usage
+    return obj
