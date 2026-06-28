@@ -1,5 +1,7 @@
-"""Unit tests for responses_api.py — the inbound Responses-API translation
-(mirror of codex_backend.py). Pure, no host."""
+"""Unit tests for responses_api.py — the inbound OpenAI Responses-API surface.
+Pure, no host. Fixtures are real Responses-API payloads (what the Codex CLI
+sends), NOT generated from the codex provider backend — the client surface is
+independent of any provider."""
 from __future__ import annotations
 
 import json
@@ -9,7 +11,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-import codex_backend as cb  # noqa: E402
 import responses_api as ra  # noqa: E402
 
 
@@ -94,9 +95,24 @@ def test_assistant_text_then_function_call_merge_into_one_message():
     ]
 
 
-def test_roundtrip_inverse_of_messages_to_input():
-    # The canonical tool-history conversation that 400d live (test_codex.py).
-    msgs = [
+def test_input_with_tool_history_becomes_chat_messages():
+    # A real Responses `input` carrying a full tool-using history (the shape the
+    # Codex CLI replays each turn): assistant tool_calls are modeled as separate
+    # `function_call` items and tool results as `function_call_output` items —
+    # the case that 400d live before this surface existed.
+    items = [
+        {"role": "system", "content": "be terse"},
+        {"role": "user", "content": "weather in BCN?"},
+        {"type": "function_call", "call_id": "call_1", "name": "get_weather",
+         "arguments": '{"city":"BCN"}'},
+        {"type": "function_call", "call_id": "call_2", "name": "get_time",
+         "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_1", "output": "22C sunny"},
+        {"type": "function_call_output", "call_id": "call_2", "output": "14:00"},
+        {"role": "assistant", "content": "It's 22C."},
+        {"role": "user", "content": "and tomorrow?"},
+    ]
+    assert ra.input_to_messages(items) == [
         {"role": "system", "content": "be terse"},
         {"role": "user", "content": "weather in BCN?"},
         {"role": "assistant", "content": None, "tool_calls": [
@@ -110,12 +126,6 @@ def test_roundtrip_inverse_of_messages_to_input():
         {"role": "assistant", "content": "It's 22C."},
         {"role": "user", "content": "and tomorrow?"},
     ]
-    # item-level inverse: _messages_to_input keeps the system message as an
-    # input ITEM (instructions is a separate Responses field, covered by its own
-    # test), so the clean round-trip passes no instructions.
-    items = cb._messages_to_input(msgs)
-    rebuilt = ra.input_to_messages(items)
-    assert rebuilt == msgs
 
 
 # ---- tools_to_chat / tool_choice_to_chat -------------------------------
@@ -128,14 +138,18 @@ def test_tools_to_chat_nests_function_tools():
         "parameters": {"type": "object", "properties": {}}}}]
 
 
-def test_tools_to_chat_is_inverse_of_to_responses_tools():
-    nested = [{"type": "function", "function": {
+def test_tools_to_chat_nests_full_function_schema():
+    # A real Responses flat tool (what Codex sends) -> the nested chat shape.
+    flat = [{"type": "function", "name": "shell",
+             "description": "run a shell command",
+             "parameters": {"type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"]}}]
+    assert ra.tools_to_chat(flat) == [{"type": "function", "function": {
         "name": "shell", "description": "run a shell command",
         "parameters": {"type": "object",
                        "properties": {"command": {"type": "string"}},
                        "required": ["command"]}}}]
-    flat = cb._to_responses_tools(nested)
-    assert ra.tools_to_chat(flat) == nested
 
 
 def test_tools_to_chat_drops_unknown_tool_types():
@@ -170,10 +184,11 @@ def test_tool_choice_to_chat_passthrough_and_named():
         "type": "function", "function": {"name": "shell"}}
 
 
-def test_tool_choice_to_chat_is_inverse_of_to_responses():
-    nested = {"type": "function", "function": {"name": "shell"}}
-    flat = cb._to_responses_tool_choice(nested)
-    assert ra.tool_choice_to_chat(flat) == nested
+def test_tool_choice_to_chat_named_function_is_nested():
+    # A real Responses named tool_choice (flat) -> the nested chat shape.
+    flat = {"type": "function", "name": "shell"}
+    assert ra.tool_choice_to_chat(flat) == {
+        "type": "function", "function": {"name": "shell"}}
 
 
 # ---- result_to_responses_object ----------------------------------------

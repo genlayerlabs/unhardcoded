@@ -1,16 +1,22 @@
 """
-responses_api.py — inbound OpenAI *Responses* API translation for the shim.
+responses_api.py — the inbound OpenAI *Responses* API surface for the shim.
 
-The mirror of codex_backend.py: codex_backend translates the router's chat
-contract OUT to the upstream Codex Responses endpoint (and its SSE back); this
-module translates a Responses request IN to the chat-completions messages/tools
-the router contract understands, and the router's result back OUT to a Responses
+A sibling of the chat-completions surface (`/v1/chat/completions`): it implements
+the OpenAI Responses wire contract for clients that speak only it (the Codex CLI).
+It translates a Responses request IN to the chat-completions messages/tools the
+router contract understands, and the router's result back OUT to a Responses
 `response` object and its SSE event stream.
 
-Pure + side-effect free (the FastAPI glue lives in shim.py), unit-tested like
-tests/test_codex.py. The SSE event vocabulary emitted here is exactly the
-vocabulary codex_backend.aggregate_codex_sse consumes, so the two stay mutually
-consistent.
+This is a CLIENT-facing surface: it is independent of which provider the router
+routes to. In particular it is unrelated to the codex *provider* backend
+(`codex_backend.py`), which consumes a ChatGPT subscription in the OPPOSITE
+direction — the two only share the external OpenAI Responses wire format, and
+each owns its own translation so a provider-driven change never reaches here.
+
+Pure + side-effect free (the FastAPI glue lives in shim.py). The SSE event names
+emitted here are the public OpenAI Responses event vocabulary (`response.created`,
+`response.output_text.*`, `response.function_call_arguments.*`,
+`response.completed` / `.failed`).
 """
 from __future__ import annotations
 
@@ -24,8 +30,8 @@ from typing import Any, Iterable
 
 def _part_text(content: Any) -> str:
     """A Responses content value (str | content-parts list | None) -> text.
-    Mirror of codex_backend._content_to_text, reading the Responses `text` field
-    of each part (input_text / output_text / text)."""
+    Reads the Responses `text` field of each content part (input_text /
+    output_text / text)."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -44,7 +50,7 @@ def _part_text(content: Any) -> str:
 def input_to_messages(input_: Any, instructions: str | None = None) -> list[dict]:
     """Responses `input` (+ `instructions`) -> chat-completions `messages`.
 
-    Inverse of codex_backend._messages_to_input:
+    The Responses item model -> chat messages:
       - `instructions` (if set) -> a leading system message.
       - a string `input` -> one user message.
       - `{role, content}` / `{type:"message", role, content}` -> a message
@@ -114,8 +120,7 @@ def input_to_messages(input_: Any, instructions: str | None = None) -> list[dict
 
 def tools_to_chat(tools: Any) -> "list[dict] | None":
     """Responses tools (FLAT {type:"function", name, ...}) -> chat-completions
-    tools (NESTED {type:"function", function:{name,...}}). Inverse of
-    codex_backend._to_responses_tools.
+    tools (NESTED {type:"function", function:{name,...}}).
 
     Unknown/native tool types (local_shell, web_search, custom, …) are DROPPED,
     not forwarded: a plain chat-completions provider rejects any tool whose
@@ -150,8 +155,8 @@ def dropped_tool_types(tools: Any) -> list[str]:
 
 
 def tool_choice_to_chat(tc: Any) -> Any:
-    """Inverse of codex_backend._to_responses_tool_choice. Strings pass through;
-    {type:"function", name} -> {type:"function", function:{name}}."""
+    """Responses tool_choice -> chat-completions tool_choice. Strings pass
+    through; {type:"function", name} -> {type:"function", function:{name}}."""
     if tc is None or isinstance(tc, str):
         return tc
     if isinstance(tc, dict) and tc.get("type") == "function":
