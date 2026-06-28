@@ -71,6 +71,12 @@ CREATE TABLE IF NOT EXISTS settings_overrides (
     value      TEXT NOT NULL,   -- JSON-encoded knob value
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS provider_overlays (
+    provider_id TEXT PRIMARY KEY,
+    entry       TEXT NOT NULL,   -- JSON provider definition (never a key)
+    added_at    INTEGER NOT NULL
+);
 """
 
 _lock = threading.Lock()
@@ -217,6 +223,45 @@ def set_overrides(overrides: dict[str, Any]) -> None:
             c.commit()
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store set_overrides failed: %s", exc)
+
+
+# ---- provider_overlays (operator-added providers; replaces providers.local.json) --
+
+def get_provider_overlays() -> dict[str, Any]:
+    """The operator-added provider overlay as {'providers': {pid: entry}}. Empty
+    on any error (no overlay -> only config.live.lua providers)."""
+    try:
+        with _lock:
+            c = _connect()
+            cur = c.execute("SELECT provider_id, entry FROM provider_overlays")
+            providers: dict[str, Any] = {}
+            for pid, entry in cur.fetchall():
+                try:
+                    providers[pid] = json.loads(entry)
+                except (TypeError, ValueError):
+                    continue
+            return {"providers": providers}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store get_provider_overlays failed: %s", exc)
+        return {"providers": {}}
+
+
+def set_provider_overlays(providers: dict[str, Any]) -> None:
+    """Replace the FULL overlay set (mirrors the old whole-file write)."""
+    try:
+        now = int(time.time())
+        rows = [(pid, json.dumps(entry),
+                 int((entry or {}).get("added_at") or now))
+                for pid, entry in (providers or {}).items()]
+        with _lock:
+            c = _connect()
+            c.execute("DELETE FROM provider_overlays")
+            c.executemany(
+                "INSERT INTO provider_overlays(provider_id, entry, added_at)"
+                " VALUES (?,?,?)", rows)
+            c.commit()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store set_provider_overlays failed: %s", exc)
 
 
 def reset() -> None:
