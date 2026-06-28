@@ -309,6 +309,53 @@ def set_consumer_keys(records: dict[str, Any]) -> None:
         _log.warning("host_store set_consumer_keys failed: %s", exc)
 
 
+# ---- one-shot backfill of legacy JSON state (run once at startup) --------------
+
+def _seed_if_empty(table: str, count_sql: str, legacy_path: str, to_rows) -> None:
+    """One-time migration: if `table` is EMPTY and the legacy JSON at
+    `legacy_path` exists, load it and seed via the table's setter. Idempotent —
+    guarded on EMPTY (not file-exists), so it never clobbers data written after
+    migration and is a no-op on every boot thereafter. Fail-soft: an absent or
+    corrupt file leaves the table empty and logs (a corrupt legacy file therefore
+    migrates to an empty table, not a failure)."""
+    try:
+        with _lock:
+            c = _connect()
+            if c.execute(count_sql).fetchone()[0] > 0:
+                return                       # already migrated (or written since)
+        p = Path(legacy_path)
+        if not p.exists():
+            return                           # fresh env, nothing to migrate
+        data = json.loads(p.read_text())
+        to_rows(data)                        # the existing set_* (its own lock)
+        _log.info("host_store: seeded %s from %s", table, legacy_path)
+    except Exception as exc:                 # noqa: BLE001
+        _log.warning("host_store seed %s failed: %s", table, exc)
+
+
+def migrate_legacy_json() -> None:
+    """One-shot backfill of the legacy JSON operational state into the store,
+    run once at startup BEFORE the app serves (and before settings.reload picks
+    up overrides). Idempotent (guard-on-empty) so it is a safe no-op on every
+    later boot. Once /x/calls and the dashboard confirm the data, delete the
+    legacy files — then this function and the env paths below can be removed."""
+    _seed_if_empty(
+        "settings_overrides", "SELECT count(*) FROM settings_overrides",
+        os.getenv("LLM_ROUTER_CONFIG_OVERRIDES",
+                  "/run/llm-router/secrets/config-overrides.json"),
+        lambda d: set_overrides(d if isinstance(d, dict) else {}))
+    _seed_if_empty(
+        "provider_overlays", "SELECT count(*) FROM provider_overlays",
+        os.getenv("PROVIDERS_OVERLAY_PATH",
+                  "/run/llm-router/secrets/providers.local.json"),
+        lambda d: set_provider_overlays((d or {}).get("providers") or {}))
+    _seed_if_empty(
+        "consumer_keys", "SELECT count(*) FROM consumer_keys",
+        os.getenv("DASHBOARD_ISSUED_KEYS_PATH",
+                  "/run/llm-router/secrets/issued-consumer-keys.json"),
+        lambda d: set_consumer_keys(d if isinstance(d, dict) else {}))
+
+
 def reset() -> None:
     """Test hook: close + forget the connection (a fresh path/file next use)."""
     global _conn, _inserts_since_prune
