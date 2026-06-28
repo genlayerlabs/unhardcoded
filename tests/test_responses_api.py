@@ -131,9 +131,24 @@ def test_tools_to_chat_is_inverse_of_to_responses_tools():
     assert ra.tools_to_chat(flat) == nested
 
 
-def test_tools_to_chat_passes_through_unknown_tool_types():
+def test_tools_to_chat_drops_unknown_tool_types():
+    # native/unknown tools would 400 a chat provider -> dropped, not forwarded.
     flat = [{"type": "local_shell"}, {"type": "web_search"}]
-    assert ra.tools_to_chat(flat) == flat
+    assert ra.tools_to_chat(flat) is None
+
+
+def test_tools_to_chat_keeps_function_drops_native_when_mixed():
+    flat = [{"type": "function", "name": "shell"}, {"type": "local_shell"}]
+    assert ra.tools_to_chat(flat) == [
+        {"type": "function", "function": {"name": "shell"}}]
+
+
+def test_dropped_tool_types_reports_dropped():
+    flat = [{"type": "function", "name": "shell"}, {"type": "local_shell"},
+            {"type": "web_search"}, {"type": "function"}]  # nameless function drops too
+    assert ra.dropped_tool_types(flat) == ["local_shell", "web_search", "function"]
+    assert ra.dropped_tool_types(None) == []
+    assert ra.dropped_tool_types([{"type": "function", "name": "ok"}]) == []
 
 
 def test_tools_to_chat_empty_is_none():
@@ -206,6 +221,13 @@ def test_object_length_finish_is_incomplete():
     obj = ra.result_to_responses_object(_result(text="x", finish="length"),
                                         response_id="r", created_at=1)
     assert obj["status"] == "incomplete"
+
+
+def test_object_usage_carries_cached_tokens():
+    res = _result(text="x")
+    res["response"]["tokens_cached"] = 4
+    obj = ra.result_to_responses_object(res, response_id="r", created_at=1)
+    assert obj["usage"]["input_tokens_details"] == {"cached_tokens": 4}
 
 
 def test_object_omits_usage_when_unknown():

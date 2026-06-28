@@ -28,6 +28,7 @@ of concurrent callers, use a luerl-based host instead.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from typing import Any
@@ -38,6 +39,8 @@ from pydantic import BaseModel, ConfigDict
 
 import route_cache
 import route_session_meter
+
+_log = logging.getLogger("unhardcoded.shim")
 
 
 # Profile name used when nothing else can be inferred. Replaced via
@@ -902,6 +905,10 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
 
     async def _handle_responses(req: ResponsesRequest, profile_name: str | None = None):
         import responses_api as _rapi
+        dropped = _rapi.dropped_tool_types(req.tools)
+        if dropped:
+            _log.warning("responses: dropped non-function tool types %s "
+                         "(chat providers accept only function tools)", dropped)
         chatreq = ChatRequest(
             model=req.model or "",
             messages=_rapi.input_to_messages(req.input, req.instructions),

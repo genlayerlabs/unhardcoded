@@ -110,7 +110,13 @@ def input_to_messages(input_: Any, instructions: str | None = None) -> list[dict
 def tools_to_chat(tools: Any) -> "list[dict] | None":
     """Responses tools (FLAT {type:"function", name, ...}) -> chat-completions
     tools (NESTED {type:"function", function:{name,...}}). Inverse of
-    codex_backend._to_responses_tools. Unknown/native tool types pass through."""
+    codex_backend._to_responses_tools.
+
+    Unknown/native tool types (local_shell, web_search, custom, …) are DROPPED,
+    not forwarded: a plain chat-completions provider rejects any tool whose
+    type != "function", which would 400 the WHOLE turn (killing even the text
+    answer). Dropping lets the text turn through; the shim logs what it dropped
+    so a tool the model actually needs is visible (see _handle_responses)."""
     if not tools:
         return None
     out: list[dict] = []
@@ -124,9 +130,18 @@ def tools_to_chat(tools: Any) -> "list[dict] | None":
             if t.get("parameters") is not None:
                 fn["parameters"] = t["parameters"]
             out.append({"type": "function", "function": fn})
-        else:
-            out.append(t)  # native/unknown tool — best-effort pass-through
+        # else: native/unknown tool type -> dropped (see docstring)
     return out or None
+
+
+def dropped_tool_types(tools: Any) -> list[str]:
+    """The `type`s tools_to_chat dropped (non-function / nameless-function),
+    so the shim can log when a tool the model may need was discarded."""
+    if not tools:
+        return []
+    return [str(t.get("type"))
+            for t in tools
+            if isinstance(t, dict) and not (t.get("type") == "function" and t.get("name"))]
 
 
 def tool_choice_to_chat(tc: Any) -> Any:
@@ -210,6 +225,10 @@ def result_to_responses_object(
         usage["output_tokens"] = resp["tokens_out"]
     if resp.get("tokens_total") is not None:
         usage["total_tokens"] = resp["tokens_total"]
+    # Standard Responses cache field so a client's context accounting treats
+    # cache reads correctly (mirrors the chat path's usage.prompt_tokens_details).
+    if resp.get("tokens_cached"):
+        usage["input_tokens_details"] = {"cached_tokens": resp["tokens_cached"]}
     if usage:
         obj["usage"] = usage
     return obj
