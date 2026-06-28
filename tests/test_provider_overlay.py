@@ -22,12 +22,9 @@ from shim import create_app  # noqa: E402
 
 
 @pytest.fixture
-def db(tmp_path, monkeypatch):
-    """Point the host store at a throwaway SQLite file for the test."""
-    monkeypatch.setenv("ROUTER_DB_PATH", str(tmp_path / "host-store.db"))
-    host_store.reset()
-    yield host_store
-    host_store.reset()
+def db(host_store_clean):
+    """A clean host store (truncated) for the test."""
+    return host_store_clean
 
 
 @pytest.fixture

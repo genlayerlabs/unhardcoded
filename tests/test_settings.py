@@ -18,12 +18,9 @@ import settings  # noqa: E402
 
 
 @pytest.fixture
-def store(tmp_path, monkeypatch):
-    monkeypatch.setenv("ROUTER_DB_PATH", str(tmp_path / "host-store.db"))
-    host_store.reset()
-    settings.reload()
+def store(host_store_clean):
+    settings.reload()                       # read the freshly-truncated store
     yield
-    host_store.reset()
 
 
 def test_override_roundtrip_and_validation(store):
@@ -52,10 +49,8 @@ def test_override_roundtrip_and_validation(store):
 def test_bad_override_value_falls_back_to_default(store):
     # A malformed stored value is skipped (get_overrides is fail-soft per key),
     # so the schema default wins — a bad override can never break ranking.
-    with host_store._lock:
-        c = host_store._connect()
-        c.execute("INSERT INTO settings_overrides(key, value, updated_at)"
-                  " VALUES (?,?,?)", ("codex.quota_429_shed", "not json{", 0))
-        c.commit()
+    with host_store._get_pool().connection() as conn:
+        conn.execute("INSERT INTO settings_overrides(key, value, updated_at)"
+                     " VALUES (%s,%s,%s)", ("codex.quota_429_shed", "not json{", 0))
     settings.reload()
     assert settings.get("codex.quota_429_shed") == 3.0

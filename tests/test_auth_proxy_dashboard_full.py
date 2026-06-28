@@ -24,10 +24,10 @@ import host_store  # noqa: E402
 
 
 def _use_db(monkeypatch, tmp_path):
-    """Point the consumer-key store (and the rest of the host store) at a tmp
-    SQLite file for the test."""
-    monkeypatch.setenv("ROUTER_DB_PATH", str(tmp_path / "host-store.db"))
+    """A clean host store (truncated) for the test — isolation against the shared
+    Postgres. (monkeypatch/tmp_path kept for call-site compatibility.)"""
     host_store.reset()
+    host_store.truncate_all_for_tests()
 
 
 def _set_issued(records):

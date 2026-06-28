@@ -1,28 +1,23 @@
-"""The host operational store (SQLite) call ledger. Dual-written alongside
-usage-history; the fact table from which route/session views are later derived.
-Fail-soft writes, time-bounded retention."""
+"""The host operational store (Postgres) call ledger + operator state. The fact
+table from which route/session views are derived; durable set_* with a success
+bool; time-bounded retention; one-shot legacy backfill."""
 from __future__ import annotations
 
 import json
-import sqlite3
 import sys
 import time
 from pathlib import Path
-
-import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import host_store as hs  # noqa: E402
+import pytest  # noqa: E402
 
 
 @pytest.fixture
-def store(tmp_path, monkeypatch):
-    monkeypatch.setenv("ROUTER_DB_PATH", str(tmp_path / "host-store.db"))
-    hs.reset()
-    yield hs
-    hs.reset()
+def store(host_store_clean):
+    return host_store_clean
 
 
 def _row(**over):
@@ -146,36 +141,43 @@ def test_backfill_failsoft_on_corrupt_file(store, tmp_path, monkeypatch):
     assert hs.get_overrides() == {}                       # corrupt -> empty, not fatal
 
 
-def test_failed_write_rolls_back_and_does_not_poison_next_commit(store, monkeypatch):
-    # A set_* that fails AFTER its DELETE (e.g. an IO error mid-INSERT) must roll
-    # back — never leave a pending DELETE on the SHARED connection that the next
-    # committer (insert_call on the next request) would flush, silently wiping the
-    # table, credentials included. Guard verified by the rejection: a write that
-    # must fail leaves the prior data intact and cannot be flushed later.
-    hs.set_consumer_keys({"crm": {"status": "active"}})
-    assert hs.get_consumer_keys()[0] == {"crm": {"status": "active"}}
+def test_set_returns_bool_contract(store):
+    # Durable writes report success/failure so callers don't pretend a save that
+    # didn't persist (a silent failed key revoke would be a security hole).
+    assert hs.set_consumer_keys({"crm": {"status": "active"}}) is True
+    assert hs.set_overrides({"compaction.at_tokens": 50000}) is True
+    assert hs.set_provider_overlays({"groq": {"auth_env": "G", "added_at": 1}}) is True
 
-    real = hs._connect()
 
-    class _ExecManyFails:                    # DELETE runs, executemany blows up
-        def execute(self, *a, **k):
-            return real.execute(*a, **k)
-        def executemany(self, *a, **k):
-            raise sqlite3.OperationalError("disk I/O error")
-        def __enter__(self):
-            return real.__enter__()
-        def __exit__(self, *a):
-            return real.__exit__(*a)
-        def __getattr__(self, name):
-            return getattr(real, name)
+def test_set_is_atomic_and_returns_false_on_failure(store, monkeypatch):
+    # A set_* is ONE transaction: a failure mid-write rolls back (existing data
+    # intact, no half-applied DELETE) and returns False. With the pool model each
+    # write is its own connection/transaction, so a failure cannot poison another.
+    import contextlib
+    assert hs.set_consumer_keys({"crm": {"status": "active"}}) is True
+    real_pool = hs._get_pool()
 
-    orig_connect = hs._connect
-    monkeypatch.setattr(hs, "_connect", lambda: _ExecManyFails())
-    hs.set_consumer_keys({"crm2": {"status": "x"}})       # fails mid-write, fail-soft
-    monkeypatch.setattr(hs, "_connect", orig_connect)     # restore (not undo: keeps DB path)
+    class _FailConn:
+        def __init__(self, c): self._c = c
+        def execute(self, *a, **k): return self._c.execute(*a, **k)   # DELETE runs
+        def cursor(self, *a, **k):
+            class _C:
+                def executemany(self, *a, **k): raise RuntimeError("boom")  # then dies
+                def __enter__(self): return self
+                def __exit__(self, *x): return False
+            return _C()
+        def __getattr__(self, n): return getattr(self._c, n)
 
-    # the failed write rolled back its DELETE -> the credentials are intact ...
-    assert hs.get_consumer_keys()[0] == {"crm": {"status": "active"}}
-    # ... and the next real commit does NOT surface a phantom DELETE.
-    hs.insert_call({"ts": 1, "status": 200, "provider": "p", "model_family": "f"})
-    assert hs.get_consumer_keys()[0] == {"crm": {"status": "active"}}   # NOT wiped
+    class _FailPool:
+        @contextlib.contextmanager
+        def connection(self):
+            with real_pool.connection() as c:    # real txn -> rolls back on the raise
+                yield _FailConn(c)
+        def __getattr__(self, n): return getattr(real_pool, n)
+
+    monkeypatch.setattr(hs, "_get_pool", lambda: _FailPool())
+    ok = hs.set_consumer_keys({"crm2": {"status": "x"}})   # DELETE then executemany boom
+    monkeypatch.setattr(hs, "_get_pool", lambda: real_pool)
+
+    assert ok is False                                     # failure surfaced, not swallowed
+    assert hs.get_consumer_keys()[0] == {"crm": {"status": "active"}}  # rolled back, intact

@@ -665,11 +665,8 @@ def test_settings_list_knob_coerces_csv_dedupes_and_validates():
     assert knobs["antseed.peer_allowlist"]["default"] == []
 
 
-def test_settings_validate_and_write_list_roundtrip(tmp_path, monkeypatch):
-    import host_store
+def test_settings_validate_and_write_list_roundtrip(host_store_clean):
     import settings
-    monkeypatch.setenv("ROUTER_DB_PATH", str(tmp_path / "host-store.db"))
-    host_store.reset()
     settings.reload()
     new, errs = settings.validate_and_write({"antseed.peer_denylist": "p1, p2, p1"})
     assert errs == [] and new["antseed.peer_denylist"] == ["p1", "p2"]
