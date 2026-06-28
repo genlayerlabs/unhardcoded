@@ -878,29 +878,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         import responses_api as _rapi
         obj = _rapi.result_to_responses_object(result, req.model or "",
                                                response_id=response_id)
-        resp = result.get("response") or {}
-        chosen = result.get("chosen") or {}
-        obj["x_router"] = {
-            "provider": chosen.get("provider_id"),
-            "model_family": chosen.get("model_family"),
-            "served_model_id": chosen.get("served_model_id"),
-            "price_in": chosen.get("price_in"),
-            "price_out": chosen.get("price_out"),
-            "cost_usd": _executed_cost_usd(result, subscription_providers),
-            "tokens_cached": resp.get("tokens_cached"),
-            "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
-            "decision_trace": _trim_trace(result.get("trace")),
-            "compact": _compact_suggested(resp),
-        }
-        if req.session:
-            acc = route_session_meter.observe(
-                req.session,
-                tokens_in=resp.get("tokens_in") or 0,
-                tokens_out=resp.get("tokens_out") or 0,
-                tokens_cached=resp.get("tokens_cached") or 0,
-                cost_usd=obj["x_router"]["cost_usd"] or 0.0,
-                owner=req.caller)
-            obj["x_router"]["session_acc"] = acc
+        obj["x_router"] = _build_x_router(result, subscription_providers,
+                                          req.session, req.caller)
         return obj
 
     async def _handle_responses(req: ResponsesRequest, profile_name: str | None = None):
@@ -1101,7 +1080,6 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     def _final_chunk_parts(result: dict, session: str | None = None,
                            owner: str | None = None):
         resp = result.get("response") or {}
-        chosen = result.get("chosen") or {}
         usage = {}
         for src_key, dst_key in (("tokens_in", "prompt_tokens"),
                                  ("tokens_out", "completion_tokens"),
@@ -1111,31 +1089,10 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         # Standard OpenAI cache field so clients parse cache reads natively.
         if resp.get("tokens_cached"):
             usage["prompt_tokens_details"] = {"cached_tokens": resp["tokens_cached"]}
-        x_router = {
-            "provider": chosen.get("provider_id"),
-            "model_family": chosen.get("model_family"),
-            "served_model_id": chosen.get("served_model_id"),
-            "price_in": chosen.get("price_in"),
-            "price_out": chosen.get("price_out"),
-            "cost_usd": _executed_cost_usd(result, subscription_providers),
-            "tokens_cached": resp.get("tokens_cached"),
-            "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
-            "decision_trace": _trim_trace(result.get("trace")),
-            "compact": _compact_suggested(resp),
-        }
-        # Per-session meter on the STREAMING path too (mirrors the non-streaming
-        # _router_response_to_openai). Streaming clients (e.g. opencode, stream:true)
-        # otherwise never fold into the session total. Idempotent per request: this
-        # runs once per final chunk.
-        if session:
-            acc = route_session_meter.observe(
-                session,
-                tokens_in=resp.get("tokens_in") or 0,
-                tokens_out=resp.get("tokens_out") or 0,
-                tokens_cached=resp.get("tokens_cached") or 0,
-                cost_usd=x_router["cost_usd"] or 0.0,
-                owner=owner)
-            x_router["session_acc"] = acc
+        # x_router + the per-session fold are shared with the unary path; the
+        # streaming final chunk folds the session here so stream:true clients
+        # (e.g. opencode) still accumulate into the session total.
+        x_router = _build_x_router(result, subscription_providers, session, owner)
         return resp, usage or None, x_router
 
     async def _pseudo_stream(result: dict, req: ChatRequest):
@@ -1434,6 +1391,38 @@ def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> floa
     return max(0.0, round(cost, 6))
 
 
+def _build_x_router(result: dict, subscription_providers=frozenset(),
+                    session: str | None = None, owner: str | None = None) -> dict:
+    """The `x_router` metadata block shared by every response surface (chat
+    unary, chat streaming final chunk, /v1/responses) plus the per-session meter
+    fold. Single source so the fields and the fold stay identical across
+    surfaces. When `session` is set the call is folded into its running total and
+    `session_acc` is attached. Idempotent per request — call once per response."""
+    resp = result.get("response") or {}
+    chosen = result.get("chosen") or {}
+    x_router = {
+        "provider": chosen.get("provider_id"),
+        "model_family": chosen.get("model_family"),
+        "served_model_id": chosen.get("served_model_id"),
+        "price_in": chosen.get("price_in"),
+        "price_out": chosen.get("price_out"),
+        "cost_usd": _executed_cost_usd(result, subscription_providers),
+        "tokens_cached": resp.get("tokens_cached"),
+        "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
+        "decision_trace": _trim_trace(result.get("trace")),
+        "compact": _compact_suggested(resp),
+    }
+    if session:
+        x_router["session_acc"] = route_session_meter.observe(
+            session,
+            tokens_in=resp.get("tokens_in") or 0,
+            tokens_out=resp.get("tokens_out") or 0,
+            tokens_cached=resp.get("tokens_cached") or 0,
+            cost_usd=x_router["cost_usd"] or 0.0,
+            owner=owner)
+    return x_router
+
+
 def _router_response_to_openai(result: dict, requested_model: str,
                                subscription_providers=frozenset(),
                                session: str | None = None,
@@ -1476,30 +1465,10 @@ def _router_response_to_openai(result: dict, requested_model: str,
     if usage:
         out["usage"] = usage
 
-    # Non-standard router metadata: ignored by OpenAI clients, useful for debugging.
-    out["x_router"] = {
-        "provider": chosen.get("provider_id"),
-        "model_family": chosen.get("model_family"),
-        "served_model_id": chosen.get("served_model_id"),
-        "price_in": chosen.get("price_in"),
-        "price_out": chosen.get("price_out"),
-        "cost_usd": _executed_cost_usd(result, subscription_providers),
-        "tokens_cached": response.get("tokens_cached"),
-        "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
-        "decision_trace": _trim_trace(result.get("trace")),
-        "compact": _compact_suggested(response),
-    }
-    # Per-session meter: fold this call into the session's running total and put
-    # BOTH on the response — per-call (above) and accumulated (session_acc).
-    if session:
-        acc = route_session_meter.observe(
-            session,
-            tokens_in=response.get("tokens_in") or 0,
-            tokens_out=response.get("tokens_out") or 0,
-            tokens_cached=response.get("tokens_cached") or 0,
-            cost_usd=out["x_router"]["cost_usd"] or 0.0,
-            owner=owner)
-        out["x_router"]["session_acc"] = acc
+    # Non-standard router metadata: ignored by OpenAI clients, useful for
+    # debugging. Shared with the streaming + /v1/responses surfaces; when a
+    # session is set it also folds this call into the session's running total.
+    out["x_router"] = _build_x_router(result, subscription_providers, session, owner)
     return out
 
 
