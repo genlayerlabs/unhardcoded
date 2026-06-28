@@ -28,6 +28,7 @@ of concurrent callers, use a luerl-based host instead.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from typing import Any
@@ -38,6 +39,8 @@ from pydantic import BaseModel, ConfigDict
 
 import route_cache
 import route_session_meter
+
+_log = logging.getLogger("unhardcoded.shim")
 
 
 # Profile name used when nothing else can be inferred. Replaced via
@@ -92,6 +95,26 @@ class ChatRequest(BaseModel):
     # the x-llm-router-caller header (consumers cannot set it — the proxy strips
     # and re-injects it). Never sent to the core; used only to bind sid->owner in
     # the session meter so the consumer-facing session view stays per-consumer.
+    caller: str | None = None
+
+
+class ResponsesRequest(BaseModel):
+    """Permissive OpenAI /v1/responses body. Unknown fields are kept
+    (extra="allow") so Responses params the shim does not read (reasoning,
+    include, store, parallel_tool_calls, prompt_cache_key, text,
+    previous_response_id, …) never break the request."""
+    model_config = ConfigDict(extra="allow")
+
+    model: str = ""
+    input: Any = None             # str | list[item]
+    instructions: str | None = None
+    tools: list[dict] | None = None
+    tool_choice: Any = None
+    stream: bool = False
+    max_output_tokens: int | None = None
+    temperature: float | None = None
+    policy_ir: list | None = None
+    session: str | None = None
     caller: str | None = None
 
 
@@ -833,6 +856,115 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         if caller:
             req.caller = caller
 
+    # ---- OpenAI Responses API surface (POST /v1/responses) ----------------
+    # The inbound mirror of codex_backend.py: translate a Responses request to
+    # the SAME chat contract the chat path builds, run the SAME engine, and
+    # translate the result back to a Responses object / SSE. Lets Responses-only
+    # clients (the Codex CLI) drive the router with all routing/policy/metering.
+
+    @app.post("/v1/responses")
+    async def responses(req: ResponsesRequest, request: Request):
+        _session_from_header(req, request)
+        return await _handle_responses(req)
+
+    @app.post("/{profile_name}/v1/responses")
+    async def responses_profiled(profile_name: str, req: ResponsesRequest,
+                                 request: Request):
+        _session_from_header(req, request)
+        return await _handle_responses(req, profile_name=profile_name)
+
+    def _responses_object_with_router(result: dict, req: ResponsesRequest,
+                                      response_id: str | None = None) -> dict:
+        import responses_api as _rapi
+        obj = _rapi.result_to_responses_object(result, req.model or "",
+                                               response_id=response_id)
+        obj["x_router"] = _build_x_router(result, subscription_providers,
+                                          req.session, req.caller)
+        return obj
+
+    async def _handle_responses(req: ResponsesRequest, profile_name: str | None = None):
+        import responses_api as _rapi
+        dropped = _rapi.dropped_tool_types(req.tools)
+        if dropped:
+            _log.warning("responses: dropped non-function tool types %s "
+                         "(chat providers accept only function tools)", dropped)
+        chatreq = ChatRequest(
+            model=req.model or "",
+            messages=_rapi.input_to_messages(req.input, req.instructions),
+            tools=_rapi.tools_to_chat(req.tools),
+            tool_choice=_rapi.tool_choice_to_chat(req.tool_choice),
+            temperature=req.temperature,
+            max_tokens=req.max_output_tokens,
+            policy_ir=req.policy_ir,
+            session=req.session,
+        )
+        contract = _request_to_contract(chatreq, default_profile, default_max_tokens)
+        if profile_name is not None:
+            contract["profile"] = profile_name
+
+        if not req.stream:
+            try:
+                result = await host.execute_async(contract)
+            except Exception as exc:
+                admission = _policy_admission_error(exc)
+                if admission is None:
+                    raise
+                return _invalid_policy_response(admission)
+            if not result.get("ok"):
+                return _openai_error_from_router(result)
+            return _responses_object_with_router(result, req)
+        return await _handle_responses_stream(contract, req)
+
+    async def _handle_responses_stream(contract: dict, req: ResponsesRequest):
+        import responses_api as _rapi
+        task = asyncio.create_task(host.execute_async(contract))
+        done, _ = await asyncio.wait({task}, timeout=_EARLY_FAIL_S,
+                                     return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            try:
+                result = task.result()
+            except Exception as exc:
+                admission = _policy_admission_error(exc)
+                if admission is None:
+                    raise
+                return _invalid_policy_response(admission)
+            if not result.get("ok"):
+                return _openai_error_from_router(result)
+            obj = _responses_object_with_router(result, req)
+
+            async def gen_ready():
+                yield _rapi.responses_created_event(obj)
+                for ev in _rapi.responses_sse_events(obj):
+                    yield ev
+            return StreamingResponse(gen_ready(), media_type="text/event-stream")
+
+        async def gen_running():
+            rid = _rapi._new_id("resp")
+            yield _rapi.responses_created_event({"id": rid, "model": req.model or ""})
+            while not task.done():
+                await asyncio.wait({task}, timeout=_HEARTBEAT_S)
+                if not task.done():
+                    yield _streaming.HEARTBEAT
+            try:
+                result = task.result()
+            except Exception as exc:
+                admission = _policy_admission_error(exc)
+                # seq=1: continues the stream after response.created (seq=0) so
+                # the Responses sequence_number stays strictly increasing.
+                yield _rapi.responses_failed_event(
+                    rid, admission or f"responses error: {exc}",
+                    "invalid_policy" if admission else "internal_error", seq=1)
+                return
+            if not result.get("ok"):
+                err = str(result.get("error") or "router error")
+                yield _rapi.responses_failed_event(
+                    rid, err, str(result.get("error") or "error"), seq=1)
+                return
+            obj = _responses_object_with_router(result, req, response_id=rid)
+            for ev in _rapi.responses_sse_events(obj):
+                yield ev
+        return StreamingResponse(gen_running(), media_type="text/event-stream")
+
     async def _handle_chat(req: ChatRequest, profile_name: str | None = None):
         contract = _request_to_contract(req, default_profile, default_max_tokens)
         if profile_name is not None:
@@ -951,7 +1083,6 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     def _final_chunk_parts(result: dict, session: str | None = None,
                            owner: str | None = None):
         resp = result.get("response") or {}
-        chosen = result.get("chosen") or {}
         usage = {}
         for src_key, dst_key in (("tokens_in", "prompt_tokens"),
                                  ("tokens_out", "completion_tokens"),
@@ -961,31 +1092,10 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         # Standard OpenAI cache field so clients parse cache reads natively.
         if resp.get("tokens_cached"):
             usage["prompt_tokens_details"] = {"cached_tokens": resp["tokens_cached"]}
-        x_router = {
-            "provider": chosen.get("provider_id"),
-            "model_family": chosen.get("model_family"),
-            "served_model_id": chosen.get("served_model_id"),
-            "price_in": chosen.get("price_in"),
-            "price_out": chosen.get("price_out"),
-            "cost_usd": _executed_cost_usd(result, subscription_providers),
-            "tokens_cached": resp.get("tokens_cached"),
-            "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
-            "decision_trace": _trim_trace(result.get("trace")),
-            "compact": _compact_suggested(resp),
-        }
-        # Per-session meter on the STREAMING path too (mirrors the non-streaming
-        # _router_response_to_openai). Streaming clients (e.g. opencode, stream:true)
-        # otherwise never fold into the session total. Idempotent per request: this
-        # runs once per final chunk.
-        if session:
-            acc = route_session_meter.observe(
-                session,
-                tokens_in=resp.get("tokens_in") or 0,
-                tokens_out=resp.get("tokens_out") or 0,
-                tokens_cached=resp.get("tokens_cached") or 0,
-                cost_usd=x_router["cost_usd"] or 0.0,
-                owner=owner)
-            x_router["session_acc"] = acc
+        # x_router + the per-session fold are shared with the unary path; the
+        # streaming final chunk folds the session here so stream:true clients
+        # (e.g. opencode) still accumulate into the session total.
+        x_router = _build_x_router(result, subscription_providers, session, owner)
         return resp, usage or None, x_router
 
     async def _pseudo_stream(result: dict, req: ChatRequest):
@@ -1284,6 +1394,38 @@ def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> floa
     return max(0.0, round(cost, 6))
 
 
+def _build_x_router(result: dict, subscription_providers=frozenset(),
+                    session: str | None = None, owner: str | None = None) -> dict:
+    """The `x_router` metadata block shared by every response surface (chat
+    unary, chat streaming final chunk, /v1/responses) plus the per-session meter
+    fold. Single source so the fields and the fold stay identical across
+    surfaces. When `session` is set the call is folded into its running total and
+    `session_acc` is attached. Idempotent per request — call once per response."""
+    resp = result.get("response") or {}
+    chosen = result.get("chosen") or {}
+    x_router = {
+        "provider": chosen.get("provider_id"),
+        "model_family": chosen.get("model_family"),
+        "served_model_id": chosen.get("served_model_id"),
+        "price_in": chosen.get("price_in"),
+        "price_out": chosen.get("price_out"),
+        "cost_usd": _executed_cost_usd(result, subscription_providers),
+        "tokens_cached": resp.get("tokens_cached"),
+        "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
+        "decision_trace": _trim_trace(result.get("trace")),
+        "compact": _compact_suggested(resp),
+    }
+    if session:
+        x_router["session_acc"] = route_session_meter.observe(
+            session,
+            tokens_in=resp.get("tokens_in") or 0,
+            tokens_out=resp.get("tokens_out") or 0,
+            tokens_cached=resp.get("tokens_cached") or 0,
+            cost_usd=x_router["cost_usd"] or 0.0,
+            owner=owner)
+    return x_router
+
+
 def _router_response_to_openai(result: dict, requested_model: str,
                                subscription_providers=frozenset(),
                                session: str | None = None,
@@ -1326,30 +1468,10 @@ def _router_response_to_openai(result: dict, requested_model: str,
     if usage:
         out["usage"] = usage
 
-    # Non-standard router metadata: ignored by OpenAI clients, useful for debugging.
-    out["x_router"] = {
-        "provider": chosen.get("provider_id"),
-        "model_family": chosen.get("model_family"),
-        "served_model_id": chosen.get("served_model_id"),
-        "price_in": chosen.get("price_in"),
-        "price_out": chosen.get("price_out"),
-        "cost_usd": _executed_cost_usd(result, subscription_providers),
-        "tokens_cached": response.get("tokens_cached"),
-        "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
-        "decision_trace": _trim_trace(result.get("trace")),
-        "compact": _compact_suggested(response),
-    }
-    # Per-session meter: fold this call into the session's running total and put
-    # BOTH on the response — per-call (above) and accumulated (session_acc).
-    if session:
-        acc = route_session_meter.observe(
-            session,
-            tokens_in=response.get("tokens_in") or 0,
-            tokens_out=response.get("tokens_out") or 0,
-            tokens_cached=response.get("tokens_cached") or 0,
-            cost_usd=out["x_router"]["cost_usd"] or 0.0,
-            owner=owner)
-        out["x_router"]["session_acc"] = acc
+    # Non-standard router metadata: ignored by OpenAI clients, useful for
+    # debugging. Shared with the streaming + /v1/responses surfaces; when a
+    # session is set it also folds this call into the session's running total.
+    out["x_router"] = _build_x_router(result, subscription_providers, session, owner)
     return out
 
 
