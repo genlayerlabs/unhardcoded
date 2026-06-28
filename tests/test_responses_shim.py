@@ -131,3 +131,36 @@ def test_responses_router_error_maps_to_status(client, host):
         "model": "policy:auto", "input": "hi", "stream": False})
     assert r.status_code >= 400
     assert r.json()["error"]["type"] == "router_error"
+
+
+def test_responses_stream_failure_sequence_numbers_strictly_increase(
+        client, host, monkeypatch):
+    # The streaming failure path (gen_running) only runs when the task is STILL
+    # in flight at the early-fail check, then fails. Force it deterministically:
+    # collapse the early-fail window AND make execute_async suspend before
+    # returning a router error (so it is not already done at the check). Every
+    # numbered SSE frame must then have a STRICTLY INCREASING sequence_number per
+    # the Responses contract. Regression guard: response.created and
+    # response.failed both defaulted to sequence_number=0, colliding on this path
+    # and tripping strict clients (e.g. the Codex CLI).
+    import asyncio
+    import shim as _shim
+
+    async def _slow_error(contract):
+        await asyncio.sleep(0.02)  # suspend so the task is "still running"
+        return {"ok": False, "error": "router error"}
+
+    monkeypatch.setattr(_shim, "_EARLY_FAIL_S", 0.0)
+    monkeypatch.setattr(host, "execute_async", _slow_error)
+
+    with client.stream("POST", "/v1/responses", json={
+            "model": "policy:auto", "input": "hi", "stream": True}) as r:
+        assert r.status_code == 200
+        body = "".join(chunk for chunk in r.iter_text())
+    datas = [json.loads(ln[len("data:"):].strip())
+             for ln in body.split("\n") if ln.startswith("data:")]
+    types = [d.get("type") for d in datas]
+    assert "response.created" in types and "response.failed" in types
+    seqs = [d["sequence_number"] for d in datas if "sequence_number" in d]
+    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), \
+        f"sequence_numbers must be strictly increasing, got {seqs}"

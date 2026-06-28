@@ -949,13 +949,16 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 result = task.result()
             except Exception as exc:
                 admission = _policy_admission_error(exc)
+                # seq=1: continues the stream after response.created (seq=0) so
+                # the Responses sequence_number stays strictly increasing.
                 yield _rapi.responses_failed_event(
                     rid, admission or f"responses error: {exc}",
-                    "invalid_policy" if admission else "internal_error")
+                    "invalid_policy" if admission else "internal_error", seq=1)
                 return
             if not result.get("ok"):
                 err = str(result.get("error") or "router error")
-                yield _rapi.responses_failed_event(rid, err, str(result.get("error") or "error"))
+                yield _rapi.responses_failed_event(
+                    rid, err, str(result.get("error") or "error"), seq=1)
                 return
             obj = _responses_object_with_router(result, req, response_id=rid)
             for ev in _rapi.responses_sse_events(obj):
