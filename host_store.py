@@ -29,6 +29,7 @@ import os
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -162,6 +163,24 @@ def insert_call(row: dict[str, Any]) -> None:
                 _prune_locked(c)
     except Exception as exc:  # noqa: BLE001 — the ledger must never break a request
         _log.warning("host_store insert_call failed: %s", exc)
+
+
+# A single-worker background writer keeps the ledger insert OFF the request's
+# latency path: otherwise every call completion blocks on the SQLite write and
+# the process-wide lock, serializing all completions. Best-effort telemetry —
+# fire-and-forget; a write dropped on shutdown is acceptable. The worker shares
+# _conn under _lock, so it serializes safely with set_*/reads.
+_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="host-store-writer")
+
+
+def insert_call_async(row: dict[str, Any]) -> None:
+    """Record a call WITHOUT blocking the caller — submit insert_call to the
+    background writer. Use this on the hot path; insert_call stays synchronous for
+    tests and for the worker itself."""
+    try:
+        _writer.submit(insert_call, row)
+    except Exception as exc:  # noqa: BLE001 — never break a request, even on submit
+        _log.warning("host_store insert_call_async submit failed: %s", exc)
 
 
 def _prune_locked(c: sqlite3.Connection) -> None:
