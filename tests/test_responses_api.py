@@ -49,6 +49,13 @@ def test_function_call_output_becomes_tool_message():
         {"role": "tool", "tool_call_id": "c1", "content": "42"}]
 
 
+def test_developer_role_is_normalized_to_system():
+    # Codex sends a `developer` role item; map it to system for provider portability.
+    items = [{"type": "message", "role": "developer",
+              "content": [{"type": "input_text", "text": "rules"}]}]
+    assert ra.input_to_messages(items) == [{"role": "system", "content": "rules"}]
+
+
 def test_reasoning_and_unknown_items_skipped():
     items = [{"type": "reasoning", "summary": []},
              {"type": "weird_future_type"},

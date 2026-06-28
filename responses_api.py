@@ -102,6 +102,11 @@ def input_to_messages(input_: Any, instructions: str | None = None) -> list[dict
         role = it.get("role")
         if role is None:
             continue  # unknown item type with no role
+        # Codex sends a `developer` role item (the OpenAI "developer" ≈ system
+        # role). Many chat-completions providers only accept system/user/
+        # assistant/tool, so normalize developer -> system for portability.
+        if role == "developer":
+            role = "system"
         messages.append({"role": role, "content": _part_text(it.get("content"))})
 
     return messages

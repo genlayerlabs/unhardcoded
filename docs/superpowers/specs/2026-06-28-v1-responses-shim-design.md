@@ -92,6 +92,9 @@ Inverse of `codex_backend._messages_to_input`.
   - `{"type":"function_call_output","call_id":id,"output":o}` →
     `{"role":"tool","tool_call_id":id,"content":o}` (coerce `output` to string).
   - `{"type":"reasoning",…}` and any unrecognized item type → skipped.
+  - a `role:"developer"` message (Codex sends one — the OpenAI "developer" ≈ system
+    role) → normalized to `role:"system"`, since many chat-completions providers accept
+    only system/user/assistant/tool. [Added after the live Codex acceptance test.]
 
 Symmetry check (must hold): for the canonical tool-history conversation in
 `test_codex.py::test_messages_to_input_translates_tool_call_history`,
