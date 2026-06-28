@@ -6,6 +6,7 @@ pkgs.mkShell {
   buildInputs = [
     (pkgs.python3.withPackages (ps: with ps; [
       lupa httpx fastapi uvicorn pydantic
+      psycopg psycopg-pool
       pytest pytest-asyncio
     ]))
   ];
