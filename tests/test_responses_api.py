@@ -2,6 +2,7 @@
 (mirror of codex_backend.py). Pure, no host."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -218,3 +219,78 @@ def test_object_uses_now_when_created_at_absent():
     obj = ra.result_to_responses_object(_result(text="x"), response_id="r",
                                         now=lambda: 555)
     assert obj["created_at"] == 555
+
+
+# ---- SSE encoders ------------------------------------------------------
+
+def _parse_sse(frames):
+    """[(event_name, data_dict), ...] from a list of 'event:..\\ndata:..\\n\\n'."""
+    out = []
+    for f in frames:
+        lines = [ln for ln in f.split("\n") if ln]
+        ev = next(ln[len("event:"):].strip() for ln in lines if ln.startswith("event:"))
+        data = next(ln[len("data:"):].strip() for ln in lines if ln.startswith("data:"))
+        out.append((ev, json.loads(data)))
+    return out
+
+
+def test_created_event_shape():
+    obj = ra.result_to_responses_object(_result(text="x"), response_id="resp_1",
+                                        created_at=1)
+    (ev, data), = _parse_sse([ra.responses_created_event(obj)])
+    assert ev == "response.created"
+    assert data["type"] == "response.created"
+    assert data["response"]["id"] == "resp_1"
+    assert data["response"]["status"] == "in_progress"
+
+
+def test_failed_event_shape():
+    (ev, data), = _parse_sse([ra.responses_failed_event("resp_1", "boom", "server_error")])
+    assert ev == "response.failed"
+    assert data["response"]["status"] == "failed"
+    assert data["response"]["error"]["message"] == "boom"
+    assert data["response"]["error"]["code"] == "server_error"
+
+
+def test_sse_events_text_sequence():
+    obj = ra.result_to_responses_object(_result(text="Hello"), response_id="r",
+                                        created_at=1, msg_id="msg_1")
+    events = _parse_sse(list(ra.responses_sse_events(obj)))
+    names = [e for e, _ in events]
+    assert names == [
+        "response.output_item.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    delta = dict(events)["response.output_text.delta"]
+    assert delta["delta"] == "Hello" and delta["item_id"] == "msg_1"
+    completed = dict(events)["response.completed"]
+    assert completed["response"]["output"] == obj["output"]
+    assert completed["response"]["usage"]["total_tokens"] == 10
+
+
+def test_sse_events_function_call_sequence():
+    tcs = [{"id": "call_1", "type": "function",
+            "function": {"name": "shell", "arguments": '{"command":"ls"}'}}]
+    obj = ra.result_to_responses_object(_result(text="", tool_calls=tcs),
+                                        response_id="r", created_at=1)
+    events = _parse_sse(list(ra.responses_sse_events(obj)))
+    names = [e for e, _ in events]
+    assert names == [
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    done = dict(events)["response.function_call_arguments.done"]
+    assert done["arguments"] == '{"command":"ls"}'
+
+
+def test_sse_events_sequence_numbers_increase():
+    obj = ra.result_to_responses_object(_result(text="hi"), response_id="r",
+                                        created_at=1)
+    seqs = [d["sequence_number"] for _, d in _parse_sse(list(ra.responses_sse_events(obj)))]
+    assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)

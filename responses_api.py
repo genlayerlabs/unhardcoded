@@ -213,3 +213,68 @@ def result_to_responses_object(
     if usage:
         obj["usage"] = usage
     return obj
+
+
+# ---- response out: Responses SSE events -----------------------------------
+
+def _sse(event: str, data: dict) -> str:
+    """One named SSE frame. Codex's parser dispatches on the `type` field inside
+    `data`; the `event:` line is emitted too for strict/event-name clients."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+def responses_created_event(obj: dict, seq: int = 0) -> str:
+    response = {"id": obj.get("id"), "object": "response", "status": "in_progress",
+                "model": obj.get("model", ""), "output": []}
+    return _sse("response.created", {"type": "response.created",
+                                     "sequence_number": seq, "response": response})
+
+
+def responses_failed_event(response_id: str, message: str,
+                           code: str | None = None, seq: int = 0) -> str:
+    response = {"id": response_id, "object": "response", "status": "failed",
+                "error": {"message": message, "code": code}}
+    return _sse("response.failed", {"type": "response.failed",
+                                    "sequence_number": seq, "response": response})
+
+
+def responses_sse_events(obj: dict, start_seq: int = 1) -> Iterable[str]:
+    """Replay a complete response object (from result_to_responses_object) as the
+    Responses SSE event sequence: per output item an added/delta/done trio, then
+    `response.completed` carrying the full object. No `[DONE]` sentinel — the
+    Responses API ends on `response.completed`."""
+    seq = start_seq
+
+    def _emit(event: str, data: dict) -> str:
+        nonlocal seq
+        frame = _sse(event, {"type": event, "sequence_number": seq, **data})
+        seq += 1
+        return frame
+
+    for out_index, item in enumerate(obj.get("output") or []):
+        if item.get("type") == "message":
+            text = (item.get("content") or [{}])[0].get("text", "")
+            yield _emit("response.output_item.added",
+                        {"output_index": out_index, "item": {**item, "content": []}})
+            yield _emit("response.output_text.delta",
+                        {"item_id": item["id"], "output_index": out_index,
+                         "content_index": 0, "delta": text})
+            yield _emit("response.output_text.done",
+                        {"item_id": item["id"], "output_index": out_index,
+                         "content_index": 0, "text": text})
+            yield _emit("response.output_item.done",
+                        {"output_index": out_index, "item": item})
+        elif item.get("type") == "function_call":
+            args = item.get("arguments") or ""
+            yield _emit("response.output_item.added",
+                        {"output_index": out_index, "item": {**item, "arguments": ""}})
+            yield _emit("response.function_call_arguments.delta",
+                        {"item_id": item["id"], "output_index": out_index,
+                         "delta": args})
+            yield _emit("response.function_call_arguments.done",
+                        {"item_id": item["id"], "output_index": out_index,
+                         "arguments": args})
+            yield _emit("response.output_item.done",
+                        {"output_index": out_index, "item": item})
+
+    yield _emit("response.completed", {"response": obj})
