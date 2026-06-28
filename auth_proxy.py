@@ -22,6 +22,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+import host_store
 from env_secrets import load_env_secrets
 
 # Operator-managed keys/consumer-hashes live on the PVC (.env.secrets) and are
@@ -2837,6 +2838,10 @@ def _rotate_usage_history(path: Path) -> None:
 
 
 def _append_usage_history(row: dict[str, Any]) -> None:
+    # Dual-write the call into the SQLite ledger (the emerging source of truth),
+    # alongside and independent of the usage-history file. Fail-soft inside; this
+    # only captures the ledger for now and replaces no reader yet.
+    host_store.insert_call(row)
     path = _usage_history_path()
     if not path:
         return

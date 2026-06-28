@@ -297,6 +297,14 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         """All session meters (operator view of per-session spend/cache)."""
         return {"sessions": route_session_meter.snapshot()}
 
+    @app.get("/x/calls")
+    def recent_calls(limit: int = 100):
+        """Recent rows from the SQLite call ledger (operator view / verification
+        of the emerging source of truth). Read-only."""
+        import host_store
+        return {"calls": host_store.recent_calls(min(max(int(limit), 1), 1000)),
+                "total": host_store.count()}
+
     # ---- AntSeed buyer hot-wallet control (dashboard self-service) -----------
     # Proxy deposit/withdraw/refresh to the sidecar control server, then refresh
     # SOURCE_STATE so /x/market reflects the new escrow at once. Internal — /x/*
