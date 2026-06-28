@@ -33,7 +33,7 @@ declarative `default` policy (balanced quality/cost) is the fallback — itself 
 core/                  -- git submodule -> genlayerlabs/unhardcoded-engine (the pure Σ_pol core)
 llm_router_host.py     -- embeds the core via lupa; sync/async backends; auth resolver
 shim.py                -- OpenAI-compatible app: /v1/chat/completions and /v1/responses (+ per-call policy_ir) and /x/* operator endpoints
-responses_api.py       -- inbound OpenAI *Responses* API translation (mirror of codex_backend.py) for /v1/responses
+responses_api.py       -- inbound OpenAI *Responses* API surface for /v1/responses (sibling of the chat-completions surface)
 auth_proxy.py          -- ingress + operator dashboard (Analytics · Builder · Activity · Market · Settings)
 serve.py               -- entry point: wires the api_kind dispatcher + runs uvicorn
 config.live.lua        -- catalog (providers + models), the `default` policy, and the observation fields (incl. OpenRouter benchmark/modality/capability fields)
