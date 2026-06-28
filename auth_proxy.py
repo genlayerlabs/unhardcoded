@@ -48,7 +48,6 @@ DASHBOARD_COOKIE_NAME = os.getenv("DASHBOARD_COOKIE_NAME", "router_dashboard_ses
 DASHBOARD_COOKIE_MAX_AGE = int(os.getenv("DASHBOARD_COOKIE_MAX_AGE", "2592000"))
 DASHBOARD_COOKIE_PATH = os.getenv("DASHBOARD_COOKIE_PATH", "/dashboard")
 DASHBOARD_KEY_ENV_PATH = os.getenv("DASHBOARD_KEY_ENV_PATH", "/run/llm-router/.env.secrets")
-DASHBOARD_ISSUED_KEYS_PATH = os.getenv("DASHBOARD_ISSUED_KEYS_PATH", "/run/llm-router/secrets/issued-consumer-keys.json")
 CODEX_ACCOUNTS_DIR = os.getenv("CODEX_ACCOUNTS_DIR", "/codex/accounts")
 CODEX_AUTH_PATH = os.getenv("CODEX_AUTH_PATH") or None
 DASHBOARD_LOGIN_HISTORY_PATH = os.getenv("DASHBOARD_LOGIN_HISTORY_PATH", "/run/llm-router/secrets/dashboard-logins.jsonl")
@@ -211,19 +210,9 @@ _issued_keys_load_failed = False
 
 def _load_issued_keys() -> dict[str, Any]:
     global _issued_keys_load_failed
-    path = Path(DASHBOARD_ISSUED_KEYS_PATH)
-    if not path.exists():
-        _issued_keys_load_failed = False
-        return {}
-    try:
-        data = json.loads(path.read_text())
-        if isinstance(data, dict):
-            _issued_keys_load_failed = False
-            return data
-    except Exception:
-        pass
-    _issued_keys_load_failed = True
-    return {}
+    records, ok = host_store.get_consumer_keys()
+    _issued_keys_load_failed = not ok
+    return records
 
 
 def _clean_route_list(value: Any) -> list[str]:
@@ -331,7 +320,7 @@ def _write_issued_consumer_records(records: dict[str, dict[str, Any]]) -> None:
         if normalized["status"] == "active" and not normalized["allowed_routes"] and normalized["rate_per_min"] is None and normalized["burst"] is None and not normalized["keys"]:
             continue
         compact[consumer] = normalized
-    _write_json_file(Path(DASHBOARD_ISSUED_KEYS_PATH), compact)
+    host_store.set_consumer_keys(compact)
 
 
 def _consumer_meta(consumer: str) -> dict[str, Any]:

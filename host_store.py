@@ -77,6 +77,12 @@ CREATE TABLE IF NOT EXISTS provider_overlays (
     entry       TEXT NOT NULL,   -- JSON provider definition (never a key)
     added_at    INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS consumer_keys (
+    consumer   TEXT PRIMARY KEY,
+    record     TEXT NOT NULL,   -- JSON consumer record (status/routes/limits/key hashes)
+    updated_at INTEGER NOT NULL
+);
 """
 
 _lock = threading.Lock()
@@ -262,6 +268,45 @@ def set_provider_overlays(providers: dict[str, Any]) -> None:
             c.commit()
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store set_provider_overlays failed: %s", exc)
+
+
+# ---- consumer_keys (dashboard-issued consumer records; replaces the JSON) ------
+
+def get_consumer_keys() -> "tuple[dict[str, Any], bool]":
+    """(records, ok). `records` is {consumer: record}; `ok` is False ONLY on a
+    real store error (so the caller can avoid clobbering good data with empty —
+    an empty table is ok=True). Mirrors the old load-failed flag."""
+    try:
+        with _lock:
+            c = _connect()
+            cur = c.execute("SELECT consumer, record FROM consumer_keys")
+            out: dict[str, Any] = {}
+            for consumer, rec in cur.fetchall():
+                try:
+                    out[consumer] = json.loads(rec)
+                except (TypeError, ValueError):
+                    continue
+            return out, True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store get_consumer_keys failed: %s", exc)
+        return {}, False
+
+
+def set_consumer_keys(records: dict[str, Any]) -> None:
+    """Replace the FULL set of consumer records (mirrors the old whole-file write)."""
+    try:
+        now = int(time.time())
+        rows = [(consumer, json.dumps(rec), now)
+                for consumer, rec in (records or {}).items()]
+        with _lock:
+            c = _connect()
+            c.execute("DELETE FROM consumer_keys")
+            c.executemany(
+                "INSERT INTO consumer_keys(consumer, record, updated_at)"
+                " VALUES (?,?,?)", rows)
+            c.commit()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store set_consumer_keys failed: %s", exc)
 
 
 def reset() -> None:
