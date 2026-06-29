@@ -37,8 +37,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-import route_cache
-import route_session_meter
+import host_store
 
 _log = logging.getLogger("unhardcoded.shim")
 
@@ -282,20 +281,18 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         consistent either way."""
         caller = request.headers.get("x-llm-router-caller")
         if caller:
-            owner = route_session_meter.owner(sid)
+            owner = host_store.session_owner(sid)
             if owner is None or owner != caller:
                 return JSONResponse(status_code=404, content={"error": {
                     "message": "session not found", "type": "not_found",
                     "code": "session_not_found"}})
-        acc = route_session_meter.get(sid) or {
-            "calls": 0, "tokens_in": 0, "tokens_out": 0,
-            "tokens_cached": 0, "cost_usd": 0.0}
-        return {**acc, "warm": route_session_meter.warm(sid)}
+        acc = host_store.session_totals(sid)
+        return {**acc, "warm": host_store.session_warm(sid)}
 
     @app.get("/x/sessions")
     def session_meters():
         """All session meters (operator view of per-session spend/cache)."""
-        return {"sessions": route_session_meter.snapshot()}
+        return {"sessions": host_store.all_session_totals()}
 
     @app.get("/x/calls")
     def recent_calls(limit: int = 100):
@@ -1252,7 +1249,7 @@ def _request_to_contract(
         # reads off ctx.request. A brand-new session has no hot route -> the key
         # is simply absent -> cache_hot is false for everyone (no phantom pin).
         contract["session"] = req.session
-        hot = route_cache.hot_route(req.session)
+        hot = host_store.hot_route(req.session)
         if hot is not None:
             contract["cache_hot_route"] = hot
 
@@ -1426,13 +1423,17 @@ def _build_x_router(result: dict, subscription_providers=frozenset(),
         "compact": _compact_suggested(resp),
     }
     if session:
-        x_router["session_acc"] = route_session_meter.observe(
-            session,
-            tokens_in=resp.get("tokens_in") or 0,
-            tokens_out=resp.get("tokens_out") or 0,
-            tokens_cached=resp.get("tokens_cached") or 0,
-            cost_usd=x_router["cost_usd"] or 0.0,
-            owner=owner)
+        # #4b: derive the running total from the committed `calls` and add THIS
+        # in-flight call (not yet in the ledger). Owner is derived from the
+        # session's earliest call, so no explicit binding is needed here.
+        prior = host_store.session_totals(session)
+        x_router["session_acc"] = {
+            "calls": prior["calls"] + 1,
+            "tokens_in": prior["tokens_in"] + (resp.get("tokens_in") or 0),
+            "tokens_out": prior["tokens_out"] + (resp.get("tokens_out") or 0),
+            "tokens_cached": prior["tokens_cached"] + (resp.get("tokens_cached") or 0),
+            "cost_usd": round(prior["cost_usd"] + (x_router["cost_usd"] or 0.0), 6),
+        }
     return x_router
 
 

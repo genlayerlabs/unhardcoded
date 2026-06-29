@@ -506,23 +506,16 @@ def test_x_router_carries_executed_cost(client, host):
     assert xr["cost_usd"] is not None       # example metrics price every pair
 
 
-def test_session_view_scoped_to_owning_consumer(client, host):
-    """Cross-consumer isolation at the endpoint the consumer-facing /v1/session
-    proxies to: a chat carrying the proxy-injected x-llm-router-caller binds the
-    sid to that consumer; only that consumer (forwarded as the same header) may
-    read the session — anyone else gets 404 (not 403, which would confirm the sid
-    exists). An operator caller (no header) stays unscoped."""
-    import route_session_meter
-    route_session_meter.reset()
-    for prov, fam in _all_pairs(host):
-        host.set_mock_response(prov, fam, _ok_response("ok"))
-    # consumer A meters sidA (the proxy injects the authed caller as this header).
-    r = client.post("/v1/chat/completions",
-                    headers={"x-llm-router-caller": "consumerA"},
-                    json={"model": "", "session": "sidA",
-                          "messages": [{"role": "user", "content": "hi"}]})
-    assert r.status_code == 200
-    assert route_session_meter.owner("sidA") == "consumerA"
+def test_session_view_scoped_to_owning_consumer(client, host, host_store_clean):
+    """Cross-consumer isolation at the consumer-facing /x/session view. The owner
+    is the caller of the session's earliest call (#4b: derived from the `calls`
+    ledger the ingress writes); only that consumer (forwarded as
+    x-llm-router-caller) may read it — anyone else gets 404 (not 403, which would
+    confirm the sid exists). An operator caller (no header) stays unscoped."""
+    from conftest import seed_call
+    # the ingress records the session's call with the authed caller.
+    seed_call(session="sidA", caller="consumerA", provider="p", family="f",
+              served_by="s", tokens_in=5, status=200)
 
     # A reads its own session -> 200 with the accumulated economics.
     r = client.get("/x/session/sidA", headers={"x-llm-router-caller": "consumerA"})
@@ -542,4 +535,3 @@ def test_session_view_scoped_to_owning_consumer(client, host):
     r = client.get("/x/session/sidA")
     assert r.status_code == 200
     assert r.json()["calls"] == 1
-    route_session_meter.reset()

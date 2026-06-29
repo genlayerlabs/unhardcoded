@@ -81,6 +81,21 @@ def seed_peer_offers(peers, observed_at=None):
                 rows)
 
 
+def seed_call(session=None, provider=None, family=None, served_by=None, status=200,
+              caller=None, tokens_in=0, tokens_out=0, tokens_cached=0, cost_usd=0.0,
+              ts=None):
+    """Insert one per-request `calls` row (as the ingress would), the raw the
+    per-session views (hot_route / session_*) derive from. ts in SECONDS."""
+    import time
+    host_store.insert_call({
+        "ts": int(time.time()) if ts is None else ts,
+        "session": session, "provider": provider, "model_family": family,
+        "served_by": served_by, "served_model_id": served_by, "status": status,
+        "caller": caller, "key_sha256": None, "tokens_in": tokens_in,
+        "tokens_out": tokens_out, "tokens_total": tokens_in + tokens_out,
+        "tokens_cached": tokens_cached, "cost_usd": cost_usd})
+
+
 def seed_route_obs(provider, family, served_by, ok, latency_ms=None, n=1, ts=None):
     """Seed n per-attempt route_observations for a route (the raw from which
     route_stats derives reliability/latency on the fly)."""

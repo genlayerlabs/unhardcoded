@@ -501,6 +501,105 @@ def route_stats(window_ms: int = 900_000) -> dict[str, dict[str, Any]]:
         return {}
 
 
+# ---- per-session views, derived on the fly from `calls` (#4b) -------------------
+# `calls` is per-request and carries session_id / status / provider_id /
+# model_family / served_by / tokens / cost / caller — everything the in-process
+# cache-affinity + session-meter folds held, now derived (fleet-consistent).
+
+_SESSION_TOTALS_ZERO = {"calls": 0, "tokens_in": 0, "tokens_out": 0,
+                        "tokens_cached": 0, "cost_usd": 0.0}
+
+
+def hot_route(session: "str | None") -> "str | None":
+    """The route (provider|family|served_by) that most recently served this
+    session SUCCESSFULLY — its prompt-cache prefix is hot there. None when unknown.
+    Matches route_reliability.route_key; resolved per request into the cache_hot
+    field. Fail-soft."""
+    if not session:
+        return None
+    try:
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT provider_id, model_family, served_by FROM calls"
+                " WHERE session_id = %s AND status < 400 AND served_by IS NOT NULL"
+                " ORDER BY ts DESC, id DESC LIMIT 1", (session,)).fetchone()
+            return f"{row[0]}|{row[1]}|{row[2]}" if row else None
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store hot_route failed: %s", exc)
+        return None
+
+
+def session_totals(session: "str | None") -> dict[str, Any]:
+    """The session's running totals (calls, tokens_in/out/cached, cost_usd) summed
+    over its committed `calls`. The caller adds the in-flight call on top. Fail-soft
+    -> zeros."""
+    if not session:
+        return dict(_SESSION_TOTALS_ZERO)
+    try:
+        with _get_pool().connection() as conn:
+            r = conn.execute(
+                "SELECT count(*), coalesce(sum(tokens_in),0), coalesce(sum(tokens_out),0),"
+                " coalesce(sum(tokens_cached),0), coalesce(sum(cost_usd),0)"
+                " FROM calls WHERE session_id = %s", (session,)).fetchone()
+            return {"calls": int(r[0]), "tokens_in": int(r[1]), "tokens_out": int(r[2]),
+                    "tokens_cached": int(r[3]), "cost_usd": round(float(r[4]), 6)}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store session_totals failed: %s", exc)
+        return dict(_SESSION_TOTALS_ZERO)
+
+
+def session_warm(session: "str | None") -> list[dict[str, Any]]:
+    """The session's warm routes for DISPLAY: per family, the most recent route
+    that served it successfully ({family, provider, served_by}). Fail-soft -> []."""
+    if not session:
+        return []
+    try:
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT DISTINCT ON (model_family) model_family, provider_id, served_by"
+                " FROM calls WHERE session_id = %s AND status < 400"
+                " AND model_family IS NOT NULL"
+                " ORDER BY model_family, ts DESC, id DESC", (session,))
+            return [{"family": f, "provider": p, "served_by": s or p}
+                    for f, p, s in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store session_warm failed: %s", exc)
+        return []
+
+
+def session_owner(session: "str | None") -> "str | None":
+    """The consumer that owns the session = the caller of its EARLIEST call
+    (first-writer-wins, for cross-consumer isolation). None when unknown."""
+    if not session:
+        return None
+    try:
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT caller FROM calls WHERE session_id = %s"
+                " ORDER BY ts ASC, id ASC LIMIT 1", (session,)).fetchone()
+            return row[0] if row else None
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store session_owner failed: %s", exc)
+        return None
+
+
+def all_session_totals() -> dict[str, dict[str, Any]]:
+    """Every session's totals (operator /x/sessions view), derived from calls."""
+    try:
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT session_id, count(*), coalesce(sum(tokens_in),0),"
+                " coalesce(sum(tokens_out),0), coalesce(sum(tokens_cached),0),"
+                " coalesce(sum(cost_usd),0) FROM calls"
+                " WHERE session_id IS NOT NULL GROUP BY session_id")
+            return {s: {"calls": int(c), "tokens_in": int(ti), "tokens_out": int(to),
+                        "tokens_cached": int(tc), "cost_usd": round(float(cu), 6)}
+                    for s, c, ti, to, tc, cu in cur.fetchall()}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store all_session_totals failed: %s", exc)
+        return {}
+
+
 # ---- peer_offers (antseed marketplace book; written by the sidecar) ------------
 
 # Columns surfaced to the reader, in the row shape sources/antseed expects. The

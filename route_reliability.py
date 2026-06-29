@@ -8,7 +8,7 @@ consistent and surviving restarts, instead of a per-pod dict.
 
 What stays here is the one thing that is pure identity, not measurement: the
 `route_key` that names a route (a specific seller peer serving a family, or the
-provider itself for a peerless gateway route). It is reused by route_cache,
+provider itself for a peerless gateway route). It is reused by host_store route/session derivations,
 route_tool_capability and the offer-stamp sites, and matches the key
 `route_stats` aggregates on. It stays entirely host-internal; the algebra never
 sees it.
