@@ -101,6 +101,29 @@ _SCHEMA_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS consumer_keys (
         consumer TEXT PRIMARY KEY, record TEXT NOT NULL, updated_at BIGINT NOT NULL
     )""",
+    # The antseed marketplace book. One RAW row per (peer, advertised service) —
+    # the seller's announced prices/caps/reputation, stored as columns, not
+    # interpreted: ranking/admission stays in sources/antseed.offers_sync (host)
+    # and the Σ_pol policy (core). WRITTEN by the antseed sidecar (the only
+    # producer; it runs the `antseed network browse` CLI), READ by
+    # sources/antseed._load_market. `observed_at` is OUR browse stamp (epoch ms),
+    # distinct from the network's `last_seen`; the 15-min sliding window that
+    # merge-market.js used to union by hand is now just a read-time filter on it.
+    """CREATE TABLE IF NOT EXISTS peer_offers (
+        peer_id         TEXT NOT NULL,
+        service         TEXT NOT NULL,
+        price_in        DOUBLE PRECISION,
+        price_out       DOUBLE PRECISION,
+        price_cached_in DOUBLE PRECISION,
+        max_concurrency INTEGER,
+        reputation      DOUBLE PRECISION,
+        last_seen       BIGINT,
+        observed_at     BIGINT NOT NULL,
+        first_seen      BIGINT,
+        fetched_at      BIGINT,
+        PRIMARY KEY (peer_id, service)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_peer_offers_observed ON peer_offers(observed_at)",
 ]
 
 _pool_lock = threading.Lock()
@@ -366,6 +389,32 @@ def set_consumer_keys(records: dict[str, Any]) -> bool:
         return False
 
 
+# ---- peer_offers (antseed marketplace book; written by the sidecar) ------------
+
+# Columns surfaced to the reader, in the row shape sources/antseed expects. The
+# window/housekeeping columns (observed_at/first_seen/fetched_at) stay internal.
+_PEER_OFFER_FIELDS = ("peer_id", "service", "price_in", "price_out",
+                      "price_cached_in", "max_concurrency", "reputation",
+                      "last_seen")
+
+
+def peer_offers(window_ms: int = 900_000) -> list[dict[str, Any]]:
+    """The antseed market book: one raw row per (peer, service) observed within
+    the last `window_ms` of OUR browsing (the sliding window, as a read-time
+    filter on observed_at). Fail-soft: returns [] on any store error, so a flaky
+    DB degrades to "no antseed candidates" exactly as a missing dump did."""
+    try:
+        cutoff = int(time.time() * 1000) - max(0, window_ms)
+        cols = ", ".join(_PEER_OFFER_FIELDS)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                f"SELECT {cols} FROM peer_offers WHERE observed_at >= %s", (cutoff,))
+            return [dict(zip(_PEER_OFFER_FIELDS, r)) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001 — market read is best-effort
+        _log.warning("host_store peer_offers failed: %s", exc)
+        return []
+
+
 # ---- one-shot backfill of legacy JSON state (run once at startup) --------------
 
 def _seed_if_empty(table: str, legacy_path: str, to_rows) -> None:
@@ -429,4 +478,4 @@ def truncate_all_for_tests() -> None:
     """Test helper: wipe every table for isolation against a shared Postgres."""
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
-                     " consumer_keys")
+                     " consumer_keys, peer_offers")

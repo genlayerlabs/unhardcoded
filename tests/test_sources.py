@@ -480,14 +480,23 @@ ANTSEED_CATALOG = {
 }
 
 
-def _antseed_source(tmp_path, market_body=None, pins=None):
+def _antseed_source(tmp_path, market_body=None, pins=None, observed_at=None):
     import json as _json
+    import host_store
+    from conftest import seed_peer_offers
     from sources.antseed import AntSeedSource
     tmp_path.mkdir(parents=True, exist_ok=True)
-    market = tmp_path / "market.json"
     if market_body is None:
         market_body = (Path(__file__).parent / "fixtures" / "antseed_market.json").read_text()
-    market.write_text(market_body if isinstance(market_body, str) else _json.dumps(market_body))
+    market = market_body if isinstance(market_body, dict) else _json.loads(market_body)
+    # the market book lives in the host store now (peer_offers); seed it as the
+    # sidecar would. Status files stay on the shared volume (pins + balances).
+    try:
+        host_store.reset()
+        host_store.truncate_all_for_tests()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"host store Postgres unavailable: {exc}")
+    seed_peer_offers(market.get("peers") or [], observed_at)
     # each buyer proxy is a session pinned to ONE peer; offers are restricted
     # to that peer (live finding: an unpinned buyer errors "no_peer_pinned")
     default_pins = {"antseed_free": "1d90f467689d499dc435e5744b4613c3203eb0aa",
@@ -676,10 +685,10 @@ def test_settings_validate_and_write_list_roundtrip(host_store_clean):
 
 
 def test_antseed_stale_market_returns_no_offers(tmp_path):
-    import os as _os
-    s = _antseed_source(tmp_path)
-    old = _os.path.getmtime(tmp_path / "market.json") - 3600
-    _os.utime(tmp_path / "market.json", (old, old))
+    # rows last observed past the window (here ~1h ago) fall outside the read-time
+    # filter -> no offers, stale flag set (was: a backdated market.json mtime).
+    old = int(time.time() * 1000) - 3600 * 1000
+    s = _antseed_source(tmp_path, observed_at=old)
     assert s.offers_sync("antseed_free") == []
     assert s.snapshot_stats()["stale"] is True
 
@@ -784,9 +793,8 @@ def test_discover_hook_serves_antseed_offers(tmp_path):
     # empty results must NOT be cached as ok (the core caches ok results for
     # the discovery TTL — a router that starts before the first market dump
     # would otherwise serve no antseed offers until the TTL expires)
-    s2 = _antseed_source(tmp_path / "empty", market_body='{"peers": []}') if False else None
-    import json as _json, os as _os
-    (tmp_path / "market.json").write_text(_json.dumps({"peers": []}))
+    import host_store
+    host_store.truncate_all_for_tests()        # empty the market book
     r2 = hook("antseed_free")
     assert r2["ok"] is False and "no offers" in r2["error"]
 

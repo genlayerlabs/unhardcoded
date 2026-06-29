@@ -63,11 +63,9 @@ atomic_write() {  # <validator-cmd> <dest> ; reads producer stdout on fd via $1
 write_market() {
     raw="$MARKET_DIR/.market.raw.$$"
     timeout -k 5 "$CLI_TIMEOUT" antseed network browse --services --top "$TOP" --json > "$raw" 2>/dev/null || true
-    # merge this browse into the rolling window (and validate: a non-dump exits
-    # non-zero -> keep the last good market.json)
-    if node "$LIB/merge-market.js" "$MARKET_DIR/market.json" < "$raw" | atomic_write "$MARKET_DIR/market.json"; then
-        :
-    else
+    # upsert this browse into the host store's peer_offers (and validate: a
+    # non-dump / DB error exits non-zero -> keep the last good window, no write)
+    if ! node "$LIB/write-market.js" < "$raw"; then
         # record what we got for debugging; keep the last good window
         cp "$raw" "$MARKET_DIR/market.err" 2>/dev/null || true
     fi

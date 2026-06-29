@@ -1,12 +1,13 @@
 """
 AntSeed source: offers, prices and wallet balances for the AntSeed buyer
-proxies, read from a market dump on a shared volume (the buyer daemon's
-control API is a unix socket inside the antseed containers; only the proxy
-ports are shared with the router's network namespace).
+proxies.
 
-The antseed-free container writes /market/market.json (network browse
---services --json) every 300 s; each buyer writes /market/status-<id>.json
-(buyer status --json).
+The marketplace book is read from the host store (`peer_offers`), which the
+antseed sidecar writes from `antseed network browse --services --json`. Buyer
+status is still read from /market/status-<id>.json on the shared volume (each
+buyer writes `buyer status --json`); the buyer daemon's control API is a unix
+socket inside the antseed containers, so only the proxy ports are shared with
+the router's network namespace.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import host_store
 import route_reliability as _route_reliability
 import route_latency as _route_latency
 import route_tool_capability as _route_tool_capability
@@ -81,24 +83,6 @@ async def _fetch_chain_balances(rpc_url: str, address: str) -> dict:
     return out
 
 
-def _as_pos_int(v: Any) -> int | None:
-    """maxConcurrency as a positive int, or None when absent/garbage (ungated)."""
-    try:
-        n = int(v)
-    except (TypeError, ValueError):
-        return None
-    return n if n > 0 else None
-
-
-def _as_score(v: Any) -> float | None:
-    """On-chain reputation as a float, or None when absent/garbage. None means
-    'no reported reputation' — kept (cold-start safe), never coerced to 0."""
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
 class AntSeedSource:
     name = "antseed"
     poll_interval_s = 300
@@ -118,57 +102,15 @@ class AntSeedSource:
     # ---- market parsing -------------------------------------------------
 
     def _load_market(self) -> list[dict]:
-        """[{service, price_in, price_out}] per peer-service row, or [] when
-        the dump is missing/stale (degraded: no antseed candidates)."""
-        path = self._dir / "market.json"
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            self._stats["stale"] = True
-            return []
-        # Freshness from the writer's embedded stamp (robust to volume
-        # copy/restore that mangles mtime); fall back to mtime when absent.
-        ts_ms = data.get("fetched_at_ms") if isinstance(data, dict) else None
-        try:
-            age_s = (time.time() - ts_ms / 1000.0) if ts_ms \
-                else (time.time() - path.stat().st_mtime)
-        except OSError:
-            age_s = float("inf")
-        if age_s > STALE_AFTER_S:
-            self._stats["stale"] = True
-            return []
-        self._stats["stale"] = False
-        rows = []
-        for peer in data.get("peers") or []:
-            for pricing in (peer.get("providerPricing") or {}).values():
-                for service, sp in (pricing.get("services") or {}).items():
-                    rows.append({
-                        "peer_id": peer.get("peerId"),
-                        "service": service,
-                        "price_in": float(sp.get("inputUsdPerMillion") or 0),
-                        "price_out": float(sp.get("outputUsdPerMillion") or 0),
-                        # Seller-advertised cached-input price, when present. The
-                        # buyer's @antseed/router-local rejects an offer whose
-                        # cached price exceeds its input price as malformed
-                        # (see offers_sync); we need it to mirror that gate.
-                        "price_cached_in": (
-                            float(sp["cachedInputUsdPerMillion"])
-                            if sp.get("cachedInputUsdPerMillion") is not None
-                            else None),
-                        # seller-advertised in-flight cap. Exceeding it earns a
-                        # 429 "Max concurrency reached"; the host gates per peer
-                        # to this (None = ungated). See llm_router_host.
-                        "max_concurrency": _as_pos_int(peer.get("maxConcurrency")),
-                        # peer's on-chain reputation (0-100), the buyer's own
-                        # admission signal. None when the peer reports none
-                        # (cold-start). Carried onto the offer + gateable via
-                        # the antseed.reputation_min knob. See offers_sync.
-                        "reputation": _as_score(peer.get("onChainReputationScore")),
-                        # peer announcement freshness (ms epoch) — the only
-                        # live signal discovery gives us per peer; dropped from
-                        # offers/ranking, surfaced in the dashboard book.
-                        "last_seen": peer.get("lastSeen"),
-                    })
+        """[{peer_id, service, price_in, price_out, price_cached_in,
+        max_concurrency, reputation, last_seen}] per peer-service row from the
+        host store (written by the antseed sidecar within the sliding window), or
+        [] when none are fresh (degraded: no antseed candidates). The fields are
+        raw seller announcements: cap mirroring (price_cached_in), per-peer gating
+        (max_concurrency), reputation admission and dashboard freshness (last_seen)
+        are applied downstream in offers_sync / market_book."""
+        rows = host_store.peer_offers(STALE_AFTER_S * 1000)
+        self._stats["stale"] = not rows
         return rows
 
     def _pinned_peer(self, provider_id: str) -> str | None:
