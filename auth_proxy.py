@@ -50,12 +50,10 @@ DASHBOARD_COOKIE_PATH = os.getenv("DASHBOARD_COOKIE_PATH", "/dashboard")
 DASHBOARD_KEY_ENV_PATH = os.getenv("DASHBOARD_KEY_ENV_PATH", "/run/llm-router/.env.secrets")
 CODEX_ACCOUNTS_DIR = os.getenv("CODEX_ACCOUNTS_DIR", "/codex/accounts")
 CODEX_AUTH_PATH = os.getenv("CODEX_AUTH_PATH") or None
-DASHBOARD_LOGIN_HISTORY_PATH = os.getenv("DASHBOARD_LOGIN_HISTORY_PATH", "/run/llm-router/secrets/dashboard-logins.jsonl")
 DASHBOARD_KEY_PREFIX = os.getenv("DASHBOARD_KEY_PREFIX", "llmr")
 DEFAULT_ROTATION_GRACE_S = int(os.getenv("DASHBOARD_KEY_ROTATION_GRACE_S", "86400"))
 DASHBOARD_POLICY_CONFIG_PATH = os.getenv("DASHBOARD_POLICY_CONFIG_PATH", "config.live.lua")
 DASHBOARD_POLICY_METRICS_PATH = os.getenv("DASHBOARD_POLICY_METRICS_PATH", "metrics.live.lua")
-USAGE_HISTORY_PATH_DEFAULT = os.getenv("ROUTER_USAGE_HISTORY_PATH", "/run/llm-router/usage-history.jsonl")
 DASHBOARD_POLICY_DIR = os.getenv("DASHBOARD_POLICY_DIR", "policies")
 ROUTER_CONTEXT_LENGTH = int(os.getenv("ROUTER_CONTEXT_LENGTH", "200000"))
 ROUTE_HEALTH_ROUTES = [r.strip() for r in os.getenv("DASHBOARD_ROUTE_HEALTH_ROUTES", "profile:default").split(",") if r.strip()]
@@ -137,11 +135,13 @@ def _new_stats() -> dict[str, Any]:
 
 
 _stats: dict[str, Any] = _new_stats()
-_login_events: deque[dict[str, Any]] = deque(maxlen=RECENT_LIMIT)
 
 
 def _reset_stats_for_tests() -> None:
-    """Reset in-memory counters without touching persistent usage history."""
+    """Reset in-memory counters. Drains the host-store write queue first so a
+    just-recorded call has landed in the `calls` ledger before the test reads the
+    derived stats back (the persistent store now backs them, #5)."""
+    host_store._write_q.join()
     with _stats_lock:
         _stats.clear()
         _stats.update(_new_stats())
@@ -593,11 +593,6 @@ def _require_admin_dashboard_caller(request: Request) -> tuple[str | None, Respo
 
 
 
-def _login_history_path() -> Path | None:
-    raw = (DASHBOARD_LOGIN_HISTORY_PATH or "").strip()
-    return Path(raw) if raw else None
-
-
 def _mask_remote(remote: str | None) -> str | None:
     if not remote:
         return None
@@ -620,36 +615,9 @@ def _user_agent_hash(request: Request) -> str | None:
     return hashlib.sha256(ua.encode()).hexdigest()[:12] if ua else None
 
 
-def _append_login_history(row: dict[str, Any]) -> None:
-    path = _login_history_path()
-    if not path:
-        return
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
-        path.chmod(0o600)
-    except Exception as exc:
-        log.warning(json.dumps({"event": "dashboard_login_history_write_failed", "path": str(path), "error": str(exc)}))
-
-
 def _read_login_history() -> list[dict[str, Any]]:
-    path = _login_history_path()
-    if not path or not path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(row, dict) and row.get("event") == "dashboard_login":
-                    rows.append(row)
-    except Exception as exc:
-        log.warning(json.dumps({"event": "dashboard_login_history_read_failed", "path": str(path), "error": str(exc)}))
-    return rows
+    # Dashboard login audit, from the store now (#5: dashboard-logins.jsonl retired).
+    return host_store.recent_logins(RECENT_LIMIT)
 
 
 def _record_dashboard_login(*, request: Request, role: str, user: str, consumer: str | None = None, key_sha256: str | None = None) -> None:
@@ -665,9 +633,7 @@ def _record_dashboard_login(*, request: Request, role: str, user: str, consumer:
         "user_agent_hash": _user_agent_hash(request),
     }
     row = {k: v for k, v in row.items() if v is not None}
-    with _stats_lock:
-        _login_events.appendleft(row)
-    _append_login_history(row)
+    host_store.insert_login(row)
 
 
 
@@ -725,6 +691,7 @@ def _provider_credentials_snapshot(*, timeframe: str = "all", viewer_role: str =
     with _stats_lock:
         usage_rows.extend([dict(r) for r in _stats["recent"] if r.get("event") == "request"])
         runtime_by_provider = {k: _counter_snapshot(v) for k, v in sorted(_stats["by_provider"].items())}
+    usage_rows = _dedup_usage_rows(usage_rows)
     if since is not None:
         usage_rows = [r for r in usage_rows if int(r.get("ts") or 0) >= since]
 
@@ -840,7 +807,6 @@ def _login_connections_snapshot(*, timeframe: str = "all", consumer: str | None 
 
     dashboard_rows = list(_read_login_history())
     with _stats_lock:
-        dashboard_rows.extend(list(_login_events))
         runtime_recent = list(_stats["recent"])
     dedup = {}
     for row in dashboard_rows:
@@ -854,6 +820,7 @@ def _login_connections_snapshot(*, timeframe: str = "all", consumer: str | None 
 
     usage_rows = _read_usage_history() if timeframe != "runtime" else []
     usage_rows.extend([r for r in runtime_recent if r.get("event") == "request"])
+    usage_rows = _dedup_usage_rows(usage_rows)
     if since is not None:
         usage_rows = [r for r in usage_rows if int(r.get("ts") or 0) >= since]
     if consumer:
@@ -2786,116 +2753,44 @@ async def proxy(path: str, request: Request) -> Response:
 
 
 def _record_reject(**event: Any) -> None:
+    # #5: a reject (auth fail / rate limit) is NOT an LLM call, so it does NOT go
+    # into the `calls` ledger — it lives in the runtime recent feed only. (Before,
+    # rejects were dual-written to usage-history; with that file retired, the
+    # persistent stats are per-LLM-call and rejects are a runtime view.)
     stored = {"ts": int(time.time()), "event": "reject", **event}
     with _stats_lock:
         _stats["total_rejects"] += 1
         _stats["recent"].appendleft(stored)
-    # Rejects survive ingress recreates like requests do, so non-runtime
-    # timeframes keep counting them. `remote` (client IP) stays in the
-    # in-memory deque only — ephemeral diagnostics, not durable data.
-    _append_usage_history({k: v for k, v in stored.items() if k != "remote"})
-
-
-def _usage_history_path() -> Path | None:
-    raw = os.getenv("ROUTER_USAGE_HISTORY_PATH", USAGE_HISTORY_PATH_DEFAULT).strip()
-    if not raw:
-        return None
-    return Path(raw)
-
-
-# The durable usage-history is for aggregation (provider/model/status/tokens/
-# cost over a timeframe); the per-request decision_trace (the full policy_term
-# AST + every ranked candidate + the decision_path) is only needed for the live
-# Activity view, which reads the in-memory `_stats["recent"]` deque — that keeps
-# the full trace. Persisting the trace in every durable row bloated the file to
-# ~23-65 KB/row, and the dashboard reader loads the whole file into memory, so a
-# few thousand rows OOM-killed the auth-proxy container. Strip the heavy fields
-# on write, bound the file, and bound the read.
-_HISTORY_HEAVY_FIELDS = ("decision_trace", "ranked", "policy_term", "decision_path")
-USAGE_HISTORY_MAX_BYTES = int(os.getenv("ROUTER_USAGE_HISTORY_MAX_BYTES", str(16 * 1024 * 1024)))
-USAGE_HISTORY_READ_TAIL_BYTES = int(os.getenv("ROUTER_USAGE_HISTORY_READ_TAIL_BYTES", str(8 * 1024 * 1024)))
-
-
-def _slim_history_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Drop the heavy debug-only fields from a durable usage row. No-op (returns
-    the same object) when none are present, so the common small-row path is free."""
-    if isinstance(row, dict) and any(k in row for k in _HISTORY_HEAVY_FIELDS):
-        return {k: v for k, v in row.items() if k not in _HISTORY_HEAVY_FIELDS}
-    return row
-
-
-def _rotate_usage_history(path: Path) -> None:
-    """Keep the append-only history bounded: once it grows past the cap, retain
-    only the most recent half. Cheap — only rewrites when the file actually
-    exceeds the cap, and reads just the tail it keeps (never the whole file)."""
-    try:
-        if path.stat().st_size <= USAGE_HISTORY_MAX_BYTES:
-            return
-        keep = max(USAGE_HISTORY_MAX_BYTES // 2, 1)
-        with path.open("rb") as fh:
-            fh.seek(-keep, os.SEEK_END)
-            data = fh.read()
-        nl = data.find(b"\n")  # drop the partial first line left by the seek
-        if nl != -1:
-            data = data[nl + 1:]
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with tmp.open("wb") as fh:
-            fh.write(data)
-        os.replace(tmp, path)
-    except Exception as exc:
-        log.warning(json.dumps({"event": "usage_history_rotate_failed", "path": str(path), "error": str(exc)}))
 
 
 def _append_usage_history(row: dict[str, Any]) -> None:
-    # Dual-write the call into the host-store ledger (the emerging source of truth),
-    # alongside and independent of the usage-history file. OFFLOADED to the host
-    # store's background writer so the DB write never sits on the request's
-    # latency path. (DEBT: the usage-history file append below is still synchronous
-    # blocking IO on the event loop — pre-existing, to offload when its reader
-    # migrates onto the ledger.)
+    # The call ledger IS the durable store now (#5: the usage-history file is
+    # retired; its reader derives from `calls`). Offloaded to the host store's
+    # background writer so the DB write never sits on the request's latency path.
     host_store.insert_call_async(row)
-    path = _usage_history_path()
-    if not path:
-        return
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(_slim_history_row(row), sort_keys=True, separators=(",", ":")) + "\n")
-        _rotate_usage_history(path)
-    except Exception as exc:
-        log.warning(json.dumps({"event": "usage_history_write_failed", "path": str(path), "error": str(exc)}))
 
 
 def _read_usage_history(*, events: tuple[str, ...] = ("request",)) -> list[dict[str, Any]]:
-    # Default stays request-only: every aggregation written before reject
-    # events were persisted assumes request-shaped rows. Readers that can
-    # discriminate (the timeframe stats) opt in via `events`.
-    path = _usage_history_path()
-    if not path or not path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
-    try:
-        # Read at most the last READ_TAIL_BYTES so an unbounded (or pre-rotation,
-        # still-bloated) file can never balloon the reader. Bytes mode lets us
-        # seek to the tail; json.loads accepts bytes directly.
-        size = path.stat().st_size
-        with path.open("rb") as fh:
-            if size > USAGE_HISTORY_READ_TAIL_BYTES:
-                fh.seek(-USAGE_HISTORY_READ_TAIL_BYTES, os.SEEK_END)
-                fh.readline()  # discard the partial first line left by the seek
-            for raw in fh:
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                if isinstance(row, dict) and row.get("event") in events:
-                    rows.append(_slim_history_row(row))
-    except Exception as exc:
-        log.warning(json.dumps({"event": "usage_history_read_failed", "path": str(path), "error": str(exc)}))
-    return rows
+    # The persistent usage rows for the dashboard timeframe stats, DERIVED from the
+    # `calls` ledger now (#5: usage-history.jsonl retired). `calls` are request
+    # events; `events` is kept for signature compatibility.
+    return host_store.usage_rows()
+
+
+def _dedup_usage_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # The persistent (calls) and runtime (recent) sources overlap: the same request
+    # is in both once its async ledger write lands. Keep one per usage_event_id
+    # (runtime wins — appended later, richer fields); rows without an id stay as-is.
+    out: list[dict[str, Any]] = []
+    by_id: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        ev = r.get("usage_event_id")
+        if ev is None:
+            out.append(r)
+        else:
+            by_id[ev] = r
+    out.extend(by_id.values())
+    return out
 
 
 _SSE_TAIL_HARD_CAP = 4 * 1024 * 1024  # 4 MiB backstop if no event boundary appears
@@ -3431,7 +3326,7 @@ def _key_usage_snapshot(*, viewer: str, key_sha256: str, caller: str | None = No
         "consumer": inferred_caller,
         "key_sha256_prefix": prefix,
         "key": _key_metadata_for_digest(digest, inferred_caller),
-        "source": {"persistent_history": persistent, "history_path_configured": _usage_history_path() is not None},
+        "source": {"persistent_history": persistent, "history_path_configured": True},
         "window": {
             "since": options.get("since"),
             "until": options.get("until"),
@@ -3609,7 +3504,7 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
             "viewer_role": viewer_role,
             "selected_consumer": selected,
             "selected_key_sha256_prefix": key_filter[:12] if key_filter else None,
-            "timeframe": {"selected": timeframe, "source": "persistent_history", "history_path_configured": _usage_history_path() is not None, "history_events": len(rows), "history_events_all": len(all_rows)},
+            "timeframe": {"selected": timeframe, "source": "persistent_history", "history_path_configured": True, "history_events": len(rows), "history_events_all": len(all_rows)},
             "rate_limit": {"rate_per_min": RATE_PER_MIN, "burst": BURST, "effective_per_min": max(RATE_PER_MIN, BURST)},
             "upstream": {"status": upstream_status, "health": upstream_health},
             "consumers": [{"name": name, "configured": True} for name in _consumers()],
@@ -3681,7 +3576,7 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
             "viewer_role": viewer_role,
             "selected_consumer": selected,
             "selected_key_sha256_prefix": key_filter[:12] if key_filter else None,
-            "timeframe": {"selected": "runtime", "source": "memory", "history_path_configured": _usage_history_path() is not None},
+            "timeframe": {"selected": "runtime", "source": "memory", "history_path_configured": True},
             "rate_limit": {"rate_per_min": RATE_PER_MIN, "burst": BURST, "effective_per_min": max(RATE_PER_MIN, BURST)},
             "upstream": {"status": upstream_status, "health": upstream_health},
             "consumers": [{"name": name, "configured": True} for name in _consumers()],
