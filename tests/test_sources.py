@@ -361,6 +361,22 @@ def test_openrouter_discovery_drops_models_with_no_usable_endpoints():
     assert {p["served_model_id"] for p in prices} == {"z-ai/glm-5.2"}
 
 
+def test_openrouter_endpoint_details_do_not_follow_foreign_origins():
+    body = {"data": [{
+        "id": "z-ai/glm-5.2",
+        "pricing": {"prompt": "0.0000004", "completion": "0.0000016"},
+        "links": {"details": "https://not-openrouter.example/models/z-ai/glm-5.2/endpoints"},
+    }]}
+    s = _or_source({"/models": FakeResponse(200, body)})
+
+    prices = asyncio.run(s.pricing())
+
+    assert [url for url, _headers in s._client.calls] == [
+        "https://openrouter.ai/api/v1/models",
+    ]
+    assert {p["served_model_id"] for p in prices} == {"z-ai/glm-5.2"}
+
+
 def test_openrouter_discovery_stamps_capability_flags_for_meets_req():
     # the core's meets_req filters on capabilities.supports_{tools,vision,...};
     # discovery must translate OpenRouter's supported_parameters into those flags
@@ -479,6 +495,53 @@ def test_bedrock_source_builds_marketplace_offers_from_models_and_prices():
     assert offer["model_family"] == "claude-opus-4-8"
     assert offer["capabilities"]["context"] == 1000000
     assert offer["capabilities"]["supports_json_mode"] is True
+
+
+def test_bedrock_source_keeps_previous_offers_when_price_refresh_fails():
+    from sources.bedrock import BedrockSource
+
+    catalog = {
+        "providers": {
+            "bedrock_mantle_market": {
+                "source": "bedrock",
+                "discovery": "marketplace",
+                "base_url": "https://bedrock.test/openai/v1",
+                "auth_env": "AWS_BEARER_TOKEN_BEDROCK",
+            },
+        },
+        "models": {
+            "claude-opus-4-8": {
+                "capabilities": {"context": 200000},
+                "served_by": [],
+            },
+        },
+    }
+    client = FakeClient({
+        "/models": FakeResponse(200, {"data": [{
+            "id": "anthropic.claude-opus-4-8-20260514-v1:0",
+        }]}),
+        "/region_index.json": FakeResponse(200, {"regions": {
+            "us-east-1": {"currentVersionUrl": "/prices/us-east-1.json"},
+        }}),
+        "/prices/us-east-1.json": FakeResponse(200, BEDROCK_PRICE_BODY),
+    })
+    source = BedrockSource(
+        catalog,
+        env_get={
+            "AWS_BEARER_TOKEN_BEDROCK": "bt-test",
+            "BEDROCK_REGION": "us-east-1",
+        }.get,
+        client=client,
+        pricing_base="https://pricing.test",
+    )
+    asyncio.run(source.pricing())
+    previous = source.offers_sync("bedrock_mantle_market")
+
+    client.routes["/prices/us-east-1.json"] = FakeResponse(500, {})
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(source.pricing())
+    assert source.offers_sync("bedrock_mantle_market") == previous
 
 
 def test_bedrock_source_is_empty_without_bearer_token():

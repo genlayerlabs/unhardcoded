@@ -13,6 +13,9 @@ local HERE = os.getenv("LLM_POLICY_DIR") or "."
 -- field schema below. Provider-level pricing/caching flow live via the EMA.
 local MM_OK, MM = pcall(dofile, HERE .. "/model_meta.lua")
 if not MM_OK then MM = {} end
+local BEDROCK_REGION = os.getenv("BEDROCK_REGION") or "us-east-1"
+local BEDROCK_MANTLE_BASE_URL = os.getenv("BEDROCK_MANTLE_BASE_URL")
+    or ("https://bedrock-mantle." .. BEDROCK_REGION .. ".api.aws/openai/v1")
 -- Per-family model trait getter. Curated families resolve from the static,
 -- deterministic model_meta.lua (MM) — the on-chain path. Discovered marketplace
 -- families (e.g. live OpenRouter models) aren't in MM; they carry their full
@@ -81,8 +84,7 @@ return {
         },
         bedrock_mantle = {
             discovery = "static",
-            base_url  = os.getenv("BEDROCK_MANTLE_BASE_URL")
-                     or "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+            base_url  = BEDROCK_MANTLE_BASE_URL,
             api_kind  = "openai_compatible",
             auth_env  = "AWS_BEARER_TOKEN_BEDROCK",
             tier      = "partner",
@@ -93,8 +95,7 @@ return {
         bedrock_mantle_market = {
             discovery        = "marketplace",
             discovery_id     = "bedrock_mantle_market",
-            base_url         = os.getenv("BEDROCK_MANTLE_BASE_URL")
-                           or "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+            base_url         = BEDROCK_MANTLE_BASE_URL,
             api_kind         = "openai_compatible",
             auth_env         = "AWS_BEARER_TOKEN_BEDROCK",
             tier             = "partner",

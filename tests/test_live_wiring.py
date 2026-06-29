@@ -196,6 +196,40 @@ def test_missing_provider_keys_are_filtered_before_ranking():
     assert "openai" not in host.dump_state().get("disabled_providers", {})
 
 
+def test_missing_provider_keys_preserve_existing_runtime_disable():
+    async def provider_call(_req):
+        return {"ok": True, "response": {"text": "ok"}}
+
+    host = LLMRouterHost(
+        router_path=ROOT / "core" / "router.lua",
+        config_path=ROOT / "config.live.lua",
+        metrics_path=ROOT / "metrics.live.lua",
+        env={"OPENROUTER_API_KEY": "sk-openrouter"},
+        now_ms=lambda: 1,
+    )
+    host.init()
+    host.set_async_call_hook(provider_call)
+    state = host.dump_state()
+    state["disabled_providers"] = {
+        "openai": {"kind": "auth_error", "at_ms": 1},
+    }
+    host.restore_state(state)
+
+    term = ["policy",
+            ["and", ["meets_req"], ["not", ["is", "disabled"]],
+             ["family_eq", "gpt-5.4"]],
+            ["lit", 1], ["argmax"], ["id"],
+            ["always", {"action": "next_candidate"}]]
+    host.rank({"policy_ir": term, "requirements": {"context": 8000}})
+    assert host.dump_state()["disabled_providers"]["openai"]["kind"] == \
+        "auth_error"
+
+    host.set_env("OPENAI_API_KEY", "sk-openai")
+    host.rank({"policy_ir": term, "requirements": {"context": 8000}})
+    assert host.dump_state()["disabled_providers"]["openai"]["kind"] == \
+        "auth_error"
+
+
 def test_context_overflow_falls_through_to_the_next_candidate():
     # A context overflow on ONE route must not abort the whole request: a
     # provider-neutral family (gpt-5.4 is served by openai AND openrouter) spans

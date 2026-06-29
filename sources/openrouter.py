@@ -8,6 +8,7 @@ import asyncio
 import os
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import host_store
 import route_reliability as _route_reliability
@@ -64,6 +65,10 @@ class OpenRouterSource:
 
     def _url_for(self, path: str) -> str:
         if path.startswith("http://") or path.startswith("https://"):
+            base = urlparse(self._base_url)
+            target = urlparse(path)
+            if (target.scheme, target.netloc) != (base.scheme, base.netloc):
+                raise RuntimeError(f"openrouter detail URL outside base origin: {path}")
             return path
         # OpenRouter embeds docs/API paths such as
         # /api/v1/models/<slug>/endpoints in links.details. The source base URL

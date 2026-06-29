@@ -217,14 +217,19 @@ class BedrockSource:
 
     async def pricing(self) -> list[Price]:
         region = self._env_get("BEDROCK_REGION") or "us-east-1"
-        try:
-            prices = await self._prices_by_family(region)
-        except Exception:
-            prices = {}
+        active_providers = {
+            pid: cfg for pid, cfg in self._providers.items()
+            if self._provider_token(cfg)
+        }
+        if not active_providers:
+            self._offers_by_provider = {}
+            return []
+
+        prices = await self._prices_by_family(region)
 
         rows: list[Price] = []
         offers_by_provider: dict[str, list[dict]] = {}
-        for pid, cfg in self._providers.items():
+        for pid, cfg in active_providers.items():
             models = await self._provider_models(cfg)
             provider_offers: list[dict] = []
             for model in models:

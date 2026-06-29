@@ -599,10 +599,10 @@ end
 
         for pid in missing:
             cur = disabled.get(pid)
-            if not (isinstance(cur, dict) and cur.get("kind") == _AUTH_UNCONFIGURED):
+            if cur is None:
                 disabled[pid] = {"kind": _AUTH_UNCONFIGURED, "at_ms": now}
                 changed = True
-            else:
+            elif isinstance(cur, dict) and cur.get("kind") == _AUTH_UNCONFIGURED:
                 # Keep it fresh so the normal disabled-provider TTL cannot make
                 # an unset env var intermittently routable.
                 cur["at_ms"] = now
