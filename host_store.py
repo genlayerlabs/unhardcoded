@@ -783,53 +783,6 @@ def buyer_status(pid: str) -> "dict[str, Any] | None":
         return None
 
 
-# ---- one-shot backfill of legacy JSON state (run once at startup) --------------
-
-def _seed_if_empty(table: str, legacy_path: str, to_rows) -> None:
-    """One-time migration: if `table` is EMPTY and the legacy JSON at `legacy_path`
-    exists, load it and seed via the table's setter. Idempotent — guarded on EMPTY
-    (not file-exists), under an advisory lock so concurrent container starts cannot
-    race. Fail-soft: an absent or corrupt file leaves the table empty and logs."""
-    try:
-        with _get_pool().connection() as conn:
-            conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_KEY,))
-            n = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-            if n > 0:
-                return                       # already migrated (or written since)
-            import pathlib
-            p = pathlib.Path(legacy_path)
-            if not p.exists():
-                return                       # fresh env, nothing to migrate
-            data = json.loads(p.read_text())
-            to_rows(data)
-            _log.info("host_store: seeded %s from %s", table, legacy_path)
-    except Exception as exc:                 # noqa: BLE001
-        _log.warning("host_store seed %s failed: %s", table, exc)
-
-
-def migrate_legacy_json() -> None:
-    """One-shot backfill of the legacy JSON operational state, run once at startup
-    BEFORE the app serves. Idempotent (guard-on-empty + advisory lock) so it is a
-    safe no-op on every later boot and safe to run from either container. Once the
-    dashboard confirms the data, delete the legacy files; then this and the env
-    paths below can be removed."""
-    _seed_if_empty(
-        "settings_overrides",
-        os.getenv("LLM_ROUTER_CONFIG_OVERRIDES",
-                  "/run/llm-router/secrets/config-overrides.json"),
-        lambda d: set_overrides(d if isinstance(d, dict) else {}))
-    _seed_if_empty(
-        "provider_overlays",
-        os.getenv("PROVIDERS_OVERLAY_PATH",
-                  "/run/llm-router/secrets/providers.local.json"),
-        lambda d: set_provider_overlays((d or {}).get("providers") or {}))
-    _seed_if_empty(
-        "consumer_keys",
-        os.getenv("DASHBOARD_ISSUED_KEYS_PATH",
-                  "/run/llm-router/secrets/issued-consumer-keys.json"),
-        lambda d: set_consumer_keys(d if isinstance(d, dict) else {}))
-
-
 def reset() -> None:
     """Test hook: close + forget the pool (recreated against DATABASE_URL next
     use). For per-test isolation against a shared DB, truncate the tables."""

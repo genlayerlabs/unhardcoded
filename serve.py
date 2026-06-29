@@ -58,13 +58,9 @@ def main() -> None:
                         "subscription provider — unofficial, ToS-risky.")
     args = p.parse_args()
 
-    # One-shot backfill: seed the host store from any legacy JSON state
-    # on the PVC (settings overrides, provider overlay, issued consumer keys),
-    # before anything reads it. Idempotent (guard-on-empty) — a no-op on every
-    # boot after the first. Then refresh settings, whose import-time reload saw
-    # the empty store.
-    import host_store
-    host_store.migrate_legacy_json()
+    # Operator settings (overrides) live in the host store (Postgres). Refresh
+    # them here so this process reflects any writes made before it started — its
+    # import-time load may have run before the pool was ready.
     import settings
     settings.reload()
 

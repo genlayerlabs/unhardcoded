@@ -80,13 +80,12 @@ services:
     environment:
       ROUTER_UPSTREAM: http://router:18080
       # Operational store: the ingress is the writer (consumer keys, the ledger,
-      # operator-config writes) + runs the one-shot legacy backfill. Prod = RDS.
+      # operator-config writes). Prod = RDS.
       DATABASE_URL: ${DATABASE_URL:-postgresql://hoststore:hoststore@postgres:5432/hoststore}
       RATE_PER_MIN: ${RATE_PER_MIN:-600}
       BURST: ${BURST:-200}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DASHBOARD_KEY_ENV_PATH: /run/llm-router/.env.secrets
-      DASHBOARD_ISSUED_KEYS_PATH: /run/llm-router/secrets/issued-consumer-keys.json
       # env_file carries the HOST path; inside the container the file is the
       # bind mount below (needed by the provider-key reveal endpoint)
       CODEX_AUTH_PATH: /codex/auth.json

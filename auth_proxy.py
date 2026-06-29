@@ -867,10 +867,8 @@ def _login_connections_snapshot(*, timeframe: str = "all", consumer: str | None 
 async def startup() -> None:
     global _client, _probe_task
     # The ingress is the owner of the operational store (consumer keys, the ledger,
-    # operator-config writes). Run the one-shot legacy-JSON backfill here too —
-    # idempotent (advisory lock + guard-on-empty), so it is safe whether the router
-    # or the ingress reaches the shared DB first (k8s starts both in parallel).
-    host_store.migrate_legacy_json()
+    # operator-config writes); all operator state lives in Postgres now (the legacy
+    # JSON backfill was retired once prod confirmed the tables were populated).
     _client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0))
     if SYNTHETIC_PROBES_ENABLED and ROUTE_HEALTH_ROUTES:
         _probe_task = asyncio.create_task(_synthetic_probe_loop())
