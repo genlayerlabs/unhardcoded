@@ -40,6 +40,14 @@ LIB=/usr/local/lib/antseed
 
 mkdir -p "$MARKET_DIR"
 
+# A CHANGE_ME / non-hex ANTSEED_IDENTITY_HEX (the unset-secret placeholder) would
+# make the CLI reject the identity; unset it so the buyer falls back to a
+# generated key on the data volume — durable enough for dev, and the prod secret
+# is a real 64-hex hot-wallet.
+if ! printf '%s' "${ANTSEED_IDENTITY_HEX:-}" | grep -qiE '^[0-9a-f]{64}$'; then
+    unset ANTSEED_IDENTITY_HEX
+fi
+
 # Buyer proxy in browse mode (no --peer: the host pins per request). A funded
 # wallet is needed to transact; discovery/pricing work unfunded.
 antseed buyer start -p "$PORT_PROXY" \
