@@ -687,7 +687,7 @@ def _provider_credentials_snapshot(*, timeframe: str = "all", viewer_role: str =
         cfg = {"providers": {}}
     providers = cfg.get("providers") or {}
 
-    usage_rows = _read_usage_history() if timeframe != "runtime" else []
+    usage_rows = _read_usage_history(since=since) if timeframe != "runtime" else []
     with _stats_lock:
         usage_rows.extend([dict(r) for r in _stats["recent"] if r.get("event") == "request"])
         runtime_by_provider = {k: _counter_snapshot(v) for k, v in sorted(_stats["by_provider"].items())}
@@ -818,7 +818,7 @@ def _login_connections_snapshot(*, timeframe: str = "all", consumer: str | None 
     if consumer:
         dashboard_rows = [r for r in dashboard_rows if r.get("consumer") == consumer or r.get("viewer") == f"consumer:{consumer}"]
 
-    usage_rows = _read_usage_history() if timeframe != "runtime" else []
+    usage_rows = _read_usage_history(since=since, caller=consumer) if timeframe != "runtime" else []
     usage_rows.extend([r for r in runtime_recent if r.get("event") == "request"])
     usage_rows = _dedup_usage_rows(usage_rows)
     if since is not None:
@@ -2770,11 +2770,17 @@ def _append_usage_history(row: dict[str, Any]) -> None:
     host_store.insert_call_async(row)
 
 
-def _read_usage_history(*, events: tuple[str, ...] = ("request",)) -> list[dict[str, Any]]:
+def _read_usage_history(*, since: int | None = None, caller: str | None = None,
+                        events: tuple[str, ...] = ("request",)) -> list[dict[str, Any]]:
     # The persistent usage rows for the dashboard timeframe stats, DERIVED from the
     # `calls` ledger now (#5: usage-history.jsonl retired). `calls` are request
     # events; `events` is kept for signature compatibility.
-    return host_store.usage_rows()
+    #
+    # Push the timeframe `since` (and optional caller) into the query so a windowed
+    # view reads only its window via idx_calls_ts — not the whole retention table
+    # to then discard almost all of it in Python. since=None ("all") still loads
+    # the retained rows (bounded by ROUTER_DB_RETENTION_DAYS).
+    return host_store.usage_rows(since_ts=since, caller=caller)
 
 
 def _dedup_usage_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3226,11 +3232,13 @@ def _add_counter(counter: dict[str, Any], row: dict[str, Any], cost: float | Non
         counter["cost_usd"] = round(float(counter.get("cost_usd") or 0) + cost, 6)
 
 
-def _usage_events_for_key(digest: str, caller: str | None) -> tuple[list[dict[str, Any]], bool]:
+def _usage_events_for_key(digest: str, caller: str | None,
+                          since: int | None = None) -> tuple[list[dict[str, Any]], bool]:
     prefix = digest[:12]
     with _stats_lock:
         memory_rows = [dict(r) for r in _stats["recent"] if r.get("key_sha256_prefix") == prefix]
-    history_rows = [dict(r) for r in _read_usage_history() if r.get("key_sha256") == digest or r.get("key_sha256_prefix") == prefix]
+    history_rows = [dict(r) for r in _read_usage_history(since=since, caller=caller)
+                    if r.get("key_sha256") == digest or r.get("key_sha256_prefix") == prefix]
     rows_by_id: dict[str, dict[str, Any]] = {}
     anonymous_rows: list[dict[str, Any]] = []
     for row in history_rows + memory_rows:
@@ -3281,7 +3289,7 @@ def _key_usage_snapshot(*, viewer: str, key_sha256: str, caller: str | None = No
     options = options or {"since": None, "until": None, "window": None, "limit": 100, "offset": 0}
     with _stats_lock:
         inferred_caller = caller or _stats["key_owner"].get(digest) or CALLER_KEY_HASHES.get(digest)
-    all_rows, persistent = _usage_events_for_key(digest, inferred_caller)
+    all_rows, persistent = _usage_events_for_key(digest, inferred_caller, since=options.get("since"))
     rows = _windowed_usage_events(all_rows, options)
     prices = _price_table()
     counter = _counter()
@@ -3404,7 +3412,9 @@ def _dashboard_timeframe_options(timeframe: str) -> dict[str, Any]:
 
 def _dashboard_history_rows(*, timeframe: str, consumer: str | None = None) -> list[dict[str, Any]]:
     opts = _dashboard_timeframe_options(timeframe)
-    rows = _windowed_usage_events(_read_usage_history(events=("request", "reject")), opts)
+    rows = _windowed_usage_events(
+        _read_usage_history(since=opts.get("since"), caller=consumer,
+                            events=("request", "reject")), opts)
     if consumer:
         rows = [r for r in rows if r.get("caller") == consumer]
     rows.sort(key=lambda r: int(r.get("ts") or 0), reverse=True)

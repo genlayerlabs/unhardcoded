@@ -31,6 +31,10 @@ os.environ.setdefault(
 # Writes run inline (no background writer thread) so each test's truncate fully
 # isolates it — the async queue races truncate/read across the shared test DB.
 os.environ.setdefault("HOST_STORE_SYNC_WRITES", "1")
+# usage_rows() floors "all" reads at the retention horizon (now - retention).
+# Suite fixtures seed fixed historical timestamps, so keep retention effectively
+# unbounded here; tests that exercise the floor/prune set _RETENTION_DAYS locally.
+os.environ.setdefault("ROUTER_DB_RETENTION_DAYS", "3650000")
 
 import host_store  # noqa: E402
 

@@ -669,12 +669,18 @@ def usage_rows(since_ts: "int | None" = None,
     so the dashboard timeframe aggregation consumes them unchanged. Optionally
     filtered by ts >= since_ts and/or caller. ts in SECONDS. Fail-soft -> []."""
     try:
-        clauses, params = [], []
+        # "all" (since_ts=None) is still bounded to the retention horizon so the
+        # read is ALWAYS time-bounded (never a bare table scan): rows older than
+        # retention are pruned anyway, so the floor only drops not-yet-pruned
+        # slack. A caller-supplied since_ts narrows further (it can't widen past
+        # what we retain).
+        floor = int(time.time()) - _RETENTION_DAYS * 86400
         if since_ts is not None:
-            clauses.append("ts >= %s"); params.append(int(since_ts))
+            floor = max(int(since_ts), floor)
+        clauses, params = ["ts >= %s"], [floor]
         if caller is not None:
             clauses.append("caller = %s"); params.append(caller)
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        where = " WHERE " + " AND ".join(clauses)
         with _get_pool().connection() as conn:
             cur = conn.execute(
                 f"SELECT {', '.join(_USAGE_COLS)} FROM calls{where} ORDER BY ts",
