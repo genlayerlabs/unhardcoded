@@ -86,12 +86,20 @@ _SCHEMA_STATEMENTS = [
         tokens_in       BIGINT,
         tokens_out      BIGINT,
         tokens_total    BIGINT,
-        cost_usd        DOUBLE PRECISION
+        tokens_cached   BIGINT,
+        cost_usd        DOUBLE PRECISION,
+        served_by       TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_calls_ts       ON calls(ts)",
     "CREATE INDEX IF NOT EXISTS idx_calls_route    ON calls(route_key, ts)",
     "CREATE INDEX IF NOT EXISTS idx_calls_session  ON calls(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_calls_consumer ON calls(consumer_sha, ts)",
+    # Evolve the existing `calls` fact table in place — CREATE TABLE IF NOT EXISTS
+    # never alters a table that already exists. Idempotent both ways: a no-op on a
+    # fresh DB (the CREATE above already has these columns), the actual migration
+    # on a DB that predates them. #3: the executed route identity + cache tokens.
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS tokens_cached BIGINT",
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS served_by TEXT",
     """CREATE TABLE IF NOT EXISTS settings_overrides (
         key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at BIGINT NOT NULL
     )""",
@@ -202,15 +210,20 @@ def insert_call(row: dict[str, Any]) -> None:
             row.get("error_type"),
             float(row["latency_ms"]) if row.get("latency_ms") is not None else None,
             row.get("tokens_in"), row.get("tokens_out"), row.get("tokens_total"),
+            row.get("tokens_cached"),
             float(row["cost_usd"]) if row.get("cost_usd") is not None else None,
+            # which route actually served the call (marketplace peer or provider),
+            # stamped by the engine on `chosen` — the per-route identity #4 derives
+            # route stats from. Raw here; combining into a route key is a later step.
+            row.get("served_by"),
         )
         with _get_pool().connection() as conn:   # one transaction, auto commit/rollback
             conn.execute(
                 "INSERT INTO calls (ts, usage_event_id, session_id, consumer_sha,"
                 " caller, route_key, provider_id, model_family, served_model_id,"
                 " requested_model, status, error_type, latency_ms, tokens_in,"
-                " tokens_out, tokens_total, cost_usd)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", values)
+                " tokens_out, tokens_total, tokens_cached, cost_usd, served_by)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", values)
         with _prune_lock:
             _inserts_since_prune += 1
             due = _inserts_since_prune >= _PRUNE_EVERY

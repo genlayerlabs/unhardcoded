@@ -2672,8 +2672,10 @@ async def proxy(path: str, request: Request) -> Response:
     provider = None
     model_family = None
     served_model_id = None
+    served_by = None
     requested_model = None
     tokens_in = tokens_out = tokens_total = 0
+    tokens_cached = None
     cost_usd = None
     decision_trace = None
     error_type = error_code = error_message = None
@@ -2681,7 +2683,7 @@ async def proxy(path: str, request: Request) -> Response:
 
     def _finish():
         latency_ms = round((time.perf_counter() - started) * 1000, 1)
-        _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, requested_model=requested_model, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, cost_usd=cost_usd, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
+        _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
         _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
 
     try:
@@ -2705,8 +2707,8 @@ async def proxy(path: str, request: Request) -> Response:
             record_in_finally = False
 
             async def _passthrough():
-                nonlocal provider, model_family, served_model_id, \
-                    tokens_in, tokens_out, tokens_total, cost_usd, \
+                nonlocal provider, model_family, served_model_id, served_by, \
+                    tokens_in, tokens_out, tokens_total, tokens_cached, cost_usd, \
                     decision_trace, error_type, error_code, error_message
                 tail = bytearray()
                 try:
@@ -2723,9 +2725,12 @@ async def proxy(path: str, request: Request) -> Response:
                             provider = xr.get("provider")
                             model_family = xr.get("model_family")
                             served_model_id = xr.get("served_model_id")
+                            served_by = xr.get("served_by")
                             decision_trace = xr.get("decision_trace") if isinstance(xr.get("decision_trace"), dict) else None
                             if isinstance(xr.get("cost_usd"), (int, float)):
                                 cost_usd = float(xr["cost_usd"])
+                            if isinstance(xr.get("tokens_cached"), int):
+                                tokens_cached = xr["tokens_cached"]
                         usage = meta.get("usage")
                         if isinstance(usage, dict):
                             tokens_in = int(usage.get("prompt_tokens") or 0)
@@ -2750,9 +2755,12 @@ async def proxy(path: str, request: Request) -> Response:
                     provider = xr.get("provider")
                     model_family = xr.get("model_family")
                     served_model_id = xr.get("served_model_id")
+                    served_by = xr.get("served_by")
                     decision_trace = xr.get("decision_trace") if isinstance(xr.get("decision_trace"), dict) else None
                     if isinstance(xr.get("cost_usd"), (int, float)):
                         cost_usd = float(xr["cost_usd"])
+                    if isinstance(xr.get("tokens_cached"), int):
+                        tokens_cached = xr["tokens_cached"]
                 usage = parsed.get("usage") if isinstance(parsed, dict) else None
                 if isinstance(parsed, dict):
                     err = parsed.get("error")

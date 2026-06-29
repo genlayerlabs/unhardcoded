@@ -235,3 +235,17 @@ def test_buyer_status_roundtrip_and_absent(store):
     assert row == {"pid": "antseed", "pinned_peer_id": "peerX",
                    "deposits_available": "1.5", "deposits_reserved": "0.2",
                    "wallet_address": "0xabc", "connection_state": "connected"}
+
+
+def test_served_by_and_tokens_cached_recorded(store):
+    # #3: the call ledger carries the executed route identity (served_by, from
+    # the engine's chosen) and the cache-token breakdown — raw per-call facts the
+    # #4 route/analytics views derive from.
+    store.insert_call(_row(served_by="peerGood", tokens_cached=128))
+    r = store.recent_calls()[0]
+    assert r["served_by"] == "peerGood"
+    assert r["tokens_cached"] == 128
+    # absent -> NULL, fail-soft (older rows / direct calls without the field)
+    store.insert_call(_row(usage_event_id="ev2"))
+    r2 = [c for c in store.recent_calls() if c["usage_event_id"] == "ev2"][0]
+    assert r2["served_by"] is None and r2["tokens_cached"] is None
