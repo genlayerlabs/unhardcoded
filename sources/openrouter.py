@@ -8,8 +8,8 @@ import os
 import time
 from typing import Any
 
+import host_store
 import route_reliability as _route_reliability
-import route_latency as _route_latency
 from sources import Balance, Price
 
 BASE_URL = "https://openrouter.ai/api/v1"
@@ -185,10 +185,13 @@ class OpenRouterSource:
         latency is keyed on the provider itself (peer == provider_id) — the same
         key the latency fold uses for peerless routes — making OpenRouter speed
         directly comparable to a marketplace peer's."""
+        # #4a: latency derived on the fly from route_observations (one query),
+        # keyed on the provider itself for these peerless gateway routes.
+        stats = host_store.route_stats()
         out = []
         for o in self._offers:
             lkey = _route_reliability.route_key(provider_id, o["model_family"], provider_id)
-            out.append({**o, "latency_ms": _route_latency.latency_ms(lkey)})
+            out.append({**o, "latency_ms": (stats.get(lkey) or {}).get("latency_ms")})
         return out
 
     def market_book(self) -> dict:

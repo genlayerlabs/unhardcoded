@@ -32,7 +32,10 @@ def host_store_clean():
     """Truncate the operational store before the test (isolation against the
     shared Postgres). Skips the test if Postgres is unreachable."""
     try:
-        host_store.reset()
+        # Drain pending async writes from a prior test FIRST so they can't land
+        # after this truncate; don't close the pool (the background writer shares
+        # it — closing it mid-write races and flakes isolation).
+        host_store._write_q.join()
         host_store.truncate_all_for_tests()
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"host store Postgres unavailable: {exc}")
@@ -76,6 +79,37 @@ def seed_peer_offers(peers, observed_at=None):
                 " reputation=EXCLUDED.reputation, last_seen=EXCLUDED.last_seen,"
                 " observed_at=EXCLUDED.observed_at, fetched_at=EXCLUDED.fetched_at",
                 rows)
+
+
+def seed_call(session=None, provider=None, family=None, served_by=None, status=200,
+              caller=None, tokens_in=0, tokens_out=0, tokens_cached=0, cost_usd=0.0,
+              ts=None):
+    """Insert one per-request `calls` row (as the ingress would), the raw the
+    per-session views (hot_route / session_*) derive from. ts in SECONDS."""
+    import time
+    host_store.insert_call({
+        "ts": int(time.time()) if ts is None else ts,
+        "session": session, "provider": provider, "model_family": family,
+        "served_by": served_by, "served_model_id": served_by, "status": status,
+        "caller": caller, "key_sha256": None, "tokens_in": tokens_in,
+        "tokens_out": tokens_out, "tokens_total": tokens_in + tokens_out,
+        "tokens_cached": tokens_cached, "cost_usd": cost_usd})
+
+
+def seed_route_obs(provider, family, served_by, ok, latency_ms=None, n=1, ts=None,
+                   tools_requested=False, tool_calls_emitted=False):
+    """Seed n per-attempt route_observations for a route (the raw from which
+    route_stats / tool_incapable_routes derive on the fly)."""
+    import time
+    t = int(time.time() * 1000) if ts is None else ts
+    rows = [(t, provider, family, served_by, ok, latency_ms,
+             tools_requested, tool_calls_emitted) for _ in range(n)]
+    with host_store._get_pool().connection() as conn:
+        conn.cursor().executemany(
+            "INSERT INTO route_observations"
+            " (ts, provider_id, model_family, served_by, ok, latency_ms,"
+            " tools_requested, tool_calls_emitted)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", rows)
 
 
 def seed_buyer_status(pid, pinned_peer_id=None, deposits_available=None,

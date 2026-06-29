@@ -100,6 +100,29 @@ _SCHEMA_STATEMENTS = [
     # on a DB that predates them. #3: the executed route identity + cache tokens.
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS tokens_cached BIGINT",
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS served_by TEXT",
+    # Per-ATTEMPT route observations (one row per provider call the engine made,
+    # including failed fallback tries — a grain `calls` does NOT have: `calls` is
+    # per-REQUEST, final route only). The RAW from which reliability/latency are
+    # derived on the fly (route_stats), replacing the in-process EMA dicts. Written
+    # by the fold site in llm_router_host; route_key identity stays host-internal
+    # (provider|family|served_by), never enters the signature.
+    """CREATE TABLE IF NOT EXISTS route_observations (
+        id                 BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        ts                 BIGINT NOT NULL,
+        provider_id        TEXT,
+        model_family       TEXT,
+        served_by          TEXT,
+        ok                 BOOLEAN NOT NULL,
+        latency_ms         DOUBLE PRECISION,
+        tools_requested    BOOLEAN,
+        tool_calls_emitted BOOLEAN
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_route_obs_ts ON route_observations(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_route_obs_route"
+    " ON route_observations(provider_id, model_family, served_by, ts)",
+    # #4c: learned tool capability is derived from these per-attempt signals.
+    "ALTER TABLE route_observations ADD COLUMN IF NOT EXISTS tools_requested BOOLEAN",
+    "ALTER TABLE route_observations ADD COLUMN IF NOT EXISTS tool_calls_emitted BOOLEAN",
     """CREATE TABLE IF NOT EXISTS settings_overrides (
         key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at BIGINT NOT NULL
     )""",
@@ -237,25 +260,32 @@ def insert_call(row: dict[str, Any]) -> None:
 
 def _prune() -> None:
     try:
-        cutoff = int(time.time()) - _RETENTION_DAYS * 86400
+        now = time.time()
+        # calls.ts is in SECONDS; route_observations.ts is in MILLISECONDS.
         with _get_pool().connection() as conn:
-            conn.execute("DELETE FROM calls WHERE ts < %s", (cutoff,))
+            conn.execute("DELETE FROM calls WHERE ts < %s",
+                         (int(now) - _RETENTION_DAYS * 86400,))
+            conn.execute("DELETE FROM route_observations WHERE ts < %s",
+                         (int(now * 1000) - _RETENTION_DAYS * 86400 * 1000,))
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store prune failed: %s", exc)
 
 
-# A bounded background queue + single worker keeps the ledger insert OFF the
-# request's latency path; the row is snapshotted (dict) so a later caller mutation
-# can't change what gets written, and the queue is capped so a slow DB cannot grow
-# an unbounded backlog — best-effort telemetry, so a dropped row is acceptable.
-_write_q: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=_WRITE_QUEUE_MAX)
+# A bounded background queue + single worker keeps every write OFF the request's
+# latency path; the payload is snapshotted so a later caller mutation can't change
+# what gets written, and the queue is capped so a slow DB cannot grow an unbounded
+# backlog — best-effort telemetry, so a dropped row is acceptable. The queue holds
+# thunks so it serves both the call ledger and the per-attempt route observations.
+_write_q: "queue.Queue" = queue.Queue(maxsize=_WRITE_QUEUE_MAX)
 
 
 def _writer_loop() -> None:
     while True:
-        row = _write_q.get()
+        job = _write_q.get()
         try:
-            insert_call(row)
+            job()
+        except Exception as exc:  # noqa: BLE001 — a bad row must not kill the writer
+            _log.warning("host_store background write failed: %s", exc)
         finally:
             _write_q.task_done()
 
@@ -263,16 +293,28 @@ def _writer_loop() -> None:
 threading.Thread(target=_writer_loop, name="host-store-writer", daemon=True).start()
 
 
+def _enqueue(job) -> None:
+    try:
+        _write_q.put_nowait(job)
+    except queue.Full:
+        _log.warning("host_store: write queue full (%d); dropping row", _WRITE_QUEUE_MAX)
+    except Exception as exc:  # noqa: BLE001 — never break a request
+        _log.warning("host_store enqueue failed: %s", exc)
+
+
 def insert_call_async(row: dict[str, Any]) -> None:
     """Record a call WITHOUT blocking the caller — enqueue a SNAPSHOT for the
     background writer. Drops the row (best-effort) if the queue is full."""
-    try:
-        _write_q.put_nowait(dict(row))
-    except queue.Full:
-        _log.warning("host_store: write queue full (%d); dropping ledger row",
-                     _WRITE_QUEUE_MAX)
-    except Exception as exc:  # noqa: BLE001 — never break a request
-        _log.warning("host_store insert_call_async failed: %s", exc)
+    snap = dict(row)
+    _enqueue(lambda: insert_call(snap))
+
+
+def observe_route_call_async(row: dict[str, Any]) -> None:
+    """Record one per-ATTEMPT route observation (provider/family/served_by + ok +
+    latency) off the latency path. The raw from which route_stats() derives
+    reliability/latency on the fly — replaces the in-process EMA folds."""
+    snap = dict(row)
+    _enqueue(lambda: _insert_route_observation(snap))
 
 
 def recent_calls(limit: int = 100) -> list[dict[str, Any]]:
@@ -416,6 +458,178 @@ def set_consumer_keys(records: dict[str, Any]) -> bool:
         return False
 
 
+# ---- route_observations (per-attempt raw; reliability/latency derived on the fly)
+
+def _insert_route_observation(row: dict[str, Any]) -> None:
+    """Append one per-attempt route observation. Fail-soft; best-effort telemetry."""
+    try:
+        with _get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO route_observations"
+                " (ts, provider_id, model_family, served_by, ok, latency_ms,"
+                " tools_requested, tool_calls_emitted)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (int(row.get("ts") or time.time() * 1000),
+                 row.get("provider_id"), row.get("model_family"), row.get("served_by"),
+                 bool(row.get("ok")),
+                 float(row["latency_ms"]) if row.get("latency_ms") is not None else None,
+                 bool(row.get("tools_requested")), bool(row.get("tool_calls_emitted"))))
+    except Exception as exc:  # noqa: BLE001 — the fold must never break a request
+        _log.warning("host_store route observation insert failed: %s", exc)
+
+
+def route_stats(window_ms: int = 900_000) -> dict[str, dict[str, Any]]:
+    """Per-route reliability + latency, DERIVED on the fly from route_observations
+    over the last `window_ms` — one aggregate query, not per-candidate. Returns
+    {route_key: {success_rate, latency_ms, count}} where route_key =
+    provider|family|served_by (host-internal, matches route_reliability.route_key).
+    Latency averages successful calls only (an error's latency is noise). Fail-soft
+    -> {} so the offer is left unstamped and the algebra falls back to its default."""
+    try:
+        cutoff = int(time.time() * 1000) - max(0, window_ms)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT provider_id, model_family, served_by,"
+                " avg(CASE WHEN ok THEN 1.0 ELSE 0.0 END) AS success_rate,"
+                " avg(latency_ms) FILTER (WHERE ok AND latency_ms IS NOT NULL) AS latency_ms,"
+                " count(*) AS n"
+                " FROM route_observations WHERE ts >= %s"
+                " GROUP BY provider_id, model_family, served_by", (cutoff,))
+            out: dict[str, dict[str, Any]] = {}
+            for prov, fam, sby, sr, lat, n in cur.fetchall():
+                key = f"{prov}|{fam}|{sby}"
+                out[key] = {
+                    "success_rate": float(sr) if sr is not None else None,
+                    "latency_ms": int(round(lat)) if lat is not None else None,
+                    "count": int(n)}
+            return out
+    except Exception as exc:  # noqa: BLE001 — measurement read is best-effort
+        _log.warning("host_store route_stats failed: %s", exc)
+        return {}
+
+
+def tool_incapable_routes(window_ms: int = 1_800_000, min_samples: int = 20) -> "set[str]":
+    """Routes that have proven they ignore tools — derived (#4c) from
+    route_observations: >= min_samples tools-requests within the last window_ms and
+    ZERO tool_calls emitted. The window IS the re-test horizon (a route ages out if
+    it stops being tool-tested); ANY tool_call in the window clears it. Capable is
+    the default (a route not in this set), so offers_sync drops supports_tools only
+    for the proven-incapable. Fail-soft -> empty set (everyone stays capable)."""
+    try:
+        cutoff = int(time.time() * 1000) - max(0, window_ms)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT provider_id, model_family, served_by FROM route_observations"
+                " WHERE ts >= %s AND tools_requested"
+                " GROUP BY provider_id, model_family, served_by"
+                " HAVING count(*) >= %s AND"
+                " coalesce(sum(CASE WHEN tool_calls_emitted THEN 1 ELSE 0 END), 0) = 0",
+                (cutoff, min_samples))
+            return {f"{p}|{f}|{s}" for p, f, s in cur.fetchall()}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store tool_incapable_routes failed: %s", exc)
+        return set()
+
+
+# ---- per-session views, derived on the fly from `calls` (#4b) -------------------
+# `calls` is per-request and carries session_id / status / provider_id /
+# model_family / served_by / tokens / cost / caller — everything the in-process
+# cache-affinity + session-meter folds held, now derived (fleet-consistent).
+
+_SESSION_TOTALS_ZERO = {"calls": 0, "tokens_in": 0, "tokens_out": 0,
+                        "tokens_cached": 0, "cost_usd": 0.0}
+
+
+def hot_route(session: "str | None") -> "str | None":
+    """The route (provider|family|served_by) that most recently served this
+    session SUCCESSFULLY — its prompt-cache prefix is hot there. None when unknown.
+    Matches route_reliability.route_key; resolved per request into the cache_hot
+    field. Fail-soft."""
+    if not session:
+        return None
+    try:
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT provider_id, model_family, served_by FROM calls"
+                " WHERE session_id = %s AND status < 400 AND served_by IS NOT NULL"
+                " ORDER BY ts DESC, id DESC LIMIT 1", (session,)).fetchone()
+            return f"{row[0]}|{row[1]}|{row[2]}" if row else None
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store hot_route failed: %s", exc)
+        return None
+
+
+def session_totals(session: "str | None") -> dict[str, Any]:
+    """The session's running totals (calls, tokens_in/out/cached, cost_usd) summed
+    over its committed `calls`. The caller adds the in-flight call on top. Fail-soft
+    -> zeros."""
+    if not session:
+        return dict(_SESSION_TOTALS_ZERO)
+    try:
+        with _get_pool().connection() as conn:
+            r = conn.execute(
+                "SELECT count(*), coalesce(sum(tokens_in),0), coalesce(sum(tokens_out),0),"
+                " coalesce(sum(tokens_cached),0), coalesce(sum(cost_usd),0)"
+                " FROM calls WHERE session_id = %s", (session,)).fetchone()
+            return {"calls": int(r[0]), "tokens_in": int(r[1]), "tokens_out": int(r[2]),
+                    "tokens_cached": int(r[3]), "cost_usd": round(float(r[4]), 6)}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store session_totals failed: %s", exc)
+        return dict(_SESSION_TOTALS_ZERO)
+
+
+def session_warm(session: "str | None") -> list[dict[str, Any]]:
+    """The session's warm routes for DISPLAY: per family, the most recent route
+    that served it successfully ({family, provider, served_by}). Fail-soft -> []."""
+    if not session:
+        return []
+    try:
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT DISTINCT ON (model_family) model_family, provider_id, served_by"
+                " FROM calls WHERE session_id = %s AND status < 400"
+                " AND model_family IS NOT NULL"
+                " ORDER BY model_family, ts DESC, id DESC", (session,))
+            return [{"family": f, "provider": p, "served_by": s or p}
+                    for f, p, s in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store session_warm failed: %s", exc)
+        return []
+
+
+def session_owner(session: "str | None") -> "str | None":
+    """The consumer that owns the session = the caller of its EARLIEST call
+    (first-writer-wins, for cross-consumer isolation). None when unknown."""
+    if not session:
+        return None
+    try:
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT caller FROM calls WHERE session_id = %s"
+                " ORDER BY ts ASC, id ASC LIMIT 1", (session,)).fetchone()
+            return row[0] if row else None
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store session_owner failed: %s", exc)
+        return None
+
+
+def all_session_totals() -> dict[str, dict[str, Any]]:
+    """Every session's totals (operator /x/sessions view), derived from calls."""
+    try:
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT session_id, count(*), coalesce(sum(tokens_in),0),"
+                " coalesce(sum(tokens_out),0), coalesce(sum(tokens_cached),0),"
+                " coalesce(sum(cost_usd),0) FROM calls"
+                " WHERE session_id IS NOT NULL GROUP BY session_id")
+            return {s: {"calls": int(c), "tokens_in": int(ti), "tokens_out": int(to),
+                        "tokens_cached": int(tc), "cost_usd": round(float(cu), 6)}
+                    for s, c, ti, to, tc, cu in cur.fetchall()}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store all_session_totals failed: %s", exc)
+        return {}
+
+
 # ---- peer_offers (antseed marketplace book; written by the sidecar) ------------
 
 # Columns surfaced to the reader, in the row shape sources/antseed expects. The
@@ -515,6 +729,9 @@ def reset() -> None:
     """Test hook: close + forget the pool (recreated against DATABASE_URL next
     use). For per-test isolation against a shared DB, truncate the tables."""
     global _pool, _inserts_since_prune
+    # Drain pending async writes first: closing the pool while the background
+    # writer holds a connection races and flakes test isolation.
+    _write_q.join()
     with _pool_lock:
         if _pool is not None:
             _pool.close()
@@ -527,4 +744,4 @@ def truncate_all_for_tests() -> None:
     """Test helper: wipe every table for isolation against a shared Postgres."""
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
-                     " consumer_keys, peer_offers, buyer_status")
+                     " consumer_keys, peer_offers, buyer_status, route_observations")

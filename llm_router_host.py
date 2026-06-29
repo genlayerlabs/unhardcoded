@@ -21,11 +21,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
+import host_store
 import route_reliability as _route_reliability
-import route_latency as _route_latency
-import route_tool_capability as _route_tool_capability
-import route_cache as _route_cache
-import route_session_meter as _route_session_meter
 from provider_adapters.anthropic import make_anthropic_async_call_provider
 from provider_adapters.common import (
     AsyncCallProviderHook,
@@ -155,7 +152,7 @@ class LLMRouterHost:
         peerless routes) has exactly one source and cannot drift across the
         Python/Lua boundary. It compares that key to the hot route the host
         resolved into `ctx.request.cache_hot_route` per request (see
-        `route_cache.hot_route`). The algebra observes only the Bool; the route
+        `host_store.hot_route`). The algebra observes only the Bool; the route
         key never enters the signature."""
         # One source of truth for the route-key serialization: the getter must
         # build a candidate's key identically to the fold, or affinity is silently
@@ -501,10 +498,10 @@ end
             result = await self._async_call_hook(request)
         else:
             result = self._call_hook(request)
-        # Fold the outcome here (not in the hook) so the streaming/override path —
-        # all of opencode's traffic, and every flow node — feeds route_latency /
-        # reliability / the call count too, the host-owned perf the algebra reads
-        # and the market view surfaces (#15). Mocks fold as well, so a mocked call
+        # Record the outcome here (not in the hook) so the streaming/override path —
+        # all of opencode's traffic, and every flow node — writes a route
+        # observation too, the host-owned perf the algebra reads (derived) and the
+        # market view surfaces (#15/#4a). Mocks record as well, so a mocked call
         # is measured exactly like a live one.
         _fold_route_outcome(request, result, session=session)
         return result
@@ -649,10 +646,10 @@ def _fold_route_outcome(request: dict, result: dict,
     reliability (success EMA), latency (EMA), and learned tool capability. Called
     from _resolve_call_async for BOTH the direct hook and the streaming/override
     path — the streaming result carries `ok` + `latency_ms` too — so opencode's
-    streamed traffic and every Σ_flow node feed the same EMAs the algebra reads
-    (offer.success_rate / offer.latency_ms). Previously this lived inside the
-    direct hook only, so route_latency/reliability stayed empty for the streaming
-    traffic that is, in practice, all of it."""
+    streamed traffic and every Σ_flow node feed the same route_observations the
+    algebra reads derived (offer.success_rate / offer.latency_ms). Previously this
+    lived inside the direct hook only, so reliability/latency stayed empty for the
+    streaming traffic that is, in practice, all of it."""
     # The route's identity is at the request TOP LEVEL (provider_id / model_family
     # / peer_id) — the core stamps it there for every call. The per-call `offer`
     # dict is only attached by some sources (antseed marketplace) and is None for
@@ -672,21 +669,17 @@ def _fold_route_outcome(request: dict, result: dict,
     # longer folds reliability for ANY route (#15), so the host folds it for all
     # of them — not just marketplace — and the market perf view reads it back.
     rkey = _route_reliability.route_key(pid, fam, peer_id or pid)
-    _route_reliability.observe(rkey, ok)
-    _route_latency.observe(rkey, result.get("latency_ms"), ok)
-    # Per-session cache affinity: a successful call makes this route the session's
-    # hot route (it now holds the prompt-cache prefix), so the next turn's
-    # cache_hot field marks it and a cache-aware policy keeps it sticky. Same one
-    # route identity as reliability/latency; no-op when the caller named no session.
-    _route_cache.observe(session, rkey, ok)
-    # Record the warm route for the per-session display panel (which family is
-    # warm, on which provider, via which peer/backend). Success only, like the
-    # affinity fold. Display-only; the routing decision stays in route_cache.
-    if ok and session:
-        _route_session_meter.observe_route(session, pid, fam, peer_id or pid)
-    # Learned tool capability is a marketplace concern only (static/partner routes
-    # declare their capabilities in config), so keep it peer-scoped.
-    if peer_id:
-        _route_tool_capability.observe(
-            rkey, bool(request.get("tools")),
-            bool((result.get("response") or {}).get("tool_calls")))
+    # #4a/#4c: record the per-ATTEMPT raw observation (every provider call,
+    # including failed fallbacks — a grain `calls` lacks). reliability, latency AND
+    # learned tool capability are derived on the fly from route_observations, not
+    # folded in-process. served_by = the peer for marketplace routes, else the
+    # provider — the identity route_stats / tool_incapable_routes key on. The tool
+    # signals carry only on tools-requests (capability is a marketplace concern).
+    host_store.observe_route_call_async({
+        "ts": int(time.time() * 1000), "provider_id": pid, "model_family": fam,
+        "served_by": peer_id or pid, "ok": ok, "latency_ms": result.get("latency_ms"),
+        "tools_requested": bool(request.get("tools")),
+        "tool_calls_emitted": bool((result.get("response") or {}).get("tool_calls"))})
+    # Cache affinity + the per-session meter are DERIVED on the fly from `calls`
+    # now (#4b): the route_observation above + the ingress's call ledger carry
+    # everything (session, route, outcome, tokens, cost), so no per-session fold.

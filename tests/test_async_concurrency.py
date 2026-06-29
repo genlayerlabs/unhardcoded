@@ -69,13 +69,11 @@ async def test_concurrent_requests_overlap():
 
 
 @pytest.mark.asyncio
-async def test_shared_state_is_coherent_under_concurrency():
-    """All coroutines fold into one host-owned reliability state; the per-route
-    observation count must equal the number of calls with no lost updates
-    (single-thread invariant). Reliability is host-owned now (#15), so the count
-    lives in route_reliability, not the engine EMA."""
-    import route_reliability as rr
-    rr.reset()
+async def test_shared_state_is_coherent_under_concurrency(host_store_clean):
+    """Every coroutine records a route observation; the per-route observation
+    count must equal the number of calls with no lost updates. Reliability is
+    host-owned and derived from route_observations now (#15/#4a)."""
+    import host_store
 
     async def hook(req):
         await asyncio.sleep(0.01)
@@ -85,5 +83,7 @@ async def test_shared_state_is_coherent_under_concurrency():
     contract = {"profile": "default", "messages": [{"role": "user", "content": "hi"}]}
     await asyncio.gather(*(host.execute_async(dict(contract)) for _ in range(N)))
 
-    total_n = sum(rr.snapshot_counts().values())
+    host_store._write_q.join()                 # drain the async route-obs writes
+    with host_store._get_pool().connection() as c:
+        total_n = c.execute("SELECT count(*) FROM route_observations").fetchone()[0]
     assert total_n == N, f"expected {N} recorded calls, got {total_n} (lost updates?)"

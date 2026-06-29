@@ -37,8 +37,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-import route_cache
-import route_session_meter
+import host_store
 
 _log = logging.getLogger("unhardcoded.shim")
 
@@ -282,20 +281,18 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         consistent either way."""
         caller = request.headers.get("x-llm-router-caller")
         if caller:
-            owner = route_session_meter.owner(sid)
+            owner = host_store.session_owner(sid)
             if owner is None or owner != caller:
                 return JSONResponse(status_code=404, content={"error": {
                     "message": "session not found", "type": "not_found",
                     "code": "session_not_found"}})
-        acc = route_session_meter.get(sid) or {
-            "calls": 0, "tokens_in": 0, "tokens_out": 0,
-            "tokens_cached": 0, "cost_usd": 0.0}
-        return {**acc, "warm": route_session_meter.warm(sid)}
+        acc = host_store.session_totals(sid)
+        return {**acc, "warm": host_store.session_warm(sid)}
 
     @app.get("/x/sessions")
     def session_meters():
         """All session meters (operator view of per-session spend/cache)."""
-        return {"sessions": route_session_meter.snapshot()}
+        return {"sessions": host_store.all_session_totals()}
 
     @app.get("/x/calls")
     def recent_calls(limit: int = 100):
@@ -446,8 +443,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         actually called that provider|family. Internal — the dashboard
         fetches this server-side; /x/* is hidden from consumers."""
         import sources as _sources
-        import route_reliability as _rr
-        import route_latency as _rl
+        import host_store
         catalog = host.catalog() or {}
         models = catalog.get("models") or {}
         state = host.dump_state() or {}
@@ -457,24 +453,24 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             pid for pid, p in (catalog.get("providers") or {}).items()
             if isinstance(p, dict) and p.get("discovery") == "marketplace"}
 
-        # Live perf is host-owned now (#15): the engine no longer folds an EMA, so
-        # build it from the host's per-route measurements (route_reliability /
-        # route_latency / the call count), aggregated across the peers/route ids
-        # that serve a given provider|family. None until the router has called it.
-        _rates = _rr.snapshot()
-        _counts = _rr.snapshot_counts()
-        _lats = _rl.snapshot()
+        # Live perf is host-owned now (#15): the engine folds no EMA, so build it
+        # from the host's per-route measurements — DERIVED on the fly from
+        # route_observations (#4a), aggregated across the peers/route ids that
+        # serve a given provider|family. None until the router has called it.
+        _stats = host_store.route_stats()  # {route_key: {success_rate, latency_ms, count}}
 
         def _perf(provider, family):
             prefix = f"{provider}|{family}|"
-            keys = [k for k in _counts if k.startswith(prefix)]
-            total = sum(_counts[k] for k in keys)
+            rows = [v for k, v in _stats.items() if k.startswith(prefix)]
+            total = sum(r["count"] for r in rows)
             if not total:
                 return None
-            sr = sum(_rates[k] * _counts[k] for k in keys if k in _rates)
-            sr_calls = sum(_counts[k] for k in keys if k in _rates)
-            lt = sum(_lats[k] * _counts[k] for k in keys if k in _lats)
-            lt_calls = sum(_counts[k] for k in keys if k in _lats)
+            sr_rows = [r for r in rows if r.get("success_rate") is not None]
+            lt_rows = [r for r in rows if r.get("latency_ms") is not None]
+            sr_calls = sum(r["count"] for r in sr_rows)
+            lt_calls = sum(r["count"] for r in lt_rows)
+            sr = sum(r["success_rate"] * r["count"] for r in sr_rows)
+            lt = sum(r["latency_ms"] * r["count"] for r in lt_rows)
             return {"success_rate": (sr / sr_calls) if sr_calls else None,
                     "latency_ms": round(lt / lt_calls) if lt_calls else None,
                     "calls": total}
@@ -1253,7 +1249,7 @@ def _request_to_contract(
         # reads off ctx.request. A brand-new session has no hot route -> the key
         # is simply absent -> cache_hot is false for everyone (no phantom pin).
         contract["session"] = req.session
-        hot = route_cache.hot_route(req.session)
+        hot = host_store.hot_route(req.session)
         if hot is not None:
             contract["cache_hot_route"] = hot
 
@@ -1427,13 +1423,17 @@ def _build_x_router(result: dict, subscription_providers=frozenset(),
         "compact": _compact_suggested(resp),
     }
     if session:
-        x_router["session_acc"] = route_session_meter.observe(
-            session,
-            tokens_in=resp.get("tokens_in") or 0,
-            tokens_out=resp.get("tokens_out") or 0,
-            tokens_cached=resp.get("tokens_cached") or 0,
-            cost_usd=x_router["cost_usd"] or 0.0,
-            owner=owner)
+        # #4b: derive the running total from the committed `calls` and add THIS
+        # in-flight call (not yet in the ledger). Owner is derived from the
+        # session's earliest call, so no explicit binding is needed here.
+        prior = host_store.session_totals(session)
+        x_router["session_acc"] = {
+            "calls": prior["calls"] + 1,
+            "tokens_in": prior["tokens_in"] + (resp.get("tokens_in") or 0),
+            "tokens_out": prior["tokens_out"] + (resp.get("tokens_out") or 0),
+            "tokens_cached": prior["tokens_cached"] + (resp.get("tokens_cached") or 0),
+            "cost_usd": round(prior["cost_usd"] + (x_router["cost_usd"] or 0.0), 6),
+        }
     return x_router
 
 

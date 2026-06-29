@@ -274,15 +274,14 @@ def test_execute_async_call_override(host):
         assert res2["response"]["text"] == "via-mock"
 
 
-def test_streaming_override_path_folds_route_metrics(host):
-    # The fix: the override (streaming) path must feed the per-route EMAs too.
-    # Before, the fold lived only inside the direct hook, so route_latency /
-    # reliability stayed empty for opencode's all-streaming traffic and flow nodes
-    # — which is exactly why the flow couldn't rank by latency.
+def test_streaming_override_path_folds_route_metrics(host, host_store_clean):
+    # The fix: the override (streaming) path must record a route observation too.
+    # Before, the fold lived only inside the direct hook, so reliability/latency
+    # stayed empty for opencode's all-streaming traffic and flow nodes — which is
+    # exactly why the flow couldn't rank by latency. Derived now (#4a) from
+    # route_observations, written async, so drain the queue before reading.
     import asyncio
-    import route_reliability as rr
-    import route_latency as rl
-    rr.reset(); rl.reset()
+    import host_store
 
     req = {"provider_id": "antseed", "model_family": "glm-5.2",
            "offer": {"model_family": "glm-5.2", "peer_id": "peerX"}}
@@ -291,32 +290,35 @@ def test_streaming_override_path_folds_route_metrics(host):
         return {"ok": True, "latency_ms": 12000, "response": {"tool_calls": None}}
 
     asyncio.run(host._resolve_call_async(req, call_override=override))
-    k = rr.route_key("antseed", "glm-5.2", "peerX")
-    assert rl.latency_ms(k) == 12000           # latency folded from the streamed call
-    assert rr.success_rate(k) == 1.0
+    host_store._write_q.join()                 # drain the async route-obs write
+    k = "antseed|glm-5.2|peerX"
+    st = host_store.route_stats()
+    assert st[k]["latency_ms"] == 12000        # latency derived from the streamed call
+    assert st[k]["success_rate"] == 1.0
 
-    # A mock folds too now (#15: the host owns perf, so a mocked call is measured
+    # A mock records too now (#15: the host owns perf, so a mocked call is measured
     # exactly like a live one — the engine no longer folds a separate EMA).
-    rr.reset(); rl.reset()
+    host_store.truncate_all_for_tests()
     host.set_mock_response("antseed", "glm-5.2",
                            {"ok": True, "latency_ms": 5, "response": {}})
     asyncio.run(host._resolve_call_async(req))
-    assert rl.latency_ms(k) == 5
+    host_store._write_q.join()
+    assert host_store.route_stats()[k]["latency_ms"] == 5
 
 
-def test_fold_uses_top_level_route_identity(host):
+def test_fold_uses_top_level_route_identity(host, host_store_clean):
     # The route identity is at the request TOP LEVEL (provider_id/model_family);
     # the per-call `offer` is None for openrouter/static/partner routes. The fold
     # read family from `offer` only, so those routes NEVER folded — latency_ms
     # stayed empty and a policy couldn't rank them by speed (the z.ai/glm-5.2 case).
     import asyncio
-    import route_reliability as rr
-    import route_latency as rl
-    rr.reset(); rl.reset()
+    import host_store
     req = {"provider_id": "openrouter", "model_family": "z-ai/glm-5.2",
            "served_model_id": "z-ai/glm-5.2"}        # no offer, no peer_id
     async def override(r):
         return {"ok": True, "latency_ms": 1500, "response": {}}
     asyncio.run(host._resolve_call_async(req, call_override=override))
-    k = rr.route_key("openrouter", "z-ai/glm-5.2", "openrouter")
-    assert rl.latency_ms(k) == 1500                  # folded from top-level identity
+    host_store._write_q.join()
+    # peerless route -> served_by is the provider itself
+    k = "openrouter|z-ai/glm-5.2|openrouter"
+    assert host_store.route_stats()[k]["latency_ms"] == 1500   # from top-level identity

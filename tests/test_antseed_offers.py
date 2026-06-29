@@ -16,9 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import route_reliability as rr  # noqa: E402
-import route_latency as rl  # noqa: E402
 from sources.antseed import AntSeedSource  # noqa: E402
-from conftest import seed_peer_offers as _seed_market  # noqa: E402
+from conftest import seed_peer_offers as _seed_market, seed_route_obs  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -65,10 +64,9 @@ def test_offers_sync_surfaces_top_n_distinct_peers(tmp_path):
 
 
 def test_offers_sync_stamps_host_measured_reliability(tmp_path):
-    rr.reset()
     _seed_market([_peer("peerA", 0.5), _peer("peerB", 1.0)])
     # peerA observed failing -> demoted; peerB never observed -> unstamped
-    rr.observe(rr.route_key("antseed", FAMILY, "peerA"), False)
+    seed_route_obs("antseed", FAMILY, "peerA", ok=False)
     offers = AntSeedSource(CATALOG).offers_sync("antseed")
     by_peer = {o["peer_id"]: o for o in offers}
     assert by_peer["peerA"]["success_rate"] == 0.0
@@ -79,10 +77,8 @@ def test_offers_sync_stamps_host_measured_latency(tmp_path):
     # The latency twin of the reliability stamp: a peer observed slow carries its
     # measured latency_ms so a policy can route by speed; an unobserved peer is
     # left unstamped (None -> field default, optimistically routable).
-    rr.reset()
-    rl.reset()
     _seed_market([_peer("peerA", 0.5), _peer("peerB", 1.0)])
-    rl.observe(rl.route_key("antseed", FAMILY, "peerA"), 12000, ok=True)
+    seed_route_obs("antseed", FAMILY, "peerA", ok=True, latency_ms=12000)
     offers = AntSeedSource(CATALOG).offers_sync("antseed")
     by_peer = {o["peer_id"]: o for o in offers}
     assert by_peer["peerA"]["latency_ms"] == 12000
@@ -122,13 +118,10 @@ def test_offers_sync_drops_supports_tools_for_learned_incapable_route(tmp_path):
     # the AntSeed default-true hole is closed by the learned signal: a route
     # observed to ignore tools is filtered from tool requests (no supports_tools),
     # while other caps and non-tool routing are unaffected.
-    import route_tool_capability as tc
-    rr.reset()
-    tc.reset()
     _seed_market([_peer("peerA", 0.5)])
-    rkey = rr.route_key("antseed", FAMILY, "peerA")
-    for _ in range(tc._MIN_SAMPLES):       # peerA never emits tool_calls on tool reqs
-        tc.observe(rkey, True, False)
+    # peerA emits no tool_calls on _MIN_SAMPLES (20) tools-requests -> incapable
+    seed_route_obs("antseed", FAMILY, "peerA", ok=True, n=20,
+                   tools_requested=True, tool_calls_emitted=False)
     caps = AntSeedSource(CATALOG).offers_sync("antseed")[0]["capabilities"]
     assert "supports_tools" not in caps    # learned-incapable -> filtered for tools
     assert caps.get("supports_json_mode") is True  # other caps unaffected

@@ -1,74 +1,27 @@
-"""Host-side per-route reliability fold (the host half of the reliability form).
+"""Host-side route identity.
 
-MEASURING reliability is the host's job — llm-router #14 made the algebra read it
-as a per-candidate field (`offer.success_rate`), like price, observed pointwise.
-This is the host's measurement: a per-route success-rate EMA over observed call
-outcomes, stamped onto AntSeed offers so the router prefers the reliable seller
-and rotates off a broken one (a different route for the same family).
+MEASURING per-route reliability/latency is the host's job (llm-router #14/#15: the
+algebra reads them as per-candidate fields, like price). The measurement used to
+be an in-process EMA folded here; since #4a it is DERIVED on the fly from the raw
+per-attempt `route_observations` ledger (`host_store.route_stats`) — fleet-
+consistent and surviving restarts, instead of a per-pod dict.
 
-The measurement is deliberately the simplest honest one — a binary success EMA.
-All of the richer judgment the form allows (weighting by error kind, latency-with-
-error, population-relative, windowing) lives here, host-side, and can grow without
-touching the algebra. Folding happens in `llm_router_host` on each call outcome;
-`offers_sync` reads `success_rate(...)` to stamp the offer.
-
-In-process (resets on restart), exactly like the engine EMA it replaces for
-marketplace routes; a missing route reads None → the offer is left unstamped → the
-algebra falls back to its own coarse EMA / the field default.
+What stays here is the one thing that is pure identity, not measurement: the
+`route_key` that names a route (a specific seller peer serving a family, or the
+provider itself for a peerless gateway route). It is reused by host_store route/session derivations,
+the offer-stamp sites, and matches the key
+`route_stats` aggregates on. It stays entirely host-internal; the algebra never
+sees it.
 """
 from __future__ import annotations
 
-import threading
-
-# Same smoothing the engine EMA used (ema_alpha). First observation seeds the
-# rate directly; subsequent ones decay geometrically toward it.
-_ALPHA = 0.2
-
-_lock = threading.Lock()
-_rates: dict[str, float] = {}
-# Per-route observation count. The engine no longer folds an EMA (reliability is
-# host-owned, #15), so the host owns the "how many calls have we made on this
-# route" count too — surfaced in the market perf view and asserted by the
-# concurrency invariant.
-_counts: dict[str, int] = {}
-
 
 def route_key(provider_id: str, model_family: str, peer_id: str) -> str:
-    """Identity of a route = a specific seller peer serving a specific family.
-    Stays entirely host-internal; the algebra never sees it."""
+    """Identity of a route = provider|family|served_by (the peer for a marketplace
+    route, else the provider). Host-internal; never enters the signature."""
     return f"{provider_id}|{model_family}|{peer_id}"
 
 
-def observe(key: str, ok: bool) -> None:
-    s = 1.0 if ok else 0.0
-    with _lock:
-        cur = _rates.get(key)
-        _rates[key] = s if cur is None else _ALPHA * s + (1.0 - _ALPHA) * cur
-        _counts[key] = _counts.get(key, 0) + 1
-
-
-def success_rate(key: str) -> float | None:
-    """The route's folded success rate, or None if never observed."""
-    return _rates.get(key)
-
-
-def count(key: str) -> int:
-    """How many outcomes have been folded for this route (0 if never observed)."""
-    return _counts.get(key, 0)
-
-
-def snapshot() -> dict[str, float]:
-    with _lock:
-        return dict(_rates)
-
-
-def snapshot_counts() -> dict[str, int]:
-    with _lock:
-        return dict(_counts)
-
-
 def reset() -> None:
-    """Test hook."""
-    with _lock:
-        _rates.clear()
-        _counts.clear()
+    """Test hook. Reliability/latency state now lives in route_observations (reset
+    by truncating the host store); kept as a no-op so callers need no change."""
