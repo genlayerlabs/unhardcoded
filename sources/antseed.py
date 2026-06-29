@@ -2,19 +2,17 @@
 AntSeed source: offers, prices and wallet balances for the AntSeed buyer
 proxies.
 
-The marketplace book is read from the host store (`peer_offers`), which the
-antseed sidecar writes from `antseed network browse --services --json`. Buyer
-status is still read from /market/status-<id>.json on the shared volume (each
-buyer writes `buyer status --json`); the buyer daemon's control API is a unix
-socket inside the antseed containers, so only the proxy ports are shared with
-the router's network namespace.
+Both the marketplace book (`peer_offers`) and the buyer status (`buyer_status`:
+session pin + escrow + wallet) are read from the host store, which the antseed
+sidecar writes — the book from `antseed network browse --services --json`, the
+status from `antseed buyer status --json`. The source no longer touches the
+filesystem; the buyer daemon's control API stays a unix socket inside the
+antseed containers (only the proxy ports are shared with the router's netns).
 """
 from __future__ import annotations
 
-import json
 import os
 import time
-from pathlib import Path
 from typing import Any
 
 import host_store
@@ -24,7 +22,6 @@ import route_tool_capability as _route_tool_capability
 import settings
 from sources import Balance, Price
 
-MARKET_DIR = Path(os.getenv("ANTSEED_MARKET_DIR", "/market"))
 STALE_AFTER_S = 900
 
 # Buyer hot-wallet on-chain reads. The marketplace spends from ESCROW
@@ -87,8 +84,7 @@ class AntSeedSource:
     name = "antseed"
     poll_interval_s = 300
 
-    def __init__(self, catalog: dict, market_dir: Path | str = MARKET_DIR):
-        self._dir = Path(market_dir)
+    def __init__(self, catalog: dict):
         self._models = catalog.get("models") or {}
         # provider_id -> its marketplace config (cap, aliases, endpoint)
         self._providers: dict[str, dict] = {
@@ -114,15 +110,12 @@ class AntSeedSource:
         return rows
 
     def _pinned_peer(self, provider_id: str) -> str | None:
-        """An optional buyer-side *session* pin (status' pinnedPeerId). Browse
-        mode leaves it null and the host pins per request instead (the offer
-        carries peer_id -> x-antseed-pin-peer); when a session pin IS set,
+        """An optional buyer-side *session* pin (buyer_status' pinned_peer_id).
+        Browse mode leaves it null and the host pins per request instead (the
+        offer carries peer_id -> x-antseed-pin-peer); when a session pin IS set,
         restrict offers to that peer's services to match what the proxy serves."""
-        try:
-            data = json.loads((self._dir / f"status-{provider_id}.json").read_text())
-        except (OSError, ValueError):
-            return None
-        return data.get("pinnedPeerId") or None
+        data = host_store.buyer_status(provider_id)
+        return (data or {}).get("pinned_peer_id") or None
 
     def _family_for(self, provider_cfg: dict, service: str) -> str | None:
         aliases = provider_cfg.get("service_aliases") or {}
@@ -346,20 +339,18 @@ class AntSeedSource:
     async def balances(self) -> dict[str, Balance]:
         out: dict[str, Balance] = {}
         for pid in self.provider_ids:
-            path = self._dir / f"status-{pid}.json"
-            try:
-                data = json.loads(path.read_text())
-            except (OSError, ValueError):
+            data = host_store.buyer_status(pid)
+            if not data:
                 continue
             try:
-                available = float(data.get("depositsAvailable"))
+                available = float(data.get("deposits_available"))
             except (TypeError, ValueError):
                 continue
-            detail = {"reserved": data.get("depositsReserved"),
-                      "wallet": data.get("walletAddress"),
-                      "connection": data.get("connectionState")}
+            detail = {"reserved": data.get("deposits_reserved"),
+                      "wallet": data.get("wallet_address"),
+                      "connection": data.get("connection_state")}
             rpc = _wallet_rpc_url()
-            addr = data.get("walletAddress")
+            addr = data.get("wallet_address")
             if rpc and addr:
                 detail.update(await _fetch_chain_balances(rpc, addr))
             out[pid] = {

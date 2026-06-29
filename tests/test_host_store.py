@@ -219,3 +219,19 @@ def test_peer_offers_window_filters_stale_rows(store):
     assert {r["peer_id"] for r in store.peer_offers(window_ms=15 * 60 * 1000)} == {"fresh"}
     # a wider window readmits the older row
     assert {r["peer_id"] for r in store.peer_offers(window_ms=30 * 60 * 1000)} == {"fresh", "stale"}
+
+
+# ---- buyer_status (antseed buyer escrow/pin/wallet; sidecar writes) ------------
+
+def test_buyer_status_roundtrip_and_absent(store):
+    assert store.buyer_status("antseed") is None      # absent -> None (degraded)
+    with store._get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO buyer_status (pid, pinned_peer_id, deposits_available,"
+            " deposits_reserved, wallet_address, connection_state, fetched_at)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            ("antseed", "peerX", "1.5", "0.2", "0xabc", "connected", 1))
+    row = store.buyer_status("antseed")
+    assert row == {"pid": "antseed", "pinned_peer_id": "peerX",
+                   "deposits_available": "1.5", "deposits_reserved": "0.2",
+                   "wallet_address": "0xabc", "connection_state": "connected"}

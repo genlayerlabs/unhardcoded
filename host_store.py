@@ -124,6 +124,20 @@ _SCHEMA_STATEMENTS = [
         PRIMARY KEY (peer_id, service)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_peer_offers_observed ON peer_offers(observed_at)",
+    # The antseed buyer's status (escrow + session pin + wallet), one row per
+    # buyer pid. WRITTEN by the antseed sidecar (write-status.js on the poll loop
+    # + control.js after a wallet op), READ by sources/antseed (_pinned_peer +
+    # balances). Raw buyer-reported fields as columns; the deposits stay TEXT (the
+    # buyer reports them as strings) and are coerced on read, as the JSON was.
+    """CREATE TABLE IF NOT EXISTS buyer_status (
+        pid                TEXT PRIMARY KEY,
+        pinned_peer_id     TEXT,
+        deposits_available TEXT,
+        deposits_reserved  TEXT,
+        wallet_address     TEXT,
+        connection_state   TEXT,
+        fetched_at         BIGINT
+    )""",
 ]
 
 _pool_lock = threading.Lock()
@@ -415,6 +429,28 @@ def peer_offers(window_ms: int = 900_000) -> list[dict[str, Any]]:
         return []
 
 
+# ---- buyer_status (antseed buyer escrow/pin/wallet; written by the sidecar) ----
+
+_BUYER_STATUS_FIELDS = ("pid", "pinned_peer_id", "deposits_available",
+                        "deposits_reserved", "wallet_address", "connection_state")
+
+
+def buyer_status(pid: str) -> "dict[str, Any] | None":
+    """The antseed buyer's latest status row (session pin + escrow + wallet) for
+    `pid`, or None when absent / on a store error (degraded: no pin, no balance),
+    exactly as a missing status file was. Fail-soft."""
+    try:
+        cols = ", ".join(_BUYER_STATUS_FIELDS)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                f"SELECT {cols} FROM buyer_status WHERE pid = %s", (pid,))
+            row = cur.fetchone()
+            return dict(zip(_BUYER_STATUS_FIELDS, row)) if row else None
+    except Exception as exc:  # noqa: BLE001 — status read is best-effort
+        _log.warning("host_store buyer_status failed: %s", exc)
+        return None
+
+
 # ---- one-shot backfill of legacy JSON state (run once at startup) --------------
 
 def _seed_if_empty(table: str, legacy_path: str, to_rows) -> None:
@@ -478,4 +514,4 @@ def truncate_all_for_tests() -> None:
     """Test helper: wipe every table for isolation against a shared Postgres."""
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
-                     " consumer_keys, peer_offers")
+                     " consumer_keys, peer_offers, buyer_status")

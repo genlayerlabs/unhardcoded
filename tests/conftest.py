@@ -76,3 +76,25 @@ def seed_peer_offers(peers, observed_at=None):
                 " reputation=EXCLUDED.reputation, last_seen=EXCLUDED.last_seen,"
                 " observed_at=EXCLUDED.observed_at, fetched_at=EXCLUDED.fetched_at",
                 rows)
+
+
+def seed_buyer_status(pid, pinned_peer_id=None, deposits_available=None,
+                      deposits_reserved=None, wallet_address=None,
+                      connection_state=None):
+    """Seed the antseed buyer status (pin + escrow + wallet) as the sidecar's
+    write-status.js / control.js do — one row per buyer pid. Deposits are the raw
+    buyer-reported strings."""
+    import time
+    with host_store._get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO buyer_status (pid, pinned_peer_id, deposits_available,"
+            " deposits_reserved, wallet_address, connection_state, fetched_at)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s)"
+            " ON CONFLICT (pid) DO UPDATE SET"
+            " pinned_peer_id=EXCLUDED.pinned_peer_id,"
+            " deposits_available=EXCLUDED.deposits_available,"
+            " deposits_reserved=EXCLUDED.deposits_reserved,"
+            " wallet_address=EXCLUDED.wallet_address,"
+            " connection_state=EXCLUDED.connection_state, fetched_at=EXCLUDED.fetched_at",
+            (pid, pinned_peer_id, deposits_available, deposits_reserved,
+             wallet_address, connection_state, int(time.time() * 1000)))

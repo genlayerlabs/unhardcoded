@@ -15,7 +15,7 @@ RUN apt-get update \
 RUN npm install -g @antseed/cli@0.1.128 pg@8.16.3
 ENV NODE_PATH=/usr/local/lib/node_modules
 
-COPY antseed/write-market.js antseed/control.js antseed/entrypoint.sh /usr/local/lib/antseed/
+COPY antseed/store.js antseed/write-market.js antseed/write-status.js antseed/control.js antseed/entrypoint.sh /usr/local/lib/antseed/
 RUN chmod +x /usr/local/lib/antseed/entrypoint.sh
 
 ENV ANTSEED_DATA_DIR=/data

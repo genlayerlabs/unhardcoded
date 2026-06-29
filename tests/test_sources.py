@@ -483,14 +483,13 @@ ANTSEED_CATALOG = {
 def _antseed_source(tmp_path, market_body=None, pins=None, observed_at=None):
     import json as _json
     import host_store
-    from conftest import seed_peer_offers
+    from conftest import seed_peer_offers, seed_buyer_status
     from sources.antseed import AntSeedSource
-    tmp_path.mkdir(parents=True, exist_ok=True)
     if market_body is None:
         market_body = (Path(__file__).parent / "fixtures" / "antseed_market.json").read_text()
     market = market_body if isinstance(market_body, dict) else _json.loads(market_body)
-    # the market book lives in the host store now (peer_offers); seed it as the
-    # sidecar would. Status files stay on the shared volume (pins + balances).
+    # the market book + buyer status both live in the host store now (peer_offers
+    # / buyer_status); seed them as the sidecar would. No status files.
     try:
         host_store.reset()
         host_store.truncate_all_for_tests()
@@ -502,10 +501,9 @@ def _antseed_source(tmp_path, market_body=None, pins=None, observed_at=None):
     default_pins = {"antseed_free": "1d90f467689d499dc435e5744b4613c3203eb0aa",
                     "antseed_cheap": "1d90f467689d499dc435e5744b4613c3203eb0aa"}
     for pid, peer in (pins if pins is not None else default_pins).items():
-        (tmp_path / f"status-{pid}.json").write_text(_json.dumps({
-            "pinnedPeerId": peer, "depositsAvailable": "0.0",
-            "depositsReserved": "0.0", "walletAddress": "0x0"}))
-    return AntSeedSource(ANTSEED_CATALOG, market_dir=tmp_path)
+        seed_buyer_status(pid, pinned_peer_id=peer, deposits_available="0.0",
+                          deposits_reserved="0.0", wallet_address="0x0")
+    return AntSeedSource(ANTSEED_CATALOG)
 
 
 def test_antseed_offers_gate_caps_aliases_and_min_price(tmp_path):
@@ -694,18 +692,16 @@ def test_antseed_stale_market_returns_no_offers(tmp_path):
 
 
 def test_antseed_balances_from_status_files(tmp_path):
-    import json as _json
+    from conftest import seed_buyer_status
     s = _antseed_source(tmp_path)
-    (tmp_path / "status-antseed_free.json").write_text(_json.dumps({
-        "depositsAvailable": "1.5", "depositsReserved": "0.2",
-        "walletAddress": "0x7C39",
-    }))
+    seed_buyer_status("antseed_free", deposits_available="1.5",
+                      deposits_reserved="0.2", wallet_address="0x7C39")
     balances = asyncio.run(s.balances())
     b = balances["antseed_free"]
     assert b["kind"] == "deposits_usdc" and b["value"] == 1.5
     assert b["detail"]["wallet"] == "0x7C39"
-    s_nofiles = _antseed_source(tmp_path / "bare", pins={})
-    assert asyncio.run(s_nofiles.balances()) == {}   # no status files -> absent
+    s_nostatus = _antseed_source(tmp_path, pins={})
+    assert asyncio.run(s_nostatus.balances()) == {}   # no buyer_status -> absent
 
 
 def test_wallet_rpc_url_default_and_disable(monkeypatch):
@@ -752,13 +748,11 @@ def test_fetch_chain_balances_parses_eth_and_usdc(monkeypatch):
 
 
 def test_balances_enriched_with_wallet_chain(tmp_path, monkeypatch):
-    import json as _json
+    from conftest import seed_buyer_status
     from sources import antseed as a
     s = _antseed_source(tmp_path)
-    (tmp_path / "status-antseed_free.json").write_text(_json.dumps({
-        "depositsAvailable": "1.5", "depositsReserved": "0.0",
-        "walletAddress": "0x" + "cd" * 20,
-    }))
+    seed_buyer_status("antseed_free", deposits_available="1.5",
+                      deposits_reserved="0.0", wallet_address="0x" + "cd" * 20)
 
     async def _fake(rpc, address):
         return {"wallet_usdc": 7.0, "wallet_eth": 0.0}

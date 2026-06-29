@@ -10,10 +10,14 @@
 #     socat exposes it on the container network. This lets us DROP
 #     `network_mode: service:router`, whose orphaned netns (router recreated,
 #     antseed not) silently zeroed discovery on every deploy.
-#   * validate-before-write      -> never clobber market.json with the CLI's
-#     non-JSON "No peers found" line.
+#   * validate-before-write      -> the writers reject the CLI's non-JSON
+#     "No peers found" line (exit non-zero) instead of wiping the store row.
 #   * --top high                 -> the CLI default is 20; we want the whole
 #     peer set.
+#
+# The market book and buyer status are written to the host store (Postgres)
+# by write-market.js / write-status.js — no market.json / status-*.json files.
+# $MARKET_DIR is now just container-local scratch for the raw CLI dumps.
 set -eu
 
 PORT_PROXY="${ANTSEED_PROXY_PORT:-8377}"      # buyer proxy (binds 127.0.0.1)
@@ -21,7 +25,7 @@ PORT_PUBLIC="${ANTSEED_PUBLIC_PORT:-8378}"    # socat, on the container network
 MARKET_DIR="${ANTSEED_MARKET_DIR:-/market}"
 TOP="${ANTSEED_BROWSE_TOP:-500}"
 INTERVAL="${ANTSEED_BROWSE_INTERVAL:-60}"     # browse cadence (s); 60s feeds the
-                                              # sliding window in merge-market.js
+                                              # observed_at sliding window in peer_offers
 MAXIN="${ANTSEED_MAX_INPUT:-1000}"            # buyer spend rail; Σ_pol policy is
 MAXOUT="${ANTSEED_MAX_OUTPUT:-1000}"          # the real per-call price ceiling
 CLI_TIMEOUT="${ANTSEED_CLI_TIMEOUT:-45}"      # hard cap per browse/status CLI call.
@@ -29,9 +33,9 @@ CLI_TIMEOUT="${ANTSEED_CLI_TIMEOUT:-45}"      # hard cap per browse/status CLI c
                                               # invocation (e.g. a concurrent buyer
                                               # command grabbing the sqlite store)
                                               # blocks the writer loop FOREVER — it
-                                              # has no self-restart — so market.json
-                                              # and status-antseed.json silently
-                                              # freeze and the catalog/wallet go stale.
+                                              # has no self-restart — so the
+                                              # peer_offers / buyer_status rows
+                                              # silently freeze and the catalog/wallet go stale.
 LIB=/usr/local/lib/antseed
 
 mkdir -p "$MARKET_DIR"
@@ -50,16 +54,6 @@ socat "TCP-LISTEN:${PORT_PUBLIC},fork,reuseaddr" "TCP:127.0.0.1:${PORT_PROXY}" &
 # Self-disables when ANTSEED_CONTROL_TOKEN is unset. See antseed/control.js.
 node "$LIB/control.js" &
 
-atomic_write() {  # <validator-cmd> <dest> ; reads producer stdout on fd via $1
-    dest="$1"; tmp="${dest}.$$.tmp"
-    if cat > "$tmp" && [ -s "$tmp" ]; then
-        mv "$tmp" "$dest"
-    else
-        rm -f "$tmp"
-        return 1
-    fi
-}
-
 write_market() {
     raw="$MARKET_DIR/.market.raw.$$"
     timeout -k 5 "$CLI_TIMEOUT" antseed network browse --services --top "$TOP" --json > "$raw" 2>/dev/null || true
@@ -75,8 +69,9 @@ write_market() {
 write_status() {
     raw="$MARKET_DIR/.status.raw.$$"
     timeout -k 5 "$CLI_TIMEOUT" antseed buyer status --json > "$raw" 2>/dev/null || true
-    node -e 'const fs=require("fs");let d;try{d=JSON.parse(fs.readFileSync(0,"utf8"))}catch(e){process.exit(2)}if(d===null||typeof d!=="object")process.exit(3);d.fetched_at_ms=Date.now();process.stdout.write(JSON.stringify(d))' \
-        < "$raw" | atomic_write "$MARKET_DIR/status-antseed.json" || true
+    # upsert the buyer status into the host store's buyer_status (validate + DB
+    # error -> exit non-zero, keep the last good row)
+    node "$LIB/write-status.js" < "$raw" || true
     rm -f "$raw"
 }
 

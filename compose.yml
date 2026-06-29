@@ -52,7 +52,6 @@ services:
       # dashboard-added Codex accounts + the account selection, shared with
       # ingress so accounts added in the dashboard actually reach the router.
       - codex-accounts:/codex/accounts
-      - antseed-market:/market:ro
       # operator-added providers (dashboard "Add provider"): read at startup
       - ./secrets:/run/llm-router/secrets:ro
     expose:
@@ -123,9 +122,9 @@ services:
 
   # One AntSeed buyer (no tiers). Browse mode (no --peer): it discovers sellers
   # on the network; the policy sets the per-call price ceiling, so the cap here
-  # is just a wide outer bound. Writes the marketplace book (browse) into the
-  # host store's peer_offers and status-antseed.json (buyer status) on the
-  # shared volume, both read by sources/antseed.py. Needs a funded
+  # is just a wide outer bound. Writes the marketplace book (browse) and the
+  # buyer status into the host store (peer_offers / buyer_status), both read by
+  # sources/antseed.py — no shared market volume any more. Needs a funded
   # wallet (antseed buyer deposit) to actually transact.
   antseed:
     build:
@@ -153,7 +152,6 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql://hoststore:hoststore@postgres:5432/hoststore}
     volumes:
       - antseed-data:/data
-      - antseed-market:/market
     depends_on:
       router:
         condition: service_healthy
@@ -211,6 +209,5 @@ networks:
 volumes:
   codex-accounts:
   antseed-data:
-  antseed-market:
   ollama-data:
   postgres-data:
