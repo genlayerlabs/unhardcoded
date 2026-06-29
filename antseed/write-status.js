@@ -6,6 +6,7 @@
 // Validation: a non-object / non-JSON exits non-zero so entrypoint.sh keeps the
 // last good row (no write).
 const { Client } = require("pg");
+const { pgConfig } = require("./db.js");
 const { UPSERT_BUYER_STATUS, buyerStatusRow } = require("./store.js");
 
 const PID = process.env.ANTSEED_BUYER_PID || "antseed";
@@ -16,7 +17,7 @@ catch (e) { process.exit(2); }                            // not JSON
 if (d === null || typeof d !== "object") process.exit(3); // JSON but not a status
 
 (async () => {
-  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  const client = new Client(pgConfig(process.env.DATABASE_URL));
   try {
     await client.connect();
     await client.query(UPSERT_BUYER_STATUS, buyerStatusRow(d, PID));
