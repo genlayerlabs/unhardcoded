@@ -12,14 +12,18 @@
 'use strict';
 const http = require('http');
 const { execFile } = require('child_process');
-const fs = require('fs');
+const { Pool } = require('pg');
+const { UPSERT_BUYER_STATUS, buyerStatusRow } = require('./store.js');
 
 const PORT = parseInt(process.env.ANTSEED_CONTROL_PORT || '8379', 10);
 const TOKEN = process.env.ANTSEED_CONTROL_TOKEN || '';
-const MARKET_DIR = process.env.ANTSEED_MARKET_DIR || '/market';
-const STATUS_FILE = MARKET_DIR + '/status-antseed.json';
+const PID = process.env.ANTSEED_BUYER_PID || 'antseed';
 const DEPOSIT_TIMEOUT_MS = 120000; // on-chain tx
 const STATUS_TIMEOUT_MS = 30000;
+
+// One pool for the long-lived control server (write-status.js, the poll-loop
+// twin, is one-shot and uses a plain Client instead).
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 if (!TOKEN) {
   console.error('[control] ANTSEED_CONTROL_TOKEN unset — control server disabled');
@@ -42,20 +46,22 @@ function run(args, timeout) {
   });
 }
 
-// Refresh /market/status-antseed.json from a fresh `buyer status --json`, in the
-// same shape the entrypoint writer uses (fetched_at_ms + atomic rename) so the
-// router's source picks up the new escrow balance on its next read.
+// Upsert the buyer's status into the host store (buyer_status) from a fresh
+// `buyer status --json`, so the router's source picks up the new escrow balance
+// on its next read — the post-wallet-op twin of write-status.js. Returns the
+// fresh status object for the HTTP response even if the persist fails (the poll
+// loop will retry the write); null only when the CLI output isn't a status.
 async function refreshStatus() {
   const r = await run(['buyer', 'status', '--json'], STATUS_TIMEOUT_MS);
   let data;
   try { data = JSON.parse(r.stdout); } catch (_) { return null; }
   if (data === null || typeof data !== 'object') return null;
   data.fetched_at_ms = Date.now();
-  const tmp = STATUS_FILE + '.' + process.pid + '.tmp';
   try {
-    fs.writeFileSync(tmp, JSON.stringify(data));
-    fs.renameSync(tmp, STATUS_FILE);
-  } catch (_) { try { fs.unlinkSync(tmp); } catch (__) {} }
+    await pool.query(UPSERT_BUYER_STATUS, buyerStatusRow(data, PID));
+  } catch (e) {
+    console.error('[control] buyer_status upsert failed:', e.message);
+  }
   return data;
 }
 

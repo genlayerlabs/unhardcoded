@@ -10,9 +10,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Pinned, vendored. Bump deliberately (newer CLIs carry fresher bootstrap nodes).
-RUN npm install -g @antseed/cli@0.1.128
+# `pg` is the market writer's Postgres client (write-market.js upserts peer_offers
+# into the shared host store). NODE_PATH lets the scripts require these globals.
+RUN npm install -g @antseed/cli@0.1.128 pg@8.16.3
+ENV NODE_PATH=/usr/local/lib/node_modules
 
-COPY antseed/merge-market.js antseed/control.js antseed/entrypoint.sh /usr/local/lib/antseed/
+COPY antseed/store.js antseed/write-market.js antseed/write-status.js antseed/control.js antseed/entrypoint.sh /usr/local/lib/antseed/
 RUN chmod +x /usr/local/lib/antseed/entrypoint.sh
 
 ENV ANTSEED_DATA_DIR=/data

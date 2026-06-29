@@ -181,3 +181,71 @@ def test_set_is_atomic_and_returns_false_on_failure(store, monkeypatch):
 
     assert ok is False                                     # failure surfaced, not swallowed
     assert hs.get_consumer_keys()[0] == {"crm": {"status": "active"}}  # rolled back, intact
+
+
+# ---- peer_offers (antseed market book; sidecar writes, host reads) -------------
+
+def _insert_peer_offer(store, peer_id, service, observed_at, **over):
+    row = {"price_in": 0.5, "price_out": 1.0, "price_cached_in": None,
+           "max_concurrency": 5, "reputation": None, "last_seen": 1,
+           "first_seen": observed_at, "fetched_at": observed_at}
+    row.update(over)
+    with store._get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO peer_offers (peer_id, service, price_in, price_out,"
+            " price_cached_in, max_concurrency, reputation, last_seen,"
+            " observed_at, first_seen, fetched_at)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (peer_id, service, row["price_in"], row["price_out"],
+             row["price_cached_in"], row["max_concurrency"], row["reputation"],
+             row["last_seen"], observed_at, row["first_seen"], row["fetched_at"]))
+
+
+def test_peer_offers_returns_rows_in_reader_shape(store):
+    now = int(time.time() * 1000)
+    _insert_peer_offer(store, "peerA", "gpt-5", now, reputation=80.0)
+    rows = store.peer_offers()
+    assert len(rows) == 1
+    r = rows[0]
+    assert r == {"peer_id": "peerA", "service": "gpt-5", "price_in": 0.5,
+                 "price_out": 1.0, "price_cached_in": None, "max_concurrency": 5,
+                 "reputation": 80.0, "last_seen": 1}
+
+
+def test_peer_offers_window_filters_stale_rows(store):
+    now = int(time.time() * 1000)
+    _insert_peer_offer(store, "fresh", "m", now)
+    _insert_peer_offer(store, "stale", "m", now - 20 * 60 * 1000)  # 20 min ago
+    assert {r["peer_id"] for r in store.peer_offers(window_ms=15 * 60 * 1000)} == {"fresh"}
+    # a wider window readmits the older row
+    assert {r["peer_id"] for r in store.peer_offers(window_ms=30 * 60 * 1000)} == {"fresh", "stale"}
+
+
+# ---- buyer_status (antseed buyer escrow/pin/wallet; sidecar writes) ------------
+
+def test_buyer_status_roundtrip_and_absent(store):
+    assert store.buyer_status("antseed") is None      # absent -> None (degraded)
+    with store._get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO buyer_status (pid, pinned_peer_id, deposits_available,"
+            " deposits_reserved, wallet_address, connection_state, fetched_at)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            ("antseed", "peerX", "1.5", "0.2", "0xabc", "connected", 1))
+    row = store.buyer_status("antseed")
+    assert row == {"pid": "antseed", "pinned_peer_id": "peerX",
+                   "deposits_available": "1.5", "deposits_reserved": "0.2",
+                   "wallet_address": "0xabc", "connection_state": "connected"}
+
+
+def test_served_by_and_tokens_cached_recorded(store):
+    # #3: the call ledger carries the executed route identity (served_by, from
+    # the engine's chosen) and the cache-token breakdown — raw per-call facts the
+    # #4 route/analytics views derive from.
+    store.insert_call(_row(served_by="peerGood", tokens_cached=128))
+    r = store.recent_calls()[0]
+    assert r["served_by"] == "peerGood"
+    assert r["tokens_cached"] == 128
+    # absent -> NULL, fail-soft (older rows / direct calls without the field)
+    store.insert_call(_row(usage_event_id="ev2"))
+    r2 = [c for c in store.recent_calls() if c["usage_event_id"] == "ev2"][0]
+    assert r2["served_by"] is None and r2["tokens_cached"] is None

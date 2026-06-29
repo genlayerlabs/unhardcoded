@@ -1,28 +1,27 @@
 """
 AntSeed source: offers, prices and wallet balances for the AntSeed buyer
-proxies, read from a market dump on a shared volume (the buyer daemon's
-control API is a unix socket inside the antseed containers; only the proxy
-ports are shared with the router's network namespace).
+proxies.
 
-The antseed-free container writes /market/market.json (network browse
---services --json) every 300 s; each buyer writes /market/status-<id>.json
-(buyer status --json).
+Both the marketplace book (`peer_offers`) and the buyer status (`buyer_status`:
+session pin + escrow + wallet) are read from the host store, which the antseed
+sidecar writes — the book from `antseed network browse --services --json`, the
+status from `antseed buyer status --json`. The source no longer touches the
+filesystem; the buyer daemon's control API stays a unix socket inside the
+antseed containers (only the proxy ports are shared with the router's netns).
 """
 from __future__ import annotations
 
-import json
 import os
 import time
-from pathlib import Path
 from typing import Any
 
+import host_store
 import route_reliability as _route_reliability
 import route_latency as _route_latency
 import route_tool_capability as _route_tool_capability
 import settings
 from sources import Balance, Price
 
-MARKET_DIR = Path(os.getenv("ANTSEED_MARKET_DIR", "/market"))
 STALE_AFTER_S = 900
 
 # Buyer hot-wallet on-chain reads. The marketplace spends from ESCROW
@@ -81,30 +80,11 @@ async def _fetch_chain_balances(rpc_url: str, address: str) -> dict:
     return out
 
 
-def _as_pos_int(v: Any) -> int | None:
-    """maxConcurrency as a positive int, or None when absent/garbage (ungated)."""
-    try:
-        n = int(v)
-    except (TypeError, ValueError):
-        return None
-    return n if n > 0 else None
-
-
-def _as_score(v: Any) -> float | None:
-    """On-chain reputation as a float, or None when absent/garbage. None means
-    'no reported reputation' — kept (cold-start safe), never coerced to 0."""
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
 class AntSeedSource:
     name = "antseed"
     poll_interval_s = 300
 
-    def __init__(self, catalog: dict, market_dir: Path | str = MARKET_DIR):
-        self._dir = Path(market_dir)
+    def __init__(self, catalog: dict):
         self._models = catalog.get("models") or {}
         # provider_id -> its marketplace config (cap, aliases, endpoint)
         self._providers: dict[str, dict] = {
@@ -118,69 +98,24 @@ class AntSeedSource:
     # ---- market parsing -------------------------------------------------
 
     def _load_market(self) -> list[dict]:
-        """[{service, price_in, price_out}] per peer-service row, or [] when
-        the dump is missing/stale (degraded: no antseed candidates)."""
-        path = self._dir / "market.json"
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            self._stats["stale"] = True
-            return []
-        # Freshness from the writer's embedded stamp (robust to volume
-        # copy/restore that mangles mtime); fall back to mtime when absent.
-        ts_ms = data.get("fetched_at_ms") if isinstance(data, dict) else None
-        try:
-            age_s = (time.time() - ts_ms / 1000.0) if ts_ms \
-                else (time.time() - path.stat().st_mtime)
-        except OSError:
-            age_s = float("inf")
-        if age_s > STALE_AFTER_S:
-            self._stats["stale"] = True
-            return []
-        self._stats["stale"] = False
-        rows = []
-        for peer in data.get("peers") or []:
-            for pricing in (peer.get("providerPricing") or {}).values():
-                for service, sp in (pricing.get("services") or {}).items():
-                    rows.append({
-                        "peer_id": peer.get("peerId"),
-                        "service": service,
-                        "price_in": float(sp.get("inputUsdPerMillion") or 0),
-                        "price_out": float(sp.get("outputUsdPerMillion") or 0),
-                        # Seller-advertised cached-input price, when present. The
-                        # buyer's @antseed/router-local rejects an offer whose
-                        # cached price exceeds its input price as malformed
-                        # (see offers_sync); we need it to mirror that gate.
-                        "price_cached_in": (
-                            float(sp["cachedInputUsdPerMillion"])
-                            if sp.get("cachedInputUsdPerMillion") is not None
-                            else None),
-                        # seller-advertised in-flight cap. Exceeding it earns a
-                        # 429 "Max concurrency reached"; the host gates per peer
-                        # to this (None = ungated). See llm_router_host.
-                        "max_concurrency": _as_pos_int(peer.get("maxConcurrency")),
-                        # peer's on-chain reputation (0-100), the buyer's own
-                        # admission signal. None when the peer reports none
-                        # (cold-start). Carried onto the offer + gateable via
-                        # the antseed.reputation_min knob. See offers_sync.
-                        "reputation": _as_score(peer.get("onChainReputationScore")),
-                        # peer announcement freshness (ms epoch) — the only
-                        # live signal discovery gives us per peer; dropped from
-                        # offers/ranking, surfaced in the dashboard book.
-                        "last_seen": peer.get("lastSeen"),
-                    })
+        """[{peer_id, service, price_in, price_out, price_cached_in,
+        max_concurrency, reputation, last_seen}] per peer-service row from the
+        host store (written by the antseed sidecar within the sliding window), or
+        [] when none are fresh (degraded: no antseed candidates). The fields are
+        raw seller announcements: cap mirroring (price_cached_in), per-peer gating
+        (max_concurrency), reputation admission and dashboard freshness (last_seen)
+        are applied downstream in offers_sync / market_book."""
+        rows = host_store.peer_offers(STALE_AFTER_S * 1000)
+        self._stats["stale"] = not rows
         return rows
 
     def _pinned_peer(self, provider_id: str) -> str | None:
-        """An optional buyer-side *session* pin (status' pinnedPeerId). Browse
-        mode leaves it null and the host pins per request instead (the offer
-        carries peer_id -> x-antseed-pin-peer); when a session pin IS set,
+        """An optional buyer-side *session* pin (buyer_status' pinned_peer_id).
+        Browse mode leaves it null and the host pins per request instead (the
+        offer carries peer_id -> x-antseed-pin-peer); when a session pin IS set,
         restrict offers to that peer's services to match what the proxy serves."""
-        try:
-            data = json.loads((self._dir / f"status-{provider_id}.json").read_text())
-        except (OSError, ValueError):
-            return None
-        return data.get("pinnedPeerId") or None
+        data = host_store.buyer_status(provider_id)
+        return (data or {}).get("pinned_peer_id") or None
 
     def _family_for(self, provider_cfg: dict, service: str) -> str | None:
         aliases = provider_cfg.get("service_aliases") or {}
@@ -404,20 +339,18 @@ class AntSeedSource:
     async def balances(self) -> dict[str, Balance]:
         out: dict[str, Balance] = {}
         for pid in self.provider_ids:
-            path = self._dir / f"status-{pid}.json"
-            try:
-                data = json.loads(path.read_text())
-            except (OSError, ValueError):
+            data = host_store.buyer_status(pid)
+            if not data:
                 continue
             try:
-                available = float(data.get("depositsAvailable"))
+                available = float(data.get("deposits_available"))
             except (TypeError, ValueError):
                 continue
-            detail = {"reserved": data.get("depositsReserved"),
-                      "wallet": data.get("walletAddress"),
-                      "connection": data.get("connectionState")}
+            detail = {"reserved": data.get("deposits_reserved"),
+                      "wallet": data.get("wallet_address"),
+                      "connection": data.get("connection_state")}
             rpc = _wallet_rpc_url()
-            addr = data.get("walletAddress")
+            addr = data.get("wallet_address")
             if rpc and addr:
                 detail.update(await _fetch_chain_balances(rpc, addr))
             out[pid] = {

@@ -86,12 +86,20 @@ _SCHEMA_STATEMENTS = [
         tokens_in       BIGINT,
         tokens_out      BIGINT,
         tokens_total    BIGINT,
-        cost_usd        DOUBLE PRECISION
+        tokens_cached   BIGINT,
+        cost_usd        DOUBLE PRECISION,
+        served_by       TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_calls_ts       ON calls(ts)",
     "CREATE INDEX IF NOT EXISTS idx_calls_route    ON calls(route_key, ts)",
     "CREATE INDEX IF NOT EXISTS idx_calls_session  ON calls(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_calls_consumer ON calls(consumer_sha, ts)",
+    # Evolve the existing `calls` fact table in place — CREATE TABLE IF NOT EXISTS
+    # never alters a table that already exists. Idempotent both ways: a no-op on a
+    # fresh DB (the CREATE above already has these columns), the actual migration
+    # on a DB that predates them. #3: the executed route identity + cache tokens.
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS tokens_cached BIGINT",
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS served_by TEXT",
     """CREATE TABLE IF NOT EXISTS settings_overrides (
         key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at BIGINT NOT NULL
     )""",
@@ -100,6 +108,43 @@ _SCHEMA_STATEMENTS = [
     )""",
     """CREATE TABLE IF NOT EXISTS consumer_keys (
         consumer TEXT PRIMARY KEY, record TEXT NOT NULL, updated_at BIGINT NOT NULL
+    )""",
+    # The antseed marketplace book. One RAW row per (peer, advertised service) —
+    # the seller's announced prices/caps/reputation, stored as columns, not
+    # interpreted: ranking/admission stays in sources/antseed.offers_sync (host)
+    # and the Σ_pol policy (core). WRITTEN by the antseed sidecar (the only
+    # producer; it runs the `antseed network browse` CLI), READ by
+    # sources/antseed._load_market. `observed_at` is OUR browse stamp (epoch ms),
+    # distinct from the network's `last_seen`; the 15-min sliding window that
+    # merge-market.js used to union by hand is now just a read-time filter on it.
+    """CREATE TABLE IF NOT EXISTS peer_offers (
+        peer_id         TEXT NOT NULL,
+        service         TEXT NOT NULL,
+        price_in        DOUBLE PRECISION,
+        price_out       DOUBLE PRECISION,
+        price_cached_in DOUBLE PRECISION,
+        max_concurrency INTEGER,
+        reputation      DOUBLE PRECISION,
+        last_seen       BIGINT,
+        observed_at     BIGINT NOT NULL,
+        first_seen      BIGINT,
+        fetched_at      BIGINT,
+        PRIMARY KEY (peer_id, service)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_peer_offers_observed ON peer_offers(observed_at)",
+    # The antseed buyer's status (escrow + session pin + wallet), one row per
+    # buyer pid. WRITTEN by the antseed sidecar (write-status.js on the poll loop
+    # + control.js after a wallet op), READ by sources/antseed (_pinned_peer +
+    # balances). Raw buyer-reported fields as columns; the deposits stay TEXT (the
+    # buyer reports them as strings) and are coerced on read, as the JSON was.
+    """CREATE TABLE IF NOT EXISTS buyer_status (
+        pid                TEXT PRIMARY KEY,
+        pinned_peer_id     TEXT,
+        deposits_available TEXT,
+        deposits_reserved  TEXT,
+        wallet_address     TEXT,
+        connection_state   TEXT,
+        fetched_at         BIGINT
     )""",
 ]
 
@@ -165,15 +210,20 @@ def insert_call(row: dict[str, Any]) -> None:
             row.get("error_type"),
             float(row["latency_ms"]) if row.get("latency_ms") is not None else None,
             row.get("tokens_in"), row.get("tokens_out"), row.get("tokens_total"),
+            row.get("tokens_cached"),
             float(row["cost_usd"]) if row.get("cost_usd") is not None else None,
+            # which route actually served the call (marketplace peer or provider),
+            # stamped by the engine on `chosen` — the per-route identity #4 derives
+            # route stats from. Raw here; combining into a route key is a later step.
+            row.get("served_by"),
         )
         with _get_pool().connection() as conn:   # one transaction, auto commit/rollback
             conn.execute(
                 "INSERT INTO calls (ts, usage_event_id, session_id, consumer_sha,"
                 " caller, route_key, provider_id, model_family, served_model_id,"
                 " requested_model, status, error_type, latency_ms, tokens_in,"
-                " tokens_out, tokens_total, cost_usd)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", values)
+                " tokens_out, tokens_total, tokens_cached, cost_usd, served_by)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", values)
         with _prune_lock:
             _inserts_since_prune += 1
             due = _inserts_since_prune >= _PRUNE_EVERY
@@ -366,6 +416,54 @@ def set_consumer_keys(records: dict[str, Any]) -> bool:
         return False
 
 
+# ---- peer_offers (antseed marketplace book; written by the sidecar) ------------
+
+# Columns surfaced to the reader, in the row shape sources/antseed expects. The
+# window/housekeeping columns (observed_at/first_seen/fetched_at) stay internal.
+_PEER_OFFER_FIELDS = ("peer_id", "service", "price_in", "price_out",
+                      "price_cached_in", "max_concurrency", "reputation",
+                      "last_seen")
+
+
+def peer_offers(window_ms: int = 900_000) -> list[dict[str, Any]]:
+    """The antseed market book: one raw row per (peer, service) observed within
+    the last `window_ms` of OUR browsing (the sliding window, as a read-time
+    filter on observed_at). Fail-soft: returns [] on any store error, so a flaky
+    DB degrades to "no antseed candidates" exactly as a missing dump did."""
+    try:
+        cutoff = int(time.time() * 1000) - max(0, window_ms)
+        cols = ", ".join(_PEER_OFFER_FIELDS)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                f"SELECT {cols} FROM peer_offers WHERE observed_at >= %s", (cutoff,))
+            return [dict(zip(_PEER_OFFER_FIELDS, r)) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001 — market read is best-effort
+        _log.warning("host_store peer_offers failed: %s", exc)
+        return []
+
+
+# ---- buyer_status (antseed buyer escrow/pin/wallet; written by the sidecar) ----
+
+_BUYER_STATUS_FIELDS = ("pid", "pinned_peer_id", "deposits_available",
+                        "deposits_reserved", "wallet_address", "connection_state")
+
+
+def buyer_status(pid: str) -> "dict[str, Any] | None":
+    """The antseed buyer's latest status row (session pin + escrow + wallet) for
+    `pid`, or None when absent / on a store error (degraded: no pin, no balance),
+    exactly as a missing status file was. Fail-soft."""
+    try:
+        cols = ", ".join(_BUYER_STATUS_FIELDS)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                f"SELECT {cols} FROM buyer_status WHERE pid = %s", (pid,))
+            row = cur.fetchone()
+            return dict(zip(_BUYER_STATUS_FIELDS, row)) if row else None
+    except Exception as exc:  # noqa: BLE001 — status read is best-effort
+        _log.warning("host_store buyer_status failed: %s", exc)
+        return None
+
+
 # ---- one-shot backfill of legacy JSON state (run once at startup) --------------
 
 def _seed_if_empty(table: str, legacy_path: str, to_rows) -> None:
@@ -429,4 +527,4 @@ def truncate_all_for_tests() -> None:
     """Test helper: wipe every table for isolation against a shared Postgres."""
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
-                     " consumer_keys")
+                     " consumer_keys, peer_offers, buyer_status")

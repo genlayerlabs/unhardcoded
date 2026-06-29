@@ -480,23 +480,30 @@ ANTSEED_CATALOG = {
 }
 
 
-def _antseed_source(tmp_path, market_body=None, pins=None):
+def _antseed_source(tmp_path, market_body=None, pins=None, observed_at=None):
     import json as _json
+    import host_store
+    from conftest import seed_peer_offers, seed_buyer_status
     from sources.antseed import AntSeedSource
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    market = tmp_path / "market.json"
     if market_body is None:
         market_body = (Path(__file__).parent / "fixtures" / "antseed_market.json").read_text()
-    market.write_text(market_body if isinstance(market_body, str) else _json.dumps(market_body))
+    market = market_body if isinstance(market_body, dict) else _json.loads(market_body)
+    # the market book + buyer status both live in the host store now (peer_offers
+    # / buyer_status); seed them as the sidecar would. No status files.
+    try:
+        host_store.reset()
+        host_store.truncate_all_for_tests()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"host store Postgres unavailable: {exc}")
+    seed_peer_offers(market.get("peers") or [], observed_at)
     # each buyer proxy is a session pinned to ONE peer; offers are restricted
     # to that peer (live finding: an unpinned buyer errors "no_peer_pinned")
     default_pins = {"antseed_free": "1d90f467689d499dc435e5744b4613c3203eb0aa",
                     "antseed_cheap": "1d90f467689d499dc435e5744b4613c3203eb0aa"}
     for pid, peer in (pins if pins is not None else default_pins).items():
-        (tmp_path / f"status-{pid}.json").write_text(_json.dumps({
-            "pinnedPeerId": peer, "depositsAvailable": "0.0",
-            "depositsReserved": "0.0", "walletAddress": "0x0"}))
-    return AntSeedSource(ANTSEED_CATALOG, market_dir=tmp_path)
+        seed_buyer_status(pid, pinned_peer_id=peer, deposits_available="0.0",
+                          deposits_reserved="0.0", wallet_address="0x0")
+    return AntSeedSource(ANTSEED_CATALOG)
 
 
 def test_antseed_offers_gate_caps_aliases_and_min_price(tmp_path):
@@ -676,27 +683,25 @@ def test_settings_validate_and_write_list_roundtrip(host_store_clean):
 
 
 def test_antseed_stale_market_returns_no_offers(tmp_path):
-    import os as _os
-    s = _antseed_source(tmp_path)
-    old = _os.path.getmtime(tmp_path / "market.json") - 3600
-    _os.utime(tmp_path / "market.json", (old, old))
+    # rows last observed past the window (here ~1h ago) fall outside the read-time
+    # filter -> no offers, stale flag set (was: a backdated market.json mtime).
+    old = int(time.time() * 1000) - 3600 * 1000
+    s = _antseed_source(tmp_path, observed_at=old)
     assert s.offers_sync("antseed_free") == []
     assert s.snapshot_stats()["stale"] is True
 
 
 def test_antseed_balances_from_status_files(tmp_path):
-    import json as _json
+    from conftest import seed_buyer_status
     s = _antseed_source(tmp_path)
-    (tmp_path / "status-antseed_free.json").write_text(_json.dumps({
-        "depositsAvailable": "1.5", "depositsReserved": "0.2",
-        "walletAddress": "0x7C39",
-    }))
+    seed_buyer_status("antseed_free", deposits_available="1.5",
+                      deposits_reserved="0.2", wallet_address="0x7C39")
     balances = asyncio.run(s.balances())
     b = balances["antseed_free"]
     assert b["kind"] == "deposits_usdc" and b["value"] == 1.5
     assert b["detail"]["wallet"] == "0x7C39"
-    s_nofiles = _antseed_source(tmp_path / "bare", pins={})
-    assert asyncio.run(s_nofiles.balances()) == {}   # no status files -> absent
+    s_nostatus = _antseed_source(tmp_path, pins={})
+    assert asyncio.run(s_nostatus.balances()) == {}   # no buyer_status -> absent
 
 
 def test_wallet_rpc_url_default_and_disable(monkeypatch):
@@ -743,13 +748,11 @@ def test_fetch_chain_balances_parses_eth_and_usdc(monkeypatch):
 
 
 def test_balances_enriched_with_wallet_chain(tmp_path, monkeypatch):
-    import json as _json
+    from conftest import seed_buyer_status
     from sources import antseed as a
     s = _antseed_source(tmp_path)
-    (tmp_path / "status-antseed_free.json").write_text(_json.dumps({
-        "depositsAvailable": "1.5", "depositsReserved": "0.0",
-        "walletAddress": "0x" + "cd" * 20,
-    }))
+    seed_buyer_status("antseed_free", deposits_available="1.5",
+                      deposits_reserved="0.0", wallet_address="0x" + "cd" * 20)
 
     async def _fake(rpc, address):
         return {"wallet_usdc": 7.0, "wallet_eth": 0.0}
@@ -784,9 +787,8 @@ def test_discover_hook_serves_antseed_offers(tmp_path):
     # empty results must NOT be cached as ok (the core caches ok results for
     # the discovery TTL — a router that starts before the first market dump
     # would otherwise serve no antseed offers until the TTL expires)
-    s2 = _antseed_source(tmp_path / "empty", market_body='{"peers": []}') if False else None
-    import json as _json, os as _os
-    (tmp_path / "market.json").write_text(_json.dumps({"peers": []}))
+    import host_store
+    host_store.truncate_all_for_tests()        # empty the market book
     r2 = hook("antseed_free")
     assert r2["ok"] is False and "no offers" in r2["error"]
 
