@@ -109,6 +109,15 @@ def test_build_registry_includes_openrouter_only_when_configured():
     assert src.build_registry({"providers": {"antseed": {}}}) == []
 
 
+def test_build_registry_adds_bedrock_source():
+    cat = {"providers": {"bedrock_mantle": {
+        "source": "bedrock", "api_kind": "openai_compatible",
+        "auth_env": "AWS_BEARER_TOKEN_BEDROCK",
+    }}, "models": {}}
+    reg = src.build_registry(cat)
+    assert [s.name for s in reg] == ["bedrock"]
+
+
 # ---- openrouter source ----------------------------------------------------
 
 OR_MODELS_BODY = {
@@ -325,6 +334,33 @@ def test_openrouter_discovery_rejects_negative_priced_models():
     assert {"z-ai/glm-5.2", "free/free-model"} <= served
 
 
+def test_openrouter_discovery_drops_models_with_no_usable_endpoints():
+    body = {"data": [
+        {"id": "~anthropic/claude-fable-latest",
+         "pricing": {"prompt": "0.00001", "completion": "0.00005"},
+         "links": {"details": "/api/v1/models/~anthropic/claude-fable-latest/endpoints"}},
+        {"id": "z-ai/glm-5.2",
+         "pricing": {"prompt": "0.0000004", "completion": "0.0000016"},
+         "links": {"details": "/api/v1/models/z-ai/glm-5.2/endpoints"}},
+    ]}
+    s = _or_source({
+        "/models": FakeResponse(200, body),
+        "/models/~anthropic/claude-fable-latest/endpoints": FakeResponse(200, {
+            "data": {"endpoints": []},
+        }),
+        "/models/z-ai/glm-5.2/endpoints": FakeResponse(200, {
+            "data": {"endpoints": [{"tag": "openrouter", "status": 0}]},
+        }),
+    })
+
+    prices = asyncio.run(s.pricing())
+
+    assert {o["wire_model_id"] for o in s.offers_sync("openrouter_market")} == {
+        "z-ai/glm-5.2",
+    }
+    assert {p["served_model_id"] for p in prices} == {"z-ai/glm-5.2"}
+
+
 def test_openrouter_discovery_stamps_capability_flags_for_meets_req():
     # the core's meets_req filters on capabilities.supports_{tools,vision,...};
     # discovery must translate OpenRouter's supported_parameters into those flags
@@ -350,6 +386,114 @@ def test_openrouter_discovery_stamps_capability_flags_for_meets_req():
     assert "supports_tools" not in offers["text-only"]["capabilities"]
 
 
+# ---- bedrock source --------------------------------------------------------
+
+BEDROCK_PRICE_BODY = {
+    "products": {
+        "IN": {"attributes": {
+            "servicename": "Claude Opus 4.8 (Amazon Bedrock Edition)",
+            "usagetype": "USE1-MP:USE1_InputTokenCount-Units",
+        }},
+        "OUT": {"attributes": {
+            "servicename": "Claude Opus 4.8 (Amazon Bedrock Edition)",
+            "usagetype": "USE1-MP:USE1_OutputTokenCount-Units",
+        }},
+        # Should be ignored: not on-demand token pricing.
+        "CACHE": {"attributes": {
+            "servicename": "Claude Opus 4.8 (Amazon Bedrock Edition)",
+            "usagetype": "USE1-MP:USE1_CacheReadInputTokenCount-Units",
+        }},
+    },
+    "terms": {"OnDemand": {
+        "IN": {"t": {"priceDimensions": {"d": {
+            "description": "Price per 1 million input tokens Units",
+            "pricePerUnit": {"USD": "5.0"},
+        }}}},
+        "OUT": {"t": {"priceDimensions": {"d": {
+            "description": "Million Response Tokens Regional Units",
+            "pricePerUnit": {"USD": "27.5"},
+        }}}},
+        "CACHE": {"t": {"priceDimensions": {"d": {
+            "description": "Million Cache Read Input Tokens Regional Units",
+            "pricePerUnit": {"USD": "0.5"},
+        }}}},
+    }},
+}
+
+
+def test_bedrock_source_builds_marketplace_offers_from_models_and_prices():
+    from sources.bedrock import BedrockSource
+
+    catalog = {
+        "providers": {
+            "bedrock_mantle_market": {
+                "source": "bedrock",
+                "discovery": "marketplace",
+                "discovery_id": "bedrock_mantle_market",
+                "base_url": "https://bedrock.test/openai/v1",
+                "api_kind": "openai_compatible",
+                "auth_env": "AWS_BEARER_TOKEN_BEDROCK",
+            },
+        },
+        "models": {
+            "claude-opus-4-8": {
+                "static_quality_hint": 0.93,
+                "capabilities": {"context": 200000, "supports_tools": True},
+                "served_by": [],
+            },
+        },
+    }
+    routes = {
+        "/models": FakeResponse(200, {"data": [{
+            "id": "anthropic.claude-opus-4-8-20260514-v1:0",
+            "context_length": 1000000,
+            "supported_parameters": ["tools", "response_format"],
+        }]}),
+        "/region_index.json": FakeResponse(200, {"regions": {
+            "us-east-1": {"currentVersionUrl": "/prices/us-east-1.json"},
+        }}),
+        "/prices/us-east-1.json": FakeResponse(200, BEDROCK_PRICE_BODY),
+    }
+    source = BedrockSource(
+        catalog,
+        env_get={
+            "AWS_BEARER_TOKEN_BEDROCK": "bt-test",
+            "BEDROCK_REGION": "us-east-1",
+        }.get,
+        client=FakeClient(routes),
+        pricing_base="https://pricing.test",
+    )
+
+    prices = asyncio.run(source.pricing())
+    offers = source.offers_sync("bedrock_mantle_market")
+
+    assert prices == [{
+        "provider_id": "bedrock_mantle_market",
+        "served_model_id": "anthropic.claude-opus-4-8-20260514-v1:0",
+        "model_family": "claude-opus-4-8",
+        "price_in_usd_per_mtok": 5.0,
+        "price_out_usd_per_mtok": 27.5,
+    }]
+    assert len(offers) == 1
+    offer = offers[0]
+    assert offer["model_family"] == "claude-opus-4-8"
+    assert offer["capabilities"]["context"] == 1000000
+    assert offer["capabilities"]["supports_json_mode"] is True
+
+
+def test_bedrock_source_is_empty_without_bearer_token():
+    from sources.bedrock import BedrockSource
+
+    catalog = {"providers": {"bedrock_mantle_market": {
+        "source": "bedrock", "discovery": "marketplace",
+        "base_url": "https://bedrock.test/openai/v1",
+        "auth_env": "AWS_BEARER_TOKEN_BEDROCK",
+    }}, "models": {}}
+    source = BedrockSource(catalog, env_get={}.get, client=FakeClient({}))
+    assert asyncio.run(source.pricing()) == []
+    assert source.offers_sync("bedrock_mantle_market") == []
+
+
 def test_pushed_price_lands_in_dump_state():
     from llm_router_host import LLMRouterHost
     host = LLMRouterHost(
@@ -370,6 +514,9 @@ def test_pushed_price_lands_in_dump_state():
     assert pushed == 1
     ema = host.dump_state()["ema_metrics"][f"{provider}|{family}"]
     assert ema["price_in"] == 123.0 and ema["price_out"] == 456.0
+    auth_env = (cat["providers"].get(provider) or {}).get("auth_env")
+    if auth_env:
+        host.set_env(auth_env, "sk-test")
     ranked, _ = host.rank({"prompt": "x", "profile": "default"})
     assert ranked  # ranking still functions on the updated store
 

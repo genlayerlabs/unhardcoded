@@ -135,4 +135,11 @@ def build_registry(catalog: dict, env_get=os.environ.get) -> list[ProviderSource
     if "ollama" in providers:
         from sources.ollama import OllamaSource
         registry.append(OllamaSource(catalog, env_get=env_get))
+    if any(
+        isinstance(p, dict)
+        and (p.get("source") == "bedrock" or str(pid).startswith("bedrock"))
+        for pid, p in providers.items()
+    ):
+        from sources.bedrock import BedrockSource
+        registry.append(BedrockSource(catalog, env_get=env_get))
     return registry

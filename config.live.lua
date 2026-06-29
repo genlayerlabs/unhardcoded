@@ -86,8 +86,22 @@ return {
             api_kind  = "openai_compatible",
             auth_env  = "AWS_BEARER_TOKEN_BEDROCK",
             tier      = "partner",
+            source    = "bedrock",
             notes     = "Amazon Bedrock Mantle OpenAI-compatible endpoint. "
                      .. "Use BEDROCK_MANTLE_BASE_URL to select region/path.",
+        },
+        bedrock_mantle_market = {
+            discovery        = "marketplace",
+            discovery_id     = "bedrock_mantle_market",
+            base_url         = os.getenv("BEDROCK_MANTLE_BASE_URL")
+                           or "https://bedrock-mantle.us-east-1.api.aws/openai/v1",
+            api_kind         = "openai_compatible",
+            auth_env         = "AWS_BEARER_TOKEN_BEDROCK",
+            tier             = "partner",
+            source           = "bedrock",
+            market_price_cap = { input = 1000, output = 1000 },
+            notes            = "Dynamic Bedrock model offers, priced from AWS's "
+                            .. "public Bedrock Foundation Models price list.",
         },
         -- Live discovery of the WHOLE OpenRouter catalog (every model it serves,
         -- straight from /models — no hand curation). Candidates/prices come from

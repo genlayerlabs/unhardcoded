@@ -17,6 +17,11 @@ from llm_router_host import LLMRouterHost  # noqa: E402
 from provider_adapters.dispatcher import make_api_kind_dispatcher  # noqa: E402
 from shim import create_app  # noqa: E402
 
+LIVE_TEST_ENV = {
+    "OPENAI_API_KEY": "sk-openai-test",
+    "OPENROUTER_API_KEY": "sk-openrouter-test",
+}
+
 
 def _build_client(default_handler, codex_handler):
     host = LLMRouterHost(
@@ -27,6 +32,7 @@ def _build_client(default_handler, codex_handler):
             default=default_handler,
             handlers={"openai_codex": codex_handler},
         ),
+        env=LIVE_TEST_ENV.copy(),
         now_ms=lambda: 1,
     )
     host.init()
@@ -103,6 +109,7 @@ def test_antseed_is_marketplace_with_no_static_rows():
         router_path=ROOT / "core" / "router.lua",
         config_path=ROOT / "config.live.lua",
         metrics_path=ROOT / "metrics.live.lua",
+        env=LIVE_TEST_ENV.copy(),
         now_ms=lambda: 1,
     )
     host.init()
@@ -125,6 +132,7 @@ def test_live_config_includes_provider_local_native_examples():
         router_path=ROOT / "core" / "router.lua",
         config_path=ROOT / "config.live.lua",
         metrics_path=ROOT / "metrics.live.lua",
+        env=LIVE_TEST_ENV.copy(),
         now_ms=lambda: 1,
     )
     host.init()
@@ -151,6 +159,41 @@ def test_live_config_includes_provider_local_native_examples():
         "gemini-3.1-pro-preview"
     assert served_by("qwen3-235b-a22b")["bedrock_mantle"] == \
         "qwen.qwen3-235b-a22b-2507"
+
+
+def test_missing_provider_keys_are_filtered_before_ranking():
+    async def provider_call(_req):
+        return {"ok": True, "response": {"text": "ok"}}
+
+    host = LLMRouterHost(
+        router_path=ROOT / "core" / "router.lua",
+        config_path=ROOT / "config.live.lua",
+        metrics_path=ROOT / "metrics.live.lua",
+        env={"OPENROUTER_API_KEY": "sk-openrouter"},
+        now_ms=lambda: 1,
+    )
+    host.init()
+    host.set_async_call_hook(provider_call)
+    term = ["policy",
+            ["and", ["meets_req"], ["not", ["is", "disabled"]],
+             ["family_eq", "gpt-5.4"]],
+            ["lit", 1], ["argmax"], ["id"],
+            ["always", {"action": "next_candidate"}]]
+
+    ranked, _ = host.rank({"policy_ir": term, "requirements": {"context": 8000}})
+    providers = [r["candidate"]["provider_id"] for r in ranked]
+
+    assert "openrouter" in providers
+    assert "openai" not in providers
+    assert host.dump_state()["disabled_providers"]["openai"]["kind"] == \
+        "auth_unconfigured"
+
+    host.set_env("OPENAI_API_KEY", "sk-openai")
+    ranked, _ = host.rank({"policy_ir": term, "requirements": {"context": 8000}})
+    providers = [r["candidate"]["provider_id"] for r in ranked]
+
+    assert "openai" in providers
+    assert "openai" not in host.dump_state().get("disabled_providers", {})
 
 
 def test_context_overflow_falls_through_to_the_next_candidate():
@@ -186,6 +229,7 @@ def test_marketplace_offers_rank_with_offer_prices():
         router_path=ROOT / "core" / "router.lua",
         config_path=ROOT / "config.live.lua",
         metrics_path=ROOT / "metrics.live.lua",
+        env={**LIVE_TEST_ENV, "ANTSEED_BASE_URL": "http://localhost:8378/v1"},
         now_ms=lambda: 1,
     )
     host.set_discover_hook(lambda did: {
@@ -214,6 +258,7 @@ def test_discovered_family_ranks_on_inline_offer_traits():
         router_path=ROOT / "core" / "router.lua",
         config_path=ROOT / "config.live.lua",
         metrics_path=ROOT / "metrics.live.lua",
+        env=LIVE_TEST_ENV.copy(),
         now_ms=lambda: 1,
     )
     host.set_discover_hook(lambda did: {
@@ -244,6 +289,7 @@ def test_discovered_alias_family_is_policy_addressable():
         router_path=ROOT / "core" / "router.lua",
         config_path=ROOT / "config.live.lua",
         metrics_path=ROOT / "metrics.live.lua",
+        env=LIVE_TEST_ENV.copy(),
         now_ms=lambda: 1,
     )
     host.set_discover_hook(lambda did: {

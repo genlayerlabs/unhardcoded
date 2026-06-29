@@ -4,6 +4,7 @@ strings) and account credits (GET /credits — needs OPENROUTER_API_KEY).
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from typing import Any
@@ -31,6 +32,10 @@ class OpenRouterSource:
         # /models snapshot cached by the async pricing() refresh so the SYNC
         # discover hook (offers_sync, called inside rank) never blocks on HTTP.
         self._models_snapshot: list[dict] = []
+        # model id -> endpoint availability. A missing entry means "unknown" and
+        # stays routable; a present false means OpenRouter explicitly reported no
+        # usable endpoint for that model.
+        self._endpoint_availability: dict[str, dict] = {}
         self._live_traits: dict[str, dict] = {}  # raw model id -> full traits (+ranks)
         # Discovery offers built ONCE per refresh (in pricing()) and served by the
         # sync hook — offers_sync runs inside rank, so it must not rebuild the
@@ -57,19 +62,85 @@ class OpenRouterSource:
                 if served.get("provider") == "openrouter" and served.get("provider_model_id"):
                     self._family_by_id[served["provider_model_id"]] = family
 
+    def _url_for(self, path: str) -> str:
+        if path.startswith("http://") or path.startswith("https://"):
+            return path
+        # OpenRouter embeds docs/API paths such as
+        # /api/v1/models/<slug>/endpoints in links.details. The source base URL
+        # already ends with /api/v1, so normalize those links before appending.
+        if path.startswith("/api/v1/") and self._base_url.endswith("/api/v1"):
+            path = path[len("/api/v1"):]
+        return self._base_url + path
+
     async def _get(self, path: str, headers: dict | None = None):
         if self._client is None:
             import httpx
             self._client = httpx.AsyncClient(timeout=15.0)
-        resp = await self._client.get(self._base_url + path, headers=headers)
+        resp = await self._client.get(self._url_for(path), headers=headers)
         if resp.status_code != 200:
             raise RuntimeError(f"openrouter GET {path} -> {resp.status_code}")
         return resp.json()
+
+    @staticmethod
+    def _endpoint_usable(endpoint: dict) -> bool:
+        status = endpoint.get("status")
+        # Observed OpenRouter shape: status=0 is live. If the field is absent,
+        # keep the endpoint because old/partial responses should not falsely
+        # remove a model. Non-zero statuses are treated as unavailable.
+        if status is None:
+            return True
+        if isinstance(status, str):
+            return status.strip().lower() in {"0", "live", "ok"}
+        return status == 0
+
+    async def _endpoint_availability_for(self, model: dict) -> tuple[str, dict | None]:
+        mid = model.get("id")
+        if not mid:
+            return "", None
+        details = ((model.get("links") or {}).get("details") or "").strip()
+        if not details:
+            return mid, None
+        try:
+            body = await self._get(details)
+        except Exception:  # noqa: BLE001 — endpoint detail is advisory
+            return mid, None
+        data = body.get("data") if isinstance(body, dict) else None
+        endpoints = (data or {}).get("endpoints") or []
+        usable = [e for e in endpoints if isinstance(e, dict) and self._endpoint_usable(e)]
+        return mid, {
+            "available": bool(usable),
+            "endpoints_total": len(endpoints),
+            "endpoints_usable": len(usable),
+            "provider_tags": [e.get("tag") for e in usable if e.get("tag")],
+        }
+
+    async def _refresh_endpoint_availability(self, models: list[dict]) -> None:
+        limit_raw = self._env_get("OPENROUTER_ENDPOINTS_CONCURRENCY") or "8"
+        try:
+            limit = max(1, min(32, int(limit_raw)))
+        except ValueError:
+            limit = 8
+        sem = asyncio.Semaphore(limit)
+
+        async def one(model: dict):
+            async with sem:
+                return await self._endpoint_availability_for(model)
+
+        availability: dict[str, dict] = {}
+        for mid, info in await asyncio.gather(*(one(m) for m in models)):
+            if mid and info is not None:
+                availability[mid] = info
+        self._endpoint_availability = availability
+
+    def _model_available(self, model_id: str) -> bool:
+        info = self._endpoint_availability.get(model_id)
+        return True if info is None else bool(info.get("available"))
 
     async def pricing(self) -> list[Price]:
         body = await self._get("/models")
         # cache for the sync offers_sync()/market_book() (whole-catalog discovery)
         self._models_snapshot = body.get("data") or []
+        await self._refresh_endpoint_availability(self._models_snapshot)
         # Live, full model-level traits (benchmarks/modalities/caps + ranks) for
         # EVERY model, keyed by raw id, ranked across the whole OpenRouter
         # catalog. Discovered families carry these inline so they rank on real
@@ -85,6 +156,8 @@ class OpenRouterSource:
         prices: list[Price] = []
         for m in self._models_snapshot:
             mid = m.get("id")
+            if mid and not self._model_available(mid):
+                continue
             pricing = m.get("pricing") or {}
             try:
                 price_in = float(pricing.get("prompt")) * 1e6
@@ -108,6 +181,8 @@ class OpenRouterSource:
         avoid a duplicate candidate) or has non-numeric pricing."""
         mid = m.get("id")
         if not mid or mid in self._family_by_id:
+            return None
+        if not self._model_available(mid):
             return None
         pricing = m.get("pricing") or {}
         try:
