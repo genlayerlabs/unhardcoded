@@ -17,6 +17,7 @@
 // Validation: a non-dump (the CLI prints a human "No peers found" line even with
 // --json) exits non-zero so entrypoint.sh keeps the last good window (no write).
 const { Client } = require("pg");
+const { pgConfig } = require("./store.js");
 
 const WINDOW_MS = Number(process.env.ANTSEED_PEER_WINDOW_MS || 15 * 60 * 1000);
 const now = Date.now();
@@ -70,7 +71,7 @@ const UPSERT = `INSERT INTO peer_offers
     fetched_at=EXCLUDED.fetched_at`;  // first_seen preserved across conflicts
 
 (async () => {
-  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  const client = new Client(pgConfig());
   try {
     await client.connect();
     for (const r of rows) await client.query(UPSERT, r);

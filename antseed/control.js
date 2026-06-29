@@ -13,7 +13,7 @@
 const http = require('http');
 const { execFile } = require('child_process');
 const { Pool } = require('pg');
-const { UPSERT_BUYER_STATUS, buyerStatusRow } = require('./store.js');
+const { UPSERT_BUYER_STATUS, buyerStatusRow, pgConfig } = require('./store.js');
 
 const PORT = parseInt(process.env.ANTSEED_CONTROL_PORT || '8379', 10);
 const TOKEN = process.env.ANTSEED_CONTROL_TOKEN || '';
@@ -23,7 +23,7 @@ const STATUS_TIMEOUT_MS = 30000;
 
 // One pool for the long-lived control server (write-status.js, the poll-loop
 // twin, is one-shot and uses a plain Client instead).
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool(pgConfig());
 
 if (!TOKEN) {
   console.error('[control] ANTSEED_CONTROL_TOKEN unset — control server disabled');
