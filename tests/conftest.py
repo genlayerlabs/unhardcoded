@@ -32,7 +32,10 @@ def host_store_clean():
     """Truncate the operational store before the test (isolation against the
     shared Postgres). Skips the test if Postgres is unreachable."""
     try:
-        host_store.reset()
+        # Drain pending async writes from a prior test FIRST so they can't land
+        # after this truncate; don't close the pool (the background writer shares
+        # it — closing it mid-write races and flakes isolation).
+        host_store._write_q.join()
         host_store.truncate_all_for_tests()
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"host store Postgres unavailable: {exc}")
@@ -76,6 +79,19 @@ def seed_peer_offers(peers, observed_at=None):
                 " reputation=EXCLUDED.reputation, last_seen=EXCLUDED.last_seen,"
                 " observed_at=EXCLUDED.observed_at, fetched_at=EXCLUDED.fetched_at",
                 rows)
+
+
+def seed_route_obs(provider, family, served_by, ok, latency_ms=None, n=1, ts=None):
+    """Seed n per-attempt route_observations for a route (the raw from which
+    route_stats derives reliability/latency on the fly)."""
+    import time
+    t = int(time.time() * 1000) if ts is None else ts
+    rows = [(t, provider, family, served_by, ok, latency_ms) for _ in range(n)]
+    with host_store._get_pool().connection() as conn:
+        conn.cursor().executemany(
+            "INSERT INTO route_observations"
+            " (ts, provider_id, model_family, served_by, ok, latency_ms)"
+            " VALUES (%s,%s,%s,%s,%s,%s)", rows)
 
 
 def seed_buyer_status(pid, pinned_peer_id=None, deposits_available=None,

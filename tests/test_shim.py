@@ -452,14 +452,16 @@ def test_x_market_attaches_model_meta_and_book_last_seen(client, host):
     src.SOURCE_STATE.clear()
 
 
-def test_x_market_attaches_live_perf_after_calls(client, host):
+def test_x_market_attaches_live_perf_after_calls(client, host, host_store_clean):
     import sources as src
+    import host_store
     src.SOURCE_STATE.clear()
     for prov, fam in _all_pairs(host):
         host.set_mock_response(prov, fam, _ok_response("ok"))
     resp = client.post("/v1/chat/completions", json={
         "model": "", "messages": [{"role": "user", "content": "hi"}]})
     provider = resp.json()["x_router"]["provider"]
+    host_store._write_q.join()                 # the call's route observation is async
     body = client.get("/x/market").json()
     perfs = [row["perf"] for f in body["families"] for row in f["rows"]
              if row["seller"] == provider and row["perf"]]

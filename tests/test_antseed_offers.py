@@ -16,9 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import route_reliability as rr  # noqa: E402
-import route_latency as rl  # noqa: E402
 from sources.antseed import AntSeedSource  # noqa: E402
-from conftest import seed_peer_offers as _seed_market  # noqa: E402
+from conftest import seed_peer_offers as _seed_market, seed_route_obs  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -65,10 +64,9 @@ def test_offers_sync_surfaces_top_n_distinct_peers(tmp_path):
 
 
 def test_offers_sync_stamps_host_measured_reliability(tmp_path):
-    rr.reset()
     _seed_market([_peer("peerA", 0.5), _peer("peerB", 1.0)])
     # peerA observed failing -> demoted; peerB never observed -> unstamped
-    rr.observe(rr.route_key("antseed", FAMILY, "peerA"), False)
+    seed_route_obs("antseed", FAMILY, "peerA", ok=False)
     offers = AntSeedSource(CATALOG).offers_sync("antseed")
     by_peer = {o["peer_id"]: o for o in offers}
     assert by_peer["peerA"]["success_rate"] == 0.0
@@ -79,10 +77,8 @@ def test_offers_sync_stamps_host_measured_latency(tmp_path):
     # The latency twin of the reliability stamp: a peer observed slow carries its
     # measured latency_ms so a policy can route by speed; an unobserved peer is
     # left unstamped (None -> field default, optimistically routable).
-    rr.reset()
-    rl.reset()
     _seed_market([_peer("peerA", 0.5), _peer("peerB", 1.0)])
-    rl.observe(rl.route_key("antseed", FAMILY, "peerA"), 12000, ok=True)
+    seed_route_obs("antseed", FAMILY, "peerA", ok=True, latency_ms=12000)
     offers = AntSeedSource(CATALOG).offers_sync("antseed")
     by_peer = {o["peer_id"]: o for o in offers}
     assert by_peer["peerA"]["latency_ms"] == 12000

@@ -249,3 +249,30 @@ def test_served_by_and_tokens_cached_recorded(store):
     store.insert_call(_row(usage_event_id="ev2"))
     r2 = [c for c in store.recent_calls() if c["usage_event_id"] == "ev2"][0]
     assert r2["served_by"] is None and r2["tokens_cached"] is None
+
+
+# ---- route_observations -> route_stats (reliability/latency derived on the fly) -
+
+def test_route_stats_derives_reliability_and_latency(store):
+    from conftest import seed_route_obs
+    # peerA: 4 ok + 1 fail -> success 0.8; latency avg over OK only
+    seed_route_obs("antseed", "m", "peerA", ok=True, latency_ms=100, n=3)
+    seed_route_obs("antseed", "m", "peerA", ok=True, latency_ms=300)   # ok=4, lat avg=150
+    seed_route_obs("antseed", "m", "peerA", ok=False, latency_ms=9999)  # failure: latency ignored
+    seed_route_obs("antseed", "m", "peerB", ok=True, latency_ms=50)
+    st = store.route_stats()
+    assert st["antseed|m|peerA"]["success_rate"] == 0.8
+    assert st["antseed|m|peerA"]["latency_ms"] == 150   # avg(100,100,100,300), failure excluded
+    assert st["antseed|m|peerA"]["count"] == 5
+    assert st["antseed|m|peerB"]["success_rate"] == 1.0
+    assert "antseed|m|missing" not in st
+
+
+def test_route_stats_window_excludes_old_observations(store):
+    from conftest import seed_route_obs
+    import time
+    now = int(time.time() * 1000)
+    seed_route_obs("p", "m", "fresh", ok=True, ts=now)
+    seed_route_obs("p", "m", "stale", ok=True, ts=now - 20 * 60 * 1000)  # 20 min ago
+    assert set(store.route_stats(window_ms=15 * 60 * 1000)) == {"p|m|fresh"}
+    assert set(store.route_stats(window_ms=30 * 60 * 1000)) == {"p|m|fresh", "p|m|stale"}

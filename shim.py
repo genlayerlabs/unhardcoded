@@ -446,8 +446,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         actually called that provider|family. Internal — the dashboard
         fetches this server-side; /x/* is hidden from consumers."""
         import sources as _sources
-        import route_reliability as _rr
-        import route_latency as _rl
+        import host_store
         catalog = host.catalog() or {}
         models = catalog.get("models") or {}
         state = host.dump_state() or {}
@@ -457,24 +456,24 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             pid for pid, p in (catalog.get("providers") or {}).items()
             if isinstance(p, dict) and p.get("discovery") == "marketplace"}
 
-        # Live perf is host-owned now (#15): the engine no longer folds an EMA, so
-        # build it from the host's per-route measurements (route_reliability /
-        # route_latency / the call count), aggregated across the peers/route ids
-        # that serve a given provider|family. None until the router has called it.
-        _rates = _rr.snapshot()
-        _counts = _rr.snapshot_counts()
-        _lats = _rl.snapshot()
+        # Live perf is host-owned now (#15): the engine folds no EMA, so build it
+        # from the host's per-route measurements — DERIVED on the fly from
+        # route_observations (#4a), aggregated across the peers/route ids that
+        # serve a given provider|family. None until the router has called it.
+        _stats = host_store.route_stats()  # {route_key: {success_rate, latency_ms, count}}
 
         def _perf(provider, family):
             prefix = f"{provider}|{family}|"
-            keys = [k for k in _counts if k.startswith(prefix)]
-            total = sum(_counts[k] for k in keys)
+            rows = [v for k, v in _stats.items() if k.startswith(prefix)]
+            total = sum(r["count"] for r in rows)
             if not total:
                 return None
-            sr = sum(_rates[k] * _counts[k] for k in keys if k in _rates)
-            sr_calls = sum(_counts[k] for k in keys if k in _rates)
-            lt = sum(_lats[k] * _counts[k] for k in keys if k in _lats)
-            lt_calls = sum(_counts[k] for k in keys if k in _lats)
+            sr_rows = [r for r in rows if r.get("success_rate") is not None]
+            lt_rows = [r for r in rows if r.get("latency_ms") is not None]
+            sr_calls = sum(r["count"] for r in sr_rows)
+            lt_calls = sum(r["count"] for r in lt_rows)
+            sr = sum(r["success_rate"] * r["count"] for r in sr_rows)
+            lt = sum(r["latency_ms"] * r["count"] for r in lt_rows)
             return {"success_rate": (sr / sr_calls) if sr_calls else None,
                     "latency_ms": round(lt / lt_calls) if lt_calls else None,
                     "calls": total}
