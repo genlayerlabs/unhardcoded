@@ -96,17 +96,20 @@ def seed_call(session=None, provider=None, family=None, served_by=None, status=2
         "tokens_cached": tokens_cached, "cost_usd": cost_usd})
 
 
-def seed_route_obs(provider, family, served_by, ok, latency_ms=None, n=1, ts=None):
+def seed_route_obs(provider, family, served_by, ok, latency_ms=None, n=1, ts=None,
+                   tools_requested=False, tool_calls_emitted=False):
     """Seed n per-attempt route_observations for a route (the raw from which
-    route_stats derives reliability/latency on the fly)."""
+    route_stats / tool_incapable_routes derive on the fly)."""
     import time
     t = int(time.time() * 1000) if ts is None else ts
-    rows = [(t, provider, family, served_by, ok, latency_ms) for _ in range(n)]
+    rows = [(t, provider, family, served_by, ok, latency_ms,
+             tools_requested, tool_calls_emitted) for _ in range(n)]
     with host_store._get_pool().connection() as conn:
         conn.cursor().executemany(
             "INSERT INTO route_observations"
-            " (ts, provider_id, model_family, served_by, ok, latency_ms)"
-            " VALUES (%s,%s,%s,%s,%s,%s)", rows)
+            " (ts, provider_id, model_family, served_by, ok, latency_ms,"
+            " tools_requested, tool_calls_emitted)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", rows)
 
 
 def seed_buyer_status(pid, pinned_peer_id=None, deposits_available=None,

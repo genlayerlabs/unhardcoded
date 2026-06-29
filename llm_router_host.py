@@ -23,7 +23,6 @@ from typing import Callable
 
 import host_store
 import route_reliability as _route_reliability
-import route_tool_capability as _route_tool_capability
 from provider_adapters.anthropic import make_anthropic_async_call_provider
 from provider_adapters.common import (
     AsyncCallProviderHook,
@@ -670,21 +669,17 @@ def _fold_route_outcome(request: dict, result: dict,
     # longer folds reliability for ANY route (#15), so the host folds it for all
     # of them — not just marketplace — and the market perf view reads it back.
     rkey = _route_reliability.route_key(pid, fam, peer_id or pid)
-    # #4a: record the per-ATTEMPT raw observation (every provider call, including
-    # failed fallbacks — a grain `calls` lacks). reliability + latency are derived
-    # on the fly from route_observations (host_store.route_stats), not folded
-    # in-process. served_by = the peer for marketplace routes, else the provider —
-    # the same identity route_stats keys on.
+    # #4a/#4c: record the per-ATTEMPT raw observation (every provider call,
+    # including failed fallbacks — a grain `calls` lacks). reliability, latency AND
+    # learned tool capability are derived on the fly from route_observations, not
+    # folded in-process. served_by = the peer for marketplace routes, else the
+    # provider — the identity route_stats / tool_incapable_routes key on. The tool
+    # signals carry only on tools-requests (capability is a marketplace concern).
     host_store.observe_route_call_async({
         "ts": int(time.time() * 1000), "provider_id": pid, "model_family": fam,
-        "served_by": peer_id or pid, "ok": ok, "latency_ms": result.get("latency_ms")})
+        "served_by": peer_id or pid, "ok": ok, "latency_ms": result.get("latency_ms"),
+        "tools_requested": bool(request.get("tools")),
+        "tool_calls_emitted": bool((result.get("response") or {}).get("tool_calls"))})
     # Cache affinity + the per-session meter are DERIVED on the fly from `calls`
     # now (#4b): the route_observation above + the ingress's call ledger carry
-    # everything (session, route, outcome, tokens, cost), so no per-session fold
-    # here — host_store.hot_route / session_* derive it, fleet-consistent.
-    # Learned tool capability is a marketplace concern only (static/partner routes
-    # declare their capabilities in config), so keep it peer-scoped.
-    if peer_id:
-        _route_tool_capability.observe(
-            rkey, bool(request.get("tools")),
-            bool((result.get("response") or {}).get("tool_calls")))
+    # everything (session, route, outcome, tokens, cost), so no per-session fold.

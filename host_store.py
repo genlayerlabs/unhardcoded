@@ -107,17 +107,22 @@ _SCHEMA_STATEMENTS = [
     # by the fold site in llm_router_host; route_key identity stays host-internal
     # (provider|family|served_by), never enters the signature.
     """CREATE TABLE IF NOT EXISTS route_observations (
-        id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-        ts            BIGINT NOT NULL,
-        provider_id   TEXT,
-        model_family  TEXT,
-        served_by     TEXT,
-        ok            BOOLEAN NOT NULL,
-        latency_ms    DOUBLE PRECISION
+        id                 BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        ts                 BIGINT NOT NULL,
+        provider_id        TEXT,
+        model_family       TEXT,
+        served_by          TEXT,
+        ok                 BOOLEAN NOT NULL,
+        latency_ms         DOUBLE PRECISION,
+        tools_requested    BOOLEAN,
+        tool_calls_emitted BOOLEAN
     )""",
     "CREATE INDEX IF NOT EXISTS idx_route_obs_ts ON route_observations(ts)",
     "CREATE INDEX IF NOT EXISTS idx_route_obs_route"
     " ON route_observations(provider_id, model_family, served_by, ts)",
+    # #4c: learned tool capability is derived from these per-attempt signals.
+    "ALTER TABLE route_observations ADD COLUMN IF NOT EXISTS tools_requested BOOLEAN",
+    "ALTER TABLE route_observations ADD COLUMN IF NOT EXISTS tool_calls_emitted BOOLEAN",
     """CREATE TABLE IF NOT EXISTS settings_overrides (
         key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at BIGINT NOT NULL
     )""",
@@ -461,12 +466,14 @@ def _insert_route_observation(row: dict[str, Any]) -> None:
         with _get_pool().connection() as conn:
             conn.execute(
                 "INSERT INTO route_observations"
-                " (ts, provider_id, model_family, served_by, ok, latency_ms)"
-                " VALUES (%s,%s,%s,%s,%s,%s)",
+                " (ts, provider_id, model_family, served_by, ok, latency_ms,"
+                " tools_requested, tool_calls_emitted)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                 (int(row.get("ts") or time.time() * 1000),
                  row.get("provider_id"), row.get("model_family"), row.get("served_by"),
                  bool(row.get("ok")),
-                 float(row["latency_ms"]) if row.get("latency_ms") is not None else None))
+                 float(row["latency_ms"]) if row.get("latency_ms") is not None else None,
+                 bool(row.get("tools_requested")), bool(row.get("tool_calls_emitted"))))
     except Exception as exc:  # noqa: BLE001 — the fold must never break a request
         _log.warning("host_store route observation insert failed: %s", exc)
 
@@ -499,6 +506,29 @@ def route_stats(window_ms: int = 900_000) -> dict[str, dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001 — measurement read is best-effort
         _log.warning("host_store route_stats failed: %s", exc)
         return {}
+
+
+def tool_incapable_routes(window_ms: int = 1_800_000, min_samples: int = 20) -> "set[str]":
+    """Routes that have proven they ignore tools — derived (#4c) from
+    route_observations: >= min_samples tools-requests within the last window_ms and
+    ZERO tool_calls emitted. The window IS the re-test horizon (a route ages out if
+    it stops being tool-tested); ANY tool_call in the window clears it. Capable is
+    the default (a route not in this set), so offers_sync drops supports_tools only
+    for the proven-incapable. Fail-soft -> empty set (everyone stays capable)."""
+    try:
+        cutoff = int(time.time() * 1000) - max(0, window_ms)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT provider_id, model_family, served_by FROM route_observations"
+                " WHERE ts >= %s AND tools_requested"
+                " GROUP BY provider_id, model_family, served_by"
+                " HAVING count(*) >= %s AND"
+                " coalesce(sum(CASE WHEN tool_calls_emitted THEN 1 ELSE 0 END), 0) = 0",
+                (cutoff, min_samples))
+            return {f"{p}|{f}|{s}" for p, f, s in cur.fetchall()}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store tool_incapable_routes failed: %s", exc)
+        return set()
 
 
 # ---- per-session views, derived on the fly from `calls` (#4b) -------------------

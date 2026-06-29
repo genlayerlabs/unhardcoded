@@ -118,13 +118,10 @@ def test_offers_sync_drops_supports_tools_for_learned_incapable_route(tmp_path):
     # the AntSeed default-true hole is closed by the learned signal: a route
     # observed to ignore tools is filtered from tool requests (no supports_tools),
     # while other caps and non-tool routing are unaffected.
-    import route_tool_capability as tc
-    rr.reset()
-    tc.reset()
     _seed_market([_peer("peerA", 0.5)])
-    rkey = rr.route_key("antseed", FAMILY, "peerA")
-    for _ in range(tc._MIN_SAMPLES):       # peerA never emits tool_calls on tool reqs
-        tc.observe(rkey, True, False)
+    # peerA emits no tool_calls on _MIN_SAMPLES (20) tools-requests -> incapable
+    seed_route_obs("antseed", FAMILY, "peerA", ok=True, n=20,
+                   tools_requested=True, tool_calls_emitted=False)
     caps = AntSeedSource(CATALOG).offers_sync("antseed")[0]["capabilities"]
     assert "supports_tools" not in caps    # learned-incapable -> filtered for tools
     assert caps.get("supports_json_mode") is True  # other caps unaffected

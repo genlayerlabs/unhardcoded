@@ -17,7 +17,6 @@ from typing import Any
 
 import host_store
 import route_reliability as _route_reliability
-import route_tool_capability as _route_tool_capability
 import settings
 from sources import Balance, Price
 
@@ -205,9 +204,11 @@ class AntSeedSource:
         self._stats["rejected_by_reputation"] = rejected_by_reputation
         self._stats["denied"] = denied
         self._stats["offers"] = len(kept_rows)
-        # #4a: reliability + latency are derived on the fly from route_observations
-        # (one query per offers_sync, not per candidate), keyed by route identity.
+        # #4a/#4c: reliability + latency + learned tool-incapability are derived on
+        # the fly from route_observations (one query each per offers_sync, not per
+        # candidate), keyed by route identity.
         stats = host_store.route_stats()
+        incapable = host_store.tool_incapable_routes()
         offers = []
         for row in kept_rows:
             family = row["family"]
@@ -219,13 +220,13 @@ class AntSeedSource:
             # request). The default-true HOLE — a peer that accepts `tools` but
             # never function-calls returns a SILENT tools-less answer (no error,
             # no retry) — is closed by the LEARNED per-route signal: a route
-            # observed to ignore tools (route_tool_capability) is dropped from
-            # supports_tools, so meets_req filters it for tool requests while it
-            # still serves non-tool requests. The learned-incapable verdict
-            # overrides even a curated claim (the peer is the ground truth);
-            # everything else (json_mode, curated caps) is unchanged.
+            # observed to ignore tools (host_store.tool_incapable_routes) is dropped
+            # from supports_tools, so meets_req filters it for tool requests while it
+            # still serves non-tool requests. The learned-incapable verdict overrides
+            # even a curated claim (the peer is the ground truth); everything else
+            # (json_mode, curated caps) is unchanged.
             caps = {"supports_json_mode": True, **(model.get("capabilities") or {})}
-            if _route_tool_capability.is_capable(rkey):
+            if rkey not in incapable:
                 caps.setdefault("supports_tools", True)
             else:
                 caps.pop("supports_tools", None)
