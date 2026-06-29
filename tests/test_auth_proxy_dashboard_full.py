@@ -20,6 +20,26 @@ os.environ["CALLER_KEYS_SHA256_JSON"] = "{}"
 os.environ["DASHBOARD_TRUSTED_USER_HEADER"] = ""
 
 import auth_proxy  # noqa: E402
+import host_store  # noqa: E402
+
+
+def _use_db(monkeypatch, tmp_path):
+    """A clean host store (truncated) for the test — isolation against the shared
+    Postgres. (monkeypatch/tmp_path kept for call-site compatibility.)"""
+    host_store.reset()
+    host_store.truncate_all_for_tests()
+
+
+def _set_issued(records):
+    host_store.set_consumer_keys(records)
+
+
+def _issued_data():
+    return host_store.get_consumer_keys()[0]
+
+
+def _issued_text():
+    return json.dumps(host_store.get_consumer_keys()[0])
 
 
 class _FakeUpstreamResponse:
@@ -143,7 +163,7 @@ def test_dashboard_full_returns_complete_sanitized_snapshot(monkeypatch):
 
 def test_dashboard_key_creation_persists_hash_metadata_not_raw_key(monkeypatch, tmp_path):
     monkeypatch.setattr(auth_proxy, "DASHBOARD_KEY_ENV_PATH", str(tmp_path / ".env.secrets"))
-    monkeypatch.setattr(auth_proxy, "DASHBOARD_ISSUED_KEYS_PATH", str(tmp_path / "issued-consumer-keys.json"))
+    _use_db(monkeypatch, tmp_path)
     original_hashes = dict(auth_proxy.CALLER_KEY_HASHES)
     auth_proxy.CALLER_KEY_HASHES.clear()
     try:
@@ -153,7 +173,7 @@ def test_dashboard_key_creation_persists_hash_metadata_not_raw_key(monkeypatch, 
         body = resp.json()
         assert body["api_key"].startswith(auth_proxy.DASHBOARD_KEY_PREFIX + "_")
         env_text = (tmp_path / ".env.secrets").read_text()
-        issued_text = (tmp_path / "issued-consumer-keys.json").read_text()
+        issued_text = _issued_text()
         assert body["api_key"] not in env_text
         assert body["api_key"] not in issued_text
         assert body["sha256_prefix"] in issued_text
@@ -311,7 +331,7 @@ class _FakeRouteClient:
 def _with_consumer_auth(monkeypatch, tmp_path, token="crm-token", consumer="crm", issued=None):
     monkeypatch.setattr(auth_proxy, "_client", _FakeRouteClient())
     monkeypatch.setattr(auth_proxy, "DASHBOARD_KEY_ENV_PATH", str(tmp_path / ".env.secrets"))
-    monkeypatch.setattr(auth_proxy, "DASHBOARD_ISSUED_KEYS_PATH", str(tmp_path / "issued-consumer-keys.json"))
+    _use_db(monkeypatch, tmp_path)
     digest = hashlib.sha256(token.encode()).hexdigest()
     original_plaintext = dict(auth_proxy.CALLER_KEYS)
     original_hashes = dict(auth_proxy.CALLER_KEY_HASHES)
@@ -320,7 +340,7 @@ def _with_consumer_auth(monkeypatch, tmp_path, token="crm-token", consumer="crm"
     auth_proxy.CALLER_KEY_HASHES.update({digest: consumer})
     auth_proxy._windows.clear()
     if issued is not None:
-        (tmp_path / "issued-consumer-keys.json").write_text(json.dumps({consumer: issued}))
+        _set_issued({consumer: issued})
     return token, digest, original_plaintext, original_hashes
 
 
@@ -352,10 +372,9 @@ def test_host_enforces_consumer_inactive_allowed_routes_and_rate_limits(monkeypa
         assert inactive.status_code == 403
         assert inactive.json()["error"]["code"] == "caller_inactive"
 
-        issued_path = tmp_path / "issued-consumer-keys.json"
-        data = json.loads(issued_path.read_text())
+        data = _issued_data()
         data["crm"]["status"] = "active"
-        issued_path.write_text(json.dumps(data))
+        _set_issued(data)
 
         blocked = client.post("/v1/chat/completions", headers=headers, json={"model": "profile:medium", "messages": []})
         assert blocked.status_code == 403
@@ -386,9 +405,9 @@ def test_host_rejects_revoked_and_expired_key_metadata(monkeypatch, tmp_path):
         assert resp.status_code == 403
         assert resp.json()["error"]["code"] == "caller_key_revoked"
 
-        data = json.loads((tmp_path / "issued-consumer-keys.json").read_text())
+        data = _issued_data()
         data["crm"]["keys"] = [{"sha256_prefix": digest[:12], "status": "active", "expires_at": 1}]
-        (tmp_path / "issued-consumer-keys.json").write_text(json.dumps(data))
+        _set_issued(data)
         expired = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"}, json={"model": "profile:edge", "messages": []})
         assert expired.status_code == 403
         assert expired.json()["error"]["code"] == "caller_key_expired"
@@ -413,16 +432,16 @@ def test_dashboard_rotates_revokes_and_updates_consumer_settings(monkeypatch, tm
         assert created.status_code == 200
         body = created.json()
         assert body["api_key"].startswith(auth_proxy.DASHBOARD_KEY_PREFIX + "_")
-        issued = json.loads((tmp_path / "issued-consumer-keys.json").read_text())["crm"]
+        issued = _issued_data()["crm"]
         old = [k for k in issued["keys"] if k["sha256_prefix"] == digest[:12]][0]
         assert old["expires_at"] > old["replaced_at"]
         assert body["sha256_prefix"] in json.dumps(issued)
-        assert body["api_key"] not in (tmp_path / "issued-consumer-keys.json").read_text()
+        assert body["api_key"] not in _issued_text()
 
         revoked = client.post("/dashboard/api/keys/revoke", json={"consumer": "crm", "sha256_prefix": body["sha256_prefix"]})
         assert revoked.status_code == 200
         assert body["sha256_prefix"] not in " ".join(auth_proxy.CALLER_KEY_HASHES.keys())
-        issued = json.loads((tmp_path / "issued-consumer-keys.json").read_text())["crm"]
+        issued = _issued_data()["crm"]
         assert any(k["sha256_prefix"] == body["sha256_prefix"] and k["status"] == "revoked" for k in issued["keys"])
     finally:
         _restore_auth_maps(original_plaintext, original_hashes)
@@ -457,7 +476,7 @@ def test_dashboard_rotation_with_zero_grace_expires_old_key_not_new_key(monkeypa
         new_token = created.json()["api_key"]
         new_prefix = created.json()["sha256_prefix"]
 
-        issued = json.loads((tmp_path / "issued-consumer-keys.json").read_text())["crm"]
+        issued = _issued_data()["crm"]
         new_rows = [k for k in issued["keys"] if k["sha256_prefix"] == new_prefix]
         assert len(new_rows) == 1
         assert "expires_at" not in new_rows[0]
@@ -477,7 +496,7 @@ def test_legacy_plaintext_keys_can_be_rotated_and_revoked(monkeypatch, tmp_path)
     digest = hashlib.sha256(token.encode()).hexdigest()
     monkeypatch.setattr(auth_proxy, "_client", _FakeRouteClient())
     monkeypatch.setattr(auth_proxy, "DASHBOARD_KEY_ENV_PATH", str(tmp_path / ".env.secrets"))
-    monkeypatch.setattr(auth_proxy, "DASHBOARD_ISSUED_KEYS_PATH", str(tmp_path / "issued-consumer-keys.json"))
+    _use_db(monkeypatch, tmp_path)
     original_plaintext = dict(auth_proxy.CALLER_KEYS)
     original_hashes = dict(auth_proxy.CALLER_KEY_HASHES)
     auth_proxy.CALLER_KEYS.clear()
@@ -602,21 +621,28 @@ def test_malformed_issued_key_metadata_fails_closed(monkeypatch, tmp_path):
     token, _, original_plaintext, original_hashes = _with_consumer_auth(monkeypatch, tmp_path)
     try:
         client = TestClient(auth_proxy.app)
-        cases = [
-            "not-json",
-            json.dumps({"crm": ["not", "an", "object"]}),
-            json.dumps({"crm": {"keys": "not-a-list"}}),
-            json.dumps({"crm": {"keys": ""}}),
-            json.dumps({"crm": {"keys": {}}}),
-            json.dumps({"crm": {"keys": 0}}),
-            json.dumps({"crm": {"keys": [{"sha256_prefix": hashlib.sha256(token.encode()).hexdigest()[:12], "status": "garbage"}]}}),
+        digest12 = hashlib.sha256(token.encode()).hexdigest()[:12]
+        bad_records = [
+            {"crm": ["not", "an", "object"]},
+            {"crm": {"keys": "not-a-list"}},
+            {"crm": {"keys": ""}},
+            {"crm": {"keys": {}}},
+            {"crm": {"keys": 0}},
+            {"crm": {"keys": [{"sha256_prefix": digest12, "status": "garbage"}]}},
         ]
-        for payload in cases:
-            (tmp_path / "issued-consumer-keys.json").write_text(payload)
+        for records in bad_records:
+            _set_issued(records)
             resp = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"}, json={"model": "profile:edge", "messages": []})
-            assert resp.status_code == 403, payload
+            assert resp.status_code == 403, records
             assert resp.json()["error"]["code"] in {"caller_inactive", "caller_key_revoked"}
             auth_proxy._issued_keys_load_failed = False
+
+        # A store LOAD FAILURE (the old unparseable file) also fails closed.
+        monkeypatch.setattr(host_store, "get_consumer_keys", lambda: ({}, False))
+        resp = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"}, json={"model": "profile:edge", "messages": []})
+        assert resp.status_code == 403
+        assert resp.json()["error"]["code"] in {"caller_inactive", "caller_key_revoked"}
+        auth_proxy._issued_keys_load_failed = False
     finally:
         _restore_auth_maps(original_plaintext, original_hashes)
         auth_proxy._issued_keys_load_failed = False

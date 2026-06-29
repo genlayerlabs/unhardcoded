@@ -1,0 +1,432 @@
+"""Host operational store (Postgres via psycopg3) — the call ledger + operator state.
+
+The host's mutable operational state (operator knob overrides, the provider
+overlay, dashboard-issued consumer keys, the call/usage ledger) is migrated off
+the scattered JSON/JSONL files + in-process dicts into a single transactional
+store.
+
+Postgres (not SQLite) because the deployment runs the router and the ingress as
+SEPARATE containers (router read-only on secrets, ingress read-write) sharing
+state: a network DB both reach over TCP — no shared-file, no mount-asymmetry, no
+WAL-reader-needs-RW gymnastics, and multi-pod ready. Prod = RDS; dev = a compose
+`postgres` service. Connection from `DATABASE_URL`.
+
+`calls` is the FACT TABLE: one raw row per LLM call, the source of truth from
+which per-route / per-session views (reliability, latency, ttft, cost, session
+totals) are DERIVED by query — not by host-side folding (combining/scoring is a
+policy's job; the host stores raw and exposes raw).
+
+Two write contracts:
+- The ledger (`calls`) is best-effort TELEMETRY: fail-soft, offloaded off the
+  request latency path via a bounded background queue.
+- OPERATOR STATE (settings_overrides / provider_overlays / consumer_keys) is
+  durable: the setters return a success bool so callers can surface a persistence
+  failure — a silently-failed key revocation would be a security hole.
+
+Schema is created idempotently under a Postgres advisory lock (race-safe across
+the two containers starting at once). Retention on the ledger is bounded by
+`DELETE WHERE ts < cutoff` (the discipline that fixed the usage-history OOMKilled
+crashloop).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import queue
+import threading
+import time
+from typing import Any
+
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+_log = logging.getLogger("unhardcoded.host_store")
+
+# A fixed 64-bit advisory-lock key for schema init (arbitrary constant).
+_SCHEMA_LOCK_KEY = 0x686F7374_73746F72
+
+_PRUNE_EVERY = 500          # run a retention sweep once per this many inserts
+_WRITE_QUEUE_MAX = 10_000   # cap the background ledger-write backlog
+
+
+def _retention_days() -> int:
+    """Validated retention window — a non-integer or < 1 env value must not crash
+    import or compute a future cutoff that prunes the whole ledger."""
+    raw = os.getenv("ROUTER_DB_RETENTION_DAYS", "30")
+    try:
+        d = int(raw)
+    except (TypeError, ValueError):
+        _log.warning("invalid ROUTER_DB_RETENTION_DAYS=%r; using 30", raw)
+        return 30
+    if d < 1:
+        _log.warning("ROUTER_DB_RETENTION_DAYS=%r must be >= 1; using 30", raw)
+        return 30
+    return d
+
+
+_RETENTION_DAYS = _retention_days()
+
+_SCHEMA_STATEMENTS = [
+    """CREATE TABLE IF NOT EXISTS calls (
+        id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        ts              BIGINT NOT NULL,
+        usage_event_id  TEXT,
+        session_id      TEXT,
+        consumer_sha    TEXT,
+        caller          TEXT,
+        route_key       TEXT,
+        provider_id     TEXT,
+        model_family    TEXT,
+        served_model_id TEXT,
+        requested_model TEXT,
+        status          INTEGER,
+        error_type      TEXT,
+        latency_ms      DOUBLE PRECISION,
+        tokens_in       BIGINT,
+        tokens_out      BIGINT,
+        tokens_total    BIGINT,
+        cost_usd        DOUBLE PRECISION
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_calls_ts       ON calls(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_calls_route    ON calls(route_key, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_calls_session  ON calls(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_calls_consumer ON calls(consumer_sha, ts)",
+    """CREATE TABLE IF NOT EXISTS settings_overrides (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at BIGINT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS provider_overlays (
+        provider_id TEXT PRIMARY KEY, entry TEXT NOT NULL, added_at BIGINT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS consumer_keys (
+        consumer TEXT PRIMARY KEY, record TEXT NOT NULL, updated_at BIGINT NOT NULL
+    )""",
+]
+
+_pool_lock = threading.Lock()
+_pool: "ConnectionPool | None" = None
+_prune_lock = threading.Lock()
+_inserts_since_prune = 0
+
+
+def _dsn() -> str:
+    return os.getenv("DATABASE_URL", "postgresql://localhost/hoststore")
+
+
+def _get_pool() -> ConnectionPool:
+    """The process-wide connection pool, created (and schema-applied) on first
+    use. The pool is thread-safe, so operations need no extra locking."""
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                p = ConnectionPool(_dsn(), min_size=1, max_size=8, open=True)
+                _init_schema(p)
+                _pool = p
+    return _pool
+
+
+def _init_schema(pool: ConnectionPool) -> None:
+    with pool.connection() as conn:
+        # Serialize concurrent schema init across containers/threads; the xact
+        # lock auto-releases when this transaction commits at block exit.
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_KEY,))
+        for stmt in _SCHEMA_STATEMENTS:
+            conn.execute(stmt)
+
+
+def _route_key(provider: "str | None", family: "str | None",
+               served: "str | None") -> "str | None":
+    """The denormalized route identity for indexing/derivation. provider|family|
+    served (peer granularity is not in the usage row yet — a later concern)."""
+    if not provider and not family:
+        return None
+    return f"{provider or ''}|{family or ''}|{served or ''}"
+
+
+# ---- calls ledger (best-effort telemetry) --------------------------------------
+
+def insert_call(row: dict[str, Any]) -> None:
+    """Record one call into the ledger from a usage-history-shaped row. Fail-soft:
+    never raises into the request path. Best-effort telemetry."""
+    global _inserts_since_prune
+    try:
+        provider = row.get("provider")
+        family = row.get("model_family")
+        served = row.get("served_model_id")
+        sha = row.get("key_sha256")
+        values = (
+            int(row.get("ts") or time.time()),
+            row.get("usage_event_id"), row.get("session"),
+            sha if isinstance(sha, str) else None,
+            row.get("caller"), _route_key(provider, family, served),
+            provider, family, served, row.get("requested_model"),
+            int(row["status"]) if str(row.get("status") or "").isdigit() else None,
+            row.get("error_type"),
+            float(row["latency_ms"]) if row.get("latency_ms") is not None else None,
+            row.get("tokens_in"), row.get("tokens_out"), row.get("tokens_total"),
+            float(row["cost_usd"]) if row.get("cost_usd") is not None else None,
+        )
+        with _get_pool().connection() as conn:   # one transaction, auto commit/rollback
+            conn.execute(
+                "INSERT INTO calls (ts, usage_event_id, session_id, consumer_sha,"
+                " caller, route_key, provider_id, model_family, served_model_id,"
+                " requested_model, status, error_type, latency_ms, tokens_in,"
+                " tokens_out, tokens_total, cost_usd)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", values)
+        with _prune_lock:
+            _inserts_since_prune += 1
+            due = _inserts_since_prune >= _PRUNE_EVERY
+            if due:
+                _inserts_since_prune = 0
+        if due:
+            _prune()
+    except Exception as exc:  # noqa: BLE001 — the ledger must never break a request
+        _log.warning("host_store insert_call failed: %s", exc)
+
+
+def _prune() -> None:
+    try:
+        cutoff = int(time.time()) - _RETENTION_DAYS * 86400
+        with _get_pool().connection() as conn:
+            conn.execute("DELETE FROM calls WHERE ts < %s", (cutoff,))
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store prune failed: %s", exc)
+
+
+# A bounded background queue + single worker keeps the ledger insert OFF the
+# request's latency path; the row is snapshotted (dict) so a later caller mutation
+# can't change what gets written, and the queue is capped so a slow DB cannot grow
+# an unbounded backlog — best-effort telemetry, so a dropped row is acceptable.
+_write_q: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=_WRITE_QUEUE_MAX)
+
+
+def _writer_loop() -> None:
+    while True:
+        row = _write_q.get()
+        try:
+            insert_call(row)
+        finally:
+            _write_q.task_done()
+
+
+threading.Thread(target=_writer_loop, name="host-store-writer", daemon=True).start()
+
+
+def insert_call_async(row: dict[str, Any]) -> None:
+    """Record a call WITHOUT blocking the caller — enqueue a SNAPSHOT for the
+    background writer. Drops the row (best-effort) if the queue is full."""
+    try:
+        _write_q.put_nowait(dict(row))
+    except queue.Full:
+        _log.warning("host_store: write queue full (%d); dropping ledger row",
+                     _WRITE_QUEUE_MAX)
+    except Exception as exc:  # noqa: BLE001 — never break a request
+        _log.warning("host_store insert_call_async failed: %s", exc)
+
+
+def recent_calls(limit: int = 100) -> list[dict[str, Any]]:
+    """The most recent calls, newest first (operator view / verification)."""
+    try:
+        with _get_pool().connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SELECT * FROM calls ORDER BY id DESC LIMIT %s",
+                            (int(limit),))
+                return cur.fetchall()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store recent_calls failed: %s", exc)
+        return []
+
+
+def count() -> int:
+    try:
+        with _get_pool().connection() as conn:
+            return int(conn.execute("SELECT count(*) FROM calls").fetchone()[0])
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store count failed: %s", exc)
+        return 0
+
+
+# ---- settings_overrides (durable operator state) -------------------------------
+
+def get_overrides() -> dict[str, Any]:
+    """All operator knob overrides, key -> decoded value. Empty (defaults win) on
+    any error."""
+    try:
+        with _get_pool().connection() as conn:
+            cur = conn.execute("SELECT key, value FROM settings_overrides")
+            out: dict[str, Any] = {}
+            for k, v in cur.fetchall():
+                try:
+                    out[k] = json.loads(v)
+                except (TypeError, ValueError):
+                    continue
+            return out
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store get_overrides failed: %s", exc)
+        return {}
+
+
+def set_overrides(overrides: dict[str, Any]) -> bool:
+    """Replace the FULL override set. Returns True on success, False on a
+    persistence failure (so the caller can report it, not pretend it saved)."""
+    try:
+        now = int(time.time())
+        rows = [(k, json.dumps(v), now) for k, v in (overrides or {}).items()]
+        with _get_pool().connection() as conn:   # atomic: commit/rollback per block
+            conn.execute("DELETE FROM settings_overrides")
+            if rows:
+                conn.cursor().executemany(
+                    "INSERT INTO settings_overrides(key, value, updated_at)"
+                    " VALUES (%s,%s,%s)", rows)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store set_overrides failed: %s", exc)
+        return False
+
+
+# ---- provider_overlays (durable operator state) --------------------------------
+
+def get_provider_overlays() -> dict[str, Any]:
+    """The operator-added provider overlay as {'providers': {pid: entry}}."""
+    try:
+        with _get_pool().connection() as conn:
+            cur = conn.execute("SELECT provider_id, entry FROM provider_overlays")
+            providers: dict[str, Any] = {}
+            for pid, entry in cur.fetchall():
+                try:
+                    providers[pid] = json.loads(entry)
+                except (TypeError, ValueError):
+                    continue
+            return {"providers": providers}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store get_provider_overlays failed: %s", exc)
+        return {"providers": {}}
+
+
+def set_provider_overlays(providers: dict[str, Any]) -> bool:
+    """Replace the FULL overlay set. Returns True on success, False on failure."""
+    try:
+        now = int(time.time())
+        rows = [(pid, json.dumps(entry), int((entry or {}).get("added_at") or now))
+                for pid, entry in (providers or {}).items()]
+        with _get_pool().connection() as conn:
+            conn.execute("DELETE FROM provider_overlays")
+            if rows:
+                conn.cursor().executemany(
+                    "INSERT INTO provider_overlays(provider_id, entry, added_at)"
+                    " VALUES (%s,%s,%s)", rows)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store set_provider_overlays failed: %s", exc)
+        return False
+
+
+# ---- consumer_keys (durable operator state, credentials) -----------------------
+
+def get_consumer_keys() -> "tuple[dict[str, Any], bool]":
+    """(records, ok). `ok` is False on a store error OR any UNREADABLE row — a
+    corrupt credentials row must fail CLOSED (the caller treats not-ok as "do not
+    trust"), never silently drop a consumer back to default metadata. An empty
+    table is ok=True."""
+    try:
+        with _get_pool().connection() as conn:
+            cur = conn.execute("SELECT consumer, record FROM consumer_keys")
+            out: dict[str, Any] = {}
+            for consumer, rec in cur.fetchall():
+                try:
+                    out[consumer] = json.loads(rec)
+                except (TypeError, ValueError):
+                    _log.warning("host_store: undecodable consumer_keys row %r;"
+                                 " failing closed", consumer)
+                    return {}, False
+            return out, True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store get_consumer_keys failed: %s", exc)
+        return {}, False
+
+
+def set_consumer_keys(records: dict[str, Any]) -> bool:
+    """Replace the FULL set of consumer records. Returns True on success, False on
+    a persistence failure — a swallowed failure here would let a key revocation be
+    reported as saved while still working after restart."""
+    try:
+        now = int(time.time())
+        rows = [(consumer, json.dumps(rec), now)
+                for consumer, rec in (records or {}).items()]
+        with _get_pool().connection() as conn:
+            conn.execute("DELETE FROM consumer_keys")
+            if rows:
+                conn.cursor().executemany(
+                    "INSERT INTO consumer_keys(consumer, record, updated_at)"
+                    " VALUES (%s,%s,%s)", rows)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store set_consumer_keys failed: %s", exc)
+        return False
+
+
+# ---- one-shot backfill of legacy JSON state (run once at startup) --------------
+
+def _seed_if_empty(table: str, legacy_path: str, to_rows) -> None:
+    """One-time migration: if `table` is EMPTY and the legacy JSON at `legacy_path`
+    exists, load it and seed via the table's setter. Idempotent — guarded on EMPTY
+    (not file-exists), under an advisory lock so concurrent container starts cannot
+    race. Fail-soft: an absent or corrupt file leaves the table empty and logs."""
+    try:
+        with _get_pool().connection() as conn:
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SCHEMA_LOCK_KEY,))
+            n = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            if n > 0:
+                return                       # already migrated (or written since)
+            import pathlib
+            p = pathlib.Path(legacy_path)
+            if not p.exists():
+                return                       # fresh env, nothing to migrate
+            data = json.loads(p.read_text())
+            to_rows(data)
+            _log.info("host_store: seeded %s from %s", table, legacy_path)
+    except Exception as exc:                 # noqa: BLE001
+        _log.warning("host_store seed %s failed: %s", table, exc)
+
+
+def migrate_legacy_json() -> None:
+    """One-shot backfill of the legacy JSON operational state, run once at startup
+    BEFORE the app serves. Idempotent (guard-on-empty + advisory lock) so it is a
+    safe no-op on every later boot and safe to run from either container. Once the
+    dashboard confirms the data, delete the legacy files; then this and the env
+    paths below can be removed."""
+    _seed_if_empty(
+        "settings_overrides",
+        os.getenv("LLM_ROUTER_CONFIG_OVERRIDES",
+                  "/run/llm-router/secrets/config-overrides.json"),
+        lambda d: set_overrides(d if isinstance(d, dict) else {}))
+    _seed_if_empty(
+        "provider_overlays",
+        os.getenv("PROVIDERS_OVERLAY_PATH",
+                  "/run/llm-router/secrets/providers.local.json"),
+        lambda d: set_provider_overlays((d or {}).get("providers") or {}))
+    _seed_if_empty(
+        "consumer_keys",
+        os.getenv("DASHBOARD_ISSUED_KEYS_PATH",
+                  "/run/llm-router/secrets/issued-consumer-keys.json"),
+        lambda d: set_consumer_keys(d if isinstance(d, dict) else {}))
+
+
+def reset() -> None:
+    """Test hook: close + forget the pool (recreated against DATABASE_URL next
+    use). For per-test isolation against a shared DB, truncate the tables."""
+    global _pool, _inserts_since_prune
+    with _pool_lock:
+        if _pool is not None:
+            _pool.close()
+        _pool = None
+    with _prune_lock:
+        _inserts_since_prune = 0
+
+
+def truncate_all_for_tests() -> None:
+    """Test helper: wipe every table for isolation against a shared Postgres."""
+    with _get_pool().connection() as conn:
+        conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
+                     " consumer_keys")

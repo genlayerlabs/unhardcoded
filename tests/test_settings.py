@@ -8,16 +8,22 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import host_store  # noqa: E402
 import settings  # noqa: E402
 
 
-def test_override_roundtrip_and_validation(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "OVERRIDES_PATH", str(tmp_path / "overrides.json"))
-    settings.reload()
+@pytest.fixture
+def store(host_store_clean):
+    settings.reload()                       # read the freshly-truncated store
+    yield
 
+
+def test_override_roundtrip_and_validation(store):
     assert settings.get("antseed.offers_top_n") == 3            # schema default
     assert settings.get("codex.imputed_price_in") == 5.0
 
@@ -40,9 +46,11 @@ def test_override_roundtrip_and_validation(tmp_path, monkeypatch):
     assert not errs and settings.get("antseed.offers_top_n") == 3
 
 
-def test_bad_override_file_falls_back_to_defaults(tmp_path, monkeypatch):
-    p = tmp_path / "overrides.json"
-    p.write_text("not json{")
-    monkeypatch.setattr(settings, "OVERRIDES_PATH", str(p))
+def test_bad_override_value_falls_back_to_default(store):
+    # A malformed stored value is skipped (get_overrides is fail-soft per key),
+    # so the schema default wins — a bad override can never break ranking.
+    with host_store._get_pool().connection() as conn:
+        conn.execute("INSERT INTO settings_overrides(key, value, updated_at)"
+                     " VALUES (%s,%s,%s)", ("codex.quota_429_shed", "not json{", 0))
     settings.reload()
     assert settings.get("codex.quota_429_shed") == 3.0

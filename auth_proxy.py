@@ -22,6 +22,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+import host_store
 from env_secrets import load_env_secrets
 
 # Operator-managed keys/consumer-hashes live on the PVC (.env.secrets) and are
@@ -47,7 +48,6 @@ DASHBOARD_COOKIE_NAME = os.getenv("DASHBOARD_COOKIE_NAME", "router_dashboard_ses
 DASHBOARD_COOKIE_MAX_AGE = int(os.getenv("DASHBOARD_COOKIE_MAX_AGE", "2592000"))
 DASHBOARD_COOKIE_PATH = os.getenv("DASHBOARD_COOKIE_PATH", "/dashboard")
 DASHBOARD_KEY_ENV_PATH = os.getenv("DASHBOARD_KEY_ENV_PATH", "/run/llm-router/.env.secrets")
-DASHBOARD_ISSUED_KEYS_PATH = os.getenv("DASHBOARD_ISSUED_KEYS_PATH", "/run/llm-router/secrets/issued-consumer-keys.json")
 CODEX_ACCOUNTS_DIR = os.getenv("CODEX_ACCOUNTS_DIR", "/codex/accounts")
 CODEX_AUTH_PATH = os.getenv("CODEX_AUTH_PATH") or None
 DASHBOARD_LOGIN_HISTORY_PATH = os.getenv("DASHBOARD_LOGIN_HISTORY_PATH", "/run/llm-router/secrets/dashboard-logins.jsonl")
@@ -210,19 +210,9 @@ _issued_keys_load_failed = False
 
 def _load_issued_keys() -> dict[str, Any]:
     global _issued_keys_load_failed
-    path = Path(DASHBOARD_ISSUED_KEYS_PATH)
-    if not path.exists():
-        _issued_keys_load_failed = False
-        return {}
-    try:
-        data = json.loads(path.read_text())
-        if isinstance(data, dict):
-            _issued_keys_load_failed = False
-            return data
-    except Exception:
-        pass
-    _issued_keys_load_failed = True
-    return {}
+    records, ok = host_store.get_consumer_keys()
+    _issued_keys_load_failed = not ok
+    return records
 
 
 def _clean_route_list(value: Any) -> list[str]:
@@ -323,14 +313,17 @@ def _issued_consumer_records() -> dict[str, dict[str, Any]]:
     return {name: _normalize_consumer_record(name, issued.get(name)) for name in consumers}
 
 
-def _write_issued_consumer_records(records: dict[str, dict[str, Any]]) -> None:
+def _write_issued_consumer_records(records: dict[str, dict[str, Any]]) -> bool:
+    """Persist the consumer records; returns True on success, False on a
+    persistence failure — a swallowed failure would let a key rotation/revocation
+    be reported as saved while still working after a restart (a security hole)."""
     compact = {}
     for consumer, record in sorted(records.items()):
         normalized = _normalize_consumer_record(consumer, record)
         if normalized["status"] == "active" and not normalized["allowed_routes"] and normalized["rate_per_min"] is None and normalized["burst"] is None and not normalized["keys"]:
             continue
         compact[consumer] = normalized
-    _write_json_file(Path(DASHBOARD_ISSUED_KEYS_PATH), compact)
+    return host_store.set_consumer_keys(compact)
 
 
 def _consumer_meta(consumer: str) -> dict[str, Any]:
@@ -906,6 +899,11 @@ def _login_connections_snapshot(*, timeframe: str = "all", consumer: str | None 
 @app.on_event("startup")
 async def startup() -> None:
     global _client, _probe_task
+    # The ingress is the owner of the operational store (consumer keys, the ledger,
+    # operator-config writes). Run the one-shot legacy-JSON backfill here too —
+    # idempotent (advisory lock + guard-on-empty), so it is safe whether the router
+    # or the ingress reaches the shared DB first (k8s starts both in parallel).
+    host_store.migrate_legacy_json()
     _client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0))
     if SYNTHETIC_PROBES_ENABLED and ROUTE_HEALTH_ROUTES:
         _probe_task = asyncio.create_task(_synthetic_probe_loop())
@@ -1017,8 +1015,8 @@ def _load_policy_config() -> dict[str, Any]:
 
 
 def _merge_provider_overlay(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Fold operator-added providers (providers.local.json) into the parsed
-    catalog so the dashboard lists them like hand-configured ones."""
+    """Fold operator-added providers (the provider_overlays store) into the
+    parsed catalog so the dashboard lists them like hand-configured ones."""
     try:
         from provider_overlay import load_overlay
         overlay = load_overlay()
@@ -2004,7 +2002,8 @@ async def dashboard_update_consumer(consumer: str, request: Request) -> Response
         meta["burst"] = _optional_int(data.get("burst"), min_value=1)
     meta["updated_at"] = int(time.time())
     records[consumer] = meta
-    _write_issued_consumer_records(records)
+    if not _write_issued_consumer_records(records):
+        return JSONResponse(status_code=500, content={"ok": False, "error": "failed to persist consumer settings"})
     _log({"event": "dashboard_consumer_updated", "consumer": consumer, "viewer": caller, "status": meta.get("status")})
     return JSONResponse(content={"ok": True, "consumer": consumer, "settings": _normalize_consumer_record(consumer, meta)})
 
@@ -2054,7 +2053,8 @@ async def dashboard_revoke_key(request: Request) -> Response:
         return JSONResponse(status_code=404, content={"error": {"message": "key prefix not found for consumer", "type": "not_found", "code": "key_not_found"}})
     meta["updated_at"] = now
     records[consumer] = meta
-    _write_issued_consumer_records(records)
+    if not _write_issued_consumer_records(records):
+        return JSONResponse(status_code=500, content={"ok": False, "error": "failed to persist key revocation"})
     _log({"event": "dashboard_key_revoked", "consumer": consumer, "viewer": caller, "sha256_prefix": prefix, "removed_hashes": removed, "removed_plaintext": removed_plaintext})
     return JSONResponse(content={"ok": True, "consumer": consumer, "sha256_prefix": prefix, "removed_hashes": removed, "removed_plaintext": removed_plaintext})
 
@@ -2062,8 +2062,8 @@ async def dashboard_revoke_key(request: Request) -> Response:
 @app.post("/dashboard/api/provider-keys/add")
 async def dashboard_add_provider(request: Request) -> Response:
     """Add a provider + its API key from the dashboard. Persists the key to
-    .env.secrets (auth_env indirection) and the provider definition to
-    providers.local.json, then hot-applies it via the router's /x/providers
+    .env.secrets (auth_env indirection) and the provider definition to the host
+    store (provider_overlays), then hot-applies it via the router's /x/providers
     so it serves without a restart. Admin-only, like key reveal."""
     caller, error = _require_admin_dashboard_caller(request)
     if error:
@@ -2094,7 +2094,8 @@ async def dashboard_add_provider(request: Request) -> Response:
         _upsert_env_line(Path(DASHBOARD_KEY_ENV_PATH), auth_env, key)
         overlay = load_overlay()
         overlay.setdefault("providers", {})[pid] = entry
-        save_overlay(overlay)
+        if not save_overlay(overlay):
+            return JSONResponse(status_code=500, content={"error": {"message": "failed to persist provider overlay", "type": "provider_add_error", "code": "provider_add"}})
     except Exception as exc:
         return JSONResponse(status_code=500, content={"error": {"message": str(exc), "type": "provider_add_error", "code": "provider_add"}})
     # hot-apply on the running router; on failure the provider still applies
@@ -2508,7 +2509,8 @@ async def dashboard_create_key(request: Request) -> Response:
     meta["status"] = meta.get("status") or "active"
     meta["updated_at"] = now
     records[consumer] = meta
-    _write_issued_consumer_records(records)
+    if not _write_issued_consumer_records(records):
+        return JSONResponse(status_code=500, content={"ok": False, "error": "failed to persist the issued key"})
     _log({"event": "dashboard_key_created", "consumer": consumer, "viewer": caller, "rotate": rotate})
     return JSONResponse(content={"ok": True, "consumer": consumer, "api_key": token, "sha256_prefix": token_hash[:12], "rotate": rotate, "grace_period_s": None if not rotate else (DEFAULT_ROTATION_GRACE_S if grace_period_s is None else grace_period_s), "warning": "Copy now. The raw key is shown once and only hashed key metadata is persisted."})
 
@@ -2837,6 +2839,13 @@ def _rotate_usage_history(path: Path) -> None:
 
 
 def _append_usage_history(row: dict[str, Any]) -> None:
+    # Dual-write the call into the host-store ledger (the emerging source of truth),
+    # alongside and independent of the usage-history file. OFFLOADED to the host
+    # store's background writer so the DB write never sits on the request's
+    # latency path. (DEBT: the usage-history file append below is still synchronous
+    # blocking IO on the event loop — pre-existing, to offload when its reader
+    # migrates onto the ledger.)
+    host_store.insert_call_async(row)
     path = _usage_history_path()
     if not path:
         return
@@ -3762,7 +3771,7 @@ def _dashboard_html() -> str:
 
     <section class='grid hidden page' id='providerKeysPage'>
       <div class='card span12'><div class='toolbar'><div><div class='label'>LLM provider credentials</div><div class='muted small'>Privatized view: env names and 12-char key fingerprints only. No raw provider keys or full hashes.</div></div><div class='toolbarRight'><button class='btn primary' id='toggleAddProvider'>Add provider</button></div></div><div id='providerKeys'></div></div>
-      <div class='card span12' id='addProviderCard' style='display:none'><div class='toolbar'><div><div class='label'>Add provider</div><div class='muted small'>OpenAI-compatible endpoints only. The key is stored in .env.secrets under the env var; the provider definition persists in providers.local.json and goes live immediately.</div></div></div><div class='cardPad'><div class='formGrid'><label>Provider id<input id='addProvId' placeholder='groq' /></label><label>Base URL<input id='addProvBaseUrl' placeholder='https://api.groq.com/openai/v1' /></label><label>Tier<select id='addProvTier' class='select'><option value='partner'>partner</option><option value='fallback'>fallback</option></select></label><label>Key env var<input id='addProvEnv' placeholder='GROQ_API_KEY' /></label><label>API key<input id='addProvKey' type='password' placeholder='sk-…' autocomplete='off' /></label><label>Served models (one per line: family or family=provider_model_id)<textarea id='addProvModels' rows='3' placeholder='llama-3.3-70b=llama-3.3-70b-versatile'></textarea></label></div><div class='actions' style='margin-top:10px'><button class='btn primary' id='addProvSubmit'>Add provider</button><button class='btn' id='addProvCancel'>Cancel</button></div><div id='addProvResult' class='muted small' style='margin-top:8px'></div></div></div>
+      <div class='card span12' id='addProviderCard' style='display:none'><div class='toolbar'><div><div class='label'>Add provider</div><div class='muted small'>OpenAI-compatible endpoints only. The key is stored in .env.secrets under the env var; the provider definition persists in the host store and goes live immediately.</div></div></div><div class='cardPad'><div class='formGrid'><label>Provider id<input id='addProvId' placeholder='groq' /></label><label>Base URL<input id='addProvBaseUrl' placeholder='https://api.groq.com/openai/v1' /></label><label>Tier<select id='addProvTier' class='select'><option value='partner'>partner</option><option value='fallback'>fallback</option></select></label><label>Key env var<input id='addProvEnv' placeholder='GROQ_API_KEY' /></label><label>API key<input id='addProvKey' type='password' placeholder='sk-…' autocomplete='off' /></label><label>Served models (one per line: family or family=provider_model_id)<textarea id='addProvModels' rows='3' placeholder='llama-3.3-70b=llama-3.3-70b-versatile'></textarea></label></div><div class='actions' style='margin-top:10px'><button class='btn primary' id='addProvSubmit'>Add provider</button><button class='btn' id='addProvCancel'>Cancel</button></div><div id='addProvResult' class='muted small' style='margin-top:8px'></div></div></div>
       <div class='card span12'><div class='toolbar'><div><div class='label'>Codex accounts</div><div class='muted small'>ChatGPT-subscription auth.json accounts (paste the output of `codex login`). Stored on the PVC, applied live. Token fingerprints only — never the raw token.</div></div><div class='toolbarRight'><button class='btn primary' id='toggleAddCodex'>Add codex account</button></div></div><div id='codexAccounts'></div></div>
       <div class='card span12' id='addCodexCard' style='display:none'><div class='cardPad'><div class='formGrid'><label>Account name<input id='addCodexName' placeholder='team-1' /></label><label>auth.json<textarea id='addCodexJson' rows='6' placeholder='{&quot;tokens&quot;:{&quot;access_token&quot;:&quot;...&quot;,&quot;refresh_token&quot;:&quot;...&quot;,&quot;account_id&quot;:&quot;...&quot;}}'></textarea></label></div><div class='actions' style='margin-top:10px'><button class='btn primary' id='addCodexSubmit'>Save account</button><button class='btn' id='addCodexCancel'>Cancel</button></div><div id='addCodexResult' class='muted small' style='margin-top:8px'></div></div></div>
     </section>

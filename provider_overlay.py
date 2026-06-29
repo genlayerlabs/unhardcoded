@@ -1,6 +1,6 @@
 """
-Operator-added providers: a JSON overlay persisted by the dashboard
-(secrets/providers.local.json), merged into the Lua catalog at startup and
+Operator-added providers: an overlay persisted by the dashboard in the host
+store (the provider_overlays table), merged into the Lua catalog at startup and
 hot-applied at runtime via the shim's POST /x/providers.
 
 Overlay shape:
@@ -24,40 +24,25 @@ that exists in config.live.lua.
 """
 from __future__ import annotations
 
-import json
-import os
 import re
-from pathlib import Path
 
-DEFAULT_OVERLAY_PATH = "/run/llm-router/secrets/providers.local.json"
+import host_store
 
-_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,40}$")
+_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,39}$")   # 2-40 chars (1 + up to 39)
 _ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,60}$")
 
 
-def overlay_path(path: str | Path | None = None) -> Path:
-    return Path(path or os.getenv("PROVIDERS_OVERLAY_PATH", DEFAULT_OVERLAY_PATH))
+def load_overlay() -> dict:
+    """The operator-added provider overlay, {'providers': {pid: entry}}, from the
+    host store."""
+    return host_store.get_provider_overlays()
 
 
-def load_overlay(path: str | Path | None = None) -> dict:
-    p = overlay_path(path)
-    try:
-        data = json.loads(p.read_text())
-    except (OSError, ValueError):
-        return {"providers": {}}
-    if not isinstance(data, dict) or not isinstance(data.get("providers"), dict):
-        return {"providers": {}}
-    return data
-
-
-def save_overlay(overlay: dict, path: str | Path | None = None) -> None:
-    p = overlay_path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(overlay, indent=2, sort_keys=True) + "\n")
-    try:
-        p.chmod(0o600)
-    except OSError:
-        pass
+def save_overlay(overlay: dict) -> bool:
+    """Persist the full overlay to the host store; returns True on success, False
+    on a persistence failure (so the caller doesn't report a provider added when it
+    wasn't durable). Keys are never stored here (they live in .env.secrets)."""
+    return host_store.set_provider_overlays((overlay or {}).get("providers") or {})
 
 
 def validate_entry(pid: str, entry: dict, catalog: dict) -> list[str]:

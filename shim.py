@@ -297,6 +297,14 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         """All session meters (operator view of per-session spend/cache)."""
         return {"sessions": route_session_meter.snapshot()}
 
+    @app.get("/x/calls")
+    def recent_calls(limit: int = 100):
+        """Recent rows from the host-store call ledger (operator view /
+        verification of the emerging source of truth). Read-only."""
+        import host_store
+        return {"calls": host_store.recent_calls(min(max(int(limit), 1), 1000)),
+                "total": host_store.count()}
+
     # ---- AntSeed buyer hot-wallet control (dashboard self-service) -----------
     # Proxy deposit/withdraw/refresh to the sidecar control server, then refresh
     # SOURCE_STATE so /x/market reflects the new escrow at once. Internal — /x/*
@@ -628,8 +636,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         only). Validates against the live catalog, injects the key into the
         process env, merges the provider into the Lua config and re-inits the
         core with breakers/EMA state preserved. Persistence is the ingress's
-        job (providers.local.json + .env.secrets); this endpoint only makes
-        it live. Internal — /x/* is hidden from consumers."""
+        job (the provider_overlays store + .env.secrets); this endpoint only
+        makes it live. Internal — /x/* is hidden from consumers."""
         import os
 
         from provider_overlay import apply_to_host, validate_entry

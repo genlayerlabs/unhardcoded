@@ -15,9 +15,16 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import host_store  # noqa: E402
 import provider_overlay as po  # noqa: E402
 from llm_router_host import LLMRouterHost  # noqa: E402
 from shim import create_app  # noqa: E402
+
+
+@pytest.fixture
+def db(host_store_clean):
+    """A clean host store (truncated) for the test."""
+    return host_store_clean
 
 
 @pytest.fixture
@@ -98,15 +105,14 @@ def test_apply_to_host_never_overwrites_and_never_duplicates(host):
     assert len([s for s in served if s.get("provider") == "newprov"]) == 1
 
 
-def test_overlay_load_save_roundtrip(tmp_path):
-    path = tmp_path / "providers.local.json"
-    assert po.load_overlay(path) == {"providers": {}}
+def test_overlay_load_save_roundtrip(db):
+    assert po.load_overlay() == {"providers": {}}
     overlay = {"providers": {"groq": {"base_url": "https://x", "auth_env": "G_KEY",
                                       "served_models": [{"family": "f"}]}}}
-    po.save_overlay(overlay, path)
-    assert po.load_overlay(path) == overlay
-    path.write_text("not json")
-    assert po.load_overlay(path) == {"providers": {}}
+    po.save_overlay(overlay)
+    assert po.load_overlay() == overlay
+    po.save_overlay({"providers": {}})        # save empty -> overlay cleared
+    assert po.load_overlay() == {"providers": {}}
 
 
 # ---- shim hot-add endpoint -----------------------------------------------------
@@ -152,12 +158,10 @@ def test_shim_add_provider_hot_applies_with_state_preserved(host, monkeypatch):
 
 # ---- dashboard add endpoint -----------------------------------------------------
 
-def test_dashboard_add_provider_persists_and_hot_applies(monkeypatch, tmp_path):
+def test_dashboard_add_provider_persists_and_hot_applies(db, monkeypatch, tmp_path):
     import auth_proxy
     env_path = tmp_path / ".env.secrets"
-    overlay_path = tmp_path / "providers.local.json"
     monkeypatch.setattr(auth_proxy, "DASHBOARD_KEY_ENV_PATH", str(env_path))
-    monkeypatch.setenv("PROVIDERS_OVERLAY_PATH", str(overlay_path))
     monkeypatch.setattr(auth_proxy, "_load_policy_config", lambda: {
         "providers": {"openrouter": {}},
         "models": {"llama-3.3-70b": {"served_by": []}},
@@ -194,7 +198,7 @@ def test_dashboard_add_provider_persists_and_hot_applies(monkeypatch, tmp_path):
     assert r.json()["ok"] is True and r.json()["applied_live"] is True
 
     assert "GROQ_API_KEY=gsk-raw" in env_path.read_text()         # key persisted
-    saved = json.loads(overlay_path.read_text())
+    saved = po.load_overlay()
     assert saved["providers"]["groq"]["auth_env"] == "GROQ_API_KEY"
     assert "key" not in saved["providers"]["groq"]                 # never in overlay
     url, body = calls[0]
@@ -209,15 +213,13 @@ def test_dashboard_add_provider_persists_and_hot_applies(monkeypatch, tmp_path):
                        json=payload).status_code == 400
 
 
-def test_merge_provider_overlay_folds_into_catalog(monkeypatch, tmp_path):
+def test_merge_provider_overlay_folds_into_catalog(db):
     import auth_proxy
-    overlay_path = tmp_path / "providers.local.json"
-    overlay_path.write_text(json.dumps({"providers": {"groq": {
+    po.save_overlay({"providers": {"groq": {
         "base_url": "https://api.groq.com/openai/v1", "auth_env": "GROQ_API_KEY",
         "served_models": [{"family": "llama-3.3-70b",
                            "provider_model_id": "llama-3.3-70b-versatile"}],
-        "added_at": 1}}}))
-    monkeypatch.setenv("PROVIDERS_OVERLAY_PATH", str(overlay_path))
+        "added_at": 1}}})
     cfg = auth_proxy._merge_provider_overlay({
         "providers": {"openrouter": {}},
         "models": {"llama-3.3-70b": {"served_by": [{"provider": "openrouter"}]}}})
