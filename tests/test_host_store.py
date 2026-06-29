@@ -1,9 +1,8 @@
 """The host operational store (Postgres) call ledger + operator state. The fact
 table from which route/session views are derived; durable set_* with a success
-bool; time-bounded retention; one-shot legacy backfill."""
+bool; time-bounded retention."""
 from __future__ import annotations
 
-import json
 import sys
 import time
 from pathlib import Path
@@ -114,60 +113,6 @@ def test_retention_prunes_old_rows(store, monkeypatch):
 def test_route_key_shape_matches_provider_family_served(store):
     assert hs._route_key("antseed", "glm-5.2", "peerX") == "antseed|glm-5.2|peerX"
     assert hs._route_key(None, None, None) is None
-
-
-# ---- one-shot legacy backfill -------------------------------------------------
-
-def _legacy_files(tmp_path, monkeypatch, *, ov=None, prov=None, keys=None):
-    if ov is not None:
-        (tmp_path / "ov.json").write_text(ov)
-        monkeypatch.setenv("LLM_ROUTER_CONFIG_OVERRIDES", str(tmp_path / "ov.json"))
-    else:
-        monkeypatch.setenv("LLM_ROUTER_CONFIG_OVERRIDES", str(tmp_path / "absent-ov.json"))
-    if prov is not None:
-        (tmp_path / "prov.json").write_text(prov)
-        monkeypatch.setenv("PROVIDERS_OVERLAY_PATH", str(tmp_path / "prov.json"))
-    else:
-        monkeypatch.setenv("PROVIDERS_OVERLAY_PATH", str(tmp_path / "absent-prov.json"))
-    if keys is not None:
-        (tmp_path / "keys.json").write_text(keys)
-        monkeypatch.setenv("DASHBOARD_ISSUED_KEYS_PATH", str(tmp_path / "keys.json"))
-    else:
-        monkeypatch.setenv("DASHBOARD_ISSUED_KEYS_PATH", str(tmp_path / "absent-keys.json"))
-
-
-def test_backfill_seeds_empty_tables(store, tmp_path, monkeypatch):
-    _legacy_files(
-        tmp_path, monkeypatch,
-        ov=json.dumps({"compaction.at_tokens": 50000}),
-        prov=json.dumps({"providers": {"groq": {
-            "base_url": "https://x", "auth_env": "G", "added_at": 1}}}),
-        keys=json.dumps({"crm": {"status": "active"}}))
-    hs.migrate_legacy_json()
-    assert hs.get_overrides() == {"compaction.at_tokens": 50000}
-    assert hs.get_provider_overlays()["providers"]["groq"]["auth_env"] == "G"
-    assert hs.get_consumer_keys() == ({"crm": {"status": "active"}}, True)
-
-
-def test_backfill_is_noop_when_table_nonempty(store, tmp_path, monkeypatch):
-    hs.set_overrides({"compaction.at_tokens": 99})        # already migrated
-    _legacy_files(tmp_path, monkeypatch,
-                  ov=json.dumps({"compaction.at_tokens": 50000}))
-    hs.migrate_legacy_json()
-    assert hs.get_overrides() == {"compaction.at_tokens": 99}  # NOT clobbered
-
-
-def test_backfill_noop_when_file_absent(store, tmp_path, monkeypatch):
-    _legacy_files(tmp_path, monkeypatch)                   # all paths absent
-    hs.migrate_legacy_json()
-    assert hs.get_overrides() == {}
-    assert hs.get_provider_overlays() == {"providers": {}}
-
-
-def test_backfill_failsoft_on_corrupt_file(store, tmp_path, monkeypatch):
-    _legacy_files(tmp_path, monkeypatch, ov="not json{")
-    hs.migrate_legacy_json()                              # must not raise
-    assert hs.get_overrides() == {}                       # corrupt -> empty, not fatal
 
 
 def test_set_returns_bool_contract(store):
