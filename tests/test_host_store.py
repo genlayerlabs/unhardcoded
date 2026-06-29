@@ -46,6 +46,35 @@ def test_insert_and_recent_roundtrip(store):
     assert r["session_id"] == "sess-A"
 
 
+def test_usage_rows_since_ts_filters_in_query(store):
+    # The timeframe window lives in SQL now (idx_calls_ts), not Python: a windowed
+    # dashboard view reads only its window, never the whole retention table to then
+    # discard almost all of it. Restores the bound the retired usage-history tail
+    # read gave (test_usage_history_oom).
+    store.insert_call(_row(usage_event_id="old", ts=1_000_000))
+    store.insert_call(_row(usage_event_id="new", ts=2_000_000))
+    assert [r["usage_event_id"] for r in store.usage_rows(since_ts=1_500_000)] == ["new"]
+    # since_ts=None ("all") still returns the retained rows (bounded by retention).
+    assert {r["usage_event_id"] for r in store.usage_rows()} == {"old", "new"}
+
+
+def test_usage_rows_caller_filters_in_query(store):
+    store.insert_call(_row(usage_event_id="a", caller="app1"))
+    store.insert_call(_row(usage_event_id="b", caller="app2"))
+    assert {r["usage_event_id"] for r in store.usage_rows(caller="app1")} == {"a"}
+
+
+def test_usage_rows_all_is_floored_at_the_retention_horizon(store, monkeypatch):
+    # "all" (since_ts=None) is not a bare table scan: it is floored at
+    # now - retention, so the read is always time-bounded. Rows older than the
+    # horizon (not yet pruned) are excluded from the aggregation feed.
+    monkeypatch.setattr(hs, "_RETENTION_DAYS", 7)
+    now = int(time.time())
+    store.insert_call(_row(usage_event_id="recent", ts=now - 86400))       # 1 day
+    store.insert_call(_row(usage_event_id="stale", ts=now - 30 * 86400))   # 30 days
+    assert {r["usage_event_id"] for r in store.usage_rows()} == {"recent"}
+
+
 def test_count_and_ordering_newest_first(store):
     store.insert_call(_row(usage_event_id="a", ts=1))
     store.insert_call(_row(usage_event_id="b", ts=2))

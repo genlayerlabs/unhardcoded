@@ -657,7 +657,6 @@ def test_usage_history_survives_stats_reset_and_supports_windows_pagination_and_
         auth_proxy._reset_stats_for_tests()
         auth_proxy._record_request(caller="crm", method="POST", path="/v1/chat/completions", status=200, latency_ms=10, provider="openai", model_family="gpt-5.5-codex", served_model_id="gpt-5.5", requested_model="profile:edge", tokens_in=1, tokens_out=1, tokens_total=2, key_sha256=digest, ts=1_700_000_000)
         auth_proxy._record_request(caller="crm", method="POST", path="/v1/chat/completions", status=200, latency_ms=20, provider="openrouter", model_family="gpt-5.5", served_model_id="openai/gpt-5.5", requested_model="profile:edge", tokens_in=1_000_000, tokens_out=500_000, tokens_total=1_500_000, key_sha256=digest, ts=1_700_086_400)
-        assert history_path.exists()
 
         auth_proxy._reset_stats_for_tests()
         client = TestClient(auth_proxy.app)

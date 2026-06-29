@@ -169,6 +169,15 @@ _SCHEMA_STATEMENTS = [
         connection_state   TEXT,
         fetched_at         BIGINT
     )""",
+    # Dashboard login audit (#5) — replaces dashboard-logins.jsonl. A small record
+    # read whole by the dashboard, so it follows the consumer_keys pattern: the
+    # row as a JSON record in TEXT (not analysed by column). ts in SECONDS.
+    """CREATE TABLE IF NOT EXISTS login_history (
+        id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        ts     BIGINT NOT NULL,
+        record TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_login_history_ts ON login_history(ts)",
 ]
 
 _pool_lock = threading.Lock()
@@ -267,6 +276,8 @@ def _prune() -> None:
                          (int(now) - _RETENTION_DAYS * 86400,))
             conn.execute("DELETE FROM route_observations WHERE ts < %s",
                          (int(now * 1000) - _RETENTION_DAYS * 86400 * 1000,))
+            conn.execute("DELETE FROM login_history WHERE ts < %s",
+                         (int(now) - _RETENTION_DAYS * 86400,))
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store prune failed: %s", exc)
 
@@ -293,7 +304,21 @@ def _writer_loop() -> None:
 threading.Thread(target=_writer_loop, name="host-store-writer", daemon=True).start()
 
 
+# Tests set HOST_STORE_SYNC_WRITES=1 so every write runs INLINE (no background
+# thread): the daemon writer otherwise interleaves its commits with the
+# truncate/read of the next test on the shared DB at non-deterministic times,
+# flaking isolation. Async buys nothing when the test asserts on the row right
+# after writing it. Production leaves it unset and keeps the off-latency-path queue.
+_SYNC_WRITES = bool(os.getenv("HOST_STORE_SYNC_WRITES"))
+
+
 def _enqueue(job) -> None:
+    if _SYNC_WRITES:
+        try:
+            job()
+        except Exception as exc:  # noqa: BLE001 — mirror the writer loop's tolerance
+            _log.warning("host_store sync write failed: %s", exc)
+        return
     try:
         _write_q.put_nowait(job)
     except queue.Full:
@@ -630,6 +655,86 @@ def all_session_totals() -> dict[str, dict[str, Any]]:
         return {}
 
 
+# ---- usage rows + dashboard logins, from the store (#5) -------------------------
+
+_USAGE_COLS = ("ts", "caller", "provider_id", "model_family", "served_model_id",
+               "served_by", "status", "error_type", "tokens_in", "tokens_out",
+               "tokens_total", "tokens_cached", "cost_usd", "requested_model",
+               "consumer_sha", "usage_event_id")
+
+
+def usage_rows(since_ts: "int | None" = None,
+               caller: "str | None" = None) -> list[dict[str, Any]]:
+    """Calls in the legacy usage-history ROW SHAPE (#5: replaces usage-history.jsonl),
+    so the dashboard timeframe aggregation consumes them unchanged. Optionally
+    filtered by ts >= since_ts and/or caller. ts in SECONDS. Fail-soft -> []."""
+    try:
+        # "all" (since_ts=None) is still bounded to the retention horizon so the
+        # read is ALWAYS time-bounded (never a bare table scan): rows older than
+        # retention are pruned anyway, so the floor only drops not-yet-pruned
+        # slack. A caller-supplied since_ts narrows further (it can't widen past
+        # what we retain).
+        floor = int(time.time()) - _RETENTION_DAYS * 86400
+        if since_ts is not None:
+            floor = max(int(since_ts), floor)
+        clauses, params = ["ts >= %s"], [floor]
+        if caller is not None:
+            clauses.append("caller = %s"); params.append(caller)
+        where = " WHERE " + " AND ".join(clauses)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                f"SELECT {', '.join(_USAGE_COLS)} FROM calls{where} ORDER BY ts",
+                params)
+            rows = []
+            for r in cur.fetchall():
+                d = dict(zip(_USAGE_COLS, r))
+                # map to the usage-history row keys the aggregation expects
+                rows.append({
+                    "event": "request", "ts": d["ts"], "caller": d["caller"],
+                    "provider": d["provider_id"], "model_family": d["model_family"],
+                    "served_model_id": d["served_model_id"], "served_by": d["served_by"],
+                    "status": d["status"], "error_type": d["error_type"],
+                    "tokens_in": d["tokens_in"], "tokens_out": d["tokens_out"],
+                    "tokens_total": d["tokens_total"], "tokens_cached": d["tokens_cached"],
+                    "cost_usd": d["cost_usd"], "requested_model": d["requested_model"],
+                    "key_sha256": d["consumer_sha"],
+                    "key_sha256_prefix": (d["consumer_sha"] or "")[:12] or None,
+                    "usage_event_id": d.get("usage_event_id")})
+            return rows
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store usage_rows failed: %s", exc)
+        return []
+
+
+def insert_login(row: dict[str, Any]) -> None:
+    """Append one dashboard login audit record. Fail-soft (audit, never blocks)."""
+    try:
+        with _get_pool().connection() as conn:
+            conn.execute("INSERT INTO login_history (ts, record) VALUES (%s,%s)",
+                         (int(row.get("ts") or time.time()), json.dumps(row)))
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store insert_login failed: %s", exc)
+
+
+def recent_logins(limit: int = 100) -> list[dict[str, Any]]:
+    """The most recent dashboard login records, newest first. Fail-soft -> []."""
+    try:
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT record FROM login_history ORDER BY ts DESC, id DESC LIMIT %s",
+                (int(limit),))
+            out = []
+            for (rec,) in cur.fetchall():
+                try:
+                    out.append(json.loads(rec))
+                except (TypeError, ValueError):
+                    continue
+            return out
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store recent_logins failed: %s", exc)
+        return []
+
+
 # ---- peer_offers (antseed marketplace book; written by the sidecar) ------------
 
 # Columns surfaced to the reader, in the row shape sources/antseed expects. The
@@ -744,4 +849,5 @@ def truncate_all_for_tests() -> None:
     """Test helper: wipe every table for isolation against a shared Postgres."""
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
-                     " consumer_keys, peer_offers, buyer_status, route_observations")
+                     " consumer_keys, peer_offers, buyer_status, route_observations,"
+                     " login_history")

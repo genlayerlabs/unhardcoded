@@ -68,8 +68,25 @@ async def test_concurrent_requests_overlap():
     assert max_in_flight >= N // 2, f"only {max_in_flight} concurrent in flight"
 
 
+@pytest.fixture
+def real_async_writes():
+    """Re-enable the background writer that conftest globally disables for test
+    isolation (HOST_STORE_SYNC_WRITES). This test exists to prove the REAL async
+    write path is coherent under concurrency, so it must use the queue + daemon
+    thread, not the inline path. Drains on teardown so nothing leaks into the
+    next test."""
+    import host_store
+    prev = host_store._SYNC_WRITES
+    host_store._SYNC_WRITES = False
+    try:
+        yield
+    finally:
+        host_store._write_q.join()
+        host_store._SYNC_WRITES = prev
+
+
 @pytest.mark.asyncio
-async def test_shared_state_is_coherent_under_concurrency(host_store_clean):
+async def test_shared_state_is_coherent_under_concurrency(host_store_clean, real_async_writes):
     """Every coroutine records a route observation; the per-route observation
     count must equal the number of calls with no lost updates. Reliability is
     host-owned and derived from route_observations now (#15/#4a)."""

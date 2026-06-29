@@ -87,7 +87,6 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DASHBOARD_KEY_ENV_PATH: /run/llm-router/.env.secrets
       DASHBOARD_ISSUED_KEYS_PATH: /run/llm-router/secrets/issued-consumer-keys.json
-      ROUTER_USAGE_HISTORY_PATH: /run/llm-router/secrets/usage-history.jsonl
       # env_file carries the HOST path; inside the container the file is the
       # bind mount below (needed by the provider-key reveal endpoint)
       CODEX_AUTH_PATH: /codex/auth.json
