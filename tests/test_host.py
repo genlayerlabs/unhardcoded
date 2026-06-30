@@ -274,6 +274,26 @@ def test_execute_async_call_override(host):
         assert res2["response"]["text"] == "via-mock"
 
 
+def test_execute_async_threads_first_token_timeout_to_provider_request(host):
+    import asyncio
+    seen = []
+
+    async def override(request):
+        seen.append(request)
+        return {"ok": True, "latency_ms": 1,
+                "response": {"text": "via-override", "finish_reason": "stop"}}
+
+    res = asyncio.run(host.execute_async({
+        "prompt": "hi",
+        "profile": "default",
+        "first_token_timeout_ms": 2500,
+    }, call_override=override))
+
+    assert res["ok"]
+    assert seen
+    assert seen[0]["first_token_timeout_ms"] == 2500
+
+
 def test_streaming_override_path_folds_route_metrics(host, host_store_clean):
     # The fix: the override (streaming) path must record a route observation too.
     # Before, the fold lived only inside the direct hook, so reliability/latency

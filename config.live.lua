@@ -221,12 +221,12 @@ return {
         --  provider entry, which marketplace discovery replaces.)
 
         -- ── `edge` tier: frontier models (quality ≥ 0.90) ──────────────────────
-        -- Codex (sunk-cost subscription) is a ROUTE of gpt-5.5, not a separate
-        -- family — its slug on the ChatGPT backend is plain "gpt-5.5". Its $0
-        -- cost is held in check by the host scarcity price ramp (sources/codex.py),
-        -- which lifts codex's ranking price as the subscription quota fills so
-        -- paid routes take over before the 429 wall. Claude/Gemini have no codex
-        -- path, so they cascade antseed_edge → openrouter.
+        -- Codex (sunk-cost subscription) is a ROUTE of each compatible OpenAI
+        -- family, not a separate family. Its $0 cost is held in check by the
+        -- host scarcity price ramp (sources/codex.py), which lifts codex's
+        -- ranking price as the subscription quota fills so paid routes take
+        -- over before the 429 wall. Claude/Gemini have no codex path, so they
+        -- cascade through their other configured providers.
         ["gpt-5.5"] = {
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.5" },
@@ -238,11 +238,19 @@ return {
         },
         ["gpt-5.4"] = {
             served_by = {
+                { provider = "openai_codex", provider_model_id = "gpt-5.4" },
                 { provider = "openai",       provider_model_id = "gpt-5.4" },
                 { provider = "openrouter",   provider_model_id = "openai/gpt-5.4" },
             },
             capabilities = { context = 400000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.90,
+        },
+        ["gpt-5.4-mini"] = {
+            served_by = {
+                { provider = "openai_codex", provider_model_id = "gpt-5.4-mini" },
+            },
+            capabilities = { context = 400000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.86,
         },
         ["claude-opus-4-8"] = {
             served_by = {

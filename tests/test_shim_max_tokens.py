@@ -41,3 +41,12 @@ def test_default_none_means_omit():
     # Opting out (default_max_tokens=None) keeps the old behaviour: omit when absent.
     c = _request_to_contract(_req(), "default", default_max_tokens=None)
     assert "max_tokens" not in c
+
+
+def test_first_token_timeout_is_forwarded_to_contract():
+    c = _request_to_contract(
+        _req(first_token_timeout_ms=2500),
+        "default",
+        default_max_tokens=4096,
+    )
+    assert c["first_token_timeout_ms"] == 2500

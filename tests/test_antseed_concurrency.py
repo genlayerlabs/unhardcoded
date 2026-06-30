@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import llm_router_host as H  # noqa: E402
+from provider_adapters.openai_compatible import make_async_call_provider  # noqa: E402
+from tests.test_streaming import FakeStreamClient, FakeStreamResponse, _openai_lines  # noqa: E402
 
 
 class _FakeResp:
@@ -94,3 +96,23 @@ async def test_oversubscribed_yields_rate_limit():
     second = await call(_req("peerC", 1, timeout_ms=50))
     assert second["ok"] is False and second["error_kind"] == "rate_limit"
     assert (await first)["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_first_token_timeout_uses_internal_streaming_for_json_calls():
+    client = FakeStreamClient(FakeStreamResponse(200, lines=_openai_lines("ok")))
+    call = make_async_call_provider(client=client)
+
+    result = await call({
+        "api_kind": "openai_compatible",
+        "base_url": "http://seller/v1",
+        "served_model_id": "m",
+        "provider_id": "antseed",
+        "messages": [{"role": "user", "content": "hi"}],
+        "auth": {"kind": "none"},
+        "first_token_timeout_ms": 1000,
+    })
+
+    assert result["ok"] is True
+    assert result["response"]["text"] == "ok"
+    assert client.requests[0]["json"]["stream"] is True

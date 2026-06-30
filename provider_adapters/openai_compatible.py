@@ -213,22 +213,38 @@ def make_async_call_provider(
                             f"antseed peer {peer_id[:10]} in-flight cap {cap} saturated")
         try:
             try:
-                if client is not None:
-                    resp = await client.post(
-                        url, json=body, headers=headers, timeout=timeout)
+                if request.get("first_token_timeout_ms") is not None:
+                    from streaming import stream_openai_compatible
+
+                    async def _ignore_delta(_delta: str) -> None:
+                        return None
+
+                    result = await stream_openai_compatible(
+                        request,
+                        _ignore_delta,
+                        client=client,
+                        env_get=_env_get,
+                        extra_headers=_extra,
+                        timeout_s=timeout_s,
+                        token_providers=token_providers,
+                        provider_rules=provider_rules,
+                    )
                 else:
-                    async with httpx.AsyncClient() as c:
-                        resp = await c.post(
+                    if client is not None:
+                        resp = await client.post(
                             url, json=body, headers=headers, timeout=timeout)
+                    else:
+                        async with httpx.AsyncClient() as c:
+                            resp = await c.post(
+                                url, json=body, headers=headers, timeout=timeout)
+                    rules = (provider_rules or {}).get(request.get("provider_id")) or {}
+                    result = _parse_openai_response(
+                        resp, _elapsed_ms(t0), error_map=rules.get("error_map"))
             except httpx.TimeoutException:
                 result = _err("timeout", 0, _elapsed_ms(t0),
                               f"POST {url} timed out")
             except (httpx.NetworkError, httpx.RequestError) as e:
                 result = _err("network_error", 0, _elapsed_ms(t0), str(e))
-            else:
-                rules = (provider_rules or {}).get(request.get("provider_id")) or {}
-                result = _parse_openai_response(
-                    resp, _elapsed_ms(t0), error_map=rules.get("error_map"))
             return result
         finally:
             if gate is not None:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from provider_adapters.common import _cached_tokens
 
+import asyncio
 import json
 import re
 import time
@@ -68,9 +69,23 @@ async def stream_openai_compatible(
     finish_reason = None
     usage: dict = {}
     raw_model = None
+    saw_output = False
+    first_token_timeout_ms = request.get("first_token_timeout_ms")
+    try:
+        first_token_timeout_s = (
+            float(first_token_timeout_ms) / 1000.0
+            if first_token_timeout_ms is not None and float(first_token_timeout_ms) > 0
+            else None
+        )
+    except (TypeError, ValueError):
+        first_token_timeout_s = None
 
     def _latency() -> int:
         return int((time.monotonic() - t0) * 1000)
+
+    def _first_token_timeout_error() -> dict:
+        return _err("timeout", 0, _latency(),
+                    f"first token timed out after {int(first_token_timeout_s * 1000)}ms")
 
     try:
         async with client.stream("POST", url, json=body, headers=headers,
@@ -81,7 +96,22 @@ async def stream_openai_compatible(
                     or _classify_status(resp.status_code, raw)
                 return _err(kind, resp.status_code, _latency(), raw)
 
-            async for line in resp.aiter_lines():
+            lines = resp.aiter_lines().__aiter__()
+            while True:
+                try:
+                    if first_token_timeout_s is not None and not saw_output:
+                        remaining = first_token_timeout_s - (time.monotonic() - t0)
+                        if remaining <= 0:
+                            return _first_token_timeout_error()
+                        line = await asyncio.wait_for(lines.__anext__(), timeout=remaining)
+                    else:
+                        line = await lines.__anext__()
+                except StopAsyncIteration:
+                    break
+                except (asyncio.TimeoutError, TimeoutError):
+                    if not saw_output:
+                        return _first_token_timeout_error()
+                    raise
                 if not line or not line.startswith("data:"):
                     continue
                 data = line[len("data:"):].strip()
@@ -101,10 +131,12 @@ async def stream_openai_compatible(
                         finish_reason = choice["finish_reason"]
                     content = delta.get("content")
                     if content:
+                        saw_output = True
                         text_parts.append(content)
                         await emit(content)
                         emitted = True
                     for tc in delta.get("tool_calls") or []:
+                        saw_output = True
                         idx = tc.get("index", 0)
                         acc = tool_calls_acc.setdefault(idx, {
                             "id": None, "type": "function",

@@ -494,6 +494,9 @@ end
             handle = step["state_handle"]
             if status == "call":
                 req = _to_py(step["request"]) or {}
+                if (contract.get("first_token_timeout_ms") is not None
+                        and req.get("first_token_timeout_ms") is None):
+                    req["first_token_timeout_ms"] = contract["first_token_timeout_ms"]
                 resp = await self._resolve_call_async(req, call_override, session=session)
                 step = self.router.execute_step(handle, None, _to_lua(self.lua, resp))
             elif status == "wait":
