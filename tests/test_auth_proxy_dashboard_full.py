@@ -1417,3 +1417,29 @@ def test_catalog_tab_renamed_and_has_skill_button(monkeypatch):
     assert ">Catalog<" in html                 # tab renamed from "Market"
     assert "marketSkill" in html               # SKILL.md download button
     assert "/dashboard/api/skill" in html
+
+
+def test_consumer_skill_endpoint_authed_by_consumer_key(monkeypatch):
+    # /skill serves the SAME SKILL.md as /dashboard/api/skill (same renderer),
+    # but authenticated by a CONSUMER KEY (Bearer) instead of a dashboard session,
+    # so an agent can fetch it with the credential it already calls /v1/* with.
+    async def _m():
+        return {}
+
+    async def _f():
+        return []
+
+    monkeypatch.setattr(auth_proxy, "_fetch_live_market", _m)
+    monkeypatch.setattr(auth_proxy, "_fetch_live_fields", _f)
+    monkeypatch.setattr(auth_proxy, "_consumer_meta", lambda c: {"status": "active"})
+    client = TestClient(auth_proxy.app)
+
+    # no key / bad key -> 401 (reuses the same key auth as /v1/*)
+    assert client.get("/skill").status_code == 401
+    assert client.get("/skill", headers={"Authorization": "Bearer nope"}).status_code == 401
+
+    # a valid consumer key -> 200, the markdown download
+    r = client.get("/skill", headers={"Authorization": "Bearer internal"})
+    assert r.status_code == 200
+    assert "text/markdown" in r.headers["content-type"]
+    assert "filename=SKILL.md" in r.headers["content-disposition"]

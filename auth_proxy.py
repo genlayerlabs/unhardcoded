@@ -1631,6 +1631,25 @@ async def dashboard_skill(request: Request) -> Response:
                     headers={"Content-Disposition": "attachment; filename=SKILL.md"})
 
 
+@app.get("/skill")
+async def consumer_skill(request: Request) -> Response:
+    """Download the same self-contained SKILL.md as /dashboard/api/skill (the
+    Σ_pol/Σ_flow authoring guide + this host's live catalog + field vocabulary),
+    but authenticated by a CONSUMER KEY (Bearer) instead of a dashboard session —
+    so an agent can fetch the guide for the host it routes through, using the same
+    credential it calls /v1/* with, no dashboard login. Reuses the same renderer
+    and the same key auth (revoked/expired/inactive keys are rejected)."""
+    auth = request.headers.get("authorization") or ""
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else auth.strip()
+    if not _caller_auth(token).get("ok"):
+        return JSONResponse(status_code=401, content={"error": {
+            "message": "invalid or inactive API key",
+            "type": "auth_error", "code": "consumer_auth"}})
+    text = _render_skill(await _fetch_live_market(), await _fetch_live_fields())
+    return Response(content=text, media_type="text/markdown; charset=utf-8",
+                    headers={"Content-Disposition": "attachment; filename=SKILL.md"})
+
+
 async def _router_post_json(path: str, payload: dict) -> Response:
     """Admin-dashboard passthrough to the shim's policy endpoints. The shim
     (and behind it the core) is the validator; this just forwards bytes and
