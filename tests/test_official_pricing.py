@@ -68,6 +68,7 @@ GEMINI_HTML = """
 CATALOG = {"models": {
     "claude-opus-4-8": {"served_by": [{"provider": "anthropic", "provider_model_id": "claude-opus-4-8"}]},
     "claude-sonnet-4-6": {"served_by": [{"provider": "anthropic", "provider_model_id": "claude-sonnet-4-6"}]},
+    "claude-haiku-4-5": {"served_by": [{"provider": "anthropic", "provider_model_id": "claude-haiku-4-5"}]},
     "gpt-5.5": {"served_by": [{"provider": "openai", "provider_model_id": "gpt-5.5"}]},
     "gemini-3.1-pro-preview": {"served_by": [{"provider": "google", "provider_model_id": "gemini-3.1-pro-preview"}]},
 }}
@@ -157,6 +158,53 @@ def test_pricing_coasts_on_host_store_when_scrape_fails(monkeypatch):
     prices = asyncio.run(src.pricing())               # must NOT raise
     assert [(p["model_family"], p["price_in_usd_per_mtok"]) for p in prices] \
         == [("gpt-5.5", 4.2)]
+
+
+def test_resolve_drops_zero_and_over_ceiling_keeps_high_but_real():
+    src = _src("anthropic")
+    rows = src._resolve([
+        {"family_hint": "Claude Opus 4.8", "price_in": 150.0, "price_out": 600.0, "price_cached_in": 15.0},
+        {"family_hint": "Claude Sonnet 4.6", "price_in": 0.0, "price_out": 15.0, "price_cached_in": 0.3},
+        {"family_hint": "Claude Haiku 4.5", "price_in": 1.0, "price_out": 5000.0, "price_cached_in": 0.1},
+    ])
+    # $600 out is high but real (o1-pro-class, kept); a $0 misparse and a misread
+    # far above the $1000 ceiling both drop
+    assert set(rows) == {"claude-opus-4-8"}
+
+
+def test_resolve_nulls_cache_when_implausible_or_not_cheaper_than_input():
+    src = _src("anthropic")
+    # a $0 cache (implausible) is nulled, in/out kept
+    z = src._resolve([{"family_hint": "Claude Opus 4.8",
+                       "price_in": 5.0, "price_out": 25.0, "price_cached_in": 0.0}])
+    assert z["claude-opus-4-8"]["price_cached_in"] is None
+    assert z["claude-opus-4-8"]["price_in"] == 5.0
+    # a cache read >= input is a misparse (it's always a fraction of input) -> nulled
+    hi = src._resolve([{"family_hint": "Claude Opus 4.8",
+                        "price_in": 5.0, "price_out": 25.0, "price_cached_in": 6.0}])
+    assert hi["claude-opus-4-8"]["price_cached_in"] is None
+
+
+def test_misparsed_zero_row_is_not_committed_to_the_table(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(host_store, "set_provider_prices",
+                        lambda rows: captured.setdefault("rows", rows) or True)
+    md = ("| Model | Input | Output |\n| --- | --- | --- |\n"
+          "| Claude Opus 4.8 | $5 | $25 |\n"
+          "| Claude Sonnet 4.6 | $0 | $0 |\n")   # parses, but $0 must not commit
+    prices = asyncio.run(_src("anthropic", client=_Client(md)).pricing())
+    assert {p["model_family"] for p in prices} == {"claude-opus-4-8"}
+    assert {r["model_family"] for r in captured["rows"]} == {"claude-opus-4-8"}
+
+
+def test_coast_does_not_re_serve_a_poisoned_stored_row(monkeypatch):
+    monkeypatch.setattr(host_store, "get_provider_prices", lambda pid=None: [
+        {"provider_id": "openai", "model_family": "gpt-5.5",
+         "price_in": 0.0, "price_out": 0.0, "price_cached_in": None},
+        {"provider_id": "openai", "model_family": "gpt-5.4",
+         "price_in": 2.5, "price_out": 15.0, "price_cached_in": 0.25}])
+    prices = asyncio.run(_src("openai", client=_Client(boom=True)).pricing())
+    assert {p["model_family"] for p in prices} == {"gpt-5.4"}   # poisoned $0 row skipped
 
 
 def test_pricing_ignores_uncataloged_page_rows(monkeypatch):

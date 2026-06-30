@@ -50,6 +50,20 @@ def _money(cell: str) -> "float | None":
     return float(m.group(1)) if m else None
 
 
+# A per-Mtok price governs routing AND billing, so it is invariant-bearing: a bad
+# parse must DROP (coast on the last good value), never commit a sticky wrong
+# price the fleet then routes/bills on. For these first-party PAID providers a $0
+# is a misparse (not a free offer, unlike the marketplace's legitimate $0), and an
+# absurd value is a misread number (a context-window/storage figure). The ceiling
+# matches config.live.lua's market_price_cap: it clears real prices (o1-pro is
+# $600/Mtok out) while a misread (context window ~272k, storage 1e6) is far above.
+_MAX_PRICE = 1000.0
+
+
+def _plausible(p: Any) -> bool:
+    return isinstance(p, (int, float)) and not isinstance(p, bool) and 0 < p <= _MAX_PRICE
+
+
 # ---- Markdown parser (OpenAI & Anthropic .md twins) ----------------------------
 
 def _md_cells(line: str) -> list[str]:
@@ -296,14 +310,28 @@ class OfficialPriceSource:
         rows: dict[str, dict] = {}
         for r in records:
             fam = self._family_by_slug.get(_slug(r["family_hint"]))
-            if fam and fam not in rows:
-                rows[fam] = r
+            if not fam or fam in rows:
+                continue
+            if not (_plausible(r.get("price_in")) and _plausible(r.get("price_out"))):
+                _log.warning("%s dropped implausible price for %s: in=%r out=%r",
+                             self.name, fam, r.get("price_in"), r.get("price_out"))
+                continue
+            # cache-read is nullable and not yet ranked; null it (rather than drop
+            # the whole good in/out row) when implausible OR not strictly cheaper
+            # than the base input — a cache read is always a fraction of input, so
+            # cached >= input is a misparse (grabbed output/storage/wrong cell).
+            cached = r.get("price_cached_in")
+            if not (_plausible(cached) and cached < r["price_in"]):
+                r = {**r, "price_cached_in": None}
+            rows[fam] = r
         return rows
 
     def _prices(self, items) -> list[Price]:
         prices: list[Price] = []
         for fam, r in items:
-            if r.get("price_in") is None or r.get("price_out") is None:
+            # symmetric guard: a poisoned row coasted from the table must not be
+            # re-served either (the invariant holds on read as well as write).
+            if not (_plausible(r.get("price_in")) and _plausible(r.get("price_out"))):
                 continue
             prices.append({
                 "provider_id": self.provider_id,
