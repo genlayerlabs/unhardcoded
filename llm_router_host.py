@@ -11,7 +11,7 @@ A real HTTP backend can be plugged in by passing call_provider=... .
 
 Dependencies:
     pip install lupa>=2.0
-    (real-HTTP backend, optional: httpx)
+    (real provider backends, optional: httpx boto3)
 """
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from typing import Callable
 import host_store
 import route_reliability as _route_reliability
 from provider_adapters.anthropic import make_anthropic_async_call_provider
+from provider_adapters.bedrock import make_bedrock_async_call_provider
 from provider_adapters.common import (
     AsyncCallProviderHook,
     CallProviderHook,
@@ -62,6 +63,7 @@ __all__ = [
     "make_async_call_provider",
     "make_http_call_provider",
     "make_anthropic_async_call_provider",
+    "make_bedrock_async_call_provider",
     "make_google_async_call_provider",
     "_PEER_GATES",
     "_cached_tokens",

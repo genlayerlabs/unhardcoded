@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from provider_adapters.anthropic import make_anthropic_async_call_provider  # noqa: E402
+from provider_adapters.bedrock import make_bedrock_async_call_provider  # noqa: E402
 from provider_adapters.google import make_google_async_call_provider  # noqa: E402
 
 
@@ -39,6 +40,16 @@ class FakeClient:
             "headers": headers,
             "timeout": timeout,
         })
+        return self.response
+
+
+class FakeBedrockClient:
+    def __init__(self, response):
+        self.response = response
+        self.requests = []
+
+    def converse(self, **kwargs):
+        self.requests.append(kwargs)
         return self.response
 
 
@@ -181,6 +192,53 @@ async def test_google_native_handler_translates_openai_shape():
 
 
 @pytest.mark.asyncio
+async def test_bedrock_native_handler_translates_openai_shape():
+    client = FakeBedrockClient({
+        "output": {"message": {"role": "assistant", "content": [
+            {"text": "Use the tool."},
+            {"toolUse": {"toolUseId": "toolu_1", "name": "lookup",
+                         "input": {"id": "abc"}}},
+        ]}},
+        "stopReason": "tool_use",
+        "usage": {"inputTokens": 11, "outputTokens": 7, "totalTokens": 18},
+    })
+    call = make_bedrock_async_call_provider(
+        env_get={"AWS_REGION": "us-east-1"}.get,
+        client=client,
+        timeout_s=12,
+    )
+
+    result = await call({
+        "provider_id": "bedrock",
+        "api_kind": "bedrock",
+        "served_model_id": "us.anthropic.claude-sonnet-4-6",
+        "offer": {"wire_model_id": "us.anthropic.claude-sonnet-4-6"},
+        "messages": [
+            {"role": "system", "content": "Be terse."},
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        ],
+        "tools": [TOOL],
+        "temperature": 0.2,
+        "max_tokens": 128,
+    })
+
+    assert result["ok"] is True
+    assert result["response"]["text"] == "Use the tool."
+    assert result["response"]["tokens_total"] == 18
+    assert result["response"]["tool_calls"][0]["function"] == {
+        "name": "lookup",
+        "arguments": '{"id": "abc"}',
+    }
+
+    req = client.requests[0]
+    assert req["modelId"] == "us.anthropic.claude-sonnet-4-6"
+    assert req["system"] == [{"text": "Be terse."}]
+    assert req["messages"] == [{"role": "user", "content": [{"text": "hi"}]}]
+    assert req["inferenceConfig"] == {"maxTokens": 128, "temperature": 0.2}
+    assert req["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]["required"] == ["id"]
+
+
+@pytest.mark.asyncio
 async def test_native_handlers_require_provider_credentials():
     call = make_google_async_call_provider(env_get={}.get, client=FakeClient(None))
 
@@ -258,6 +316,31 @@ async def test_google_native_tool_roundtrip():
     # the result keys by function NAME (recovered from call_1), as Gemini wants.
     assert contents[2] == {"role": "user", "parts": [
         {"functionResponse": {"name": "lookup", "response": {"result": "value=42"}}}]}
+
+
+@pytest.mark.asyncio
+async def test_bedrock_native_tool_roundtrip():
+    client = FakeBedrockClient({
+        "output": {"message": {"role": "assistant",
+                               "content": [{"text": "ok"}]}},
+        "stopReason": "end_turn",
+        "usage": {"inputTokens": 5, "outputTokens": 2, "totalTokens": 7},
+    })
+    call = make_bedrock_async_call_provider(
+        env_get={"AWS_REGION": "us-east-1"}.get, client=client)
+    result = await call({
+        "api_kind": "bedrock",
+        "served_model_id": "us.anthropic.claude-sonnet-4-6",
+        "messages": list(_TOOL_TURN), "tools": [TOOL],
+    })
+    assert result["ok"] is True
+    messages = client.requests[0]["messages"]
+    assert messages[1] == {"role": "assistant", "content": [{
+        "toolUse": {"toolUseId": "call_1", "name": "lookup",
+                    "input": {"id": "abc"}}}]}
+    assert messages[2] == {"role": "user", "content": [{
+        "toolResult": {"toolUseId": "call_1",
+                       "content": [{"text": "value=42"}]}}]}
 
 
 class RaisingClient:

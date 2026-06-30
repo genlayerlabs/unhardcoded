@@ -143,8 +143,10 @@ def test_live_config_includes_provider_local_native_examples():
     assert providers["openai_codex"]["api_kind"] == "openai_codex"
     assert providers["anthropic"]["api_kind"] == "anthropic"
     assert providers["gemini"]["api_kind"] == "google"
-    assert providers["bedrock_mantle"]["api_kind"] == "openai_compatible"
-    assert providers["bedrock_mantle"]["base_url"].endswith("/openai/v1")
+    assert providers["bedrock"]["api_kind"] == "bedrock"
+    assert providers["bedrock"]["aws_region"] == "us-east-1"
+    assert providers["bedrock_market"]["api_kind"] == "bedrock"
+    assert providers["bedrock_market"]["discovery_id"] == "bedrock_market"
 
     def served_by(family):
         return {
@@ -155,10 +157,11 @@ def test_live_config_includes_provider_local_native_examples():
     assert served_by("gpt-5.5")["openai"] == "gpt-5.5"
     assert served_by("gpt-5.5")["openai_codex"] == "gpt-5.5"
     assert served_by("claude-opus-4-8")["anthropic"] == "claude-opus-4-8"
+    assert "bedrock" not in served_by("claude-opus-4-8")
     assert served_by("gemini-3.1-pro-preview")["gemini"] == \
         "gemini-3.1-pro-preview"
-    assert served_by("qwen3-235b-a22b")["bedrock_mantle"] == \
-        "qwen.qwen3-235b-a22b-2507"
+    assert served_by("qwen3-235b-a22b")["bedrock"] == \
+        "qwen.qwen3-vl-235b-a22b"
 
 
 def test_missing_provider_keys_are_filtered_before_ranking():

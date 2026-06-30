@@ -14,8 +14,6 @@ local HERE = os.getenv("LLM_POLICY_DIR") or "."
 local MM_OK, MM = pcall(dofile, HERE .. "/model_meta.lua")
 if not MM_OK then MM = {} end
 local BEDROCK_REGION = os.getenv("BEDROCK_REGION") or "us-east-1"
-local BEDROCK_MANTLE_BASE_URL = os.getenv("BEDROCK_MANTLE_BASE_URL")
-    or ("https://bedrock-mantle." .. BEDROCK_REGION .. ".api.aws/openai/v1")
 -- Per-family model trait getter. Curated families resolve from the static,
 -- deterministic model_meta.lua (MM) — the on-chain path. Discovered marketplace
 -- families (e.g. live OpenRouter models) aren't in MM; they carry their full
@@ -82,27 +80,27 @@ return {
             tier      = "partner",
             notes     = "Native Gemini generateContent API.",
         },
-        bedrock_mantle = {
+        bedrock = {
             discovery = "static",
-            base_url  = BEDROCK_MANTLE_BASE_URL,
-            api_kind  = "openai_compatible",
-            auth_env  = "AWS_BEARER_TOKEN_BEDROCK",
+            base_url  = "bedrock://" .. BEDROCK_REGION,
+            api_kind  = "bedrock",
+            aws_region = BEDROCK_REGION,
             tier      = "partner",
             source    = "bedrock",
-            notes     = "Amazon Bedrock Mantle OpenAI-compatible endpoint. "
-                     .. "Use BEDROCK_MANTLE_BASE_URL to select region/path.",
+            notes     = "Amazon Bedrock Runtime via native AWS auth "
+                     .. "(IRSA/EKS Pod Identity in AWS, AWS_PROFILE locally).",
         },
-        bedrock_mantle_market = {
+        bedrock_market = {
             discovery        = "marketplace",
-            discovery_id     = "bedrock_mantle_market",
-            base_url         = BEDROCK_MANTLE_BASE_URL,
-            api_kind         = "openai_compatible",
-            auth_env         = "AWS_BEARER_TOKEN_BEDROCK",
+            discovery_id     = "bedrock_market",
+            base_url         = "bedrock://" .. BEDROCK_REGION,
+            api_kind         = "bedrock",
+            aws_region       = BEDROCK_REGION,
             tier             = "partner",
             source           = "bedrock",
             market_price_cap = { input = 1000, output = 1000 },
-            notes            = "Dynamic Bedrock model offers, priced from AWS's "
-                            .. "public Bedrock Foundation Models price list.",
+            notes            = "Dynamic Bedrock model/profile offers, priced "
+                            .. "from AWS public Bedrock price lists.",
         },
         -- Live discovery of the WHOLE OpenRouter catalog (every model it serves,
         -- straight from /models — no hand curation). Candidates/prices come from
@@ -281,7 +279,7 @@ return {
         -- while this Qwen route returned valid content/tool-call responses.
         ["qwen3-235b-a22b"] = {
             served_by = {
-                { provider = "bedrock_mantle", provider_model_id = "qwen.qwen3-235b-a22b-2507" },
+                { provider = "bedrock", provider_model_id = "qwen.qwen3-vl-235b-a22b" },
                 { provider = "openrouter", provider_model_id = "qwen/qwen3-235b-a22b-2507" },
             },
             capabilities = { context = 262000, supports_tools = true, supports_json_mode = true },
@@ -306,6 +304,7 @@ return {
         ["claude-sonnet-4-6"] = {
             served_by = {
                 { provider = "anthropic",     provider_model_id = "claude-sonnet-4-6" },
+                { provider = "bedrock",       provider_model_id = "us.anthropic.claude-sonnet-4-6" },
                 { provider = "openrouter",    provider_model_id = "anthropic/claude-sonnet-4-6" },
             },
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
@@ -343,6 +342,7 @@ return {
         },
         ["gpt-oss-120b"] = {
             served_by = {
+                { provider = "bedrock",       provider_model_id = "openai.gpt-oss-120b-1:0" },
                 { provider = "openrouter",    provider_model_id = "openai/gpt-oss-120b" },
             },
             capabilities = { context = 128000, supports_tools = true, supports_json_mode = true },
@@ -350,6 +350,7 @@ return {
         },
         ["gemma-3-27b"] = {
             served_by = {
+                { provider = "bedrock",       provider_model_id = "google.gemma-3-27b-it" },
                 { provider = "openrouter",    provider_model_id = "google/gemma-3-27b-it" },
             },
             capabilities = { context = 96000, supports_tools = true, supports_json_mode = true },

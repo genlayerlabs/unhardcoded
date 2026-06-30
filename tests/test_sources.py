@@ -110,9 +110,8 @@ def test_build_registry_includes_openrouter_only_when_configured():
 
 
 def test_build_registry_adds_bedrock_source():
-    cat = {"providers": {"bedrock_mantle": {
-        "source": "bedrock", "api_kind": "openai_compatible",
-        "auth_env": "AWS_BEARER_TOKEN_BEDROCK",
+    cat = {"providers": {"bedrock": {
+        "source": "bedrock", "api_kind": "bedrock",
     }}, "models": {}}
     reg = src.build_registry(cat)
     assert [s.name for s in reg] == ["bedrock"]
@@ -436,19 +435,106 @@ BEDROCK_PRICE_BODY = {
     }},
 }
 
+BEDROCK_GENERAL_PRICE_BODY = {
+    "products": {
+        "QIN": {"attributes": {
+            "model": "Qwen3 Coder Next",
+            "provider": "Qwen",
+            "inferenceType": "Input tokens",
+            "usagetype": "USE1-qwen.qwen3-coder-next-mantle-input-tokens-standard",
+        }},
+        "QOUT": {"attributes": {
+            "model": "Qwen3 Coder Next",
+            "provider": "Qwen",
+            "inferenceType": "Output tokens",
+            "usagetype": "USE1-qwen.qwen3-coder-next-mantle-output-tokens-standard",
+        }},
+    },
+    "terms": {"OnDemand": {
+        "QIN": {"t": {"priceDimensions": {"d": {
+            "description": "$0.0005 per 1K input tokens for Qwen3 Coder Next",
+            "unit": "1K tokens",
+            "pricePerUnit": {"USD": "0.0005"},
+        }}}},
+        "QOUT": {"t": {"priceDimensions": {"d": {
+            "description": "$0.0012 per 1K output tokens for Qwen3 Coder Next",
+            "unit": "1K tokens",
+            "pricePerUnit": {"USD": "0.0012"},
+        }}}},
+    }},
+}
+
+EMPTY_PRICE_BODY = {"products": {}, "terms": {"OnDemand": {}}}
+
+
+class FakeBedrockControlClient:
+    def __init__(self, availability=None):
+        self.model_summaries = [
+            {
+                "modelId": "anthropic.claude-opus-4-8",
+                "modelName": "Claude Opus 4.8",
+                "providerName": "Anthropic",
+            },
+            {
+                "modelId": "qwen.qwen3-coder-next",
+                "modelName": "Qwen3 Coder Next",
+                "providerName": "Qwen",
+            },
+        ]
+        self.availability = availability or {}
+        self.profile_summaries = [{
+            "inferenceProfileId": "us.anthropic.claude-opus-4-8",
+            "status": "ACTIVE",
+            "models": [{
+                "modelArn": (
+                    "arn:aws:bedrock:us-east-1::foundation-model/"
+                    "anthropic.claude-opus-4-8"
+                ),
+            }],
+        }]
+
+    def list_foundation_models(self):
+        return {"modelSummaries": self.model_summaries}
+
+    def list_inference_profiles(self):
+        return {"inferenceProfileSummaries": self.profile_summaries}
+
+    def get_foundation_model_availability(self, modelId):
+        return self.availability.get(modelId) or {
+            "modelId": modelId,
+            "agreementAvailability": {"status": "AVAILABLE"},
+            "authorizationStatus": "AUTHORIZED",
+            "entitlementAvailability": "AVAILABLE",
+            "regionAvailability": "AVAILABLE",
+        }
+
+
+def _bedrock_price_routes(general=BEDROCK_GENERAL_PRICE_BODY,
+                          service=EMPTY_PRICE_BODY,
+                          foundation=BEDROCK_PRICE_BODY):
+    routes = {}
+    for offer, body in (
+        ("AmazonBedrock", general),
+        ("AmazonBedrockService", service),
+        ("AmazonBedrockFoundationModels", foundation),
+    ):
+        routes[f"/{offer}/current/region_index.json"] = FakeResponse(200, {
+            "regions": {"us-east-1": {"currentVersionUrl": f"/prices/{offer}/us-east-1.json"}},
+        })
+        routes[f"/prices/{offer}/us-east-1.json"] = FakeResponse(200, body)
+    return routes
+
 
 def test_bedrock_source_builds_marketplace_offers_from_models_and_prices():
     from sources.bedrock import BedrockSource
 
     catalog = {
         "providers": {
-            "bedrock_mantle_market": {
+            "bedrock_market": {
                 "source": "bedrock",
                 "discovery": "marketplace",
-                "discovery_id": "bedrock_mantle_market",
-                "base_url": "https://bedrock.test/openai/v1",
-                "api_kind": "openai_compatible",
-                "auth_env": "AWS_BEARER_TOKEN_BEDROCK",
+                "discovery_id": "bedrock_market",
+                "api_kind": "bedrock",
             },
         },
         "models": {
@@ -457,44 +543,44 @@ def test_bedrock_source_builds_marketplace_offers_from_models_and_prices():
                 "capabilities": {"context": 200000, "supports_tools": True},
                 "served_by": [],
             },
+            "qwen3-coder-next": {
+                "static_quality_hint": 0.88,
+                "capabilities": {"context": 262000, "supports_tools": True},
+                "served_by": [],
+            },
         },
-    }
-    routes = {
-        "/models": FakeResponse(200, {"data": [{
-            "id": "anthropic.claude-opus-4-8-20260514-v1:0",
-            "context_length": 1000000,
-            "supported_parameters": ["tools", "response_format"],
-        }]}),
-        "/region_index.json": FakeResponse(200, {"regions": {
-            "us-east-1": {"currentVersionUrl": "/prices/us-east-1.json"},
-        }}),
-        "/prices/us-east-1.json": FakeResponse(200, BEDROCK_PRICE_BODY),
     }
     source = BedrockSource(
         catalog,
-        env_get={
-            "AWS_BEARER_TOKEN_BEDROCK": "bt-test",
-            "BEDROCK_REGION": "us-east-1",
-        }.get,
-        client=FakeClient(routes),
+        env_get={"BEDROCK_REGION": "us-east-1"}.get,
+        client=FakeClient(_bedrock_price_routes()),
+        bedrock_client=FakeBedrockControlClient(),
         pricing_base="https://pricing.test",
     )
 
     prices = asyncio.run(source.pricing())
-    offers = source.offers_sync("bedrock_mantle_market")
+    offers = source.offers_sync("bedrock_market")
 
-    assert prices == [{
-        "provider_id": "bedrock_mantle_market",
-        "served_model_id": "anthropic.claude-opus-4-8-20260514-v1:0",
+    by_family = {p["model_family"]: p for p in prices}
+    assert by_family["claude-opus-4-8"] == {
+        "provider_id": "bedrock_market",
+        "served_model_id": "us.anthropic.claude-opus-4-8",
         "model_family": "claude-opus-4-8",
         "price_in_usd_per_mtok": 5.0,
         "price_out_usd_per_mtok": 27.5,
-    }]
-    assert len(offers) == 1
-    offer = offers[0]
-    assert offer["model_family"] == "claude-opus-4-8"
-    assert offer["capabilities"]["context"] == 1000000
-    assert offer["capabilities"]["supports_json_mode"] is True
+    }
+    assert by_family["qwen3-coder-next"] == {
+        "provider_id": "bedrock_market",
+        "served_model_id": "qwen.qwen3-coder-next",
+        "model_family": "qwen3-coder-next",
+        "price_in_usd_per_mtok": 0.5,
+        "price_out_usd_per_mtok": 1.2,
+    }
+    offer_by_family = {o["model_family"]: o for o in offers}
+    assert offer_by_family["claude-opus-4-8"]["wire_model_id"] == \
+        "us.anthropic.claude-opus-4-8"
+    assert offer_by_family["qwen3-coder-next"]["wire_model_id"] == \
+        "qwen.qwen3-coder-next"
 
 
 def test_bedrock_source_keeps_previous_offers_when_price_refresh_fails():
@@ -502,11 +588,10 @@ def test_bedrock_source_keeps_previous_offers_when_price_refresh_fails():
 
     catalog = {
         "providers": {
-            "bedrock_mantle_market": {
+            "bedrock_market": {
                 "source": "bedrock",
                 "discovery": "marketplace",
-                "base_url": "https://bedrock.test/openai/v1",
-                "auth_env": "AWS_BEARER_TOKEN_BEDROCK",
+                "api_kind": "bedrock",
             },
         },
         "models": {
@@ -516,46 +601,69 @@ def test_bedrock_source_keeps_previous_offers_when_price_refresh_fails():
             },
         },
     }
-    client = FakeClient({
-        "/models": FakeResponse(200, {"data": [{
-            "id": "anthropic.claude-opus-4-8-20260514-v1:0",
-        }]}),
-        "/region_index.json": FakeResponse(200, {"regions": {
-            "us-east-1": {"currentVersionUrl": "/prices/us-east-1.json"},
-        }}),
-        "/prices/us-east-1.json": FakeResponse(200, BEDROCK_PRICE_BODY),
-    })
+    client = FakeClient(_bedrock_price_routes(general=EMPTY_PRICE_BODY))
     source = BedrockSource(
         catalog,
-        env_get={
-            "AWS_BEARER_TOKEN_BEDROCK": "bt-test",
-            "BEDROCK_REGION": "us-east-1",
-        }.get,
+        env_get={"BEDROCK_REGION": "us-east-1"}.get,
         client=client,
+        bedrock_client=FakeBedrockControlClient(),
         pricing_base="https://pricing.test",
     )
     asyncio.run(source.pricing())
-    previous = source.offers_sync("bedrock_mantle_market")
+    previous = source.offers_sync("bedrock_market")
     assert previous
 
-    client.routes["/prices/us-east-1.json"] = FakeResponse(500, {})
+    client.routes["/prices/AmazonBedrockFoundationModels/us-east-1.json"] = \
+        FakeResponse(500, {})
 
     with pytest.raises(RuntimeError):
         asyncio.run(source.pricing())
-    assert source.offers_sync("bedrock_mantle_market") == previous
+    assert source.offers_sync("bedrock_market") == previous
 
 
-def test_bedrock_source_is_empty_without_bearer_token():
+def test_bedrock_source_filters_unavailable_account_models():
     from sources.bedrock import BedrockSource
 
-    catalog = {"providers": {"bedrock_mantle_market": {
-        "source": "bedrock", "discovery": "marketplace",
-        "base_url": "https://bedrock.test/openai/v1",
-        "auth_env": "AWS_BEARER_TOKEN_BEDROCK",
-    }}, "models": {}}
-    source = BedrockSource(catalog, env_get={}.get, client=FakeClient({}))
-    assert asyncio.run(source.pricing()) == []
-    assert source.offers_sync("bedrock_mantle_market") == []
+    catalog = {
+        "providers": {"bedrock_market": {
+            "source": "bedrock",
+            "discovery": "marketplace",
+            "api_kind": "bedrock",
+        }},
+        "models": {
+            "claude-opus-4-8": {
+                "static_quality_hint": 0.93,
+                "capabilities": {"context": 200000},
+                "served_by": [],
+            },
+            "qwen3-coder-next": {
+                "static_quality_hint": 0.88,
+                "capabilities": {"context": 262000},
+                "served_by": [],
+            },
+        },
+    }
+    source = BedrockSource(
+        catalog,
+        env_get={"BEDROCK_REGION": "us-east-1"}.get,
+        client=FakeClient(_bedrock_price_routes()),
+        bedrock_client=FakeBedrockControlClient(availability={
+            "anthropic.claude-opus-4-8": {
+                "modelId": "anthropic.claude-opus-4-8",
+                "agreementAvailability": {"status": "NOT_AVAILABLE"},
+                "authorizationStatus": "AUTHORIZED",
+                "entitlementAvailability": "AVAILABLE",
+                "regionAvailability": "AVAILABLE",
+            },
+        }),
+        pricing_base="https://pricing.test",
+    )
+
+    prices = asyncio.run(source.pricing())
+    families = {p["model_family"] for p in prices}
+
+    assert "claude-opus-4-8" not in families
+    assert "qwen3-coder-next" in families
 
 
 def test_pushed_price_lands_in_dump_state():
