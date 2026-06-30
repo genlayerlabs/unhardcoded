@@ -256,12 +256,12 @@ def native_adapter_handlers(timeout_s: float) -> "dict[str, Any]":
 def _price_multiplier_knob(provider_id: str) -> dict:
     return {
         "provider": provider_id, "type": "float", "default": 1.0,
-        "min": 0.0, "max": 100.0, "label": "Effective price multiplier",
-        "help": "Scales this provider's reported list price before ranking — the "
-                "effective vs list factor (a negotiated discount/credits = < 1, a "
-                "risk premium = > 1). 1.0 = list price as-is. Applied at push time, "
-                "so the stored list price stays raw; marketplace/offer prices are "
-                "the live market and are not scaled."}
+        "min": 0.1, "max": 100.0, "label": "Ranking price multiplier",
+        "help": "A FICTITIOUS routing lever: scales this provider's price for "
+                "RANKING only (< 1 = prefer it, > 1 = avoid it). It does NOT change "
+                "billing — cost_usd always settles at the real reported cost or the "
+                "raw list price. 1.0 = no nudge. Marketplace/offer prices are the "
+                "live market and are not scaled."}
 
 
 def provider_knob_schema() -> "dict[str, dict]":

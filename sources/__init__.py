@@ -64,10 +64,11 @@ def push_prices(host: Any, catalog: dict, prices: list[Price]) -> int:
     and price-ceiling filters read). Unmapped or un-cataloged prices are
     skipped — sources never widen the catalog.
 
-    Each price is scaled by the provider's effective-price multiplier (the
-    `<provider>.price_multiplier` operator knob, default 1.0) on the way in, so
-    ranking sees the EFFECTIVE price (negotiated discount/credits/risk premium)
-    while the raw list price stays untouched at the source/table."""
+    Each price is scaled by the provider's `<provider>.price_multiplier` knob
+    (default 1.0) on the way in, so RANKING sees a nudged price (a fictitious
+    routing lever). Billing is unaffected: the raw list price stays untouched at
+    the source/table, and shim._executed_cost_usd divides the same multiplier back
+    out before computing cost_usd — so the lever never distorts spend."""
     import settings  # lazy: settings -> providers, never imports sources back
     pairs = _served_pairs(catalog)
     now = int(time.time())

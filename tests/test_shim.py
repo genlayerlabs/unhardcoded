@@ -548,6 +548,20 @@ def test_executed_cost_usd_rules():
     assert _executed_cost_usd(neg) == 0.0
 
 
+def test_executed_cost_usd_ignores_the_ranking_multiplier(monkeypatch):
+    """The price_multiplier is a fictitious RANKING lever; billing must bill the
+    raw list price. A 0.5 multiplier nudges the ranked price (list 2.0 -> 1.0),
+    but _executed_cost_usd divides it back out, so cost_usd stays at the list
+    price — invariant to the lever (the Axis-7 billing invariant)."""
+    import settings
+    from shim import _executed_cost_usd
+    monkeypatch.setitem(settings._overrides, "openai.price_multiplier", 0.5)
+    # chosen.price = list (2.0/10.0) x multiplier (0.5) = what push_prices wrote
+    result = {"chosen": {"provider_id": "openai", "price_in": 1.0, "price_out": 5.0},
+              "response": {"tokens_in": 1_000_000, "tokens_out": 100_000}}
+    assert _executed_cost_usd(result) == 3.0   # == raw list 2.0/10.0, not 1.5
+
+
 def test_x_router_carries_executed_cost(client, host):
     for prov, fam in _all_pairs(host):
         host.set_mock_response(prov, fam, _ok_response("ok"))
