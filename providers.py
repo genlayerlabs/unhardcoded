@@ -103,6 +103,19 @@ def _codex_source(catalog, env_get):
     return CodexSource(pid) if pid else None
 
 
+def _official_price_source(provider_id):
+    # a direct provider (openai/anthropic/google) priced from its OFFICIAL pricing
+    # page into host_store.provider_prices — see sources/official_pricing.
+    def factory(catalog, env_get):
+        from sources.official_pricing import OfficialPriceSource
+        return OfficialPriceSource(catalog, provider_id, env_get=env_get)
+    return factory
+
+
+def _present(provider_id):
+    return lambda c: provider_id in (c.get("providers") or {})
+
+
 # The provider registry. Each entry composes the aspects above; absent aspects
 # are simply None/empty (composition, not inheritance — nothing is forced).
 PROVIDERS: "list[Provider]" = [
@@ -168,8 +181,15 @@ PROVIDERS: "list[Provider]" = [
                                or str(pid).startswith("bedrock")),
         api_kind="bedrock", adapter=_bedrock_adapter,
     ),
-    Provider("anthropic", api_kind="anthropic", adapter=_anthropic_adapter),
-    Provider("google", api_kind="google", adapter=_google_adapter),
+    # Direct first-party providers: no marketplace catalog of their own, but a
+    # price source feeding host_store.provider_prices from each official pricing
+    # page, so they can compete on cost instead of defaulting to +inf.
+    Provider("openai", source=_official_price_source("openai"),
+             enabled=_present("openai")),
+    Provider("anthropic", api_kind="anthropic", adapter=_anthropic_adapter,
+             source=_official_price_source("anthropic"), enabled=_present("anthropic")),
+    Provider("google", api_kind="google", adapter=_google_adapter,
+             source=_official_price_source("google"), enabled=_present("google")),
     # codex: its source is built like any provider's (via _codex_source); only the
     # ADAPTER and the observe/bind coupling (the source watching its own backend's
     # quota traffic) are wired imperatively in serve.py — that, not the source, is

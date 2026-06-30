@@ -1185,7 +1185,7 @@ def test_codex_source_without_parseable_headers_has_none_value():
 
 
 def test_build_source_registry_adds_codex_for_openai_codex_api_kind():
-    cat = {"providers": {"openai": {"api_kind": "openai_codex"}}, "models": {}}
+    cat = {"providers": {"openai_codex": {"api_kind": "openai_codex"}}, "models": {}}
     reg = providers.build_source_registry(cat)
     assert [s.name for s in reg] == ["codex"]
     assert reg[0].poll_interval_s == 30             # local self-refresh tick (no endpoint probe)
