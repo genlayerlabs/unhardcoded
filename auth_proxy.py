@@ -24,6 +24,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 
 import host_store
 from env_secrets import load_env_secrets
+from shim import _CACHE_READ_FACTOR   # the billing cache-read discount — one source
 
 # Operator-managed keys/consumer-hashes live on the PVC (.env.secrets) and are
 # the source of truth — load them over the container env BEFORE reading any of
@@ -2457,9 +2458,6 @@ async def dashboard_delete_codex_account(request: Request, name: str) -> Respons
     return JSONResponse(content={"ok": True, "account": name, "applied_live": applied_live})
 
 
-_CACHE_READ_FACTOR = 0.1   # mirrors shim._executed_cost_usd cache-read discount
-
-
 def _cost_accuracy_rows(routes, ema, mult_of, *, min_calls=20, threshold=0.15):
     """Per-provider measured-vs-list cost, joining the ledger aggregate (`routes`,
     from host_store.cost_by_route) with the live ranked prices (`ema`,
@@ -2487,25 +2485,33 @@ def _cost_accuracy_rows(routes, ema, mult_of, *, min_calls=20, threshold=0.15):
                     + r["tokens_out"] * list_out) / 1e6
         agg = roll.setdefault(r["provider"], {
             "provider": r["provider"], "calls": 0, "tokens_total": 0,
-            "measured_usd": 0.0, "expected_usd": 0.0})
+            "measured_usd": 0.0, "expected_usd": 0.0, "n_reported": 0})
         agg["calls"] += r["calls"]
         agg["tokens_total"] += r["tokens_in"] + r["tokens_out"]
         agg["measured_usd"] += r["cost_usd"]
         agg["expected_usd"] += expected
+        agg["n_reported"] += r.get("n_reported", 0)
     rows = []
     for a in roll.values():
         if a["expected_usd"] <= 0 or a["tokens_total"] <= 0:
             continue
         mtok = a["tokens_total"] / 1e6
         deviation = a["measured_usd"] / a["expected_usd"]
+        # 'reported' = the provider's own authoritative cost (independent signal);
+        # 'derived' = cost computed from the same list price -> deviation ~1.0 by
+        # construction, any drift is reprice noise. Only flag drift where the
+        # signal is real, else the badge is non-actionable and trains the operator
+        # to ignore it.
+        signal = "reported" if 2 * a["n_reported"] >= a["calls"] else "derived"
         rows.append({
-            "provider": a["provider"], "calls": a["calls"],
+            "provider": a["provider"], "calls": a["calls"], "signal": signal,
             "measured_usd_per_mtok": round(a["measured_usd"] / mtok, 4),
             "expected_usd_per_mtok": round(a["expected_usd"] / mtok, 4),
             "measured_usd": round(a["measured_usd"], 4),
             "expected_usd": round(a["expected_usd"], 4),
             "deviation": round(deviation, 3),
-            "warn": a["calls"] >= min_calls and abs(deviation - 1) >= threshold,
+            "warn": signal == "reported" and a["calls"] >= min_calls
+            and abs(deviation - 1) >= threshold,
         })
     rows.sort(key=lambda x: abs(x["deviation"] - 1), reverse=True)
     return rows
@@ -2810,13 +2816,14 @@ async def proxy(path: str, request: Request) -> Response:
     tokens_in = tokens_out = tokens_total = 0
     tokens_cached = None
     cost_usd = None
+    cost_basis = None
     decision_trace = None
     error_type = error_code = error_message = None
     record_in_finally = True
 
     def _finish():
         latency_ms = round((time.perf_counter() - started) * 1000, 1)
-        _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
+        _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
         _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
 
     try:
@@ -2842,7 +2849,7 @@ async def proxy(path: str, request: Request) -> Response:
             async def _passthrough():
                 nonlocal provider, model_family, served_model_id, served_by, \
                     tokens_in, tokens_out, tokens_total, tokens_cached, cost_usd, \
-                    decision_trace, error_type, error_code, error_message
+                    cost_basis, decision_trace, error_type, error_code, error_message
                 tail = bytearray()
                 try:
                     async for chunk in r.aiter_raw():
@@ -2862,6 +2869,7 @@ async def proxy(path: str, request: Request) -> Response:
                             decision_trace = xr.get("decision_trace") if isinstance(xr.get("decision_trace"), dict) else None
                             if isinstance(xr.get("cost_usd"), (int, float)):
                                 cost_usd = float(xr["cost_usd"])
+                            cost_basis = xr.get("cost_basis")
                             if isinstance(xr.get("tokens_cached"), int):
                                 tokens_cached = xr["tokens_cached"]
                         usage = meta.get("usage")
@@ -2892,6 +2900,7 @@ async def proxy(path: str, request: Request) -> Response:
                     decision_trace = xr.get("decision_trace") if isinstance(xr.get("decision_trace"), dict) else None
                     if isinstance(xr.get("cost_usd"), (int, float)):
                         cost_usd = float(xr["cost_usd"])
+                    cost_basis = xr.get("cost_basis")
                     if isinstance(xr.get("tokens_cached"), int):
                         tokens_cached = xr["tokens_cached"]
                 usage = parsed.get("usage") if isinstance(parsed, dict) else None
@@ -3839,7 +3848,7 @@ def _dashboard_html() -> str:
       <div class='card span6'><div class='toolbar'><div class='label'>By model family</div></div><div id='anByModel'></div></div>
       <div class='card span6'><div class='toolbar'><div class='label'>By consumer</div></div><div id='anByConsumer'></div></div>
       <div class='card span6'><div class='toolbar'><div class='label'>By status</div></div><div id='anByStatus'></div></div>
-      <div class='card span12'><div class='toolbar'><div class='label'>Cost accuracy</div><span class='muted small' style='margin-left:auto'>measured spend vs advertised list price · drift &gt; 15% (≥ 20 calls) flags</span></div><div id='anCostAccuracy'></div></div>
+      <div class='card span12'><div class='toolbar'><div class='label'>Cost accuracy</div><span class='muted small' style='margin-left:auto'>measured spend vs advertised list · drift flags only where the provider reports its own cost (≥ 20 calls)</span></div><div id='anCostAccuracy'></div></div>
     </section>
 
     <section class='grid hidden page' id='consumersPage'>
@@ -3953,7 +3962,7 @@ function anCols(){return [{label:'Name',f:r=>`<span class="pill">${esc(r.name)}<
 function fillFilter(id,opts,allLabel){const sel=$(id);if(!sel)return;const cur=sel.value;sel.innerHTML=`<option value="">${esc(allLabel)}</option>`+(opts||[]).map(o=>`<option value="${esc(o)}"${o===cur?' selected':''}>${esc(o)}</option>`).join('');if([...sel.options].some(o=>o.value===cur))sel.value=cur}
 function renderSeries(days){if(!days||!days.length){$('anSeries').innerHTML='<div class="muted small">No data in this window.</div>';return}const rows=days.slice(0,30);const max=Math.max(1,...rows.map(d=>Number(d.requests||0)));$('anSeries').innerHTML=rows.map(d=>{const r=Number(d.requests||0),w=Math.round(r/max*100);return `<div style="display:flex;align-items:center;gap:10px;margin:3px 0;font-size:12px"><span class="muted" style="width:88px;flex:none">${esc(d.date||d.month||'—')}</span><div style="flex:1;background:rgba(255,255,255,.04);border-radius:4px;height:14px;overflow:hidden"><div style="width:${w}%;height:100%;background:linear-gradient(90deg,#7170ff,#5e6ad2)"></div></div><span style="width:54px;text-align:right;flex:none">${fmt(r)}</span><span class="muted" style="width:78px;text-align:right;flex:none">$${Number(d.cost_usd||0).toFixed(4)}</span></div>`}).join('')}
 function renderAnalytics(d){const t=d.totals||{};const req=Number(t.requests||0),err=Number(t.errors||0);$('anRequests').textContent=fmt(req);$('anReqSub').textContent=`${fmt(err)} errors · ${fmt(t.rejects||0)} rejects`;$('anSpend').textContent='$'+Number(t.cost_usd||0).toFixed(4);$('anSpendSub').textContent=`over ${fmt(req)} requests`;$('anTokens').textContent=fmt(t.tokens_total);$('anTokSub').textContent=`in ${fmt(t.tokens_in)} · out ${fmt(t.tokens_out)}`;const sr=req?(req-err)/req:null;$('anSuccess').textContent=sr==null?'—':Math.round(sr*100)+'%';$('anSuccess').className='metric '+(sr==null?'':sr>=0.95?'ok':sr>=0.8?'warn':'bad');$('anSuccessSub').textContent=`${fmt(req-err)} ok / ${fmt(req)}`;$('anByProvider').innerHTML=table(counterRows(d.by_provider),anCols());$('anByModel').innerHTML=table(counterRows(d.by_model_family),anCols());$('anByConsumer').innerHTML=table(counterRows(d.by_caller),anCols());$('anByStatus').innerHTML=table(Object.entries(d.by_status||{}).map(([name,count])=>({name,requests:count})),[{label:'Status',f:r=>`<span class="pill">${esc(r.name)}</span>`},{label:'Count',cls:'right',f:r=>fmt(r.requests)}]);renderSeries(d.daily_totals||[]);const fo=d.filter_options||{};fillFilter('anProvider',fo.providers,'All providers');fillFilter('anModel',fo.models,'All models')}
-function renderCostAccuracy(rows){const el=$('anCostAccuracy');if(!el)return;if(!rows||!rows.length){el.innerHTML='<div class="empty">No priced traffic in the window yet.</div>';return}const drift=r=>{const pct=Math.round((r.deviation-1)*100);const cls=r.warn?(pct>0?'bad':'warn'):'muted';const sign=pct>0?'+':'';return `<span class="${cls}">${sign}${pct}%</span>${r.warn?' <span class="pill warn">drift</span>':''}`};el.innerHTML=table(rows,[{label:'Provider',f:r=>`<b>${esc(r.provider)}</b>`},{label:'Effective $/Mtok',cls:'right',f:r=>'$'+Number(r.measured_usd_per_mtok).toFixed(3)},{label:'List $/Mtok',cls:'right',f:r=>'$'+Number(r.expected_usd_per_mtok).toFixed(3)},{label:'Drift',cls:'right',f:drift},{label:'Calls',cls:'right',f:r=>fmt(r.calls)}])}
+function renderCostAccuracy(rows){const el=$('anCostAccuracy');if(!el)return;if(!rows||!rows.length){el.innerHTML='<div class="empty">No priced traffic in the window yet.</div>';return}const drift=r=>{const pct=Math.round((r.deviation-1)*100);const cls=r.warn?(pct>0?'bad':'warn'):'muted';const sign=pct>0?'+':'';return `<span class="${cls}">${sign}${pct}%</span>${r.warn?' <span class="pill warn">drift</span>':''}`};const sig=r=>r.signal==='reported'?'<span class="pill" title="provider reports its own cost — drift is real signal">reported</span>':'<span class="muted small" title="cost derived from the list price — drift is reprice noise, not a discount">derived</span>';el.innerHTML=table(rows,[{label:'Provider',f:r=>`<b>${esc(r.provider)}</b> ${sig(r)}`},{label:'Effective $/Mtok',cls:'right',f:r=>'$'+Number(r.measured_usd_per_mtok).toFixed(3)},{label:'List $/Mtok',cls:'right',f:r=>'$'+Number(r.expected_usd_per_mtok).toFixed(3)},{label:'Drift',cls:'right',f:drift},{label:'Calls',cls:'right',f:r=>fmt(r.calls)}])}
 async function loadCostAccuracy(){try{const r=await fetch('/dashboard/api/cost-accuracy',{credentials:'same-origin'});if(!r.ok)return;const d=await r.json();renderCostAccuracy(d.rows||[])}catch(e){}}
 function render(d){$('login').classList.add('hidden');applyViewerMode(d);document.querySelectorAll('.page').forEach(el=>el.classList.add('hidden'));$(({overview:'app',consumers:'consumersPage',providerKeys:'providerKeysPage',keyUsage:'keyUsagePage',market:'marketPage',builder:'builderPage',activity:'activityPage',config:'configPage'})[activeTab]||'app').classList.remove('hidden');syncConsumers(d.consumers||[],d.selected_consumer||'');renderAnalytics(d);renderConsumers(d.keys||[]);renderConsumerDetail(d);renderProviderKeys(d);let recent=(d.recent||[]);if(activityKind)recent=recent.filter(r=>r.event===activityKind);renderActivity(recent.slice(0,60))}
 async function login(){try{clearErr();const r=await fetch('/dashboard/login',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({password:$('password').value})});if(!r.ok)throw new Error('login failed');$('password').value='';toast('Logged in');load()}catch(e){showErr(e.message)}}async function apiKeyLogin(){try{clearErr();const r=await fetch('/dashboard/login',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({api_key:$('apiKeyLogin').value})});if(!r.ok)throw new Error('API key login failed');$('apiKeyLogin').value='';activeTab='consumers';toast('Logged in');load()}catch(e){showErr(e.message)}}async function logout(){await fetch('/dashboard/logout',{method:'POST',credentials:'same-origin'});showLogin()}async function revealKeys(){try{const c=$('revealConsumer').value.trim();const r=await fetch('/dashboard/api/keys/reveal?consumer='+encodeURIComponent(c),{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`reveal ${r.status}`);const d=await r.json();$('revealKeyBox').style.display='block';$('revealKeyValue').value=(d.keys||[]).map(k=>k.api_key).join('\\n');$('revealMeta').textContent=d.message||`${(d.keys||[]).length} recoverable · ${d.hash_only_count||0} hash-only`;toast('Reveal loaded')}catch(e){showErr(e.message)}}
