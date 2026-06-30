@@ -2457,6 +2457,87 @@ async def dashboard_delete_codex_account(request: Request, name: str) -> Respons
     return JSONResponse(content={"ok": True, "account": name, "applied_live": applied_live})
 
 
+_CACHE_READ_FACTOR = 0.1   # mirrors shim._executed_cost_usd cache-read discount
+
+
+def _cost_accuracy_rows(routes, ema, mult_of, *, min_calls=20, threshold=0.15):
+    """Per-provider measured-vs-list cost, joining the ledger aggregate (`routes`,
+    from host_store.cost_by_route) with the live ranked prices (`ema`,
+    "<provider>|<family>" -> {price_in, price_out}). The list price is the ranked
+    price with the fictitious price_multiplier divided back out (mult_of(provider)),
+    so the comparison is measured-spend vs advertised-list. A route with no known
+    or non-positive price is skipped (nothing to compare). Pure (no IO) so the
+    join/deviation logic is unit-tested directly."""
+    roll: dict[str, dict] = {}
+    for r in routes:
+        m = ema.get(f"{r['provider']}|{r['family']}")
+        if not isinstance(m, dict):
+            continue
+        mult = mult_of(r["provider"]) or 1.0
+        try:
+            list_in = float(m.get("price_in")) / mult
+            list_out = float(m.get("price_out")) / mult
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+        if list_in < 0 or list_out < 0:        # unpriced sentinel / +inf
+            continue
+        uncached = max(0, r["tokens_in"] - r["tokens_cached"])
+        expected = (uncached * list_in
+                    + r["tokens_cached"] * list_in * _CACHE_READ_FACTOR
+                    + r["tokens_out"] * list_out) / 1e6
+        agg = roll.setdefault(r["provider"], {
+            "provider": r["provider"], "calls": 0, "tokens_total": 0,
+            "measured_usd": 0.0, "expected_usd": 0.0})
+        agg["calls"] += r["calls"]
+        agg["tokens_total"] += r["tokens_in"] + r["tokens_out"]
+        agg["measured_usd"] += r["cost_usd"]
+        agg["expected_usd"] += expected
+    rows = []
+    for a in roll.values():
+        if a["expected_usd"] <= 0 or a["tokens_total"] <= 0:
+            continue
+        mtok = a["tokens_total"] / 1e6
+        deviation = a["measured_usd"] / a["expected_usd"]
+        rows.append({
+            "provider": a["provider"], "calls": a["calls"],
+            "measured_usd_per_mtok": round(a["measured_usd"] / mtok, 4),
+            "expected_usd_per_mtok": round(a["expected_usd"] / mtok, 4),
+            "measured_usd": round(a["measured_usd"], 4),
+            "expected_usd": round(a["expected_usd"], 4),
+            "deviation": round(deviation, 3),
+            "warn": a["calls"] >= min_calls and abs(deviation - 1) >= threshold,
+        })
+    rows.sort(key=lambda x: abs(x["deviation"] - 1), reverse=True)
+    return rows
+
+
+@app.get("/dashboard/api/cost-accuracy")
+async def dashboard_cost_accuracy(request: Request) -> Response:
+    """Measured effective cost (from the calls ledger) vs the advertised list price
+    per provider, with a drift flag. Read-only observability — never touches
+    routing. The signal is strongest for providers that report their own cost
+    (e.g. openrouter); a compute-from-price provider reads ~1.0 by construction.
+    Admin-only."""
+    caller, error = _require_admin_dashboard_caller(request)
+    if error:
+        return error
+    try:
+        window_s = int(request.query_params.get("window_s") or 86_400)
+    except ValueError:
+        window_s = 86_400
+    window_s = max(3_600, min(window_s, 90 * 86_400))
+    rt = await _fetch_router_runtime() or {}
+    ema = rt.get("ema_metrics") or {}
+
+    def mult_of(provider: str) -> float:
+        key = f"{provider}.price_multiplier"
+        return settings.get(key) if key in settings.SCHEMA else 1.0
+
+    rows = _cost_accuracy_rows(host_store.cost_by_route(window_s), ema, mult_of)
+    return JSONResponse(content={"rows": rows, "window_s": window_s,
+                                 "generated_at": int(time.time())})
+
+
 @app.get("/dashboard/api/config")
 async def dashboard_get_config(request: Request) -> Response:
     """Operator-tunable knobs per provider (antseed top-N, codex scarcity ramp,
@@ -3758,6 +3839,7 @@ def _dashboard_html() -> str:
       <div class='card span6'><div class='toolbar'><div class='label'>By model family</div></div><div id='anByModel'></div></div>
       <div class='card span6'><div class='toolbar'><div class='label'>By consumer</div></div><div id='anByConsumer'></div></div>
       <div class='card span6'><div class='toolbar'><div class='label'>By status</div></div><div id='anByStatus'></div></div>
+      <div class='card span12'><div class='toolbar'><div class='label'>Cost accuracy</div><span class='muted small' style='margin-left:auto'>measured spend vs advertised list price · drift &gt; 15% (≥ 20 calls) flags</span></div><div id='anCostAccuracy'></div></div>
     </section>
 
     <section class='grid hidden page' id='consumersPage'>
@@ -3858,7 +3940,7 @@ function renderConsumers(keys){const q=($('consumerSearch')?.value||'').toLowerC
 function pickConsumer(c){scopeConsumer(c)}function scopeConsumer(c){$('consumer').value=c;activeTab='consumers';showPage('consumers');load()}
 function renderConsumerDetail(d){const c=d.selected_consumer;if(!c){$('consumerDetail').innerHTML='<div class="cardPad empty">Click a consumer row to see usage, route breakdowns, and recent activity in this same view.</div>';return}const row=(d.keys||[]).find(k=>k.consumer===c)||{};const stats=row.stats||{};const recent=(d.recent||[]).slice(0,40);$('consumerDetail').innerHTML=`<div class="toolbar"><div><div class="label">${esc(c)} usage</div><div class="sub">${esc((d.timeframe||{}).selected||'all')} · ${fmt(stats.requests||0)} requests · last seen ${ts(stats.last_seen)}</div></div><div class="toolbarRight">${d.viewer_role==='consumer'?'':`<button class="btn" onclick="openDrawer(${jsarg(c)},'settings')">Settings</button><button class="btn" onclick="openDrawer(${jsarg(c)},'reveal')">Reveal key</button><button class="btn primary" onclick="openDrawer(${jsarg(c)},'create')">Generate key</button>`}</div></div><div class="cardsOnly cardPad"><div class="card cardPad span3"><div class="label">Requests</div><div class="metric">${fmt(stats.requests||0)}</div><div class="statSub">errors ${fmt(stats.errors||0)}</div></div><div class="card cardPad span3"><div class="label">Tokens</div><div class="metric">${fmt(stats.tokens_total||0)}</div><div class="statSub">in ${fmt(stats.tokens_in||0)} · out ${fmt(stats.tokens_out||0)}</div></div><div class="card cardPad span3"><div class="label">Est. spend</div><div class="metric">${money(stats.cost_usd)}</div><div class="statSub">priced from live price book</div></div><div class="card cardPad span3"><div class="label">Avg latency</div><div class="metric">${fmt(Math.round(stats.latency_ms_avg||0))}</div><div class="statSub">max ${fmt(Math.round(stats.latency_ms_max||0))} ms</div></div><div class="card cardPad span3"><div class="label">Status</div><div class="metric ${row.status==='active'?'ok':'warn'}">${esc(row.status||'—')}</div><div class="statSub">routes ${esc(row.allowed_routes||'all')}</div></div><div class="card span6"><div class="toolbar"><div class="label">Routes</div></div>${table(counterRows(d.by_route),cols())}</div><div class="card span6"><div class="toolbar"><div class="label">Providers</div></div>${table(counterRows(d.by_provider),cols())}</div><div class="card span12"><div class="toolbar"><div class="label">Recent activity</div></div>${table(recent,[{label:'Time',f:r=>ts(r.ts)},{label:'Status',cls:'right',f:r=>esc(r.status||'—')},{label:'Route',f:r=>esc(r.requested_model||r.route||'—')},{label:'Provider',f:r=>esc(r.provider||'—')},{label:'Model',f:r=>esc(r.served_model_id||'—')},{label:'Tokens',cls:'right',f:r=>fmt(r.tokens_total||0)},{label:'Error',f:r=>esc(r.error_code||r.error_type||'—')}])}</div></div>`}
 function fillConsumerFields(c){['settingsConsumer','revealConsumer','newKeyConsumer','revokeConsumer'].forEach(id=>$(id).value=c||'');const row=(lastStats.keys||[]).find(k=>k.consumer===c)||{};$('settingsStatus').value=row.status||'active';$('settingsAllowedRoutes').value=row.allowed_routes==='all'?'':(row.allowed_routes||'');$('settingsRate').value=row.rate_per_min||'';$('settingsBurst').value=row.burst||'';$('drawerTitle').textContent=c||'Consumer controls';$('drawerSub').textContent=row.consumer?`${row.status||'inactive'} · ${row.key_storage||'key storage unknown'}`:'Manage settings and keys'}function openDrawer(c,mode){fillConsumerFields(c);$('drawerShade').classList.add('open');if(mode==='reveal')setTimeout(()=>$('revealKeys').focus(),0);if(mode==='create')setTimeout(()=>$('createKey').focus(),0);if(mode==='settings')setTimeout(()=>$('settingsStatus').focus(),0)}function closeDrawer(){$('drawerShade').classList.remove('open')}
-async function load(){try{clearErr();const c=$('consumer').value;const tf=$('timeframe').value||'all';const qs=new URLSearchParams();if(c)qs.set('consumer',c);qs.set('timeframe',tf);const pv=$('anProvider')?$('anProvider').value:'';const md=$('anModel')?$('anModel').value:'';if(pv)qs.set('provider',pv);if(md)qs.set('model',md);const r=await fetch('/dashboard/api/stats?'+qs.toString(),{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`stats ${r.status}`);const d=await r.json();lastStats=d;render(d)}catch(e){showErr(e.message)}}
+async function load(){try{clearErr();const c=$('consumer').value;const tf=$('timeframe').value||'all';const qs=new URLSearchParams();if(c)qs.set('consumer',c);qs.set('timeframe',tf);const pv=$('anProvider')?$('anProvider').value:'';const md=$('anModel')?$('anModel').value:'';if(pv)qs.set('provider',pv);if(md)qs.set('model',md);const r=await fetch('/dashboard/api/stats?'+qs.toString(),{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`stats ${r.status}`);const d=await r.json();lastStats=d;render(d);loadCostAccuracy()}catch(e){showErr(e.message)}}
 function applyViewerMode(d){const consumerMode=d.viewer_role==='consumer';$('consumer').classList.toggle('hidden',consumerMode);$('newConsumerKey').classList.toggle('hidden',consumerMode);$('tabMarket').classList.toggle('hidden',consumerMode);$('tabProviderKeys').classList.toggle('hidden',consumerMode);$('tabKeyUsage').classList.add('hidden');if(consumerMode&&(activeTab==='policies'||activeTab==='market'||activeTab==='providerKeys'))activeTab='consumers';if(consumerMode)$('pageSub').textContent='Your API-key-scoped usage and activity.'}
 function renderProviderKeys(d){const pk=d.provider_keys||{};const rows=(pk.rows||[]).map(r=>({...r,last_seen_text:ts(r.last_seen),requests:r.usage?.requests||0,errors:r.usage?.errors||0,tokens:r.usage?.tokens_total||0,latency:r.usage?.latency_ms_avg||0,cost:r.estimated_cost_usd||0}));$('providerKeys').innerHTML=table(rows,[{label:'Provider',f:r=>`<div class="rowTitle">${esc(r.provider)}</div><div class="rowMeta">${esc(r.api_kind||'—')} · ${esc(r.tier||'—')}</div>`},{label:'Credential / wallet',f:r=>r.wallet?walletCell(r.wallet):`<span class="pill ${r.credential_status==='missing'?'bad':'ok'}">${esc(r.credential_status)}</span><div class="rowMeta">${esc(r.auth_env||r.auth_kind||'none')}${r.key_fingerprint?' · '+esc(r.key_fingerprint):''}</div>${(r.key_present||r.credential_status==='oauth_configured'||r.auth_env)?`<div class="actions" style="margin-top:4px">${(r.key_present||r.credential_status==='oauth_configured')?`<button class="btn iconBtn ghost" title="Reveal key" onclick="revealProviderKey(${jsarg(r.provider)},this)">👁</button><button class="btn iconBtn ghost" title="Copy key to clipboard" onclick="copyProviderKey(${jsarg(r.provider)})">⧉</button>`:''}${r.auth_env?`<button class="btn iconBtn ghost" title="Set/replace key" onclick="editProviderKey(${jsarg(r.provider)})">✎</button>`:''}</div>`:''}`},{label:'Requests',cls:'right',f:r=>fmt(r.requests)},{label:'Errors',cls:'right',f:r=>fmt(r.errors)},{label:'Tokens',cls:'right',f:r=>fmt(r.tokens)},{label:'Est. cost',cls:'right',f:r=>r.cost?('$'+Number(r.cost).toFixed(4)):'—'},{label:'Last seen',f:r=>esc(r.last_seen_text)},{label:'Last route/model',f:r=>`${esc(r.last_route||'—')}<div class="rowMeta">${esc(r.last_model_family||'')}</div>`}])}
 function actStep(e,n){const skip=e.event==='skipped';const ok=!skip&&!e.error_kind;const err=`${esc(e.error_kind||'')}${e.http_status?` (${esc(e.http_status)})`:''}${e.error_message?': '+esc(String(e.error_message).slice(0,200)):''}`;const dot=skip?'<span class="dot"></span>':`<span class="dot ${ok?'ok':'bad'}"></span>`;const tag=skip?'<span class="muted small">skipped</span>':ok?'<span class="ok small">ok ✓</span>':`<span class="bad small">${err}</span>`;return `<div class="actStep"><span class="stepN">${n}</span>${dot}<code>${esc(e.provider_id||e.provider||'—')}</code>${e.model_family?`<span class="muted small">${esc(e.model_family)}</span>`:''}${tag}</div>`}
@@ -3871,6 +3953,8 @@ function anCols(){return [{label:'Name',f:r=>`<span class="pill">${esc(r.name)}<
 function fillFilter(id,opts,allLabel){const sel=$(id);if(!sel)return;const cur=sel.value;sel.innerHTML=`<option value="">${esc(allLabel)}</option>`+(opts||[]).map(o=>`<option value="${esc(o)}"${o===cur?' selected':''}>${esc(o)}</option>`).join('');if([...sel.options].some(o=>o.value===cur))sel.value=cur}
 function renderSeries(days){if(!days||!days.length){$('anSeries').innerHTML='<div class="muted small">No data in this window.</div>';return}const rows=days.slice(0,30);const max=Math.max(1,...rows.map(d=>Number(d.requests||0)));$('anSeries').innerHTML=rows.map(d=>{const r=Number(d.requests||0),w=Math.round(r/max*100);return `<div style="display:flex;align-items:center;gap:10px;margin:3px 0;font-size:12px"><span class="muted" style="width:88px;flex:none">${esc(d.date||d.month||'—')}</span><div style="flex:1;background:rgba(255,255,255,.04);border-radius:4px;height:14px;overflow:hidden"><div style="width:${w}%;height:100%;background:linear-gradient(90deg,#7170ff,#5e6ad2)"></div></div><span style="width:54px;text-align:right;flex:none">${fmt(r)}</span><span class="muted" style="width:78px;text-align:right;flex:none">$${Number(d.cost_usd||0).toFixed(4)}</span></div>`}).join('')}
 function renderAnalytics(d){const t=d.totals||{};const req=Number(t.requests||0),err=Number(t.errors||0);$('anRequests').textContent=fmt(req);$('anReqSub').textContent=`${fmt(err)} errors · ${fmt(t.rejects||0)} rejects`;$('anSpend').textContent='$'+Number(t.cost_usd||0).toFixed(4);$('anSpendSub').textContent=`over ${fmt(req)} requests`;$('anTokens').textContent=fmt(t.tokens_total);$('anTokSub').textContent=`in ${fmt(t.tokens_in)} · out ${fmt(t.tokens_out)}`;const sr=req?(req-err)/req:null;$('anSuccess').textContent=sr==null?'—':Math.round(sr*100)+'%';$('anSuccess').className='metric '+(sr==null?'':sr>=0.95?'ok':sr>=0.8?'warn':'bad');$('anSuccessSub').textContent=`${fmt(req-err)} ok / ${fmt(req)}`;$('anByProvider').innerHTML=table(counterRows(d.by_provider),anCols());$('anByModel').innerHTML=table(counterRows(d.by_model_family),anCols());$('anByConsumer').innerHTML=table(counterRows(d.by_caller),anCols());$('anByStatus').innerHTML=table(Object.entries(d.by_status||{}).map(([name,count])=>({name,requests:count})),[{label:'Status',f:r=>`<span class="pill">${esc(r.name)}</span>`},{label:'Count',cls:'right',f:r=>fmt(r.requests)}]);renderSeries(d.daily_totals||[]);const fo=d.filter_options||{};fillFilter('anProvider',fo.providers,'All providers');fillFilter('anModel',fo.models,'All models')}
+function renderCostAccuracy(rows){const el=$('anCostAccuracy');if(!el)return;if(!rows||!rows.length){el.innerHTML='<div class="empty">No priced traffic in the window yet.</div>';return}const drift=r=>{const pct=Math.round((r.deviation-1)*100);const cls=r.warn?(pct>0?'bad':'warn'):'muted';const sign=pct>0?'+':'';return `<span class="${cls}">${sign}${pct}%</span>${r.warn?' <span class="pill warn">drift</span>':''}`};el.innerHTML=table(rows,[{label:'Provider',f:r=>`<b>${esc(r.provider)}</b>`},{label:'Effective $/Mtok',cls:'right',f:r=>'$'+Number(r.measured_usd_per_mtok).toFixed(3)},{label:'List $/Mtok',cls:'right',f:r=>'$'+Number(r.expected_usd_per_mtok).toFixed(3)},{label:'Drift',cls:'right',f:drift},{label:'Calls',cls:'right',f:r=>fmt(r.calls)}])}
+async function loadCostAccuracy(){try{const r=await fetch('/dashboard/api/cost-accuracy',{credentials:'same-origin'});if(!r.ok)return;const d=await r.json();renderCostAccuracy(d.rows||[])}catch(e){}}
 function render(d){$('login').classList.add('hidden');applyViewerMode(d);document.querySelectorAll('.page').forEach(el=>el.classList.add('hidden'));$(({overview:'app',consumers:'consumersPage',providerKeys:'providerKeysPage',keyUsage:'keyUsagePage',market:'marketPage',builder:'builderPage',activity:'activityPage',config:'configPage'})[activeTab]||'app').classList.remove('hidden');syncConsumers(d.consumers||[],d.selected_consumer||'');renderAnalytics(d);renderConsumers(d.keys||[]);renderConsumerDetail(d);renderProviderKeys(d);let recent=(d.recent||[]);if(activityKind)recent=recent.filter(r=>r.event===activityKind);renderActivity(recent.slice(0,60))}
 async function login(){try{clearErr();const r=await fetch('/dashboard/login',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({password:$('password').value})});if(!r.ok)throw new Error('login failed');$('password').value='';toast('Logged in');load()}catch(e){showErr(e.message)}}async function apiKeyLogin(){try{clearErr();const r=await fetch('/dashboard/login',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({api_key:$('apiKeyLogin').value})});if(!r.ok)throw new Error('API key login failed');$('apiKeyLogin').value='';activeTab='consumers';toast('Logged in');load()}catch(e){showErr(e.message)}}async function logout(){await fetch('/dashboard/logout',{method:'POST',credentials:'same-origin'});showLogin()}async function revealKeys(){try{const c=$('revealConsumer').value.trim();const r=await fetch('/dashboard/api/keys/reveal?consumer='+encodeURIComponent(c),{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`reveal ${r.status}`);const d=await r.json();$('revealKeyBox').style.display='block';$('revealKeyValue').value=(d.keys||[]).map(k=>k.api_key).join('\\n');$('revealMeta').textContent=d.message||`${(d.keys||[]).length} recoverable · ${d.hash_only_count||0} hash-only`;toast('Reveal loaded')}catch(e){showErr(e.message)}}
 function buildKeyHandoff(apiKey,consumer){

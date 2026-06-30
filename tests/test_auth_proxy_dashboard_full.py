@@ -1507,3 +1507,45 @@ def test_consumer_skill_endpoint_authed_by_consumer_key(monkeypatch):
     assert r.status_code == 200
     assert "text/markdown" in r.headers["content-type"]
     assert "filename=SKILL.md" in r.headers["content-disposition"]
+
+
+def test_cost_accuracy_rows_flags_drift_and_divides_out_multiplier():
+    """The cost-accuracy join: measured spend vs advertised list (= ranked price
+    with the fictitious multiplier divided back out), drift-flagged per provider."""
+    ema = {
+        "openrouter|gpt-5.5": {"price_in": 2.0, "price_out": 10.0},   # list 2/10
+        "openai|gpt-5.4": {"price_in": 2.0, "price_out": 10.0},
+        "disc|fam": {"price_in": 4.0, "price_out": 20.0},             # = list 2/10 x2.0 mult
+    }
+    mult = {"disc": 2.0}
+    routes = [
+        # openrouter actually billed 15.0 vs expected 12.0 -> +25% drift, warns
+        {"provider": "openrouter", "family": "gpt-5.5", "calls": 100,
+         "tokens_in": 1_000_000, "tokens_out": 1_000_000, "tokens_cached": 0, "cost_usd": 15.0},
+        # openai billed exactly list (12.0) -> ~1.0, no warn
+        {"provider": "openai", "family": "gpt-5.4", "calls": 100,
+         "tokens_in": 1_000_000, "tokens_out": 1_000_000, "tokens_cached": 0, "cost_usd": 12.0},
+        # provider with a 2.0 ranking multiplier: list divided back out, cost matches
+        {"provider": "disc", "family": "fam", "calls": 50,
+         "tokens_in": 1_000_000, "tokens_out": 1_000_000, "tokens_cached": 0, "cost_usd": 12.0},
+        # no ranked price -> skipped entirely
+        {"provider": "bedrock", "family": "nope", "calls": 100,
+         "tokens_in": 1_000_000, "tokens_out": 0, "tokens_cached": 0, "cost_usd": 9.9},
+    ]
+    rows = {r["provider"]: r for r in auth_proxy._cost_accuracy_rows(
+        routes, ema, lambda p: mult.get(p, 1.0))}
+    assert "bedrock" not in rows                          # unpriced -> not compared
+    assert rows["openrouter"]["deviation"] == 1.25 and rows["openrouter"]["warn"] is True
+    assert rows["openrouter"]["measured_usd_per_mtok"] == 7.5   # 15 / 2 Mtok
+    assert rows["openai"]["warn"] is False                # at list -> no drift
+    assert rows["disc"]["deviation"] == 1.0              # multiplier divided out before compare
+    # sorted by |deviation - 1| desc -> the drifting provider first
+    assert auth_proxy._cost_accuracy_rows(routes, ema, lambda p: mult.get(p, 1.0))[0]["provider"] == "openrouter"
+
+
+def test_cost_accuracy_rows_needs_minimum_calls_to_warn():
+    ema = {"openrouter|f": {"price_in": 2.0, "price_out": 10.0}}
+    routes = [{"provider": "openrouter", "family": "f", "calls": 5,   # < 20 -> no warn
+               "tokens_in": 1_000_000, "tokens_out": 1_000_000, "tokens_cached": 0, "cost_usd": 20.0}]
+    row = auth_proxy._cost_accuracy_rows(routes, ema, lambda p: 1.0)[0]
+    assert row["deviation"] > 1.5 and row["warn"] is False   # big drift but too few samples

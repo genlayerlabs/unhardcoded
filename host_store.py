@@ -670,6 +670,29 @@ def all_session_totals() -> dict[str, dict[str, Any]]:
         return {}
 
 
+def cost_by_route(window_s: int = 86_400) -> list[dict[str, Any]]:
+    """Per (provider, family) ledger aggregate over the last `window_s` seconds —
+    the RAW from which measured effective cost is DERIVED by query (#41), for the
+    dashboard's cost-accuracy panel. Fail-soft -> []."""
+    try:
+        floor = int(time.time()) - max(0, window_s)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT provider_id, model_family, count(*),"
+                " coalesce(sum(tokens_in),0), coalesce(sum(tokens_out),0),"
+                " coalesce(sum(tokens_cached),0), coalesce(sum(cost_usd),0)"
+                " FROM calls WHERE ts >= %s AND cost_usd IS NOT NULL"
+                " AND provider_id IS NOT NULL AND model_family IS NOT NULL"
+                " GROUP BY provider_id, model_family", (floor,))
+            return [{"provider": p, "family": f, "calls": int(c),
+                     "tokens_in": int(ti), "tokens_out": int(to),
+                     "tokens_cached": int(tc), "cost_usd": round(float(cu), 6)}
+                    for p, f, c, ti, to, tc, cu in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001 — panel is best-effort
+        _log.warning("host_store cost_by_route failed: %s", exc)
+        return []
+
+
 # ---- usage rows + dashboard logins, from the store (#5) -------------------------
 
 _USAGE_COLS = ("ts", "caller", "provider_id", "model_family", "served_model_id",
