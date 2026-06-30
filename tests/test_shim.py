@@ -562,6 +562,19 @@ def test_executed_cost_usd_ignores_the_ranking_multiplier(monkeypatch):
     assert _executed_cost_usd(result) == 3.0   # == raw list 2.0/10.0, not 1.5
 
 
+def test_cost_basis_tiers():
+    """How cost_usd was determined — the raw fact the cost-accuracy panel reads to
+    tell real signal (reported) from tautological rows (computed)."""
+    from shim import _cost_basis
+    assert _cost_basis({"chosen": {"provider_id": "openai"}, "response": {}},
+                       frozenset({"openai"})) == "subscription"
+    assert _cost_basis({"chosen": {"provider_id": "openrouter"},
+                        "response": {"cost_reported": 0.5}}) == "reported"
+    assert _cost_basis({"chosen": {"provider_id": "openai", "price_in": 5.0},
+                        "response": {}}) == "computed"
+    assert _cost_basis({"chosen": {"provider_id": "x"}, "response": {}}) is None
+
+
 def test_x_router_carries_executed_cost(client, host):
     for prov, fam in _all_pairs(host):
         host.set_mock_response(prov, fam, _ok_response("ok"))

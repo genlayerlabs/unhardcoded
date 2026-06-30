@@ -1399,25 +1399,41 @@ def _trim_trace(trace):
 _CACHE_READ_FACTOR = 0.1
 
 
-def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> float | None:
-    """Dollars actually spent on THIS request, accurate across providers.
-    Order: (1) subscription backends (codex) cost $0; (2) the provider's OWN
-    reported cost when present (e.g. OpenRouter `usage.cost`) — authoritative and
-    already net of prompt-cache discounts; (3) computed from the ranked price,
-    billing cache-read tokens at a fraction so a cache hit is not charged at full
-    input price. None when uncomputable (read-time estimator is the fallback)."""
+def _cost_basis(result: dict, subscription_providers=frozenset()) -> "str | None":
+    """How cost_usd was determined for THIS call — a raw fact for cost analysis:
+    'subscription' (codex, $0), 'reported' (the provider's OWN usage.cost,
+    authoritative — an INDEPENDENT signal vs the list price), 'computed' (derived
+    from the ranked list price — tautological vs that price), or None when there is
+    no price to compute from. Single source of the cost tiering."""
     chosen = result.get("chosen") or {}
     resp = result.get("response") or {}
     if chosen.get("provider_id") in subscription_providers:
-        return 0.0
-    # (2) authoritative provider-reported cost — works for ANY provider that gives it
+        return "subscription"
     reported = resp.get("cost_reported")
     if isinstance(reported, (int, float)) and not isinstance(reported, bool) and reported >= 0:
-        return round(float(reported), 6)
-    # (3) compute from the ranker price, discounting cache-read input tokens
-    pin, pout = chosen.get("price_in"), chosen.get("price_out")
-    if pin is None and pout is None:
+        return "reported"
+    if chosen.get("price_in") is not None or chosen.get("price_out") is not None:
+        return "computed"
+    return None
+
+
+def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> float | None:
+    """Dollars actually spent on THIS request, accurate across providers, tiered by
+    _cost_basis: (1) subscription backends (codex) cost $0; (2) the provider's OWN
+    reported cost (e.g. OpenRouter `usage.cost`) — authoritative, net of prompt-cache
+    discounts; (3) computed from the ranked price, billing cache-read tokens at a
+    fraction. None when uncomputable (read-time estimator is the fallback)."""
+    basis = _cost_basis(result, subscription_providers)
+    resp = result.get("response") or {}
+    if basis == "subscription":
+        return 0.0
+    if basis == "reported":
+        return round(float(resp["cost_reported"]), 6)
+    if basis != "computed":
         return None
+    # (3) compute from the ranker price, discounting cache-read input tokens
+    chosen = result.get("chosen") or {}
+    pin, pout = chosen.get("price_in"), chosen.get("price_out")
     # The ranking price carries the provider's effective-price multiplier — a
     # FICTITIOUS routing lever (providers.price_multiplier, applied in
     # sources.push_prices). Billing must use the RAW list price, so divide it back
@@ -1460,6 +1476,7 @@ def _build_x_router(result: dict, subscription_providers=frozenset(),
         "price_in": chosen.get("price_in"),
         "price_out": chosen.get("price_out"),
         "cost_usd": _executed_cost_usd(result, subscription_providers),
+        "cost_basis": _cost_basis(result, subscription_providers),
         "tokens_cached": resp.get("tokens_cached"),
         "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
         "decision_trace": _trim_trace(result.get("trace")),

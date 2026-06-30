@@ -100,6 +100,11 @@ _SCHEMA_STATEMENTS = [
     # on a DB that predates them. #3: the executed route identity + cache tokens.
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS tokens_cached BIGINT",
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS served_by TEXT",
+    # How cost_usd was determined ('reported' = the provider's own authoritative
+    # cost = an INDEPENDENT signal; 'computed' = derived from the list price =
+    # tautological; 'subscription' = $0). Lets the cost-accuracy panel flag only
+    # rows with real signal instead of training the operator to ignore drift.
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS cost_basis TEXT",
     # Per-ATTEMPT route observations (one row per provider call the engine made,
     # including failed fallback tries — a grain `calls` does NOT have: `calls` is
     # per-REQUEST, final route only). The RAW from which reliability/latency are
@@ -263,14 +268,16 @@ def insert_call(row: dict[str, Any]) -> None:
             # stamped by the engine on `chosen` — the per-route identity #4 derives
             # route stats from. Raw here; combining into a route key is a later step.
             row.get("served_by"),
+            row.get("cost_basis"),   # how cost_usd was determined (reported/computed/…)
         )
         with _get_pool().connection() as conn:   # one transaction, auto commit/rollback
             conn.execute(
                 "INSERT INTO calls (ts, usage_event_id, session_id, consumer_sha,"
                 " caller, route_key, provider_id, model_family, served_model_id,"
                 " requested_model, status, error_type, latency_ms, tokens_in,"
-                " tokens_out, tokens_total, tokens_cached, cost_usd, served_by)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", values)
+                " tokens_out, tokens_total, tokens_cached, cost_usd, served_by,"
+                " cost_basis)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", values)
         with _prune_lock:
             _inserts_since_prune += 1
             due = _inserts_since_prune >= _PRUNE_EVERY
@@ -668,6 +675,31 @@ def all_session_totals() -> dict[str, dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store all_session_totals failed: %s", exc)
         return {}
+
+
+def cost_by_route(window_s: int = 86_400) -> list[dict[str, Any]]:
+    """Per (provider, family) ledger aggregate over the last `window_s` seconds —
+    the RAW from which measured effective cost is DERIVED by query (#41), for the
+    dashboard's cost-accuracy panel. Fail-soft -> []."""
+    try:
+        floor = int(time.time()) - max(0, window_s)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT provider_id, model_family, count(*),"
+                " coalesce(sum(tokens_in),0), coalesce(sum(tokens_out),0),"
+                " coalesce(sum(tokens_cached),0), coalesce(sum(cost_usd),0),"
+                " coalesce(sum((cost_basis = 'reported')::int),0)"
+                " FROM calls WHERE ts >= %s AND cost_usd IS NOT NULL"
+                " AND provider_id IS NOT NULL AND model_family IS NOT NULL"
+                " GROUP BY provider_id, model_family", (floor,))
+            return [{"provider": p, "family": f, "calls": int(c),
+                     "tokens_in": int(ti), "tokens_out": int(to),
+                     "tokens_cached": int(tc), "cost_usd": round(float(cu), 6),
+                     "n_reported": int(nr)}
+                    for p, f, c, ti, to, tc, cu, nr in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001 — panel is best-effort
+        _log.warning("host_store cost_by_route failed: %s", exc)
+        return []
 
 
 # ---- usage rows + dashboard logins, from the store (#5) -------------------------

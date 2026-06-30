@@ -1507,3 +1507,58 @@ def test_consumer_skill_endpoint_authed_by_consumer_key(monkeypatch):
     assert r.status_code == 200
     assert "text/markdown" in r.headers["content-type"]
     assert "filename=SKILL.md" in r.headers["content-disposition"]
+
+
+def test_cost_accuracy_rows_flags_drift_and_divides_out_multiplier():
+    """The cost-accuracy join: measured spend vs advertised list (= ranked price
+    with the fictitious multiplier divided back out), drift-flagged per provider."""
+    ema = {
+        "openrouter|gpt-5.5": {"price_in": 2.0, "price_out": 10.0},   # list 2/10
+        "openai|gpt-5.4": {"price_in": 2.0, "price_out": 10.0},
+        "disc|fam": {"price_in": 4.0, "price_out": 20.0},             # = list 2/10 x2.0 mult
+    }
+    mult = {"disc": 2.0}
+    routes = [
+        # openrouter REPORTS its cost (n_reported=calls): billed 15.0 vs expected
+        # 12.0 -> +25% drift, real signal, warns
+        {"provider": "openrouter", "family": "gpt-5.5", "calls": 100, "n_reported": 100,
+         "tokens_in": 1_000_000, "tokens_out": 1_000_000, "tokens_cached": 0, "cost_usd": 15.0},
+        # openai cost is COMPUTED (n_reported=0): billed exactly list -> ~1.0, derived
+        {"provider": "openai", "family": "gpt-5.4", "calls": 100, "n_reported": 0,
+         "tokens_in": 1_000_000, "tokens_out": 1_000_000, "tokens_cached": 0, "cost_usd": 12.0},
+        # provider with a 2.0 ranking multiplier: list divided back out, cost matches
+        {"provider": "disc", "family": "fam", "calls": 50, "n_reported": 0,
+         "tokens_in": 1_000_000, "tokens_out": 1_000_000, "tokens_cached": 0, "cost_usd": 12.0},
+        # no ranked price -> skipped entirely
+        {"provider": "bedrock", "family": "nope", "calls": 100, "n_reported": 0,
+         "tokens_in": 1_000_000, "tokens_out": 0, "tokens_cached": 0, "cost_usd": 9.9},
+    ]
+    rows = {r["provider"]: r for r in auth_proxy._cost_accuracy_rows(
+        routes, ema, lambda p: mult.get(p, 1.0))}
+    assert "bedrock" not in rows                          # unpriced -> not compared
+    assert rows["openrouter"]["signal"] == "reported" and rows["openrouter"]["warn"] is True
+    assert rows["openrouter"]["deviation"] == 1.25
+    assert rows["openrouter"]["measured_usd_per_mtok"] == 7.5   # 15 / 2 Mtok
+    assert rows["openai"]["signal"] == "derived" and rows["openai"]["warn"] is False
+    assert rows["disc"]["deviation"] == 1.0              # multiplier divided out before compare
+    # sorted by |deviation - 1| desc -> the drifting provider first
+    assert auth_proxy._cost_accuracy_rows(routes, ema, lambda p: mult.get(p, 1.0))[0]["provider"] == "openrouter"
+
+
+def test_cost_accuracy_rows_does_not_warn_a_derived_provider():
+    # a compute-from-price provider (n_reported=0) with a big apparent drift is
+    # reprice noise, not signal -> labelled derived and never warned (no
+    # non-actionable badge that trains the operator to ignore drift).
+    ema = {"anthropic|claude": {"price_in": 5.0, "price_out": 25.0}}
+    routes = [{"provider": "anthropic", "family": "claude", "calls": 500, "n_reported": 0,
+               "tokens_in": 1_000_000, "tokens_out": 1_000_000, "tokens_cached": 0, "cost_usd": 90.0}]
+    row = auth_proxy._cost_accuracy_rows(routes, ema, lambda p: 1.0)[0]
+    assert abs(row["deviation"] - 1) > 1.5 and row["signal"] == "derived" and row["warn"] is False
+
+
+def test_cost_accuracy_rows_needs_minimum_calls_to_warn():
+    ema = {"openrouter|f": {"price_in": 2.0, "price_out": 10.0}}
+    routes = [{"provider": "openrouter", "family": "f", "calls": 5, "n_reported": 5,  # <20
+               "tokens_in": 1_000_000, "tokens_out": 1_000_000, "tokens_cached": 0, "cost_usd": 20.0}]
+    row = auth_proxy._cost_accuracy_rows(routes, ema, lambda p: 1.0)[0]
+    assert row["signal"] == "reported" and row["deviation"] > 1.5 and row["warn"] is False
