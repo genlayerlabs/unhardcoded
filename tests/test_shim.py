@@ -168,6 +168,58 @@ def test_unknown_model_string_falls_back_to_default(client, host):
     assert r.json()["choices"][0]["message"]["content"] == "fallback"
 
 
+# ---- policy: model selector requires a policy_ir -----------------------
+
+def test_policy_model_without_ir_helper_logic():
+    # Pure guard logic: `policy:` model + no policy_ir/flow_ir -> a 400 message;
+    # everything else -> None (the request is fine).
+    from types import SimpleNamespace
+    from shim import _policy_model_without_ir as g
+
+    def mk(**k):
+        return SimpleNamespace(model=k.get("model", ""),
+                               policy_ir=k.get("policy_ir"), flow_ir=k.get("flow_ir"))
+
+    assert g(mk(model="policy:auto")) is not None              # the offending case
+    assert g(mk(model="policy:x", policy_ir=["policy"])) is None  # policy supplied
+    assert g(mk(model="policy:x", flow_ir=["flow"])) is None       # flow supplied
+    assert g(mk(model="profile:default")) is None              # real selector
+    assert g(mk(model="totally-made-up")) is None              # plain model -> default
+    assert g(mk(model="")) is None                             # empty -> default
+
+
+def test_policy_model_without_ir_is_rejected_chat(client, host):
+    # The exact prod symptom: a consumer sends model="policy:auto" with no
+    # policy_ir -> a hard 400 (was: silently routed with the `default` profile).
+    for prov, fam in _all_pairs(host):
+        host.set_mock_response(prov, fam, _ok_response())
+    r = client.post("/v1/chat/completions", json={
+        "model": "policy:auto", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "policy_in_model_field"
+
+
+def test_policy_model_without_ir_is_rejected_responses(client, host):
+    for prov, fam in _all_pairs(host):
+        host.set_mock_response(prov, fam, _ok_response())
+    r = client.post("/v1/responses", json={"model": "policy:auto", "input": "hi"})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "policy_in_model_field"
+
+
+def test_policy_model_with_policy_ir_does_not_trip_the_guard(client, host):
+    # Once a policy_ir is supplied the `model` string is irrelevant: the guard
+    # must NOT fire (the request reaches admission — 200 if the term is valid,
+    # 400 invalid_policy if not, but never our policy_in_model_field).
+    for prov, fam in _all_pairs(host):
+        host.set_mock_response(prov, fam, _ok_response())
+    r = client.post("/v1/chat/completions", json={
+        "model": "policy:auto", "policy_ir": ["policy", ["meets_req"]],
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert not (r.status_code == 400
+                and r.json().get("error", {}).get("code") == "policy_in_model_field")
+
+
 # ---- response shape ----------------------------------------------------
 
 def test_response_shape_is_openai_compatible(client, host):

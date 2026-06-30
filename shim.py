@@ -887,6 +887,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         return obj
 
     async def _handle_responses(req: ResponsesRequest, profile_name: str | None = None):
+        if profile_name is None and (msg := _policy_model_without_ir(req)):
+            return _bad_policy_selector_response(msg)
         import responses_api as _rapi
         dropped = _rapi.dropped_tool_types(req.tools)
         if dropped:
@@ -970,6 +972,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         return StreamingResponse(gen_running(), media_type="text/event-stream")
 
     async def _handle_chat(req: ChatRequest, profile_name: str | None = None):
+        if profile_name is None and (msg := _policy_model_without_ir(req)):
+            return _bad_policy_selector_response(msg)
         contract = _request_to_contract(req, default_profile, default_max_tokens)
         if profile_name is not None:
             contract["profile"] = profile_name  # the path is authoritative
@@ -1261,6 +1265,34 @@ def _invalid_policy_response(message: str) -> JSONResponse:
         "message": f"policy_ir rejected at admission: {message}",
         "type": "invalid_request_error",
         "code": "invalid_policy",
+    }})
+
+
+def _policy_model_without_ir(req) -> "str | None":
+    """A request whose `model` carries the `policy:` selector but supplies NO
+    per-call policy is a client error: a policy must travel as a `policy_ir`
+    (or `flow_ir`) TERM in the request body, never as the `model` string. Such a
+    request used to fall through to the `default` profile silently — routing with
+    a policy the caller believed it sent but never did. Return the 400 message,
+    or None when the request is fine. (Skip on the profiled endpoints — there the
+    URL profile is authoritative and `model` is genuinely irrelevant.)"""
+    model = (getattr(req, "model", "") or "").strip()
+    if (model.startswith("policy:")
+            and getattr(req, "policy_ir", None) is None
+            and getattr(req, "flow_ir", None) is None):
+        return (
+            f"model {model!r} is not a policy selector. A per-call policy must be "
+            f"sent as a `policy_ir` term in the request body (or a `flow_ir`); the "
+            f"`model` field does not select a policy. Recognized `model` prefixes "
+            f"are `profile:`, `family:` and `pin:`.")
+    return None
+
+
+def _bad_policy_selector_response(message: str) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"error": {
+        "message": message,
+        "type": "invalid_request_error",
+        "code": "policy_in_model_field",
     }})
 
 
