@@ -9,94 +9,28 @@ always wins, so a bad override can never break ranking.
 """
 from __future__ import annotations
 
-import os
 import threading
 from typing import Any
 
 import host_store
-
-
-def _f(env: str, d: float) -> float:
-    try:
-        return float(os.getenv(env, str(d)))
-    except ValueError:
-        return d
-
-
-def _i(env: str, d: int) -> int:
-    try:
-        return int(os.getenv(env, str(d)))
-    except ValueError:
-        return d
+from env_coerce import env_int
 
 
 # key -> declarative knob. `provider` groups it in the UI; type/min/max validate.
 SCHEMA: dict[str, dict[str, Any]] = {
     "compaction.at_tokens": {
-        "provider": "compaction", "type": "int", "default": _i("COMPACT_AT_TOKENS", 24000),
+        "provider": "compaction", "type": "int", "default": env_int("COMPACT_AT_TOKENS", 24000),
         "min": 1000, "max": 2000000, "label": "Suggest compaction at (input tokens)",
         "help": "When a call's input exceeds this, the response carries "
                 "x_router.compact=true so the agent knows to POST /v1/compact."},
-    "antseed.offers_top_n": {
-        "provider": "antseed", "type": "int", "default": _i("ANTSEED_OFFERS_TOP_N", 3),
-        "min": 1, "max": 10, "label": "Offers per family (top-N peers)",
-        "help": "Cheapest distinct seller peers surfaced per family to rotate between on failure."},
-    "antseed.reputation_min": {
-        "provider": "antseed", "type": "float", "default": _f("ANTSEED_REPUTATION_MIN", 0),
-        "min": 0, "max": 100, "label": "Min peer on-chain reputation",
-        "help": "Drop AntSeed peers whose on-chain reputation score (0-100) is below "
-                "this. 0 = off. Peers that report no reputation are kept (cold-start safe)."},
-    "antseed.peer_allowlist": {
-        "provider": "antseed", "type": "list", "default": [],
-        "min": 0, "max": 500, "label": "Peer allowlist (peer IDs)",
-        "help": "If non-empty, ONLY these AntSeed peer IDs are offered. "
-                "Comma-separated. Empty (default) = every peer is eligible."},
-    "antseed.peer_denylist": {
-        "provider": "antseed", "type": "list", "default": [],
-        "min": 0, "max": 500, "label": "Peer denylist (peer IDs)",
-        "help": "AntSeed peer IDs that are never offered. Comma-separated. "
-                "Takes precedence over the allowlist. Empty (default) = none denied."},
-    "antseed.runway_deposits_low_usdc": {
-        "provider": "antseed", "type": "float", "default": _f("RUNWAY_DEPOSITS_LOW_USDC", 2),
-        "min": 0, "max": 100000, "label": "Wallet runway: low (USDC)",
-        "help": "Deposits below this read as 'low · top up'."},
-    "antseed.runway_deposits_empty_usdc": {
-        "provider": "antseed", "type": "float", "default": _f("RUNWAY_DEPOSITS_EMPTY_USDC", 0.01),
-        "min": 0, "max": 100000, "label": "Wallet runway: empty (USDC)",
-        "help": "Deposits at/below this read as 'empty'."},
-    "codex.imputed_price_in": {
-        "provider": "codex", "type": "float", "default": _f("CODEX_IMPUTED_PRICE_IN", 5),
-        "min": 0, "max": 1000, "label": "Scarcity price in ($/Mtok at full demote)",
-        "help": "Imputed input price when the subscription quota is fully strained."},
-    "codex.imputed_price_out": {
-        "provider": "codex", "type": "float", "default": _f("CODEX_IMPUTED_PRICE_OUT", 25),
-        "min": 0, "max": 1000, "label": "Scarcity price out ($/Mtok at full demote)",
-        "help": "Imputed output price at full demote."},
-    "codex.quota_demote_start": {
-        "provider": "codex", "type": "float", "default": _f("CODEX_QUOTA_DEMOTE_START", 0.5),
-        "min": 0, "max": 1, "label": "Quota demote start (fraction)",
-        "help": "Quota-used fraction at which the scarcity price ramp begins."},
-    "codex.quota_429_window_s": {
-        "provider": "codex", "type": "float", "default": _f("CODEX_QUOTA_429_WINDOW_S", 120),
-        "min": 1, "max": 3600, "label": "429 window (s)",
-        "help": "How long an observed 429 counts toward the scarcity ramp."},
-    "codex.quota_429_shed": {
-        "provider": "codex", "type": "float", "default": _f("CODEX_QUOTA_429_SHED", 3),
-        "min": 1, "max": 100, "label": "429s to full demote",
-        "help": "Recent 429s within the window that ramp the price to full."},
-    "codex.runway_quota_low_fraction": {
-        "provider": "codex", "type": "float", "default": _f("RUNWAY_QUOTA_LOW_FRACTION", 0.8),
-        "min": 0, "max": 1, "label": "Quota runway: low (fraction)",
-        "help": "Quota-used above this reads as 'low'."},
-    "openrouter.runway_credits_low_usd": {
-        "provider": "openrouter", "type": "float", "default": _f("RUNWAY_CREDITS_LOW_USD", 25),
-        "min": 0, "max": 1000000, "label": "Credits runway: low (USD)",
-        "help": "Credits below this read as 'low'."},
-    "openrouter.runway_credits_empty_usd": {
-        "provider": "openrouter", "type": "float", "default": _f("RUNWAY_CREDITS_EMPTY_USD", 1),
-        "min": 0, "max": 1000000, "label": "Credits runway: empty (USD)",
-        "help": "Credits at/below this read as 'empty'."},
 }
+# Per-provider knobs are declared next to each provider in `providers.py` (the
+# modular 4th aspect) and merged here, so `settings.get()` and the Config tab keep
+# the same flat `<provider>.<knob>` schema while the definitions live with the
+# provider rather than scattered in this file.
+import providers as _providers  # noqa: E402
+
+SCHEMA.update(_providers.provider_knob_schema())
 
 _lock = threading.Lock()
 _overrides: dict[str, Any] = {}

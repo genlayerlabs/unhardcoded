@@ -8,7 +8,6 @@ first refresh). See docs/superpowers/specs/2026-06-10-provider-sources-design.md
 from __future__ import annotations
 
 import asyncio
-import os
 import random
 import time
 from typing import Any, Literal, Protocol, TypedDict
@@ -112,34 +111,3 @@ def start_refresh_tasks(host: Any, catalog: dict,
     immediately; cadence is per-source."""
     return [asyncio.create_task(_run_source(host, catalog, s))
             for s in registry if s.poll_interval_s]
-
-
-def build_registry(catalog: dict, env_get=os.environ.get) -> list[ProviderSource]:
-    registry: list[ProviderSource] = []
-    providers = catalog.get("providers") or {}
-    if "openrouter" in providers:
-        from sources.openrouter import OpenRouterSource
-        registry.append(OpenRouterSource(catalog, env_get=env_get))
-    marketplace = [pid for pid, p in providers.items()
-                   if isinstance(p, dict) and p.get("discovery") == "marketplace"
-                   and str(p.get("discovery_id", "")).startswith("antseed")]
-    if marketplace:
-        from sources.antseed import AntSeedSource
-        registry.append(AntSeedSource(catalog))
-    for pid, p in providers.items():
-        if isinstance(p, dict) and p.get("api_kind") == "openai_codex":
-            from sources.codex import CodexSource
-            registry.append(CodexSource(pid))
-            break
-    # Ollama: local + cloud discovery
-    if "ollama" in providers:
-        from sources.ollama import OllamaSource
-        registry.append(OllamaSource(catalog, env_get=env_get))
-    if any(
-        isinstance(p, dict)
-        and (p.get("source") == "bedrock" or str(pid).startswith("bedrock"))
-        for pid, p in providers.items()
-    ):
-        from sources.bedrock import BedrockSource
-        registry.append(BedrockSource(catalog, env_get=env_get))
-    return registry
