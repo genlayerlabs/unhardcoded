@@ -1475,11 +1475,12 @@ def test_dashboard_skill_endpoint_requires_auth():
     assert TestClient(auth_proxy.app).get("/dashboard/api/skill").status_code == 401
 
 
-def test_catalog_tab_renamed_and_has_skill_button(monkeypatch):
+def test_catalog_tab_renamed_and_skill_is_its_own_tab(monkeypatch):
     html = _dashboard_client(monkeypatch).get("/dashboard").text
     assert ">Catalog<" in html                 # tab renamed from "Market"
-    assert "marketSkill" in html               # SKILL.md download button
-    assert "/dashboard/api/skill" in html
+    assert "marketSkill" not in html           # the Catalog SKILL button moved out
+    assert "tabSkill" in html and "skillPage" in html  # SKILL.md is its own side-menu tab
+    assert "/dashboard/api/skill" in html      # the tab loads + downloads the live SKILL.md
 
 
 def test_consumer_skill_endpoint_authed_by_consumer_key(monkeypatch):
