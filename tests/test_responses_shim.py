@@ -61,7 +61,7 @@ def _seed(host, resp):
 def test_responses_nonstream_returns_response_object(client, host):
     _seed(host, _ok("hello from router"))
     r = client.post("/v1/responses", json={
-        "model": "policy:auto", "input": "hi", "stream": False})
+        "model": "", "input": "hi", "stream": False})
     assert r.status_code == 200
     body = r.json()
     assert body["object"] == "response"
@@ -85,7 +85,7 @@ def test_responses_input_items_and_instructions(client, host):
 def test_responses_stream_emits_completed(client, host):
     _seed(host, _ok("streamed hi"))
     with client.stream("POST", "/v1/responses", json={
-            "model": "policy:auto", "input": "hi", "stream": True}) as r:
+            "model": "", "input": "hi", "stream": True}) as r:
         assert r.status_code == 200
         body = "".join(chunk for chunk in r.iter_text())
     events = [ln[len("event:"):].strip()
@@ -106,7 +106,7 @@ def test_responses_tool_call_surfaces_function_call_item(client, host):
             "function": {"name": "shell", "arguments": '{"command":"ls"}'}}]
     _seed(host, _ok(text="", tool_calls=tcs))
     r = client.post("/v1/responses", json={
-        "model": "policy:auto", "input": "run ls",
+        "model": "", "input": "run ls",
         "tools": [{"type": "function", "name": "shell",
                    "parameters": {"type": "object",
                                   "properties": {"command": {"type": "string"}}}}],
@@ -128,7 +128,7 @@ def test_responses_profiled_route(client, host):
 def test_responses_router_error_maps_to_status(client, host):
     # no mocks set -> candidates fail -> router returns an error
     r = client.post("/v1/responses", json={
-        "model": "policy:auto", "input": "hi", "stream": False})
+        "model": "", "input": "hi", "stream": False})
     assert r.status_code >= 400
     assert r.json()["error"]["type"] == "router_error"
 
@@ -154,7 +154,7 @@ def test_responses_stream_failure_sequence_numbers_strictly_increase(
     monkeypatch.setattr(host, "execute_async", _slow_error)
 
     with client.stream("POST", "/v1/responses", json={
-            "model": "policy:auto", "input": "hi", "stream": True}) as r:
+            "model": "", "input": "hi", "stream": True}) as r:
         assert r.status_code == 200
         body = "".join(chunk for chunk in r.iter_text())
     datas = [json.loads(ln[len("data:"):].strip())
