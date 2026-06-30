@@ -23,14 +23,10 @@ CORE = ROOT / "core"                 # the unhardcoded-engine core (git submodul
 sys.path.insert(0, str(ROOT))
 
 from llm_router_host import LLMRouterHost  # noqa: E402
-from provider_adapters.anthropic import (  # noqa: E402
-    make_anthropic_async_call_provider,
-)
-from provider_adapters.bedrock import make_bedrock_async_call_provider  # noqa: E402
+# The native api_kind adapters (anthropic/bedrock/google) are now owned by the
+# modular provider registry (`providers.py`); serve only needs the dispatcher,
+# the default openai_compatible backend, and the codex backend (special).
 from provider_adapters.dispatcher import make_api_kind_dispatcher  # noqa: E402
-from provider_adapters.google import (  # noqa: E402
-    make_google_async_call_provider,
-)
 from provider_adapters.openai_compatible import make_async_call_provider  # noqa: E402
 
 
@@ -136,15 +132,16 @@ def main() -> None:
     codex_auth = CodexAuthStore(legacy_path=args.codex_auth)
     if codex_auth.names():
         print(f"codex accounts: {', '.join(codex_auth.names())}")
+    # The native api_kind adapters (anthropic/bedrock/google) come from the
+    # modular provider registry; codex is wired here because its backend takes
+    # the `observe` hook that feeds its scarcity-price source.
+    import providers as _providers
+    _native = _providers.native_adapter_handlers(args.timeout_s)
     call_async = make_api_kind_dispatcher(
         default=make_async_call_provider(timeout_s=args.timeout_s,
                                          provider_rules=provider_rules),
-        handlers={
-            "openai_codex": make_codex_async_call_provider(codex_auth, observe=observe),
-            "anthropic": make_anthropic_async_call_provider(timeout_s=args.timeout_s),
-            "bedrock": make_bedrock_async_call_provider(timeout_s=args.timeout_s),
-            "google": make_google_async_call_provider(timeout_s=args.timeout_s),
-        },
+        handlers={**_native,
+                  "openai_codex": make_codex_async_call_provider(codex_auth, observe=observe)},
     )
     host.set_async_call_hook(call_async)
 
@@ -161,14 +158,12 @@ def main() -> None:
         default=functools.partial(stream_openai_compatible,
                                   timeout_s=args.timeout_s,
                                   provider_rules=provider_rules),
-        handlers={
-            "openai_codex": functools.partial(stream_codex,
-                                              auth=codex_auth,
-                                              observe=observe),
-            "anthropic": stream_unsupported_api_kind,
-            "bedrock": stream_unsupported_api_kind,
-            "google": stream_unsupported_api_kind,
-        },
+        # the native adapters don't stream natively (fall back to unsupported);
+        # codex has a real streaming twin that also feeds `observe`.
+        handlers={**{ak: stream_unsupported_api_kind for ak in _native},
+                  "openai_codex": functools.partial(stream_codex,
+                                                    auth=codex_auth,
+                                                    observe=observe)},
     )
 
     from shim import create_app  # local import: keeps argparse errors fast

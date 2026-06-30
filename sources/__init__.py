@@ -115,31 +115,18 @@ def start_refresh_tasks(host: Any, catalog: dict,
 
 
 def build_registry(catalog: dict, env_get=os.environ.get) -> list[ProviderSource]:
-    registry: list[ProviderSource] = []
-    providers = catalog.get("providers") or {}
-    if "openrouter" in providers:
-        from sources.openrouter import OpenRouterSource
-        registry.append(OpenRouterSource(catalog, env_get=env_get))
-    marketplace = [pid for pid, p in providers.items()
-                   if isinstance(p, dict) and p.get("discovery") == "marketplace"
-                   and str(p.get("discovery_id", "")).startswith("antseed")]
-    if marketplace:
-        from sources.antseed import AntSeedSource
-        registry.append(AntSeedSource(catalog))
-    for pid, p in providers.items():
+    """The ProviderSource list, derived from the modular `providers.PROVIDERS`
+    registry (each provider declares its own source + `enabled` predicate). The
+    one exception is codex: its source OBSERVES its own wire backend (serve.py
+    binds it) and needs the codex provider id from the catalog, so it is built
+    here, not in the registry — keeping that source↔backend coupling a single
+    documented case rather than a general hook."""
+    import providers as _providers
+    registry: list[ProviderSource] = list(
+        _providers.build_source_registry(catalog, env_get))
+    for pid, p in (catalog.get("providers") or {}).items():
         if isinstance(p, dict) and p.get("api_kind") == "openai_codex":
             from sources.codex import CodexSource
             registry.append(CodexSource(pid))
             break
-    # Ollama: local + cloud discovery
-    if "ollama" in providers:
-        from sources.ollama import OllamaSource
-        registry.append(OllamaSource(catalog, env_get=env_get))
-    if any(
-        isinstance(p, dict)
-        and (p.get("source") == "bedrock" or str(pid).startswith("bedrock"))
-        for pid, p in providers.items()
-    ):
-        from sources.bedrock import BedrockSource
-        registry.append(BedrockSource(catalog, env_get=env_get))
     return registry
