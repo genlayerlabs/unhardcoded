@@ -1650,6 +1650,74 @@ async def consumer_skill(request: Request) -> Response:
                     headers={"Content-Disposition": "attachment; filename=SKILL.md"})
 
 
+# ---- consumer-key validation surface ---------------------------------------
+# SKILL.md tells an agent to dry-run / identify a term WITHOUT spending via the
+# router's /x/* admission endpoints (normalize, rank, fields, build). Those live
+# on the router; the ingress only reached them server-side (dashboard), so a
+# consumer-key holder — the exact audience of /skill — got 404 and the documented
+# "admit before you run" workflow was unusable. Expose the READ-ONLY / no-spend
+# ones here under the same key auth as /skill. None execute a call, move money,
+# or mutate state: they admit/normalize a term, preview the ranking, or list the
+# field vocabulary — all derived from the live catalog the skill already shows.
+async def _consumer_x_proxy(request: Request, method: str, path: str) -> Response:
+    if not _caller_auth(_extract_token(request)).get("ok"):
+        return JSONResponse(status_code=401, content={"error": {
+            "message": "invalid or inactive API key",
+            "type": "auth_error", "code": "consumer_auth"}})
+    if _client is None:
+        return JSONResponse(status_code=502, content={"error": {
+            "message": "router client unavailable", "type": "router_error", "code": "router"}})
+    params = dict(request.query_params)
+    try:
+        if method == "POST":
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001 — a malformed body becomes an empty POST
+                body = {}
+            r = await _client.post(f"{UPSTREAM}{path}", json=body, params=params, timeout=10.0)
+        else:
+            r = await _client.get(f"{UPSTREAM}{path}", params=params, timeout=10.0)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=502, content={"error": {
+            "message": f"router {path} unreachable: {exc}",
+            "type": "router_error", "code": "router"}})
+    try:
+        return JSONResponse(status_code=r.status_code, content=r.json())
+    except Exception:  # noqa: BLE001 — pass through a non-JSON router body verbatim
+        return Response(status_code=r.status_code, content=r.text,
+                        media_type=r.headers.get("content-type", "application/json"))
+
+
+@app.get("/x/fields")
+async def consumer_x_fields(request: Request) -> Response:
+    return await _consumer_x_proxy(request, "GET", "/x/fields")
+
+
+@app.post("/x/policy/normalize")
+async def consumer_x_policy_normalize(request: Request) -> Response:
+    return await _consumer_x_proxy(request, "POST", "/x/policy/normalize")
+
+
+@app.post("/x/flow/normalize")
+async def consumer_x_flow_normalize(request: Request) -> Response:
+    return await _consumer_x_proxy(request, "POST", "/x/flow/normalize")
+
+
+@app.post("/x/policy/build")
+async def consumer_x_policy_build(request: Request) -> Response:
+    return await _consumer_x_proxy(request, "POST", "/x/policy/build")
+
+
+@app.get("/x/rank")
+async def consumer_x_rank_get(request: Request) -> Response:
+    return await _consumer_x_proxy(request, "GET", "/x/rank")
+
+
+@app.post("/x/rank")
+async def consumer_x_rank_post(request: Request) -> Response:
+    return await _consumer_x_proxy(request, "POST", "/x/rank")
+
+
 async def _router_post_json(path: str, payload: dict) -> Response:
     """Admin-dashboard passthrough to the shim's policy endpoints. The shim
     (and behind it the core) is the validator; this just forwards bytes and

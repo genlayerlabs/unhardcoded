@@ -352,6 +352,69 @@ def _restore_auth_maps(original_plaintext, original_hashes):
     auth_proxy._windows.clear()
 
 
+class _CannedResp:
+    def __init__(self, payload, status=200):
+        self._payload, self.status_code = payload, status
+        self.headers = {"content-type": "application/json"}
+
+    def json(self):
+        return self._payload
+
+    @property
+    def text(self):
+        return json.dumps(self._payload)
+
+
+class _RecordingRouteClient:
+    """Records the forwarded (method, url, json, params) and returns a canned
+    router response — to assert the ingress proxies the consumer validation
+    endpoints to the router."""
+    def __init__(self, payload):
+        self.calls = []
+        self._payload = payload
+
+    async def post(self, url, json=None, params=None, timeout=None):
+        self.calls.append(("POST", url, json, dict(params or {})))
+        return _CannedResp(self._payload)
+
+    async def get(self, url, params=None, timeout=None):
+        self.calls.append(("GET", url, None, dict(params or {})))
+        return _CannedResp(self._payload)
+
+
+def test_consumer_validation_endpoints_proxy_to_router(monkeypatch, tmp_path):
+    # The SKILL.md dry-run surface (/x/policy/normalize, /x/rank, /x/fields, …)
+    # must be reachable by a consumer key on the ingress — not just internally.
+    digest = hashlib.sha256("crm-token".encode()).hexdigest()
+    token, digest, op, oh = _with_consumer_auth(
+        monkeypatch, tmp_path,
+        issued={"status": "active", "allowed_routes": ["all"],
+                "keys": [{"sha256_prefix": digest[:12], "status": "active"}]})
+    rec = _RecordingRouteClient({"policy_ir": ["policy"], "fingerprint": "abc",
+                                 "version": "sigma-pol/v2"})
+    monkeypatch.setattr(auth_proxy, "_client", rec)
+    try:
+        client = TestClient(auth_proxy.app)
+        h = {"Authorization": f"Bearer {token}"}
+        # no key -> 401, never reaches the router
+        anon = client.post("/x/policy/normalize", json={"policy_ir": ["policy"]})
+        assert anon.status_code == 401 and not rec.calls
+        # POST is forwarded to the router's matching path, body and all
+        r = client.post("/x/policy/normalize", headers=h, json={"policy_ir": ["policy"]})
+        assert r.status_code == 200 and r.json()["fingerprint"] == "abc"
+        assert any(c[0] == "POST" and c[1].endswith("/x/policy/normalize")
+                   and c[2] == {"policy_ir": ["policy"]} for c in rec.calls)
+        # GET /x/fields is forwarded
+        assert client.get("/x/fields", headers=h).status_code == 200
+        assert any(c[0] == "GET" and c[1].endswith("/x/fields") for c in rec.calls)
+        # GET /x/rank carries the query through
+        client.get("/x/rank?profile=default", headers=h)
+        assert any(c[1].endswith("/x/rank") and c[3].get("profile") == "default"
+                   for c in rec.calls)
+    finally:
+        _restore_auth_maps(op, oh)
+
+
 def test_host_enforces_consumer_inactive_allowed_routes_and_rate_limits(monkeypatch, tmp_path):
     digest = hashlib.sha256("crm-token".encode()).hexdigest()
     token, digest, original_plaintext, original_hashes = _with_consumer_auth(
