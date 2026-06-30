@@ -358,13 +358,18 @@ return {
             -- genuinely per-provider for the same model (OpenRouter's benchmark
             -- can't tell you a peer's reliability). Its cold-start default is 1,
             -- so it's neutral until real traffic differentiates: a peer that
-            -- starts failing has its EMA fall and is demoted automatically.
+            -- starts failing has its EMA fall and is PROGRESSIVELY demoted as the
+            -- failures accumulate. Weighted 0.30 (was 0.10): at 0.10 the demotion
+            -- was too weak to overcome a failing peer's price edge, so dead peers
+            -- (e.g. a marketplace seller timing out every request) kept being
+            -- re-chosen. At 0.30 a peer whose EMA collapses falls below a reliable
+            -- alternative — self-healing, and it climbs back if it recovers.
             -- (Raw latency_ms is deliberately NOT scored here: its cold-start
             -- default is +inf, which would freeze out every never-tried peer.)
             scorer       = { "add",
-                { "scale", 0.45, { "field", "bench_intelligence" } },
-                { "scale", 0.45, { "neg", { "normalize", { "field", "price_in" } } } },
-                { "scale", 0.10, { "field", "success_rate" } },
+                { "scale", 0.35, { "field", "bench_intelligence" } },
+                { "scale", 0.35, { "neg", { "normalize", { "field", "price_in" } } } },
+                { "scale", 0.30, { "field", "success_rate" } },
             },
             filter       = { "requirements", "not_disabled" },
             selector     = "argmax",
