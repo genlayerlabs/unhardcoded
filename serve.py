@@ -26,6 +26,7 @@ from llm_router_host import LLMRouterHost  # noqa: E402
 from provider_adapters.anthropic import (  # noqa: E402
     make_anthropic_async_call_provider,
 )
+from provider_adapters.bedrock import make_bedrock_async_call_provider  # noqa: E402
 from provider_adapters.dispatcher import make_api_kind_dispatcher  # noqa: E402
 from provider_adapters.google import (  # noqa: E402
     make_google_async_call_provider,
@@ -73,9 +74,9 @@ def main() -> None:
     if loaded:
         print(f"env secrets loaded from PVC: {len(loaded)} keys")
 
-    # api_kind=openai_codex is served by a dedicated backend (Codex Responses
-    # endpoint + codex login token); everything else uses the OpenAI-compatible
-    # backend. The Codex backend reads auth.json lazily on first use.
+    # Native api_kind providers get dedicated adapters; OpenAI-compatible
+    # providers stay on the default HTTP backend. The Codex backend reads
+    # auth.json lazily on first use.
     from codex_auth import CodexAuthStore     # noqa: E402
     from codex_backend import make_codex_async_call_provider  # noqa: E402
 
@@ -141,6 +142,7 @@ def main() -> None:
         handlers={
             "openai_codex": make_codex_async_call_provider(codex_auth, observe=observe),
             "anthropic": make_anthropic_async_call_provider(timeout_s=args.timeout_s),
+            "bedrock": make_bedrock_async_call_provider(timeout_s=args.timeout_s),
             "google": make_google_async_call_provider(timeout_s=args.timeout_s),
         },
     )
@@ -164,6 +166,7 @@ def main() -> None:
                                               auth=codex_auth,
                                               observe=observe),
             "anthropic": stream_unsupported_api_kind,
+            "bedrock": stream_unsupported_api_kind,
             "google": stream_unsupported_api_kind,
         },
     )

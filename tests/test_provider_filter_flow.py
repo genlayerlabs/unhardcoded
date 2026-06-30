@@ -58,6 +58,10 @@ def _client() -> TestClient:
         config_path=ROOT / "config.live.lua",
         metrics_path=ROOT / "metrics.live.lua",
         call_provider_async=make_api_kind_dispatcher(default=backend),
+        env={
+            "OPENAI_API_KEY": "sk-openai-test",
+            "OPENROUTER_API_KEY": "sk-openrouter-test",
+        },
         now_ms=lambda: 1,
     )
     host.init()

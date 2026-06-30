@@ -4,3 +4,4 @@ fastapi==0.136.3
 uvicorn==0.48.0
 pydantic==2.13.4
 psycopg[binary,pool]==3.2.12
+boto3==1.43.37

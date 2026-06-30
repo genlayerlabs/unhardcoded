@@ -23,12 +23,23 @@ from llm_router_host import LLMRouterHost  # noqa: E402
 LATENCY = 0.10  # seconds each "provider call" takes
 N = 25          # concurrent agents
 
+EXAMPLE_TEST_ENV = {
+    "COMPUT3_API_KEY": "sk-comput3-test",
+    "IONET_API_KEY": "sk-ionet-test",
+    "HEURIST_API_KEY": "sk-heurist-test",
+    "MORPHEUS_API_KEY": "sk-morpheus-test",
+    "CHUTES_API_KEY": "sk-chutes-test",
+    "ATOMA_API_KEY": "sk-atoma-test",
+    "ANTSEED_API_KEY": "sk-antseed-test",
+}
+
 
 def _make_host(hook):
     h = LLMRouterHost(
         router_path=ROOT / "core" / "router.lua",
         config_path=ROOT / "core" / "config.example.lua",
         call_provider_async=hook,
+        env=EXAMPLE_TEST_ENV.copy(),
         now_ms=lambda: int(time.monotonic() * 1000),
     )
     h.init()

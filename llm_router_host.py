@@ -11,7 +11,7 @@ A real HTTP backend can be plugged in by passing call_provider=... .
 
 Dependencies:
     pip install lupa>=2.0
-    (real-HTTP backend, optional: httpx)
+    (real provider backends, optional: httpx boto3)
 """
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from typing import Callable
 import host_store
 import route_reliability as _route_reliability
 from provider_adapters.anthropic import make_anthropic_async_call_provider
+from provider_adapters.bedrock import make_bedrock_async_call_provider
 from provider_adapters.common import (
     AsyncCallProviderHook,
     CallProviderHook,
@@ -62,6 +63,7 @@ __all__ = [
     "make_async_call_provider",
     "make_http_call_provider",
     "make_anthropic_async_call_provider",
+    "make_bedrock_async_call_provider",
     "make_google_async_call_provider",
     "_PEER_GATES",
     "_cached_tokens",
@@ -78,6 +80,15 @@ __all__ = [
 DiscoverHook = Callable[[str], dict]
 Logger = Callable[[str, str, dict], None]
 Clock = Callable[[], int]
+
+_AUTH_UNCONFIGURED = "auth_unconfigured"
+_SECRET_PLACEHOLDERS = {"", "CHANGE_ME", "TODO", "TODO_CHANGE_ME", "PLACEHOLDER"}
+
+
+def _secret_configured(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().upper() not in _SECRET_PLACEHOLDERS
 
 
 class FlowAdmissionError(ValueError):
@@ -113,9 +124,13 @@ class LLMRouterHost:
         env: dict[str, str] | None = None,
         now_ms: Clock | None = None,
         logger: Logger | None = None,
+        enforce_provider_auth: bool | None = None,
     ):
         self.lua = LuaRuntime(unpack_returned_tuples=True)
 
+        self._custom_call_hook = call_provider is not None
+        self._custom_async_call_hook = call_provider_async is not None
+        self._enforce_provider_auth = enforce_provider_auth
         self._call_hook: CallProviderHook = call_provider or _default_mock_call
         self._async_call_hook: AsyncCallProviderHook | None = call_provider_async
         self._discover_hook: DiscoverHook | None = discover
@@ -187,6 +202,8 @@ end
 
     def rank(self, contract: dict) -> tuple[list[dict], list[dict]]:
         """Return (ranked_survivors, rejected). Raises on error."""
+        if self._should_enforce_provider_auth():
+            self._sync_provider_auth_state()
         ranked, err, rejected = self.router.rank(_to_lua(self.lua, contract))
         if err:
             raise RuntimeError(f"rank failed: {err}")
@@ -445,6 +462,8 @@ end
         return _to_py(extract(self.config, _to_lua(self.lua, families))) or {}
 
     def execute(self, contract: dict) -> dict:
+        if self._should_enforce_provider_auth():
+            self._sync_provider_auth_state()
         return _to_py(self.router.execute(_to_lua(self.lua, contract)))
 
     async def execute_async(self, contract: dict, call_override=None) -> dict:
@@ -460,6 +479,8 @@ end
         (the streaming path uses it to thread a per-request delta channel);
         mock responses still take precedence per (provider, family) pair.
         """
+        if self._should_enforce_provider_auth():
+            self._sync_provider_auth_state()
         # Session id (if the caller named one) rides host-side from here to the
         # fold so route_cache learns which peer served this conversation. It is a
         # local of this coroutine, so concurrent executes never share it.
@@ -519,6 +540,87 @@ end
         pushed here as well as into os.environ)."""
         self._env[str(name)] = str(value)
 
+    def _provider_auth_configured(self, provider_id: str, provider: dict) -> bool:
+        """Whether this host has the credential material a provider declares.
+
+        This is intentionally a pre-routing admission check, not a provider
+        health signal: a missing env var is deterministic local config, so the
+        router should not waste a request discovering it as an auth_error.
+        OAuth providers that do not expose an env-backed token are left to their
+        adapter because their readiness is backend-specific and refreshable.
+        """
+        auth = provider.get("auth") if isinstance(provider.get("auth"), dict) else None
+        kind = auth.get("kind") if auth else None
+        env = provider.get("auth_env") or (auth.get("env") if auth else None)
+
+        if provider_id == "ollama" and self._env.get("OLLAMA_CLOUD") != "1":
+            # Local Ollama deliberately runs without an API key. The cloud path
+            # sets OLLAMA_CLOUD=1 and is gated by OLLAMA_API_KEY as usual.
+            return True
+
+        if kind in (None, "bearer") and env:
+            return _secret_configured(self._env.get(str(env)))
+        if kind in (None, "none") and not env:
+            return True
+        if kind == "none":
+            return True
+        if kind == "bearer":
+            return _secret_configured(self._env.get(str(env))) if env else False
+        if kind == "oauth":
+            # Codex and future OAuth adapters can refresh/read outside the host
+            # env snapshot. Do not pre-disable them unless they declare an env.
+            return _secret_configured(self._env.get(str(env))) if env else True
+        return False
+
+    def _should_enforce_provider_auth(self) -> bool:
+        if self._enforce_provider_auth is not None:
+            return bool(self._enforce_provider_auth)
+        return self._custom_call_hook or self._custom_async_call_hook
+
+    def _sync_provider_auth_state(self) -> None:
+        """Reflect missing provider credentials into the core's disabled set.
+
+        The core already knows how to filter disabled providers and how to skip
+        them during execution. We mark only deterministic local config misses
+        with a distinct kind, and remove only that kind when a key appears. Real
+        runtime auth_error disables, breakers, and EMAs are preserved.
+        """
+        catalog = self.catalog()
+        providers = catalog.get("providers") or {}
+        if not providers:
+            return
+
+        missing = {
+            pid for pid, provider in providers.items()
+            if isinstance(provider, dict) and not self._provider_auth_configured(pid, provider)
+        }
+        state = self.dump_state() or {}
+        disabled = dict(state.get("disabled_providers") or {})
+        changed = False
+        now = self._now_ms()
+
+        for pid in missing:
+            cur = disabled.get(pid)
+            if cur is None:
+                disabled[pid] = {"kind": _AUTH_UNCONFIGURED, "at_ms": now}
+                changed = True
+            elif isinstance(cur, dict) and cur.get("kind") == _AUTH_UNCONFIGURED:
+                # Keep it fresh so the normal disabled-provider TTL cannot make
+                # an unset env var intermittently routable.
+                cur["at_ms"] = now
+                changed = True
+
+        for pid, cur in list(disabled.items()):
+            if pid in missing:
+                continue
+            if isinstance(cur, dict) and cur.get("kind") == _AUTH_UNCONFIGURED:
+                del disabled[pid]
+                changed = True
+
+        if changed:
+            state["disabled_providers"] = disabled
+            self.restore_state(state)
+
     def catalog(self) -> dict:
         """The loaded config as plain Python (providers/models/profiles)."""
         return _to_py(self.config) or {}
@@ -527,6 +629,7 @@ end
         """Replace the async provider-call hook (e.g. once provider rules
         derived from the loaded catalog are available)."""
         self._async_call_hook = hook
+        self._custom_async_call_hook = hook is not None
 
     def update_metrics(self, provider: str, model: str, delta: dict) -> None:
         self.router.update_metrics(provider, model, _to_lua(self.lua, delta))
