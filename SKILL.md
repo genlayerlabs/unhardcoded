@@ -78,6 +78,7 @@ Always start the filter with the host floor, then AND your conditions:
 | Set of families | `["or", ["family_eq","gpt-5.5"], ["family_eq","kimi-k2.6"]]` |
 | Tier exactly | `["tier_eq", "partner"]` |
 | Tier at least | `["min_tier", "marketplace"]` (order `fallback < marketplace < partner`) |
+| Specific seller/peer | `["served_by_eq", "<peer-id>"]` — executed route (marketplace peer, or provider for a direct route); set: `served_by_in`, exclude: `served_by_not_in` |
 | **In the top N by a benchmark** | `["cmp", "<field>_rank", "le", N]` (e.g. `bench_intelligence_rank`) |
 | Either of two | `["or", <predA>, <predB>]` |
 
@@ -233,9 +234,13 @@ a multi-input node joins its predecessors' outputs.
   *narrow* what the host allows, never widen it.
 - **Limits:** term depth ≤ 64, ≤ 4096 nodes; flow ≤ 256 nodes, in-degree ≤ 32.
 - **Numbers** must be finite (no NaN/Inf); integers render without a decimal.
-- Targeting a *specific provider/peer* is not a policy concern — peer selection
-  on marketplace providers is automatic (cheapest under the host's cap). You
-  gate on *families and fields*, not sellers.
+- You *can* target a specific seller — `["served_by_eq", "<peer>"]` pins the
+  executed route (a marketplace peer, or the provider for a direct route), with
+  `served_by_in` / `served_by_not_in` as the set sugar — but prefer gating on
+  *properties* over identities: `["cmp", "reputation_score", "ge", 40]` or a
+  `success_rate` weight keeps working as peers come and go, whereas a pinned peer
+  id rots. Reach for `served_by_eq` for a trusted-peer allowlist, not as the
+  default; for the rest, gate on *families and fields*.
 
 ---
 
