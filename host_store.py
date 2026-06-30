@@ -178,6 +178,21 @@ _SCHEMA_STATEMENTS = [
         record TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_login_history_ts ON login_history(ts)",
+    # Direct-provider list prices (openai/anthropic/google) scraped from each
+    # provider's OFFICIAL pricing page by sources/official_pricing, one row per
+    # (provider, curated family). The DURABLE source of truth: routing coasts on
+    # this table when a scrape is stale or fails, so a redesigned pricing page
+    # degrades coverage instead of zeroing a price to +inf. price_cached_in is the
+    # cache-READ (hit) price — kept for effective-cost work, mirrors peer_offers.
+    """CREATE TABLE IF NOT EXISTS provider_prices (
+        provider_id     TEXT NOT NULL,
+        model_family    TEXT NOT NULL,
+        price_in        DOUBLE PRECISION,
+        price_out       DOUBLE PRECISION,
+        price_cached_in DOUBLE PRECISION,
+        updated_at      BIGINT,
+        PRIMARY KEY (provider_id, model_family)
+    )""",
 ]
 
 _pool_lock = threading.Lock()
@@ -783,6 +798,56 @@ def buyer_status(pid: str) -> "dict[str, Any] | None":
         return None
 
 
+# ---- provider_prices (direct-provider list prices; written by sources/official_pricing) ----
+
+_PROVIDER_PRICE_FIELDS = ("provider_id", "model_family", "price_in",
+                         "price_out", "price_cached_in")
+
+
+def get_provider_prices(provider_id: "str | None" = None) -> list[dict[str, Any]]:
+    """Last-known direct-provider list prices, one row per (provider, family).
+    Fail-soft: [] on any store error, so a source coasts on nothing exactly as an
+    empty scrape would. Pass provider_id to scope to one provider."""
+    try:
+        cols = ", ".join(_PROVIDER_PRICE_FIELDS)
+        with _get_pool().connection() as conn:
+            if provider_id is None:
+                cur = conn.execute(f"SELECT {cols} FROM provider_prices")
+            else:
+                cur = conn.execute(
+                    f"SELECT {cols} FROM provider_prices WHERE provider_id = %s",
+                    (provider_id,))
+            return [dict(zip(_PROVIDER_PRICE_FIELDS, r)) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001 — price read is best-effort
+        _log.warning("host_store get_provider_prices failed: %s", exc)
+        return []
+
+
+def set_provider_prices(rows: list[dict[str, Any]]) -> bool:
+    """Upsert direct-provider prices (one row per (provider_id, model_family)).
+    Upsert, NOT replace: providers share the table, each writes only its own rows.
+    Returns False on a persistence failure so the source can log it."""
+    try:
+        now = int(time.time())
+        values = [(r["provider_id"], r["model_family"], r.get("price_in"),
+                   r.get("price_out"), r.get("price_cached_in"), now)
+                  for r in (rows or [])]
+        if not values:
+            return True
+        with _get_pool().connection() as conn:
+            conn.cursor().executemany(
+                "INSERT INTO provider_prices(provider_id, model_family, price_in,"
+                " price_out, price_cached_in, updated_at) VALUES (%s,%s,%s,%s,%s,%s)"
+                " ON CONFLICT (provider_id, model_family) DO UPDATE SET"
+                " price_in=EXCLUDED.price_in, price_out=EXCLUDED.price_out,"
+                " price_cached_in=EXCLUDED.price_cached_in,"
+                " updated_at=EXCLUDED.updated_at", values)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store set_provider_prices failed: %s", exc)
+        return False
+
+
 def reset() -> None:
     """Test hook: close + forget the pool (recreated against DATABASE_URL next
     use). For per-test isolation against a shared DB, truncate the tables."""
@@ -803,4 +868,4 @@ def truncate_all_for_tests() -> None:
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
                      " consumer_keys, peer_offers, buyer_status, route_observations,"
-                     " login_history")
+                     " login_history, provider_prices")
