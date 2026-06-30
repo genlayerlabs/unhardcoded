@@ -13,135 +13,20 @@ falls through to the next candidate exactly as in non-streaming mode.
 """
 from __future__ import annotations
 
-from provider_adapters.common import _cached_tokens
-
 import json
 import re
 import time
 import uuid
 from typing import Any, Awaitable, Callable
 
-from provider_adapters.common import (
-    _classify_status,
-    _err,
-)
-from provider_adapters.openai_compatible import (
-    _classify_from_map,
-    _prepare_openai_call,
-)
+from provider_adapters.common import _err
+# The openai-compatible STREAM backend lives with its non-stream sibling in the
+# adapter leaf (it shares _prepare_openai_call); re-exported here so the dispatcher
+# and shim keep their import site. This module → provider_adapters (the allowed
+# direction); the adapter leaf never imports back (no cycle).
+from provider_adapters.openai_compatible import stream_openai_compatible
 
 Emit = Callable[[str], Awaitable[None]]
-
-
-# ---- openai-compatible stream backend --------------------------------------
-
-async def stream_openai_compatible(
-    request: dict,
-    emit: Emit,
-    *,
-    client: Any = None,
-    env_get=None,
-    extra_headers: dict | None = None,
-    timeout_s: float = 45.0,
-    token_providers: dict | None = None,
-    provider_rules: dict[str, dict] | None = None,
-) -> dict:
-    import os
-
-    prep, err = _prepare_openai_call(
-        request, env_get or os.environ.get, dict(extra_headers or {}),
-        timeout_s, token_providers)
-    if err is not None:
-        return err
-    url, body, headers, timeout = prep
-    body["stream"] = True
-    rules = (provider_rules or {}).get(request.get("provider_id")) or {}
-
-    if client is None:
-        import httpx
-        client = httpx.AsyncClient()
-
-    t0 = time.monotonic()
-    emitted = False
-    text_parts: list[str] = []
-    tool_calls_acc: dict[int, dict] = {}
-    finish_reason = None
-    usage: dict = {}
-    raw_model = None
-
-    def _latency() -> int:
-        return int((time.monotonic() - t0) * 1000)
-
-    try:
-        async with client.stream("POST", url, json=body, headers=headers,
-                                 timeout=timeout) as resp:
-            if not (200 <= resp.status_code < 300):
-                raw = (await resp.aread()).decode("utf-8", "replace")[:500]
-                kind = _classify_from_map(raw, rules.get("error_map")) \
-                    or _classify_status(resp.status_code, raw)
-                return _err(kind, resp.status_code, _latency(), raw)
-
-            async for line in resp.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                data = line[len("data:"):].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except ValueError:
-                    continue
-                if raw_model is None:
-                    raw_model = chunk.get("model")
-                if chunk.get("usage"):
-                    usage = chunk["usage"]
-                for choice in chunk.get("choices") or []:
-                    delta = choice.get("delta") or {}
-                    if choice.get("finish_reason"):
-                        finish_reason = choice["finish_reason"]
-                    content = delta.get("content")
-                    if content:
-                        text_parts.append(content)
-                        await emit(content)
-                        emitted = True
-                    for tc in delta.get("tool_calls") or []:
-                        idx = tc.get("index", 0)
-                        acc = tool_calls_acc.setdefault(idx, {
-                            "id": None, "type": "function",
-                            "function": {"name": "", "arguments": ""}})
-                        if tc.get("id"):
-                            acc["id"] = tc["id"]
-                        fn = tc.get("function") or {}
-                        if fn.get("name"):
-                            acc["function"]["name"] = fn["name"]
-                        if fn.get("arguments"):
-                            acc["function"]["arguments"] += fn["arguments"]
-    except Exception as exc:  # noqa: BLE001 — classified below
-        partial = "".join(text_parts)
-        if emitted:
-            return _err("stream_interrupted", 0, _latency(),
-                        f"{type(exc).__name__}: {exc} (partial: {partial[:200]!r})")
-        return _err("network_error", 0, _latency(), f"{type(exc).__name__}: {exc}")
-
-    tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)] or None
-    text = "".join(text_parts)
-    if not text.strip() and not tool_calls:
-        return _err("bad_response", 200, _latency(), "empty assistant content")
-    return {
-        "ok": True,
-        "latency_ms": _latency(),
-        "response": {
-            "text": text,
-            "tool_calls": tool_calls,
-            "finish_reason": finish_reason,
-            "tokens_in": usage.get("prompt_tokens"),
-            "tokens_out": usage.get("completion_tokens"),
-            "tokens_total": usage.get("total_tokens"),
-            "tokens_cached": _cached_tokens(usage),
-            "cost_reported": usage.get("cost"),
-            "raw_model": raw_model,
-        },
-    }
 
 
 # ---- codex stream backend ----------------------------------------------------

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
-from typing import Callable, Any
+import time
+from typing import Awaitable, Callable, Any
 
 from provider_adapters.common import (
     CallProviderHook,
@@ -15,6 +17,8 @@ from provider_adapters.common import (
     _err,
     _provider_error_message,
 )
+
+Emit = Callable[[str], Awaitable[None]]
 
 
 def _resolve_auth_headers(
@@ -213,22 +217,38 @@ def make_async_call_provider(
                             f"antseed peer {peer_id[:10]} in-flight cap {cap} saturated")
         try:
             try:
-                if client is not None:
-                    resp = await client.post(
-                        url, json=body, headers=headers, timeout=timeout)
+                if request.get("first_token_timeout_ms") is not None:
+                    # Reuse the streaming backend (defined below in this module) to
+                    # get a first-token bound, discarding deltas — a non-stream call.
+                    async def _ignore_delta(_delta: str) -> None:
+                        return None
+
+                    result = await stream_openai_compatible(
+                        request,
+                        _ignore_delta,
+                        client=client,
+                        env_get=_env_get,
+                        extra_headers=_extra,
+                        timeout_s=timeout_s,
+                        token_providers=token_providers,
+                        provider_rules=provider_rules,
+                    )
                 else:
-                    async with httpx.AsyncClient() as c:
-                        resp = await c.post(
+                    if client is not None:
+                        resp = await client.post(
                             url, json=body, headers=headers, timeout=timeout)
+                    else:
+                        async with httpx.AsyncClient() as c:
+                            resp = await c.post(
+                                url, json=body, headers=headers, timeout=timeout)
+                    rules = (provider_rules or {}).get(request.get("provider_id")) or {}
+                    result = _parse_openai_response(
+                        resp, _elapsed_ms(t0), error_map=rules.get("error_map"))
             except httpx.TimeoutException:
                 result = _err("timeout", 0, _elapsed_ms(t0),
                               f"POST {url} timed out")
             except (httpx.NetworkError, httpx.RequestError) as e:
                 result = _err("network_error", 0, _elapsed_ms(t0), str(e))
-            else:
-                rules = (provider_rules or {}).get(request.get("provider_id")) or {}
-                result = _parse_openai_response(
-                    resp, _elapsed_ms(t0), error_map=rules.get("error_map"))
             return result
         finally:
             if gate is not None:
@@ -246,6 +266,152 @@ def _classify_from_map(err_msg: str, error_map: dict | None) -> str | None:
         if needle.lower() in msg:
             return str(kind)
     return None
+
+
+async def stream_openai_compatible(
+    request: dict,
+    emit: Emit,
+    *,
+    client: Any = None,
+    env_get=None,
+    extra_headers: dict | None = None,
+    timeout_s: float = 45.0,
+    token_providers: dict | None = None,
+    provider_rules: dict[str, dict] | None = None,
+) -> dict:
+    """The OpenAI-compatible STREAMING wire backend (sibling of `call`). Returns the
+    SAME complete-response dict the non-streaming backend does, so the core's
+    fallback/retry is wire-agnostic. Lives here, beside `call`/`_prepare_openai_call`,
+    rather than in `streaming.py` — both are openai-compatible wire backends, and
+    keeping it here keeps the adapter leaf from importing the shim-layer module
+    (streaming.py re-exports this name). Honors `request.first_token_timeout_ms`: a
+    pre-delta timeout returns a classified `timeout` error WITHOUT emitting, so the
+    core falls through to the next candidate."""
+    prep, err = _prepare_openai_call(
+        request, env_get or os.environ.get, dict(extra_headers or {}),
+        timeout_s, token_providers)
+    if err is not None:
+        return err
+    url, body, headers, timeout = prep
+    body["stream"] = True
+    rules = (provider_rules or {}).get(request.get("provider_id")) or {}
+
+    if client is None:
+        import httpx
+        client = httpx.AsyncClient()
+
+    t0 = time.monotonic()
+    emitted = False
+    text_parts: list[str] = []
+    tool_calls_acc: dict[int, dict] = {}
+    finish_reason = None
+    usage: dict = {}
+    raw_model = None
+    saw_output = False
+    first_token_timeout_ms = request.get("first_token_timeout_ms")
+    try:
+        first_token_timeout_s = (
+            float(first_token_timeout_ms) / 1000.0
+            if first_token_timeout_ms is not None and float(first_token_timeout_ms) > 0
+            else None
+        )
+    except (TypeError, ValueError):
+        first_token_timeout_s = None
+
+    def _latency() -> int:
+        return int((time.monotonic() - t0) * 1000)
+
+    def _first_token_timeout_error() -> dict:
+        return _err("timeout", 0, _latency(),
+                    f"first token timed out after {int(first_token_timeout_s * 1000)}ms")
+
+    try:
+        async with client.stream("POST", url, json=body, headers=headers,
+                                 timeout=timeout) as resp:
+            if not (200 <= resp.status_code < 300):
+                raw = (await resp.aread()).decode("utf-8", "replace")[:500]
+                kind = _classify_from_map(raw, rules.get("error_map")) \
+                    or _classify_status(resp.status_code, raw)
+                return _err(kind, resp.status_code, _latency(), raw)
+
+            lines = resp.aiter_lines().__aiter__()
+            while True:
+                try:
+                    if first_token_timeout_s is not None and not saw_output:
+                        remaining = first_token_timeout_s - (time.monotonic() - t0)
+                        if remaining <= 0:
+                            return _first_token_timeout_error()
+                        line = await asyncio.wait_for(lines.__anext__(), timeout=remaining)
+                    else:
+                        line = await lines.__anext__()
+                except StopAsyncIteration:
+                    break
+                except (asyncio.TimeoutError, TimeoutError):
+                    if not saw_output:
+                        return _first_token_timeout_error()
+                    raise
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue
+                if raw_model is None:
+                    raw_model = chunk.get("model")
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+                    content = delta.get("content")
+                    if content:
+                        saw_output = True
+                        text_parts.append(content)
+                        await emit(content)
+                        emitted = True
+                    for tc in delta.get("tool_calls") or []:
+                        saw_output = True
+                        idx = tc.get("index", 0)
+                        acc = tool_calls_acc.setdefault(idx, {
+                            "id": None, "type": "function",
+                            "function": {"name": "", "arguments": ""}})
+                        if tc.get("id"):
+                            acc["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            acc["function"]["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            acc["function"]["arguments"] += fn["arguments"]
+    except Exception as exc:  # noqa: BLE001 — classified below
+        partial = "".join(text_parts)
+        if emitted:
+            return _err("stream_interrupted", 0, _latency(),
+                        f"{type(exc).__name__}: {exc} (partial: {partial[:200]!r})")
+        return _err("network_error", 0, _latency(), f"{type(exc).__name__}: {exc}")
+
+    tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)] or None
+    text = "".join(text_parts)
+    if not text.strip() and not tool_calls:
+        return _err("bad_response", 200, _latency(), "empty assistant content")
+    return {
+        "ok": True,
+        "latency_ms": _latency(),
+        "response": {
+            "text": text,
+            "tool_calls": tool_calls,
+            "finish_reason": finish_reason,
+            "tokens_in": usage.get("prompt_tokens"),
+            "tokens_out": usage.get("completion_tokens"),
+            "tokens_total": usage.get("total_tokens"),
+            "tokens_cached": _cached_tokens(usage),
+            "cost_reported": usage.get("cost"),
+            "raw_model": raw_model,
+        },
+    }
 
 
 def _parse_openai_response(

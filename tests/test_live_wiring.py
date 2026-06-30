@@ -156,6 +156,8 @@ def test_live_config_includes_provider_local_native_examples():
 
     assert served_by("gpt-5.5")["openai"] == "gpt-5.5"
     assert served_by("gpt-5.5")["openai_codex"] == "gpt-5.5"
+    assert served_by("gpt-5.4")["openai_codex"] == "gpt-5.4"
+    assert served_by("gpt-5.4-mini")["openai_codex"] == "gpt-5.4-mini"
     assert served_by("claude-opus-4-8")["anthropic"] == "claude-opus-4-8"
     assert "bedrock" not in served_by("claude-opus-4-8")
     assert served_by("gemini-3.1-pro-preview")["gemini"] == \

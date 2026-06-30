@@ -72,6 +72,9 @@ class ChatRequest(BaseModel):
     temperature: float | None = None
     seed: int | None = None
     max_tokens: int | None = None
+    # Optional upstream liveness guard. For OpenAI-compatible streaming-capable
+    # routes, fail/fallback if no content/tool delta arrives before this budget.
+    first_token_timeout_ms: int | None = None
     # Σ_pol per-call policy: a TERM (plain JSON array, e.g.
     # ["policy", ["ev_zero"], ["meets_req"], ...]). Data, never code: the
     # core admits it (sorts/arity/depth/node bounds) and ∧-composes the
@@ -112,6 +115,7 @@ class ResponsesRequest(BaseModel):
     stream: bool = False
     max_output_tokens: int | None = None
     temperature: float | None = None
+    first_token_timeout_ms: int | None = None
     policy_ir: list | None = None
     session: str | None = None
     caller: str | None = None
@@ -901,6 +905,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             tool_choice=_rapi.tool_choice_to_chat(req.tool_choice),
             temperature=req.temperature,
             max_tokens=req.max_output_tokens,
+            first_token_timeout_ms=req.first_token_timeout_ms,
             policy_ir=req.policy_ir,
             session=req.session,
         )
@@ -1239,6 +1244,8 @@ def _request_to_contract(
     max_tokens = req.max_tokens if req.max_tokens is not None else default_max_tokens
     if max_tokens is not None:
         contract["max_tokens"] = max_tokens
+    if req.first_token_timeout_ms is not None:
+        contract["first_token_timeout_ms"] = req.first_token_timeout_ms
     if req.policy_ir is not None:
         # Forwarded verbatim: the CORE is the admission boundary (check ->
         # normalize -> eval, bounded), and it ∧-applies the host envelope.

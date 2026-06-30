@@ -40,6 +40,17 @@ class FakeStreamResponse:
         return False
 
 
+class SlowFirstLineStreamResponse(FakeStreamResponse):
+    def __init__(self, delay, lines):
+        super().__init__(200, lines=lines)
+        self.delay = delay
+
+    async def aiter_lines(self):
+        await asyncio.sleep(self.delay)
+        for line in self._lines:
+            yield line
+
+
 class FakeStreamClient:
     def __init__(self, response):
         self._response = response
@@ -134,6 +145,22 @@ def test_stream_openai_compatible_uses_wire_model_id():
     client = FakeStreamClient(FakeStreamResponse(200, lines=_openai_lines("x")))
     _collect(streaming.stream_openai_compatible(req, emit, client=client))
     assert client.requests[0]["json"]["model"] == "qwen3-235b-instruct"
+
+
+def test_stream_openai_compatible_first_token_timeout_before_delta():
+    deltas = []
+
+    async def emit(d):
+        deltas.append(d)
+
+    req = dict(OPENAI_REQ, first_token_timeout_ms=10)
+    client = FakeStreamClient(SlowFirstLineStreamResponse(
+        0.05, _openai_lines("late")))
+    resp = _collect(streaming.stream_openai_compatible(req, emit, client=client))
+    assert deltas == []
+    assert resp["ok"] is False
+    assert resp["error_kind"] == "timeout"
+    assert "first token timed out" in resp["error_message"]
 
 
 # ---- codex stream backend -----------------------------------------------------
