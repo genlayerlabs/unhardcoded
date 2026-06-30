@@ -22,6 +22,26 @@ from sources import Balance, Price
 
 STALE_AFTER_S = 900
 
+# Vendor prefixes stripped (as a whole leading token) when canonicalizing a
+# marketplace service name to match curated families. `claude-` is included so a
+# curated `claude-opus-4-8` and a peer's bare `opus-4.8` reduce to the same form.
+_VENDOR_PREFIXES = ("anthropic-", "claude-", "openai-", "google-", "gemini-",
+                    "meta-", "qwen-", "x-ai-", "deepseek-")
+
+
+def _canon_service(name: str) -> str:
+    """Canonical form for matching a peer's wire model name to a curated family:
+    lowercase, dots->dashes, and strip ONE leading known vendor prefix. Kept
+    deliberately conservative — it bridges `opus-4.8` / `anthropic-claude-opus-4.8`
+    to `claude-opus-4-8`, but does NOT merge digit-run differences (`gpt-55` vs
+    `gpt-5.5`) or model variants (`...-fast`), so it cannot collapse two distinct
+    models into one route."""
+    s = (name or "").strip().lower().replace(".", "-")
+    for vp in _VENDOR_PREFIXES:
+        if s.startswith(vp):
+            return s[len(vp):]
+    return s
+
 # Buyer hot-wallet on-chain reads. The marketplace spends from ESCROW
 # (depositsAvailable); the raw wallet balance — USDC sitting in the wallet, plus
 # ETH for gas — is what tells you whether you can deposit more or pay for a tx at
@@ -115,10 +135,37 @@ class AntSeedSource:
         data = host_store.buyer_status(provider_id)
         return (data or {}).get("pinned_peer_id") or None
 
+    def _canon_models(self) -> dict[str, str]:
+        """Lazy {canonical_name -> curated family} index over self._models, so a
+        peer that names a curated model with a different vendor prefix / separator
+        (e.g. `opus-4.8`, `anthropic-claude-sonnet-4.6`) still folds into the
+        curated family instead of being exposed under its raw wire name. A
+        canonical form shared by TWO curated families is AMBIGUOUS and dropped —
+        never risk routing to the wrong model; the offer falls through to raw."""
+        cached = getattr(self, "_canon_models_cache", None)
+        if cached is None:
+            index: dict[str, str] = {}
+            ambiguous: set[str] = set()
+            for fam in self._models:
+                c = _canon_service(fam)
+                if c in index and index[c] != fam:
+                    ambiguous.add(c)
+                index[c] = fam
+            for c in ambiguous:
+                index.pop(c, None)
+            cached = self._canon_models_cache = index
+        return cached
+
     def _family_for(self, provider_cfg: dict, service: str) -> str | None:
+        # Exact wire name and the operator's static aliases are authoritative.
         aliases = provider_cfg.get("service_aliases") or {}
         family = aliases.get(service, service)
-        return family if family in self._models else None
+        if family in self._models:
+            return family
+        # Conservative canonical match (vendor-prefix + separator/case only): a
+        # peer's `opus-4.8` reaches the curated `claude-opus-4-8`. None on no/
+        # ambiguous match, so the caller keeps exposing the service raw.
+        return self._canon_models().get(_canon_service(service))
 
     def offers_sync(self, provider_id: str) -> list[dict]:
         """One offer per advertised service for this buyer proxy — the WHOLE

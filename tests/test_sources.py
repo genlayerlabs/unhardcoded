@@ -554,6 +554,48 @@ def test_antseed_pricing_rows_match_offers(tmp_path):
     assert ("antseed_cheap", "claude-sonnet-4-6") in rows
 
 
+def test_canon_service_is_conservative():
+    from sources.antseed import _canon_service
+    assert _canon_service("opus-4.8") == "opus-4-8"            # dots -> dashes
+    assert _canon_service("claude-opus-4-8") == "opus-4-8"     # strip vendor prefix
+    assert _canon_service("OpenAI-GPT-OSS-120B") == "gpt-oss-120b"  # case + prefix
+    assert _canon_service("gpt-5.5") == "gpt-5-5"              # no vendor prefix
+    # does NOT bridge digit-run differences -> stays distinct from gpt-5-5
+    assert _canon_service("gpt-55") == "gpt-55"
+    # strips only ONE leading prefix (real peers use a single form)
+    assert _canon_service("anthropic-claude-sonnet-4.6") == "claude-sonnet-4-6"
+
+
+def test_family_for_canonicalizes_vendor_prefix_and_separators():
+    # A2: a peer naming a curated model with a bare/dotted form folds into the
+    # curated family instead of being exposed under its raw wire name.
+    from sources.antseed import AntSeedSource
+    s = AntSeedSource(ANTSEED_CATALOG)
+    cfg = ANTSEED_CATALOG["providers"]["antseed_cheap"]
+    assert s._family_for(cfg, "sonnet-4.6") == "claude-sonnet-4-6"        # bare + dotted
+    assert s._family_for(cfg, "claude-sonnet-4-6") == "claude-sonnet-4-6"  # exact
+    assert s._family_for(cfg, "qwen3-235b-instruct") == "qwen3-235b-a22b"  # static alias wins
+    # never collapse a variant or an unknown into a curated family
+    assert s._family_for(cfg, "sonnet-4.6-fast") is None
+    assert s._family_for(cfg, "some-unknown-model") is None
+
+
+def test_family_for_drops_ambiguous_canonical():
+    # Two curated families sharing a canonical form must NOT auto-match (it would
+    # risk routing to the wrong model); only an exact wire name still resolves.
+    from sources.antseed import AntSeedSource
+    cat = {
+        "providers": {"antseed_cheap": {"discovery": "marketplace",
+                                        "discovery_id": "antseed_cheap"}},
+        "models": {"claude-opus-4-8": {"served_by": []},
+                   "opus-4-8": {"served_by": []}},   # both canonicalize to "opus-4-8"
+    }
+    s = AntSeedSource(cat)
+    cfg = cat["providers"]["antseed_cheap"]
+    assert s._family_for(cfg, "opus-4.8") is None                      # ambiguous -> raw
+    assert s._family_for(cfg, "claude-opus-4-8") == "claude-opus-4-8"  # exact still ok
+
+
 def test_antseed_drops_offer_when_cached_input_exceeds_input(tmp_path):
     # The buyer's @antseed/router-local rejects an offer whose cached-input price
     # exceeds its input price (cachedInput must be <= input) as malformed — the

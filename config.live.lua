@@ -239,6 +239,19 @@ return {
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.93,
         },
+        -- Curated so it has a DIRECT (non-marketplace) fallback: until now
+        -- claude-fable-5 lived only as raw marketplace offers (2 thin/failing
+        -- sellers), so a fable-5 request had no route home when they failed.
+        -- Direct anthropic/openrouter routes give it a fallback, and being
+        -- curated lets the marketplace canonicalizer fold fable-5 wire variants.
+        ["claude-fable-5"] = {
+            served_by = {
+                { provider = "anthropic",    provider_model_id = "claude-fable-5" },
+                { provider = "openrouter",   provider_model_id = "anthropic/claude-fable-5" },
+            },
+            capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.90,
+        },
         ["gemini-3.1-pro-preview"] = {
             served_by = {
                 { provider = "gemini",       provider_model_id = "gemini-3.1-pro-preview" },
