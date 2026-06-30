@@ -41,10 +41,34 @@ present — the policy drives the choice.
 }
 ```
 
-Dry-run / identify a term without spending: `POST /x/policy/normalize`
-(`{policy_ir}` → `{policy_ir, fingerprint, version}`) and `POST /x/rank`
-(`{policy_ir}` → the ordered candidates this host would try). Σ_flow: `POST
-/x/flow/normalize` to admit + identify before use.
+## The feedback loop — author → preview → run → read
+
+Every step is a request with the **same** `Authorization: Bearer <key>` you used to fetch this guide. You never have to fly blind:
+
+1. **Author** the `policy_ir` (the grammar is below).
+2. **Admit & identify — no spend.** `POST /x/policy/normalize` `{policy_ir}` → `{policy_ir, fingerprint, version}`. A `400` here pinpoints what's invalid (unknown op, undeclared field, …) so you fix the term before paying.
+3. **Preview the ranking — no spend.** `POST /x/rank` `{policy_ir}` → `{ranked, rejected}`: the candidates this host would admit and how it orders them, plus the ones it filtered out, each with the `reason` it failed. This is how you see *what your policy does* without a single call.
+4. **Run it for real.** `POST /v1/chat/completions` with `policy_ir` (or `flow_ir`) + `messages` (the example above). A real call — real spend.
+5. **Read how it routed.** The response carries **`x_router`** — your debugger for what actually happened:
+
+   | `x_router` field | what it tells you |
+   |---|---|
+   | `provider` · `served_model_id` | the model that answered |
+   | `served_by` | the *executed route* — the marketplace peer, or the provider for a direct route |
+   | `cost_usd` · `price_in` · `price_out` | what the call cost |
+   | `policy_fingerprint` | the identity of the policy that ran (matches `/x/policy/normalize`) |
+   | `decision_trace` | `ranked` (the candidates considered) **and** `decision_path` (the real fallback attempts — which routes were tried, and `ok` or the error each hit) |
+   | `session_acc` | running totals, when the call carries a session |
+
+   `decision_trace.decision_path` is the fallback story — exactly which routes were tried and why it fell through; `served_by` + `cost_usd` say where it landed and what it cost. Refine the term and loop.
+
+**The same loop for a Σ_flow** (a DAG of nodes, each with its own `policy_ir` — see *Σ_flow* below):
+
+1. **Author** the `flow_ir`.
+2. **Admit & identify — no spend.** `POST /x/flow/normalize` `{flow_ir}` → `{flow_ir, fingerprint, version}`.
+3. **Preview — no spend.** A flow has no single ranking (each node routes on its own policy), so preview a node by sending *its* `policy_ir` to `POST /x/rank`.
+4. **Run it for real.** `POST /v1/chat/completions` with `flow_ir` + `messages`.
+5. **Read how it routed.** `x_router.decision_trace` carries **`flow_nodes`** — one entry per node with its `node` id, `provider` / `served_by`, tokens, latency, and the node's own `decision_path` (its fallback attempts). That's the per-node debugger: you see which node ran what, where each landed, and any fallback inside a node.
 
 ## The Σ_pol term, exactly
 
