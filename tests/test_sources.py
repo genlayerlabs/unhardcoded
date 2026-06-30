@@ -536,6 +536,7 @@ def test_bedrock_source_keeps_previous_offers_when_price_refresh_fails():
     )
     asyncio.run(source.pricing())
     previous = source.offers_sync("bedrock_mantle_market")
+    assert previous
 
     client.routes["/prices/us-east-1.json"] = FakeResponse(500, {})
 
