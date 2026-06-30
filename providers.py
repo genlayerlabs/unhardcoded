@@ -30,6 +30,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from env_coerce import env_float, env_int
+
 
 def _has(catalog: dict, pred: Callable[[str, dict], bool]) -> bool:
     return any(isinstance(p, dict) and pred(pid, p)
@@ -42,7 +44,7 @@ class Provider:
     # SOURCE — (catalog, env_get) -> ProviderSource. None = no catalog source.
     source: "Callable[..., Any] | None" = None
     # ENABLED — build the source only when the loaded catalog actually has this
-    # provider (preserves build_registry's per-provider gating). None = always.
+    # provider (preserves build_source_registry's per-provider gating). None = always.
     enabled: "Callable[[dict], bool] | None" = None
     # ADAPTER (wire) — the api_kind this provider's backend serves + a factory
     # (timeout_s) -> AsyncCallProviderHook. api_kind=None ⇒ default
@@ -101,21 +103,6 @@ def _codex_source(catalog, env_get):
     return CodexSource(pid) if pid else None
 
 
-# --- helpers for declaring knobs (mirror settings._i/_f without importing it) --
-def _i(env, d):
-    try:
-        return int(os.getenv(env, str(d)))
-    except (TypeError, ValueError):
-        return d
-
-
-def _f(env, d):
-    try:
-        return float(os.getenv(env, str(d)))
-    except (TypeError, ValueError):
-        return d
-
-
 # The provider registry. Each entry composes the aspects above; absent aspects
 # are simply None/empty (composition, not inheritance — nothing is forced).
 PROVIDERS: "list[Provider]" = [
@@ -125,11 +112,11 @@ PROVIDERS: "list[Provider]" = [
         enabled=lambda c: "openrouter" in (c.get("providers") or {}),
         knobs={
             "runway_credits_low_usd": {
-                "type": "float", "default": _f("RUNWAY_CREDITS_LOW_USD", 25),
+                "type": "float", "default": env_float("RUNWAY_CREDITS_LOW_USD", 25),
                 "min": 0, "max": 1000000, "label": "Credits runway: low (USD)",
                 "help": "Credits below this read as 'low'."},
             "runway_credits_empty_usd": {
-                "type": "float", "default": _f("RUNWAY_CREDITS_EMPTY_USD", 1),
+                "type": "float", "default": env_float("RUNWAY_CREDITS_EMPTY_USD", 1),
                 "min": 0, "max": 1000000, "label": "Credits runway: empty (USD)",
                 "help": "Credits at/below this read as 'empty'."},
         },
@@ -141,11 +128,11 @@ PROVIDERS: "list[Provider]" = [
                                and str(p.get("discovery_id", "")).startswith("antseed")),
         knobs={
             "offers_top_n": {
-                "type": "int", "default": _i("ANTSEED_OFFERS_TOP_N", 3),
+                "type": "int", "default": env_int("ANTSEED_OFFERS_TOP_N", 3),
                 "min": 1, "max": 10, "label": "Offers per family (top-N peers)",
                 "help": "Cheapest distinct seller peers surfaced per family to rotate between on failure."},
             "reputation_min": {
-                "type": "float", "default": _f("ANTSEED_REPUTATION_MIN", 0),
+                "type": "float", "default": env_float("ANTSEED_REPUTATION_MIN", 0),
                 "min": 0, "max": 100, "label": "Min peer on-chain reputation",
                 "help": "Drop AntSeed peers whose on-chain reputation score (0-100) is below "
                         "this. 0 = off. Peers that report no reputation are kept (cold-start safe)."},
@@ -160,11 +147,11 @@ PROVIDERS: "list[Provider]" = [
                 "help": "AntSeed peer IDs that are never offered. Comma-separated. "
                         "Takes precedence over the allowlist. Empty (default) = none denied."},
             "runway_deposits_low_usdc": {
-                "type": "float", "default": _f("RUNWAY_DEPOSITS_LOW_USDC", 2),
+                "type": "float", "default": env_float("RUNWAY_DEPOSITS_LOW_USDC", 2),
                 "min": 0, "max": 100000, "label": "Wallet runway: low (USDC)",
                 "help": "Deposits below this read as 'low · top up'."},
             "runway_deposits_empty_usdc": {
-                "type": "float", "default": _f("RUNWAY_DEPOSITS_EMPTY_USDC", 0.01),
+                "type": "float", "default": env_float("RUNWAY_DEPOSITS_EMPTY_USDC", 0.01),
                 "min": 0, "max": 100000, "label": "Wallet runway: empty (USDC)",
                 "help": "Deposits at/below this read as 'empty'."},
         },
@@ -193,27 +180,27 @@ PROVIDERS: "list[Provider]" = [
         enabled=lambda c: _has(c, lambda pid, p: p.get("api_kind") == "openai_codex"),
         knobs={
             "imputed_price_in": {
-                "type": "float", "default": _f("CODEX_IMPUTED_PRICE_IN", 5),
+                "type": "float", "default": env_float("CODEX_IMPUTED_PRICE_IN", 5),
                 "min": 0, "max": 1000, "label": "Scarcity price in ($/Mtok at full demote)",
                 "help": "Imputed input price when the subscription quota is fully strained."},
             "imputed_price_out": {
-                "type": "float", "default": _f("CODEX_IMPUTED_PRICE_OUT", 25),
+                "type": "float", "default": env_float("CODEX_IMPUTED_PRICE_OUT", 25),
                 "min": 0, "max": 1000, "label": "Scarcity price out ($/Mtok at full demote)",
                 "help": "Imputed output price at full demote."},
             "quota_demote_start": {
-                "type": "float", "default": _f("CODEX_QUOTA_DEMOTE_START", 0.5),
+                "type": "float", "default": env_float("CODEX_QUOTA_DEMOTE_START", 0.5),
                 "min": 0, "max": 1, "label": "Quota demote start (fraction)",
                 "help": "Quota-used fraction at which the scarcity price ramp begins."},
             "quota_429_window_s": {
-                "type": "float", "default": _f("CODEX_QUOTA_429_WINDOW_S", 120),
+                "type": "float", "default": env_float("CODEX_QUOTA_429_WINDOW_S", 120),
                 "min": 1, "max": 3600, "label": "429 window (s)",
                 "help": "How long an observed 429 counts toward the scarcity ramp."},
             "quota_429_shed": {
-                "type": "float", "default": _f("CODEX_QUOTA_429_SHED", 3),
+                "type": "float", "default": env_float("CODEX_QUOTA_429_SHED", 3),
                 "min": 1, "max": 100, "label": "429s to full demote",
                 "help": "Recent 429s within the window that ramp the price to full."},
             "runway_quota_low_fraction": {
-                "type": "float", "default": _f("RUNWAY_QUOTA_LOW_FRACTION", 0.8),
+                "type": "float", "default": env_float("RUNWAY_QUOTA_LOW_FRACTION", 0.8),
                 "min": 0, "max": 1, "label": "Quota runway: low (fraction)",
                 "help": "Quota-used above this reads as 'low'."},
         },

@@ -9,31 +9,17 @@ always wins, so a bad override can never break ranking.
 """
 from __future__ import annotations
 
-import os
 import threading
 from typing import Any
 
 import host_store
-
-
-def _f(env: str, d: float) -> float:
-    try:
-        return float(os.getenv(env, str(d)))
-    except ValueError:
-        return d
-
-
-def _i(env: str, d: int) -> int:
-    try:
-        return int(os.getenv(env, str(d)))
-    except ValueError:
-        return d
+from env_coerce import env_int
 
 
 # key -> declarative knob. `provider` groups it in the UI; type/min/max validate.
 SCHEMA: dict[str, dict[str, Any]] = {
     "compaction.at_tokens": {
-        "provider": "compaction", "type": "int", "default": _i("COMPACT_AT_TOKENS", 24000),
+        "provider": "compaction", "type": "int", "default": env_int("COMPACT_AT_TOKENS", 24000),
         "min": 1000, "max": 2000000, "label": "Suggest compaction at (input tokens)",
         "help": "When a call's input exceeds this, the response carries "
                 "x_router.compact=true so the agent knows to POST /v1/compact."},
