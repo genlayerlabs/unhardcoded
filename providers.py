@@ -13,15 +13,17 @@ aspects, declared in ONE place:
      persisted via the host store), declared next to the provider, not scattered.
 
 `build_source_registry()` (the source list), the api_kind dispatcher handlers,
-and the settings SCHEMA all DERIVE from `PROVIDERS` — one source of truth.
+and the settings SCHEMA all DERIVE from `PROVIDERS` — one source of truth, and the
+single composition root: this module depends DOWN on `sources/*` and
+`provider_adapters/*`, which never import back (no cycle).
 Adding a provider = one `config.live.lua` entry + one `Provider` record here.
 
 Behaviour note (`special`): `codex` is the one provider whose source OBSERVES its
-own wire backend (the scarcity-price source ingests the backend's quota traffic),
-so its source/adapter/streaming are wired imperatively in `serve.py`. The registry
-still lists it (for its knobs and for the Config view) but skips building its
-source/adapter here — generalising that one coupling into the record would be
-mechanism for a single case (act over potency)."""
+own wire backend (the scarcity-price source ingests the backend's quota traffic).
+Its *source* is built here like any other (it only needs the codex provider id);
+what `special` marks is that its ADAPTER and that observe/bind coupling are wired
+imperatively in `serve.py` — generalising that one coupling into the record would
+be mechanism for a single case (act over potency)."""
 from __future__ import annotations
 
 import os
@@ -47,9 +49,6 @@ class Provider:
     # openai_compatible backend (no dedicated adapter).
     api_kind: "str | None" = None
     adapter: "Callable[..., Any] | None" = None
-    # streaming twin for the api_kind: a factory () -> stream hook, or None ⇒
-    # `stream_unsupported_api_kind` (native non-streaming backends fall back).
-    stream_adapter: "Callable[..., Any] | None" = None
     # KNOBS — operator-tunable settings.SCHEMA entries (keyed bare; namespaced
     # `<id>.<knob>` at registration). Declared next to the provider.
     knobs: "dict[str, dict]" = field(default_factory=dict)
@@ -90,6 +89,16 @@ def _bedrock_adapter(timeout_s):
 def _google_adapter(timeout_s):
     from provider_adapters.google import make_google_async_call_provider
     return make_google_async_call_provider(timeout_s=timeout_s)
+
+
+def _codex_source(catalog, env_get):
+    # codex's source just needs the codex provider id from the loaded catalog;
+    # the OBSERVE/bind coupling (the source watching the backend's quota traffic)
+    # is wired in serve.py. Constructing the source is not itself special.
+    from sources.codex import CodexSource
+    pid = next((pid for pid, p in (catalog.get("providers") or {}).items()
+                if isinstance(p, dict) and p.get("api_kind") == "openai_codex"), None)
+    return CodexSource(pid) if pid else None
 
 
 # --- helpers for declaring knobs (mirror settings._i/_f without importing it) --
@@ -174,10 +183,14 @@ PROVIDERS: "list[Provider]" = [
     ),
     Provider("anthropic", api_kind="anthropic", adapter=_anthropic_adapter),
     Provider("google", api_kind="google", adapter=_google_adapter),
-    # codex: source ↔ backend coupling (observe) wired in serve.py; listed here
-    # for its knobs and the Config view. Its source/adapter are skipped below.
+    # codex: its source is built like any provider's (via _codex_source); only the
+    # ADAPTER and the observe/bind coupling (the source watching its own backend's
+    # quota traffic) are wired imperatively in serve.py — that, not the source, is
+    # what `special` marks.
     Provider(
         "codex", special=True,
+        source=_codex_source,
+        enabled=lambda c: _has(c, lambda pid, p: p.get("api_kind") == "openai_codex"),
         knobs={
             "imputed_price_in": {
                 "type": "float", "default": _f("CODEX_IMPUTED_PRICE_IN", 5),
@@ -209,17 +222,19 @@ PROVIDERS: "list[Provider]" = [
 
 
 def build_source_registry(catalog: dict, env_get=os.environ.get) -> list:
-    """The ProviderSource list, derived from PROVIDERS: build each provider's
-    source when it has one, is enabled for the loaded catalog, and is not the
-    specially-wired codex (built in serve.py). Replaces the old conditional
-    build_registry — same providers, same gating."""
+    """The complete ProviderSource list, derived from PROVIDERS: every provider
+    with a source factory, enabled for the loaded catalog, built once. This is the
+    single composition root for the registry — serve.py and settings depend DOWN
+    on it, and `sources/*` stay leaves (they never import this module)."""
     out = []
     for p in PROVIDERS:
-        if p.special or p.source is None:
+        if p.source is None:
             continue
         if p.enabled is not None and not p.enabled(catalog):
             continue
-        out.append(p.source(catalog, env_get))
+        s = p.source(catalog, env_get)
+        if s is not None:
+            out.append(s)
     return out
 
 

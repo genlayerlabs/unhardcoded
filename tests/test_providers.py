@@ -1,5 +1,5 @@
 """The modular provider registry: every provider composes its aspects (source /
-adapter / knobs / enabled) in ONE place, and build_registry, the api_kind
+adapter / knobs / enabled) in ONE place, and build_source_registry, the api_kind
 dispatcher handlers, and settings.SCHEMA all derive from it."""
 from __future__ import annotations
 
@@ -53,6 +53,9 @@ def test_native_api_kinds_declared_and_codex_is_the_one_exception():
     native = {p.api_kind for p in providers.PROVIDERS if p.api_kind and not p.special}
     assert {"anthropic", "bedrock", "google"} <= native
     codex = next(p for p in providers.PROVIDERS if p.id == "codex")
-    assert codex.special and codex.api_kind is None  # source↔backend coupling wired in serve.py
-    # build_source_registry / native handlers never build codex here
-    assert not any(p.special and (p.source or p.adapter) for p in providers.PROVIDERS)
+    # codex is special only in its WIRE: its adapter + the observe/bind coupling
+    # live in serve.py, so it declares no api_kind/adapter here and never lands in
+    # the native handler table. Its SOURCE, though, is built generically.
+    assert codex.special and codex.api_kind is None and codex.adapter is None
+    cat = {"providers": {"oai": {"api_kind": "openai_codex"}}, "models": {}}
+    assert [s.name for s in providers.build_source_registry(cat)] == ["codex"]

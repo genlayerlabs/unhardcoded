@@ -8,7 +8,6 @@ first refresh). See docs/superpowers/specs/2026-06-10-provider-sources-design.md
 from __future__ import annotations
 
 import asyncio
-import os
 import random
 import time
 from typing import Any, Literal, Protocol, TypedDict
@@ -112,21 +111,3 @@ def start_refresh_tasks(host: Any, catalog: dict,
     immediately; cadence is per-source."""
     return [asyncio.create_task(_run_source(host, catalog, s))
             for s in registry if s.poll_interval_s]
-
-
-def build_registry(catalog: dict, env_get=os.environ.get) -> list[ProviderSource]:
-    """The ProviderSource list, derived from the modular `providers.PROVIDERS`
-    registry (each provider declares its own source + `enabled` predicate). The
-    one exception is codex: its source OBSERVES its own wire backend (serve.py
-    binds it) and needs the codex provider id from the catalog, so it is built
-    here, not in the registry — keeping that source↔backend coupling a single
-    documented case rather than a general hook."""
-    import providers as _providers
-    registry: list[ProviderSource] = list(
-        _providers.build_source_registry(catalog, env_get))
-    for pid, p in (catalog.get("providers") or {}).items():
-        if isinstance(p, dict) and p.get("api_kind") == "openai_codex":
-            from sources.codex import CodexSource
-            registry.append(CodexSource(pid))
-            break
-    return registry

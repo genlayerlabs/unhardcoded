@@ -107,9 +107,9 @@ def main() -> None:
     # Per-provider declarative rules (error_map) come from the loaded catalog,
     # so the dispatcher is built after the host. The source registry is also
     # built here: the codex source must observe the codex backend's traffic.
-    import sources as sources_mod
+    import providers
     catalog = host.catalog()
-    registry = sources_mod.build_registry(catalog)
+    registry = providers.build_source_registry(catalog)
     codex_src = next((s for s in registry if s.name == "codex"), None)
     observe = None
     if codex_src is not None:
@@ -135,8 +135,7 @@ def main() -> None:
     # The native api_kind adapters (anthropic/bedrock/google) come from the
     # modular provider registry; codex is wired here because its backend takes
     # the `observe` hook that feeds its scarcity-price source.
-    import providers as _providers
-    _native = _providers.native_adapter_handlers(args.timeout_s)
+    _native = providers.native_adapter_handlers(args.timeout_s)
     call_async = make_api_kind_dispatcher(
         default=make_async_call_provider(timeout_s=args.timeout_s,
                                          provider_rules=provider_rules),
@@ -217,10 +216,12 @@ def attach_sources(app, host, catalog=None, registry=None) -> None:
     FastAPI 0.13x removed the on_event/add_event_handler path."""
     import contextlib
 
+    import providers
     import sources as sources_mod
 
     catalog = catalog if catalog is not None else host.catalog()
-    registry = registry if registry is not None else sources_mod.build_registry(catalog)
+    registry = (registry if registry is not None
+                else providers.build_source_registry(catalog))
     if any(getattr(s, "offers_sync", None) for s in registry):
         host.set_discover_hook(make_discover_hook(registry))
     inner = app.router.lifespan_context

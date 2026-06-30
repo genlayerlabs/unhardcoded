@@ -15,6 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import providers  # noqa: E402
 import sources as src  # noqa: E402
 
 
@@ -103,17 +104,17 @@ def test_refresh_once_isolates_failures():
     assert host.pushed == []
 
 
-def test_build_registry_includes_openrouter_only_when_configured():
-    reg = src.build_registry(CATALOG)
+def test_build_source_registry_includes_openrouter_only_when_configured():
+    reg = providers.build_source_registry(CATALOG)
     assert [s.name for s in reg] == ["openrouter"]
-    assert src.build_registry({"providers": {"antseed": {}}}) == []
+    assert providers.build_source_registry({"providers": {"antseed": {}}}) == []
 
 
-def test_build_registry_adds_bedrock_source():
+def test_build_source_registry_adds_bedrock_source():
     cat = {"providers": {"bedrock": {
         "source": "bedrock", "api_kind": "bedrock",
     }}, "models": {}}
-    reg = src.build_registry(cat)
+    reg = providers.build_source_registry(cat)
     assert [s.name for s in reg] == ["bedrock"]
 
 
@@ -715,7 +716,7 @@ def test_attach_sources_starts_and_stops_refresh_tasks(monkeypatch):
     src.SOURCE_STATE.clear()
     fake = FakeSource(prices=[], balances={"openrouter": {
         "kind": "credits_usd", "value": 1.0, "detail": {}, "fetched_at": 1}})
-    monkeypatch.setattr(src, "build_registry", lambda catalog, env_get=None: [fake])
+    monkeypatch.setattr(providers, "build_source_registry", lambda catalog, env_get=None: [fake])
 
     serve.attach_sources(app, host)
     with TestClient(app) as client:
@@ -1183,9 +1184,9 @@ def test_codex_source_without_parseable_headers_has_none_value():
     assert b["detail"]["recent_429_count"] == 0
 
 
-def test_build_registry_adds_codex_for_openai_codex_api_kind():
+def test_build_source_registry_adds_codex_for_openai_codex_api_kind():
     cat = {"providers": {"openai": {"api_kind": "openai_codex"}}, "models": {}}
-    reg = src.build_registry(cat)
+    reg = providers.build_source_registry(cat)
     assert [s.name for s in reg] == ["codex"]
     assert reg[0].poll_interval_s == 30             # local self-refresh tick (no endpoint probe)
 
