@@ -40,6 +40,16 @@ def test_settings_schema_merges_provider_knobs_plus_compaction():
         assert key in settings.SCHEMA
 
 
+def test_priced_providers_get_an_effective_multiplier_knob():
+    sch = providers.provider_knob_schema()
+    for p in providers.PROVIDERS:
+        key = f"{p.id}.price_multiplier"
+        if p.source is not None:                 # only providers that push a price
+            assert key in sch and sch[key]["default"] == 1.0 and sch[key]["type"] == "float"
+        else:
+            assert key not in sch                # no dead knob where it can't apply
+
+
 def test_enabled_predicates_gate_on_the_catalog():
     antseed = next(p for p in providers.PROVIDERS if p.id == "antseed")
     assert antseed.enabled(

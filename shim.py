@@ -1418,6 +1418,17 @@ def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> floa
     pin, pout = chosen.get("price_in"), chosen.get("price_out")
     if pin is None and pout is None:
         return None
+    # The ranking price carries the provider's effective-price multiplier — a
+    # FICTITIOUS routing lever (providers.price_multiplier, applied in
+    # sources.push_prices). Billing must use the RAW list price, so divide it back
+    # out: cost_usd never moves with the multiplier. Reported-cost providers settle
+    # in step 2 and never reach here, so this keeps billing uniform across them.
+    import settings
+    mkey = f"{chosen.get('provider_id')}.price_multiplier"
+    mult = settings.get(mkey) if mkey in settings.SCHEMA else 1.0
+    if mult and mult > 0:
+        pin = pin / mult if pin is not None else pin
+        pout = pout / mult if pout is not None else pout
     tin = resp.get("tokens_in") or 0
     cached = resp.get("tokens_cached") or 0
     uncached = max(0, tin - cached)
