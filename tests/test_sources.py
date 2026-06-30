@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import providers  # noqa: E402
+import settings  # noqa: E402
 import sources as src  # noqa: E402
 
 
@@ -56,8 +57,21 @@ def test_push_prices_only_pushes_cataloged_pairs():
     assert pushed == 1
     (provider, family, delta), = host.pushed
     assert (provider, family) == ("openrouter", "gpt-5.5")
-    assert delta["price_in"] == 5.0 and delta["price_out"] == 30.0
+    assert delta["price_in"] == 5.0 and delta["price_out"] == 30.0   # multiplier 1.0 default
     assert isinstance(delta["price_refreshed_at"], int)
+
+
+def test_push_prices_applies_effective_price_multiplier(monkeypatch):
+    # a 0.5 effective multiplier (e.g. a negotiated 50% discount) scales the price
+    # the ranking sees, while the source's raw list price is untouched.
+    monkeypatch.setitem(settings._overrides, "openrouter.price_multiplier", 0.5)
+    host = FakeHost()
+    src.push_prices(host, CATALOG, [
+        {"provider_id": "openrouter", "served_model_id": "openai/gpt-5.5",
+         "model_family": "gpt-5.5",
+         "price_in_usd_per_mtok": 5.0, "price_out_usd_per_mtok": 30.0}])
+    (_, _, delta), = host.pushed
+    assert (delta["price_in"], delta["price_out"]) == (2.5, 15.0)
 
 
 class FakeSource:

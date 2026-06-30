@@ -253,11 +253,26 @@ def native_adapter_handlers(timeout_s: float) -> "dict[str, Any]":
             if not p.special and p.api_kind and p.adapter}
 
 
+def _price_multiplier_knob(provider_id: str) -> dict:
+    return {
+        "provider": provider_id, "type": "float", "default": 1.0,
+        "min": 0.0, "max": 100.0, "label": "Effective price multiplier",
+        "help": "Scales this provider's reported list price before ranking — the "
+                "effective vs list factor (a negotiated discount/credits = < 1, a "
+                "risk premium = > 1). 1.0 = list price as-is. Applied at push time, "
+                "so the stored list price stays raw; marketplace/offer prices are "
+                "the live market and are not scaled."}
+
+
 def provider_knob_schema() -> "dict[str, dict]":
     """The provider knobs, namespaced `<id>.<knob>` and stamped with the provider
-    group — the per-provider half of settings.SCHEMA, derived from PROVIDERS."""
+    group — the per-provider half of settings.SCHEMA, derived from PROVIDERS. Every
+    provider that contributes a price (has a source) also gets an effective-price
+    multiplier knob, applied centrally in sources.push_prices."""
     schema: dict[str, dict] = {}
     for p in PROVIDERS:
+        if p.source is not None:
+            schema[f"{p.id}.price_multiplier"] = _price_multiplier_knob(p.id)
         for name, spec in p.knobs.items():
             schema[f"{p.id}.{name}"] = {**spec, "provider": p.id}
     return schema

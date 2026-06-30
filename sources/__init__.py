@@ -62,7 +62,13 @@ def _served_pairs(catalog: dict) -> set[tuple[str, str]]:
 def push_prices(host: Any, catalog: dict, prices: list[Price]) -> int:
     """Write mapped prices into the core's metrics store (the one ranking
     and price-ceiling filters read). Unmapped or un-cataloged prices are
-    skipped — sources never widen the catalog."""
+    skipped — sources never widen the catalog.
+
+    Each price is scaled by the provider's effective-price multiplier (the
+    `<provider>.price_multiplier` operator knob, default 1.0) on the way in, so
+    ranking sees the EFFECTIVE price (negotiated discount/credits/risk premium)
+    while the raw list price stays untouched at the source/table."""
+    import settings  # lazy: settings -> providers, never imports sources back
     pairs = _served_pairs(catalog)
     now = int(time.time())
     pushed = 0
@@ -71,9 +77,11 @@ def push_prices(host: Any, catalog: dict, prices: list[Price]) -> int:
         provider = p.get("provider_id")
         if not family or (provider, family) not in pairs:
             continue
+        key = f"{provider}.price_multiplier"
+        mult = settings.get(key) if key in settings.SCHEMA else 1.0
         host.update_metrics(provider, family, {
-            "price_in": p["price_in_usd_per_mtok"],
-            "price_out": p["price_out_usd_per_mtok"],
+            "price_in": p["price_in_usd_per_mtok"] * mult,
+            "price_out": p["price_out_usd_per_mtok"] * mult,
             "price_refreshed_at": now,
         })
         pushed += 1
