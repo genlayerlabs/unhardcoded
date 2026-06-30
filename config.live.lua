@@ -248,6 +248,8 @@ return {
         ["gpt-5.4-mini"] = {
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.4-mini" },
+                { provider = "openai",       provider_model_id = "gpt-5.4-mini" },
+                { provider = "openrouter",   provider_model_id = "openai/gpt-5.4-mini" },
             },
             capabilities = { context = 400000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.86,

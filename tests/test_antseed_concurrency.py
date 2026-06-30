@@ -116,3 +116,9 @@ async def test_first_token_timeout_uses_internal_streaming_for_json_calls():
     assert result["ok"] is True
     assert result["response"]["text"] == "ok"
     assert client.requests[0]["json"]["stream"] is True
+    # §3 response-shape parity: the stream-under-hood path returns the SAME shape
+    # the non-stream path does — not just text, but finish_reason + usage — so the
+    # core's aggregation and cost-accounting are unaffected by the timeout opt-in.
+    assert result["response"]["finish_reason"] == "stop"
+    assert result["response"]["tokens_out"] == 2
+    assert result["response"]["tokens_total"] == 5

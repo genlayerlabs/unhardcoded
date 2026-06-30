@@ -294,6 +294,29 @@ def test_execute_async_threads_first_token_timeout_to_provider_request(host):
     assert seen[0]["first_token_timeout_ms"] == 2500
 
 
+def test_execute_async_first_token_timeout_falls_through_to_next_candidate(host):
+    # End-to-end: the `timeout` error the first-token guard produces must trigger
+    # the core's retry policy (config.example.lua: timeout = next_candidate), so a
+    # stalled first seller falls through to the next — the whole point of the knob.
+    import asyncio
+    seen = []
+
+    async def override(request):
+        seen.append(request["provider_id"])
+        if len(seen) == 1:                       # the exact shape stream_openai_compatible
+            return {"ok": False, "error_kind": "timeout", "http_status": 0,  # returns on a
+                    "latency_ms": 1, "error_message": "first token timed out after 10ms"}  # TTFB miss
+        return {"ok": True, "latency_ms": 1,
+                "response": {"text": "second-seller", "finish_reason": "stop"}}
+
+    res = asyncio.run(host.execute_async({
+        "prompt": "hi", "profile": "default", "first_token_timeout_ms": 10,
+    }, call_override=override))
+
+    assert res["ok"] and res["response"]["text"] == "second-seller"
+    assert len(seen) >= 2                          # #1 timed out -> fell through to #2
+
+
 def test_streaming_override_path_folds_route_metrics(host, host_store_clean):
     # The fix: the override (streaming) path must record a route observation too.
     # Before, the fold lived only inside the direct hook, so reliability/latency
