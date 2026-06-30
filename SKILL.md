@@ -74,8 +74,10 @@ Always start the filter with the host floor, then AND your conditions:
 | Numeric threshold | `["cmp", "<field>", "<rel>", <number>]` — rel ∈ `le lt ge gt eq ne` |
 | Boolean is true | `["is", "<bool_field>"]` |
 | Boolean is false | `["not", ["is", "<bool_field>"]]` |
+| Has a capability | `["has_cap", "supports_tools"]` (model serves it; e.g. `supports_json_mode`) |
 | One model family | `["family_eq", "gpt-5.5"]` |
 | Set of families | `["or", ["family_eq","gpt-5.5"], ["family_eq","kimi-k2.6"]]` |
+| One provider | `["provider_eq", "openrouter"]` — route by *who serves*; set: `provider_in`, exclude: `not`/`provider_not_in` (e.g. drop a marketplace provider) |
 | Tier exactly | `["tier_eq", "partner"]` |
 | Tier at least | `["min_tier", "marketplace"]` (order `fallback < marketplace < partner`) |
 | Specific seller/peer | `["served_by_eq", "<peer-id>"]` — executed route (marketplace peer, or provider for a direct route); set: `served_by_in`, exclude: `served_by_not_in` |
