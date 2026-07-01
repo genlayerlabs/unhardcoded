@@ -17,7 +17,7 @@ def test_every_provider_declares_at_least_one_aspect():
     # composition, not inheritance: a provider supplies only the aspects it has,
     # but it must contribute *something* (a source, a wire adapter, or knobs).
     for p in providers.PROVIDERS:
-        assert p.source or p.adapter or p.knobs or p.special, p.id
+        assert p.source or p.adapter or p.stream_adapter or p.knobs or p.special, p.id
 
 
 def test_knob_schema_is_namespaced_and_grouped():
@@ -65,6 +65,8 @@ def test_enabled_predicates_gate_on_the_catalog():
 def test_native_api_kinds_declared_and_codex_is_the_one_exception():
     native = {p.api_kind for p in providers.PROVIDERS if p.api_kind and not p.special}
     assert {"anthropic", "bedrock", "google"} <= native
+    streaming = providers.native_streaming_adapter_handlers(timeout_s=1)
+    assert {"anthropic", "bedrock", "google"} <= set(streaming)
     codex = next(p for p in providers.PROVIDERS if p.id == "codex")
     # codex is special only in its WIRE: its adapter + the observe/bind coupling
     # live in serve.py, so it declares no api_kind/adapter here and never lands in

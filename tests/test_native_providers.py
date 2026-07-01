@@ -14,8 +14,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from provider_adapters.anthropic import make_anthropic_async_call_provider  # noqa: E402
+from provider_adapters.anthropic import stream_anthropic  # noqa: E402
 from provider_adapters.bedrock import make_bedrock_async_call_provider  # noqa: E402
+from provider_adapters.bedrock import stream_bedrock  # noqa: E402
 from provider_adapters.google import make_google_async_call_provider  # noqa: E402
+from provider_adapters.google import stream_google  # noqa: E402
 
 
 class FakeResponse:
@@ -43,12 +46,68 @@ class FakeClient:
         return self.response
 
 
-class FakeBedrockClient:
+class FakeStreamResponse:
+    def __init__(self, status_code, lines=None, body=b"", open_delay=0, line_delay=0):
+        self.status_code = status_code
+        self._lines = lines or []
+        self._body = body
+        self._open_delay = open_delay
+        self._line_delay = line_delay
+        self.headers = {}
+
+    async def __aenter__(self):
+        if self._open_delay:
+            import asyncio
+            await asyncio.sleep(self._open_delay)
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def aiter_lines(self):
+        if self._line_delay:
+            import asyncio
+            await asyncio.sleep(self._line_delay)
+        for line in self._lines:
+            yield line
+
+    async def aread(self):
+        return self._body
+
+
+class FakeStreamClient:
     def __init__(self, response):
         self.response = response
         self.requests = []
 
+    def stream(self, method, url, json=None, headers=None, timeout=None):
+        self.requests.append({
+            "method": method,
+            "url": url,
+            "json": json,
+            "headers": headers,
+            "timeout": timeout,
+        })
+        return self.response
+
+
+class FakeBedrockClient:
+    def __init__(self, response, stream_delay=0):
+        self.response = response
+        self.stream_delay = stream_delay
+        self.requests = []
+        self.methods = []
+
     def converse(self, **kwargs):
+        self.methods.append("converse")
+        self.requests.append(kwargs)
+        return self.response
+
+    def converse_stream(self, **kwargs):
+        if self.stream_delay:
+            import time
+            time.sleep(self.stream_delay)
+        self.methods.append("converse_stream")
         self.requests.append(kwargs)
         return self.response
 
@@ -65,6 +124,10 @@ TOOL = {
         },
     },
 }
+
+
+def _sse(data: dict) -> str:
+    return "data: " + json.dumps(data)
 
 
 @pytest.mark.asyncio
@@ -236,6 +299,218 @@ async def test_bedrock_native_handler_translates_openai_shape():
     assert req["messages"] == [{"role": "user", "content": [{"text": "hi"}]}]
     assert req["inferenceConfig"] == {"maxTokens": 128, "temperature": 0.2}
     assert req["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]["required"] == ["id"]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_native_stream_emits_and_aggregates():
+    deltas = []
+    client = FakeStreamClient(FakeStreamResponse(200, [
+        _sse({"type": "message_start", "message": {
+            "model": "claude-sonnet-4-6",
+            "usage": {"input_tokens": 11},
+        }}),
+        _sse({"type": "content_block_delta", "index": 0,
+              "delta": {"type": "text_delta", "text": "Use the tool."}}),
+        _sse({"type": "content_block_start", "index": 1,
+              "content_block": {"type": "tool_use", "id": "toolu_1",
+                                "name": "lookup", "input": {}}}),
+        _sse({"type": "content_block_delta", "index": 1,
+              "delta": {"type": "input_json_delta",
+                        "partial_json": '{"id": "abc"}'}}),
+        _sse({"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+              "usage": {"output_tokens": 7}}),
+    ]))
+
+    async def emit(delta):
+        deltas.append(delta)
+
+    result = await stream_anthropic({
+        "provider_id": "anthropic",
+        "api_kind": "anthropic",
+        "auth_env": "ANTHROPIC_TEST_KEY",
+        "served_model_id": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+    }, emit, env_get={"ANTHROPIC_TEST_KEY": "anth-key"}.get, client=client)
+
+    assert deltas == ["Use the tool."]
+    assert result["ok"] is True
+    assert result["response"]["text"] == "Use the tool."
+    assert result["response"]["tokens_total"] == 18
+    assert result["response"]["tool_calls"][0]["function"] == {
+        "name": "lookup",
+        "arguments": '{"id": "abc"}',
+    }
+    assert client.requests[0]["json"]["stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_google_native_stream_emits_and_aggregates():
+    deltas = []
+    client = FakeStreamClient(FakeStreamResponse(200, [
+        _sse({"modelVersion": "gemini-3.1-pro-preview",
+              "candidates": [{"content": {"parts": [{"text": "Done."}]}}]}),
+        _sse({"candidates": [{"finishReason": "STOP",
+              "content": {"parts": [
+                  {"functionCall": {"name": "lookup", "args": {"id": "abc"}}},
+              ]}}],
+              "usageMetadata": {
+                  "promptTokenCount": 13,
+                  "candidatesTokenCount": 5,
+                  "totalTokenCount": 18,
+              }}),
+    ]))
+
+    async def emit(delta):
+        deltas.append(delta)
+
+    result = await stream_google({
+        "provider_id": "gemini",
+        "api_kind": "google",
+        "auth_env": "GEMINI_TEST_KEY",
+        "served_model_id": "gemini-3.1-pro-preview",
+        "messages": [{"role": "user", "content": "hi"}],
+    }, emit, env_get={"GEMINI_TEST_KEY": "gem-key"}.get, client=client)
+
+    assert deltas == ["Done."]
+    assert result["ok"] is True
+    assert result["response"]["text"] == "Done."
+    assert result["response"]["raw_model"] == "gemini-3.1-pro-preview"
+    assert result["response"]["tokens_total"] == 18
+    assert result["response"]["tool_calls"][0]["function"] == {
+        "name": "lookup",
+        "arguments": '{"id": "abc"}',
+    }
+    assert client.requests[0]["url"].endswith(
+        "/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse")
+
+
+@pytest.mark.asyncio
+async def test_bedrock_native_stream_emits_and_aggregates():
+    deltas = []
+    client = FakeBedrockClient({"stream": [
+        {"contentBlockDelta": {"contentBlockIndex": 0,
+                               "delta": {"text": "Use the tool."}}},
+        {"contentBlockStart": {"contentBlockIndex": 1,
+                               "start": {"toolUse": {
+                                   "toolUseId": "toolu_1",
+                                   "name": "lookup",
+                               }}}},
+        {"contentBlockDelta": {"contentBlockIndex": 1,
+                               "delta": {"toolUse": {
+                                   "input": '{"id": "abc"}',
+                               }}}},
+        {"messageStop": {"stopReason": "tool_use"}},
+        {"metadata": {"usage": {"inputTokens": 11, "outputTokens": 7,
+                                "totalTokens": 18}}},
+    ]})
+
+    async def emit(delta):
+        deltas.append(delta)
+
+    result = await stream_bedrock({
+        "provider_id": "bedrock",
+        "api_kind": "bedrock",
+        "served_model_id": "us.anthropic.claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+    }, emit, env_get={"AWS_REGION": "us-east-1"}.get, client=client)
+
+    assert deltas == ["Use the tool."]
+    assert result["ok"] is True
+    assert result["response"]["text"] == "Use the tool."
+    assert result["response"]["raw_model"] == "us.anthropic.claude-sonnet-4-6"
+    assert result["response"]["tokens_total"] == 18
+    assert result["response"]["tool_calls"][0]["function"] == {
+        "name": "lookup",
+        "arguments": '{"id": "abc"}',
+    }
+    assert client.methods == ["converse_stream"]
+
+
+@pytest.mark.asyncio
+async def test_native_call_providers_use_streaming_when_first_token_timeout_present():
+    anthropic = FakeStreamClient(FakeStreamResponse(200, [
+        _sse({"type": "content_block_delta", "index": 0,
+              "delta": {"type": "text_delta", "text": "a"}}),
+    ]))
+    call = make_anthropic_async_call_provider(
+        env_get={"ANTHROPIC_API_KEY": "k"}.get, client=anthropic)
+    result = await call({
+        "served_model_id": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "first_token_timeout_ms": 100,
+    })
+    assert result["ok"] is True
+    assert anthropic.requests[0]["json"]["stream"] is True
+
+    google = FakeStreamClient(FakeStreamResponse(200, [
+        _sse({"candidates": [{"content": {"parts": [{"text": "g"}]}}]}),
+    ]))
+    call = make_google_async_call_provider(
+        env_get={"GEMINI_API_KEY": "k"}.get, client=google)
+    result = await call({
+        "served_model_id": "gemini-3.1-pro-preview",
+        "messages": [{"role": "user", "content": "hi"}],
+        "first_token_timeout_ms": 100,
+    })
+    assert result["ok"] is True
+    assert ":streamGenerateContent?alt=sse" in google.requests[0]["url"]
+
+    bedrock = FakeBedrockClient({"stream": [
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "b"}}},
+    ]})
+    call = make_bedrock_async_call_provider(
+        env_get={"AWS_REGION": "us-east-1"}.get, client=bedrock)
+    result = await call({
+        "api_kind": "bedrock",
+        "served_model_id": "us.anthropic.claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "first_token_timeout_ms": 100,
+    })
+    assert result["ok"] is True
+    assert bedrock.methods == ["converse_stream"]
+
+
+@pytest.mark.asyncio
+async def test_native_streams_enforce_first_token_timeout_before_output():
+    async def emit(_delta):
+        raise AssertionError("no text should be emitted before timeout")
+
+    anthropic = await stream_anthropic({
+        "served_model_id": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "first_token_timeout_ms": 10,
+    }, emit, env_get={"ANTHROPIC_API_KEY": "k"}.get,
+        client=FakeStreamClient(FakeStreamResponse(
+            200,
+            [_sse({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "text_delta", "text": "late"}})],
+            open_delay=0.05,
+        )))
+    assert anthropic["error_kind"] == "timeout"
+
+    google = await stream_google({
+        "served_model_id": "gemini-3.1-pro-preview",
+        "messages": [{"role": "user", "content": "hi"}],
+        "first_token_timeout_ms": 10,
+    }, emit, env_get={"GEMINI_API_KEY": "k"}.get,
+        client=FakeStreamClient(FakeStreamResponse(
+            200,
+            [_sse({"candidates": [{"content": {"parts": [{"text": "late"}]}}]})],
+            line_delay=0.05,
+        )))
+    assert google["error_kind"] == "timeout"
+
+    bedrock = await stream_bedrock({
+        "api_kind": "bedrock",
+        "served_model_id": "us.anthropic.claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "first_token_timeout_ms": 10,
+    }, emit, env_get={"AWS_REGION": "us-east-1"}.get,
+        client=FakeBedrockClient({"stream": [
+            {"contentBlockDelta": {"contentBlockIndex": 0,
+                                   "delta": {"text": "late"}}},
+        ]}, stream_delay=0.05))
+    assert bedrock["error_kind"] == "timeout"
 
 
 @pytest.mark.asyncio
