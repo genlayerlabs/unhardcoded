@@ -74,3 +74,41 @@ def test_native_api_kinds_declared_and_codex_is_the_one_exception():
     assert codex.special and codex.api_kind is None and codex.adapter is None
     cat = {"providers": {"oai": {"api_kind": "openai_codex"}}, "models": {}}
     assert [s.name for s in providers.build_source_registry(cat)] == ["codex"]
+
+
+def test_native_streaming_handlers_bind_the_real_backends():
+    # serve.py wires the streaming dispatcher from these handlers: a native
+    # api_kind must reach its REAL stream backend, not the old
+    # stream_unsupported_api_kind fallback (#63).
+    from provider_adapters import anthropic, bedrock, google
+    handlers = providers.native_streaming_adapter_handlers(timeout_s=1)
+    assert handlers["anthropic"].func is anthropic.stream_anthropic
+    assert handlers["google"].func is google.stream_google
+    assert handlers["bedrock"].func is bedrock.stream_bedrock
+
+
+def test_streaming_dispatcher_routes_by_api_kind():
+    # the dispatcher selects the per-api_kind streaming backend and falls back to
+    # the default for openai_compatible — the wiring serve.py relies on.
+    import asyncio
+    from streaming import make_streaming_dispatcher
+
+    seen = {}
+
+    async def _default(req, emit):
+        seen["h"] = "default"
+        return {"ok": True}
+
+    async def _anthropic(req, emit):
+        seen["h"] = "anthropic"
+        return {"ok": True}
+
+    async def _emit(_d):
+        return None
+
+    dispatch = make_streaming_dispatcher(default=_default,
+                                         handlers={"anthropic": _anthropic})
+    asyncio.run(dispatch({"api_kind": "anthropic"}, _emit))
+    assert seen["h"] == "anthropic"
+    asyncio.run(dispatch({"api_kind": "openai_compatible"}, _emit))
+    assert seen["h"] == "default"

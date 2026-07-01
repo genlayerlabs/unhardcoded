@@ -12,6 +12,7 @@ from provider_adapters.common import (
     before_first_output,
     first_token_timeout_err,
     first_token_timeout_s,
+    ignore_delta,
     json_args,
     text_from_content,
     _elapsed_ms,
@@ -405,11 +406,8 @@ def make_bedrock_async_call_provider(
             return _err("unsupported_api_kind", 0, 0,
                         f"api_kind={api_kind!r} not supported by Bedrock backend")
         if request.get("first_token_timeout_ms") is not None:
-            async def _ignore_delta(_delta: str) -> None:
-                return None
-
             return await stream_bedrock(
-                request, _ignore_delta, env_get=_env_get, timeout_s=timeout_s,
+                request, ignore_delta, env_get=_env_get, timeout_s=timeout_s,
                 client=client, client_factory=client_factory)
 
         body = _bedrock_request(request)

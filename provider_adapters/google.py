@@ -1,20 +1,18 @@
 """Google Gemini generateContent provider adapter."""
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import time
-from contextlib import AsyncExitStack
 from typing import Any, Callable
 from urllib.parse import quote
 
 from provider_adapters.common import (
     AsyncCallProviderHook,
+    StreamAcc,
     auth_token,
-    before_first_output,
-    first_token_timeout_err,
-    first_token_timeout_s,
+    drive_http_sse,
+    ignore_delta,
     json_args,
     text_from_content,
     _classify_status,
@@ -211,103 +209,55 @@ async def stream_google(
     if client is None:
         client = httpx.AsyncClient()
 
-    t0 = time.monotonic()
-    saw_output = False
-    emitted = False
-    text_parts: list[str] = []
-    tool_calls: list[dict] = []
-    finish_reason = None
-    usage: dict = {}
-    raw_model = None
-    first_timeout_s = first_token_timeout_s(request)
+    async def _on_event(chunk: dict, acc: StreamAcc) -> "dict | None":
+        acc.raw_model = chunk.get("modelVersion") or acc.raw_model
+        if chunk.get("usageMetadata"):
+            acc.usage = chunk["usageMetadata"]
+        for cand in chunk.get("candidates") or []:
+            acc.finish_reason = cand.get("finishReason") or acc.finish_reason
+            for part in ((cand.get("content") or {}).get("parts") or []):
+                if part.get("text"):
+                    acc.saw_output = True
+                    acc.emitted = True
+                    acc.text_parts.append(part["text"])
+                    await emit(part["text"])
+                if part.get("functionCall"):
+                    acc.saw_output = True
+                    if acc.tool_calls is None:
+                        acc.tool_calls = []
+                    fc = part["functionCall"]
+                    acc.tool_calls.append({
+                        "id": fc.get("id") or fc.get("name"),
+                        "type": "function",
+                        "function": {
+                            "name": fc.get("name") or "",
+                            "arguments": json.dumps(fc.get("args") or {}),
+                        },
+                    })
+        return None
 
-    def _latency() -> int:
-        return _elapsed_ms(t0)
+    acc, error = await drive_http_sse(
+        client=client, url=url, body=body, headers=headers, timeout=timeout,
+        request=request, on_event=_on_event)
+    if error is not None:
+        return error
 
-    def _saw_output() -> bool:
-        return saw_output
-
-    def _timeout_err() -> dict:
-        return first_token_timeout_err(first_timeout_s, _latency())
-
-    try:
-        async with AsyncExitStack() as stack:
-            try:
-                resp = await before_first_output(
-                    stack.enter_async_context(
-                        client.stream("POST", url, json=body, headers=headers,
-                                      timeout=timeout)),
-                    first_timeout_s, t0, _saw_output)
-            except (asyncio.TimeoutError, TimeoutError):
-                return _timeout_err()
-            if not (200 <= resp.status_code < 300):
-                raw = (await resp.aread()).decode("utf-8", "replace")[:500]
-                return _err(_classify_status(resp.status_code, raw),
-                            resp.status_code, _latency(), raw)
-
-            lines = resp.aiter_lines().__aiter__()
-            while True:
-                try:
-                    line = await before_first_output(
-                        lines.__anext__(), first_timeout_s, t0, _saw_output)
-                except StopAsyncIteration:
-                    break
-                except (asyncio.TimeoutError, TimeoutError):
-                    if not saw_output:
-                        return _timeout_err()
-                    raise
-                if not line or not line.startswith("data:"):
-                    continue
-                data = line[len("data:"):].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except ValueError:
-                    continue
-                raw_model = chunk.get("modelVersion") or raw_model
-                if chunk.get("usageMetadata"):
-                    usage = chunk["usageMetadata"]
-                for cand in chunk.get("candidates") or []:
-                    finish_reason = cand.get("finishReason") or finish_reason
-                    for part in ((cand.get("content") or {}).get("parts") or []):
-                        if part.get("text"):
-                            saw_output = True
-                            emitted = True
-                            text_parts.append(part["text"])
-                            await emit(part["text"])
-                        if part.get("functionCall"):
-                            saw_output = True
-                            fc = part["functionCall"]
-                            tool_calls.append({
-                                "id": fc.get("id") or fc.get("name"),
-                                "type": "function",
-                                "function": {
-                                    "name": fc.get("name") or "",
-                                    "arguments": json.dumps(fc.get("args") or {}),
-                                },
-                            })
-    except Exception as exc:  # noqa: BLE001
-        partial = "".join(text_parts)
-        if emitted:
-            return _err("stream_interrupted", 0, _latency(),
-                        f"{type(exc).__name__}: {exc} (partial: {partial[:200]!r})")
-        return _err("network_error", 0, _latency(), f"{type(exc).__name__}: {exc}")
-
-    text = "".join(text_parts)
+    text = "".join(acc.text_parts)
+    tool_calls = acc.tool_calls or None
     if not text.strip() and not tool_calls:
-        return _err("bad_response", 200, _latency(), "empty assistant content")
+        return _err("bad_response", 200, acc.latency(), "empty assistant content")
+    usage = acc.usage
     return {
         "ok": True,
-        "latency_ms": _latency(),
+        "latency_ms": acc.latency(),
         "response": {
             "text": text,
-            "tool_calls": tool_calls or None,
-            "finish_reason": finish_reason,
+            "tool_calls": tool_calls,
+            "finish_reason": acc.finish_reason,
             "tokens_in": usage.get("promptTokenCount"),
             "tokens_out": usage.get("candidatesTokenCount"),
             "tokens_total": usage.get("totalTokenCount"),
-            "raw_model": raw_model,
+            "raw_model": acc.raw_model,
         },
     }
 
@@ -329,11 +279,8 @@ def make_google_async_call_provider(
         if error is not None:
             return error
         if request.get("first_token_timeout_ms") is not None:
-            async def _ignore_delta(_delta: str) -> None:
-                return None
-
             return await stream_google(
-                request, _ignore_delta, env_get=_env_get, timeout_s=timeout_s,
+                request, ignore_delta, env_get=_env_get, timeout_s=timeout_s,
                 extra_headers=_extra, client=client)
         url, body, headers = _google_request(request, token, _extra)
         timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0

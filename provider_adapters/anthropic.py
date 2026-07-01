@@ -1,19 +1,17 @@
 """Anthropic Messages API provider adapter."""
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import time
-from contextlib import AsyncExitStack
 from typing import Any, Callable
 
 from provider_adapters.common import (
     AsyncCallProviderHook,
+    StreamAcc,
     auth_token,
-    before_first_output,
-    first_token_timeout_err,
-    first_token_timeout_s,
+    drive_http_sse,
+    ignore_delta,
     json_args,
     text_from_content,
     _classify_status,
@@ -172,134 +170,88 @@ async def stream_anthropic(
     if client is None:
         client = httpx.AsyncClient()
 
-    t0 = time.monotonic()
-    saw_output = False
-    emitted = False
-    text_parts: list[str] = []
-    tool_calls_acc: dict[int, dict] = {}
-    finish_reason = None
-    usage: dict = {}
-    raw_model = None
-    first_timeout_s = first_token_timeout_s(request)
+    async def _on_event(ev: dict, acc: StreamAcc) -> "dict | None":
+        etype = ev.get("type")
+        if etype == "message_start":
+            msg = ev.get("message") or {}
+            acc.raw_model = msg.get("model") or acc.raw_model
+            acc.usage.update(msg.get("usage") or {})
+        elif etype == "content_block_start":
+            idx = ev.get("index", 0)
+            block = ev.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                acc.saw_output = True
+                if acc.tool_calls is None:
+                    acc.tool_calls = {}
+                acc.tool_calls[idx] = {
+                    "id": block.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name") or "",
+                        "arguments": (
+                            json.dumps(block.get("input"))
+                            if block.get("input") else ""
+                        ),
+                    },
+                }
+        elif etype == "content_block_delta":
+            idx = ev.get("index", 0)
+            delta = ev.get("delta") or {}
+            if delta.get("type") == "text_delta" and delta.get("text"):
+                acc.saw_output = True
+                acc.emitted = True
+                acc.text_parts.append(delta["text"])
+                await emit(delta["text"])
+            elif delta.get("type") == "input_json_delta":
+                acc.saw_output = True
+                if acc.tool_calls is None:
+                    acc.tool_calls = {}
+                tc = acc.tool_calls.setdefault(idx, {
+                    "id": None,
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                })
+                if delta.get("partial_json"):
+                    tc["function"]["arguments"] += delta["partial_json"]
+            elif str(delta.get("type") or "").endswith("_delta"):
+                acc.saw_output = True
+        elif etype == "message_delta":
+            delta = ev.get("delta") or {}
+            acc.finish_reason = delta.get("stop_reason") or acc.finish_reason
+            acc.usage.update(ev.get("usage") or {})
+        elif etype == "error":
+            e = ev.get("error") or {}
+            msg = e.get("message") or str(e or ev)
+            return _err(_classify_status(acc.status, msg), acc.status,
+                        acc.latency(), msg[:500])
+        return None
 
-    def _latency() -> int:
-        return _elapsed_ms(t0)
+    acc, error = await drive_http_sse(
+        client=client, url=url, body=body, headers=headers, timeout=timeout,
+        request=request, on_event=_on_event)
+    if error is not None:
+        return error
 
-    def _saw_output() -> bool:
-        return saw_output
-
-    def _timeout_err() -> dict:
-        return first_token_timeout_err(first_timeout_s, _latency())
-
-    try:
-        async with AsyncExitStack() as stack:
-            try:
-                resp = await before_first_output(
-                    stack.enter_async_context(
-                        client.stream("POST", url, json=body, headers=headers,
-                                      timeout=timeout)),
-                    first_timeout_s, t0, _saw_output)
-            except (asyncio.TimeoutError, TimeoutError):
-                return _timeout_err()
-            if not (200 <= resp.status_code < 300):
-                raw = (await resp.aread()).decode("utf-8", "replace")[:500]
-                return _err(_classify_status(resp.status_code, raw),
-                            resp.status_code, _latency(), raw)
-
-            lines = resp.aiter_lines().__aiter__()
-            while True:
-                try:
-                    line = await before_first_output(
-                        lines.__anext__(), first_timeout_s, t0, _saw_output)
-                except StopAsyncIteration:
-                    break
-                except (asyncio.TimeoutError, TimeoutError):
-                    if not saw_output:
-                        return _timeout_err()
-                    raise
-                if not line or not line.startswith("data:"):
-                    continue
-                data = line[len("data:"):].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    ev = json.loads(data)
-                except ValueError:
-                    continue
-                etype = ev.get("type")
-                if etype == "message_start":
-                    msg = ev.get("message") or {}
-                    raw_model = msg.get("model") or raw_model
-                    usage.update(msg.get("usage") or {})
-                elif etype == "content_block_start":
-                    idx = ev.get("index", 0)
-                    block = ev.get("content_block") or {}
-                    if block.get("type") == "tool_use":
-                        saw_output = True
-                        tool_calls_acc[idx] = {
-                            "id": block.get("id"),
-                            "type": "function",
-                            "function": {
-                                "name": block.get("name") or "",
-                                "arguments": (
-                                    json.dumps(block.get("input"))
-                                    if block.get("input") else ""
-                                ),
-                            },
-                        }
-                elif etype == "content_block_delta":
-                    idx = ev.get("index", 0)
-                    delta = ev.get("delta") or {}
-                    if delta.get("type") == "text_delta" and delta.get("text"):
-                        saw_output = True
-                        emitted = True
-                        text_parts.append(delta["text"])
-                        await emit(delta["text"])
-                    elif delta.get("type") == "input_json_delta":
-                        saw_output = True
-                        acc = tool_calls_acc.setdefault(idx, {
-                            "id": None,
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        })
-                        if delta.get("partial_json"):
-                            acc["function"]["arguments"] += delta["partial_json"]
-                    elif str(delta.get("type") or "").endswith("_delta"):
-                        saw_output = True
-                elif etype == "message_delta":
-                    delta = ev.get("delta") or {}
-                    finish_reason = delta.get("stop_reason") or finish_reason
-                    usage.update(ev.get("usage") or {})
-                elif etype == "error":
-                    err = ev.get("error") or {}
-                    msg = err.get("message") or str(err or ev)
-                    return _err(_classify_status(resp.status_code, msg),
-                                resp.status_code, _latency(), msg[:500])
-    except Exception as exc:  # noqa: BLE001
-        partial = "".join(text_parts)
-        if emitted:
-            return _err("stream_interrupted", 0, _latency(),
-                        f"{type(exc).__name__}: {exc} (partial: {partial[:200]!r})")
-        return _err("network_error", 0, _latency(), f"{type(exc).__name__}: {exc}")
-
-    tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)] or None
-    text = "".join(text_parts)
+    by_index = acc.tool_calls or {}
+    tool_calls = [by_index[i] for i in sorted(by_index)] or None
+    text = "".join(acc.text_parts)
     if not text.strip() and not tool_calls:
-        return _err("bad_response", 200, _latency(), "empty assistant content")
+        return _err("bad_response", 200, acc.latency(), "empty assistant content")
+    usage = acc.usage
     return {
         "ok": True,
-        "latency_ms": _latency(),
+        "latency_ms": acc.latency(),
         "response": {
             "text": text,
             "tool_calls": tool_calls,
-            "finish_reason": finish_reason,
+            "finish_reason": acc.finish_reason,
             "tokens_in": usage.get("input_tokens"),
             "tokens_out": usage.get("output_tokens"),
             "tokens_total": (
                 (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
                 if usage else None
             ),
-            "raw_model": raw_model,
+            "raw_model": acc.raw_model,
         },
     }
 
@@ -321,11 +273,8 @@ def make_anthropic_async_call_provider(
         if error is not None:
             return error
         if request.get("first_token_timeout_ms") is not None:
-            async def _ignore_delta(_delta: str) -> None:
-                return None
-
             return await stream_anthropic(
-                request, _ignore_delta, env_get=_env_get, timeout_s=timeout_s,
+                request, ignore_delta, env_get=_env_get, timeout_s=timeout_s,
                 extra_headers=_extra, client=client)
         url, body, headers = _anthropic_request(request, token, _extra)
         timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
