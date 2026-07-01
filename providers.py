@@ -27,6 +27,7 @@ be mechanism for a single case (act over potency)."""
 from __future__ import annotations
 
 import os
+import functools
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -51,6 +52,7 @@ class Provider:
     # openai_compatible backend (no dedicated adapter).
     api_kind: "str | None" = None
     adapter: "Callable[..., Any] | None" = None
+    stream_adapter: "Callable[..., Any] | None" = None
     # KNOBS — operator-tunable settings.SCHEMA entries (keyed bare; namespaced
     # `<id>.<knob>` at registration). Declared next to the provider.
     knobs: "dict[str, dict]" = field(default_factory=dict)
@@ -83,14 +85,29 @@ def _anthropic_adapter(timeout_s):
     return make_anthropic_async_call_provider(timeout_s=timeout_s)
 
 
+def _anthropic_stream_adapter(timeout_s):
+    from provider_adapters.anthropic import stream_anthropic
+    return functools.partial(stream_anthropic, timeout_s=timeout_s)
+
+
 def _bedrock_adapter(timeout_s):
     from provider_adapters.bedrock import make_bedrock_async_call_provider
     return make_bedrock_async_call_provider(timeout_s=timeout_s)
 
 
+def _bedrock_stream_adapter(timeout_s):
+    from provider_adapters.bedrock import stream_bedrock
+    return functools.partial(stream_bedrock, timeout_s=timeout_s)
+
+
 def _google_adapter(timeout_s):
     from provider_adapters.google import make_google_async_call_provider
     return make_google_async_call_provider(timeout_s=timeout_s)
+
+
+def _google_stream_adapter(timeout_s):
+    from provider_adapters.google import stream_google
+    return functools.partial(stream_google, timeout_s=timeout_s)
 
 
 def _codex_source(catalog, env_get):
@@ -180,6 +197,7 @@ PROVIDERS: "list[Provider]" = [
         enabled=lambda c: _has(c, lambda pid, p: p.get("source") == "bedrock"
                                or str(pid).startswith("bedrock")),
         api_kind="bedrock", adapter=_bedrock_adapter,
+        stream_adapter=_bedrock_stream_adapter,
     ),
     # Direct first-party providers: no marketplace catalog of their own, but a
     # price source feeding host_store.provider_prices from each official pricing
@@ -187,8 +205,10 @@ PROVIDERS: "list[Provider]" = [
     Provider("openai", source=_official_price_source("openai"),
              enabled=_present("openai")),
     Provider("anthropic", api_kind="anthropic", adapter=_anthropic_adapter,
+             stream_adapter=_anthropic_stream_adapter,
              source=_official_price_source("anthropic"), enabled=_present("anthropic")),
     Provider("google", api_kind="google", adapter=_google_adapter,
+             stream_adapter=_google_stream_adapter,
              source=_official_price_source("google"), enabled=_present("google")),
     # codex: its source is built like any provider's (via _codex_source); only the
     # ADAPTER and the observe/bind coupling (the source watching its own backend's
@@ -251,6 +271,14 @@ def native_adapter_handlers(timeout_s: float) -> "dict[str, Any]":
     return {p.api_kind: p.adapter(timeout_s)
             for p in PROVIDERS
             if not p.special and p.api_kind and p.adapter}
+
+
+def native_streaming_adapter_handlers(timeout_s: float) -> "dict[str, Any]":
+    """api_kind -> true streaming backend for native providers that support it
+    (codex remains wired separately in serve.py because it needs `observe`)."""
+    return {p.api_kind: p.stream_adapter(timeout_s)
+            for p in PROVIDERS
+            if not p.special and p.api_kind and p.stream_adapter}
 
 
 def _price_multiplier_knob(provider_id: str) -> dict:

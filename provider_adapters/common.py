@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import asyncio
 import time
+from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Any
 
 CallProviderHook = Callable[[dict], dict]
@@ -186,6 +188,106 @@ async def before_first_output(
 def first_token_timeout_err(timeout_s: float, latency_ms: int) -> dict:
     return err("timeout", 0, latency_ms,
                f"first token timed out after {int(timeout_s * 1000)}ms")
+
+
+async def ignore_delta(_delta: str) -> None:
+    """A no-op emit for driving a streaming backend as a NON-streaming call
+    (the first-token deadline path): the deltas are discarded, only the
+    aggregated final response is returned."""
+    return None
+
+
+@dataclass
+class StreamAcc:
+    """Mutable accumulator an SSE event handler folds a native stream into, then
+    the adapter reads to build its complete-response dict. `tool_calls` is left
+    handler-owned (a dict keyed by content index, or a list) so each provider
+    accumulates in its own shape."""
+    t0: float
+    status: int = 0
+    text_parts: list = field(default_factory=list)
+    tool_calls: Any = None
+    finish_reason: Any = None
+    usage: dict = field(default_factory=dict)
+    raw_model: Any = None
+    saw_output: bool = False
+    emitted: bool = False
+
+    def latency(self) -> int:
+        return elapsed_ms(self.t0)
+
+
+async def drive_http_sse(
+    *,
+    client: Any,
+    url: str,
+    body: dict,
+    headers: dict,
+    timeout: float,
+    request: dict,
+    on_event: Callable[[dict, "StreamAcc"], Awaitable["dict | None"]],
+) -> "tuple[StreamAcc | None, dict | None]":
+    """Drive an httpx Server-Sent-Events stream with the first-token deadline,
+    shared by the native httpx adapters (Anthropic, Gemini). Opens the stream
+    (guarded by the first-token timeout), maps a non-2xx to a classified error,
+    then feeds each decoded `data:` JSON object to `on_event(ev, acc)` — which
+    mutates `acc` and returns an error dict to abort or None to continue. Returns
+    `(acc, None)` on a clean end or `(None, error_dict)`; the caller finalizes the
+    accumulator into its provider-specific response shape. Bedrock is NOT a
+    consumer (its transport is the boto3 event stream, not httpx SSE)."""
+    acc = StreamAcc(t0=time.monotonic())
+    timeout_s = first_token_timeout_s(request)
+
+    def _saw() -> bool:
+        return acc.saw_output
+
+    try:
+        async with AsyncExitStack() as stack:
+            try:
+                resp = await before_first_output(
+                    stack.enter_async_context(
+                        client.stream("POST", url, json=body, headers=headers,
+                                      timeout=timeout)),
+                    timeout_s, acc.t0, _saw)
+            except (asyncio.TimeoutError, TimeoutError):
+                return None, first_token_timeout_err(timeout_s, acc.latency())
+            acc.status = resp.status_code
+            if not (200 <= resp.status_code < 300):
+                raw = (await resp.aread()).decode("utf-8", "replace")[:500]
+                return None, err(classify_status(resp.status_code, raw),
+                                 resp.status_code, acc.latency(), raw)
+
+            lines = resp.aiter_lines().__aiter__()
+            while True:
+                try:
+                    line = await before_first_output(
+                        lines.__anext__(), timeout_s, acc.t0, _saw)
+                except StopAsyncIteration:
+                    break
+                except (asyncio.TimeoutError, TimeoutError):
+                    if not acc.saw_output:
+                        return None, first_token_timeout_err(timeout_s, acc.latency())
+                    raise
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    ev = json.loads(data)
+                except ValueError:
+                    continue
+                aborted = await on_event(ev, acc)
+                if aborted is not None:
+                    return None, aborted
+    except Exception as exc:  # noqa: BLE001
+        if acc.emitted:
+            partial = "".join(acc.text_parts)
+            return None, err("stream_interrupted", 0, acc.latency(),
+                             f"{type(exc).__name__}: {exc} (partial: {partial[:200]!r})")
+        return None, err("network_error", 0, acc.latency(),
+                         f"{type(exc).__name__}: {exc}")
+    return acc, None
 
 
 # Back-compat names used by older tests/scripts that import through

@@ -151,15 +151,15 @@ def main() -> None:
         make_streaming_dispatcher,
         stream_codex,
         stream_openai_compatible,
-        stream_unsupported_api_kind,
     )
+    _native_streaming = providers.native_streaming_adapter_handlers(args.timeout_s)
     streaming_call = make_streaming_dispatcher(
         default=functools.partial(stream_openai_compatible,
                                   timeout_s=args.timeout_s,
                                   provider_rules=provider_rules),
-        # the native adapters don't stream natively (fall back to unsupported);
-        # codex has a real streaming twin that also feeds `observe`.
-        handlers={**{ak: stream_unsupported_api_kind for ak in _native},
+        # Native providers and Codex have real streaming twins; Codex also feeds
+        # `observe` for quota/scarcity pricing.
+        handlers={**_native_streaming,
                   "openai_codex": functools.partial(stream_codex,
                                                     auth=codex_auth,
                                                     observe=observe)},

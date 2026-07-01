@@ -8,7 +8,10 @@ from typing import Any, Callable
 
 from provider_adapters.common import (
     AsyncCallProviderHook,
+    StreamAcc,
     auth_token,
+    drive_http_sse,
+    ignore_delta,
     json_args,
     text_from_content,
     _classify_status,
@@ -117,6 +120,142 @@ def _parse_anthropic_response(data: dict, status: int, latency: int) -> dict:
     }
 
 
+def _anthropic_request(request: dict, token: str, extra_headers: dict) -> tuple[str, dict, dict]:
+    messages, system = _openai_messages_to_anthropic(
+        request.get("messages") or [])
+    body: dict[str, Any] = {
+        "model": (request.get("offer") or {}).get("wire_model_id")
+        or request["served_model_id"],
+        "messages": messages,
+        "max_tokens": request.get("max_tokens") or 4096,
+    }
+    if system:
+        body["system"] = system
+    if request.get("temperature") is not None:
+        body["temperature"] = request["temperature"]
+    tools = _openai_tools_to_anthropic(request.get("tools"))
+    if tools:
+        body["tools"] = tools
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": token,
+        "anthropic-version": "2023-06-01",
+        **extra_headers,
+    }
+    url = (
+        (request.get("base_url") or "https://api.anthropic.com/v1").rstrip("/")
+        + "/messages"
+    )
+    return url, body, headers
+
+
+async def stream_anthropic(
+    request: dict,
+    emit,
+    *,
+    env_get: Callable[[str], str | None] | None = None,
+    timeout_s: float = 30.0,
+    extra_headers: dict[str, str] | None = None,
+    client: Any = None,
+) -> dict:
+    """Native Anthropic streaming backend for api_kind='anthropic'."""
+    import httpx
+
+    token, error = auth_token(request, env_get or os.environ.get, "ANTHROPIC_API_KEY")
+    if error is not None:
+        return error
+    url, body, headers = _anthropic_request(request, token, dict(extra_headers or {}))
+    body["stream"] = True
+    timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
+    if client is None:
+        client = httpx.AsyncClient()
+
+    async def _on_event(ev: dict, acc: StreamAcc) -> "dict | None":
+        etype = ev.get("type")
+        if etype == "message_start":
+            msg = ev.get("message") or {}
+            acc.raw_model = msg.get("model") or acc.raw_model
+            acc.usage.update(msg.get("usage") or {})
+        elif etype == "content_block_start":
+            idx = ev.get("index", 0)
+            block = ev.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                acc.saw_output = True
+                if acc.tool_calls is None:
+                    acc.tool_calls = {}
+                acc.tool_calls[idx] = {
+                    "id": block.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name") or "",
+                        "arguments": (
+                            json.dumps(block.get("input"))
+                            if block.get("input") else ""
+                        ),
+                    },
+                }
+        elif etype == "content_block_delta":
+            idx = ev.get("index", 0)
+            delta = ev.get("delta") or {}
+            if delta.get("type") == "text_delta" and delta.get("text"):
+                acc.saw_output = True
+                acc.emitted = True
+                acc.text_parts.append(delta["text"])
+                await emit(delta["text"])
+            elif delta.get("type") == "input_json_delta":
+                acc.saw_output = True
+                if acc.tool_calls is None:
+                    acc.tool_calls = {}
+                tc = acc.tool_calls.setdefault(idx, {
+                    "id": None,
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                })
+                if delta.get("partial_json"):
+                    tc["function"]["arguments"] += delta["partial_json"]
+            elif str(delta.get("type") or "").endswith("_delta"):
+                acc.saw_output = True
+        elif etype == "message_delta":
+            delta = ev.get("delta") or {}
+            acc.finish_reason = delta.get("stop_reason") or acc.finish_reason
+            acc.usage.update(ev.get("usage") or {})
+        elif etype == "error":
+            e = ev.get("error") or {}
+            msg = e.get("message") or str(e or ev)
+            return _err(_classify_status(acc.status, msg), acc.status,
+                        acc.latency(), msg[:500])
+        return None
+
+    acc, error = await drive_http_sse(
+        client=client, url=url, body=body, headers=headers, timeout=timeout,
+        request=request, on_event=_on_event)
+    if error is not None:
+        return error
+
+    by_index = acc.tool_calls or {}
+    tool_calls = [by_index[i] for i in sorted(by_index)] or None
+    text = "".join(acc.text_parts)
+    if not text.strip() and not tool_calls:
+        return _err("bad_response", 200, acc.latency(), "empty assistant content")
+    usage = acc.usage
+    return {
+        "ok": True,
+        "latency_ms": acc.latency(),
+        "response": {
+            "text": text,
+            "tool_calls": tool_calls,
+            "finish_reason": acc.finish_reason,
+            "tokens_in": usage.get("input_tokens"),
+            "tokens_out": usage.get("output_tokens"),
+            "tokens_total": (
+                (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+                if usage else None
+            ),
+            "raw_model": acc.raw_model,
+        },
+    }
+
+
 def make_anthropic_async_call_provider(
     env_get: Callable[[str], str | None] | None = None,
     timeout_s: float = 30.0,
@@ -133,31 +272,11 @@ def make_anthropic_async_call_provider(
         token, error = auth_token(request, _env_get, "ANTHROPIC_API_KEY")
         if error is not None:
             return error
-        messages, system = _openai_messages_to_anthropic(
-            request.get("messages") or [])
-        body: dict[str, Any] = {
-            "model": (request.get("offer") or {}).get("wire_model_id")
-            or request["served_model_id"],
-            "messages": messages,
-            "max_tokens": request.get("max_tokens") or 4096,
-        }
-        if system:
-            body["system"] = system
-        if request.get("temperature") is not None:
-            body["temperature"] = request["temperature"]
-        tools = _openai_tools_to_anthropic(request.get("tools"))
-        if tools:
-            body["tools"] = tools
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": token,
-            "anthropic-version": "2023-06-01",
-            **_extra,
-        }
-        url = (
-            (request.get("base_url") or "https://api.anthropic.com/v1").rstrip("/")
-            + "/messages"
-        )
+        if request.get("first_token_timeout_ms") is not None:
+            return await stream_anthropic(
+                request, ignore_delta, env_get=_env_get, timeout_s=timeout_s,
+                extra_headers=_extra, client=client)
+        url, body, headers = _anthropic_request(request, token, _extra)
         timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
         t0 = time.monotonic()
         try:

@@ -9,7 +9,10 @@ from urllib.parse import quote
 
 from provider_adapters.common import (
     AsyncCallProviderHook,
+    StreamAcc,
     auth_token,
+    drive_http_sse,
+    ignore_delta,
     json_args,
     text_from_content,
     _classify_status,
@@ -144,6 +147,121 @@ def _parse_gemini_response(data: dict, status: int, latency: int) -> dict:
     }
 
 
+def _google_request(
+    request: dict,
+    token: str,
+    extra_headers: dict,
+    *,
+    stream: bool = False,
+) -> tuple[str, dict, dict]:
+    model = (request.get("offer") or {}).get("wire_model_id") \
+        or request["served_model_id"]
+    model_path = model if str(model).startswith("models/") else f"models/{model}"
+    contents, system = _openai_messages_to_gemini(request.get("messages") or [])
+    body: dict[str, Any] = {"contents": contents}
+    if system:
+        body["systemInstruction"] = system
+    generation = {}
+    if request.get("max_tokens") is not None:
+        generation["maxOutputTokens"] = request["max_tokens"]
+    if request.get("temperature") is not None:
+        generation["temperature"] = request["temperature"]
+    if generation:
+        body["generationConfig"] = generation
+    tools = _openai_tools_to_gemini(request.get("tools"))
+    if tools:
+        body["tools"] = tools
+    base = (
+        request.get("base_url")
+        or "https://generativelanguage.googleapis.com/v1beta"
+    ).rstrip("/")
+    suffix = "streamGenerateContent?alt=sse" if stream else "generateContent"
+    # The API key rides the x-goog-api-key header, never the URL query —
+    # a `?key=<secret>` URL leaks into error_message/logs/traces on
+    # timeout/network errors (§3: keys are never logged or echoed).
+    url = f"{base}/{quote(model_path, safe='/')}:{suffix}"
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": token,
+        **extra_headers,
+    }
+    return url, body, headers
+
+
+async def stream_google(
+    request: dict,
+    emit,
+    *,
+    env_get: Callable[[str], str | None] | None = None,
+    timeout_s: float = 30.0,
+    extra_headers: dict[str, str] | None = None,
+    client: Any = None,
+) -> dict:
+    """Native Gemini streamGenerateContent backend for api_kind='google'."""
+    import httpx
+
+    token, error = auth_token(request, env_get or os.environ.get, "GEMINI_API_KEY")
+    if error is not None:
+        return error
+    url, body, headers = _google_request(
+        request, token, dict(extra_headers or {}), stream=True)
+    timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
+    if client is None:
+        client = httpx.AsyncClient()
+
+    async def _on_event(chunk: dict, acc: StreamAcc) -> "dict | None":
+        acc.raw_model = chunk.get("modelVersion") or acc.raw_model
+        if chunk.get("usageMetadata"):
+            acc.usage = chunk["usageMetadata"]
+        for cand in chunk.get("candidates") or []:
+            acc.finish_reason = cand.get("finishReason") or acc.finish_reason
+            for part in ((cand.get("content") or {}).get("parts") or []):
+                if part.get("text"):
+                    acc.saw_output = True
+                    acc.emitted = True
+                    acc.text_parts.append(part["text"])
+                    await emit(part["text"])
+                if part.get("functionCall"):
+                    acc.saw_output = True
+                    if acc.tool_calls is None:
+                        acc.tool_calls = []
+                    fc = part["functionCall"]
+                    acc.tool_calls.append({
+                        "id": fc.get("id") or fc.get("name"),
+                        "type": "function",
+                        "function": {
+                            "name": fc.get("name") or "",
+                            "arguments": json.dumps(fc.get("args") or {}),
+                        },
+                    })
+        return None
+
+    acc, error = await drive_http_sse(
+        client=client, url=url, body=body, headers=headers, timeout=timeout,
+        request=request, on_event=_on_event)
+    if error is not None:
+        return error
+
+    text = "".join(acc.text_parts)
+    tool_calls = acc.tool_calls or None
+    if not text.strip() and not tool_calls:
+        return _err("bad_response", 200, acc.latency(), "empty assistant content")
+    usage = acc.usage
+    return {
+        "ok": True,
+        "latency_ms": acc.latency(),
+        "response": {
+            "text": text,
+            "tool_calls": tool_calls,
+            "finish_reason": acc.finish_reason,
+            "tokens_in": usage.get("promptTokenCount"),
+            "tokens_out": usage.get("candidatesTokenCount"),
+            "tokens_total": usage.get("totalTokenCount"),
+            "raw_model": acc.raw_model,
+        },
+    }
+
+
 def make_google_async_call_provider(
     env_get: Callable[[str], str | None] | None = None,
     timeout_s: float = 30.0,
@@ -160,36 +278,11 @@ def make_google_async_call_provider(
         token, error = auth_token(request, _env_get, "GEMINI_API_KEY")
         if error is not None:
             return error
-        model = (request.get("offer") or {}).get("wire_model_id") \
-            or request["served_model_id"]
-        model_path = model if str(model).startswith("models/") else f"models/{model}"
-        contents, system = _openai_messages_to_gemini(request.get("messages") or [])
-        body: dict[str, Any] = {"contents": contents}
-        if system:
-            body["systemInstruction"] = system
-        generation = {}
-        if request.get("max_tokens") is not None:
-            generation["maxOutputTokens"] = request["max_tokens"]
-        if request.get("temperature") is not None:
-            generation["temperature"] = request["temperature"]
-        if generation:
-            body["generationConfig"] = generation
-        tools = _openai_tools_to_gemini(request.get("tools"))
-        if tools:
-            body["tools"] = tools
-        base = (
-            request.get("base_url")
-            or "https://generativelanguage.googleapis.com/v1beta"
-        ).rstrip("/")
-        # The API key rides the x-goog-api-key header, never the URL query —
-        # a `?key=<secret>` URL leaks into error_message/logs/traces on
-        # timeout/network errors (§3: keys are never logged or echoed).
-        url = f"{base}/{quote(model_path, safe='/')}:generateContent"
-        headers = {
-            "Content-Type": "application/json",
-            "x-goog-api-key": token,
-            **_extra,
-        }
+        if request.get("first_token_timeout_ms") is not None:
+            return await stream_google(
+                request, ignore_delta, env_get=_env_get, timeout_s=timeout_s,
+                extra_headers=_extra, client=client)
+        url, body, headers = _google_request(request, token, _extra)
         timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
         t0 = time.monotonic()
         try:
