@@ -550,30 +550,37 @@ def test_executed_cost_usd_rules():
 
 def test_executed_cost_usd_ignores_the_ranking_multiplier(monkeypatch):
     """The price_multiplier is a fictitious RANKING lever; billing must bill the
-    raw list price. A 0.5 multiplier nudges the ranked price (list 2.0 -> 1.0),
-    but _executed_cost_usd divides it back out, so cost_usd stays at the list
-    price — invariant to the lever (the Axis-7 billing invariant)."""
+    raw list price. The engine returns both ranking and raw prices; cost_usd uses
+    raw prices and is invariant to the lever (the Axis-7 billing invariant)."""
     import settings
     from shim import _executed_cost_usd
-    monkeypatch.setitem(settings._overrides, "openai.price_multiplier", 0.5)
-    # chosen.price = list (2.0/10.0) x multiplier (0.5) = what push_prices wrote
-    result = {"chosen": {"provider_id": "openai", "price_in": 1.0, "price_out": 5.0},
+    result = {"chosen": {
+                  "provider_id": "openai",
+                  "price_in": 1.0, "price_out": 5.0,
+                  "raw_price_in": 2.0, "raw_price_out": 10.0,
+                  "price_multiplier": 0.5,
+              },
               "response": {"tokens_in": 1_000_000, "tokens_out": 100_000}}
     assert _executed_cost_usd(result) == 3.0   # == raw list 2.0/10.0, not 1.5
 
-    # Marketplace providers may not have their own settings key
-    # (e.g. bedrock_market inherits bedrock.price_multiplier during discovery),
-    # so the chosen candidate carries the exact multiplier ranking used.
     market = {
         "chosen": {
             "provider_id": "bedrock_market",
             "price_in": 0.8,
             "price_out": 8.0,
+            "raw_price_in": 1.0,
+            "raw_price_out": 10.0,
             "price_multiplier": 0.8,
         },
         "response": {"tokens_in": 1_000_000, "tokens_out": 100_000},
     }
     assert _executed_cost_usd(market) == 2.0   # == raw quote 1.0/10.0, not 1.6
+
+    # Back-compat for older engine results that only carried ranking prices.
+    monkeypatch.setitem(settings._overrides, "openai.price_multiplier", 0.5)
+    old = {"chosen": {"provider_id": "openai", "price_in": 1.0, "price_out": 5.0},
+           "response": {"tokens_in": 1_000_000, "tokens_out": 100_000}}
+    assert _executed_cost_usd(old) == 3.0
 
 
 def test_cost_basis_tiers():

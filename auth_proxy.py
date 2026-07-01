@@ -2458,24 +2458,23 @@ async def dashboard_delete_codex_account(request: Request, name: str) -> Respons
     return JSONResponse(content={"ok": True, "account": name, "applied_live": applied_live})
 
 
-def _cost_accuracy_rows(routes, ema, mult_of, *, min_calls=20, threshold=0.15):
+def _cost_accuracy_rows(routes, ema, _mult_of, *, min_calls=20, threshold=0.15):
     """Per-provider measured-vs-list cost, joining the ledger aggregate (`routes`,
     from host_store.cost_by_route) with the live ranked prices (`ema`,
-    "<provider>|<family>" -> {price_in, price_out}). The list price is the ranked
-    price with the fictitious price_multiplier divided back out (mult_of(provider)),
-    so the comparison is measured-spend vs advertised-list. A route with no known
-    or non-positive price is skipped (nothing to compare). Pure (no IO) so the
+    "<provider>|<family>" -> raw {price_in, price_out}). The fictitious
+    price_multiplier is applied at selection time and is not persisted here, so
+    the comparison is measured-spend vs advertised-list directly. A route with no
+    known or non-positive price is skipped (nothing to compare). Pure (no IO) so the
     join/deviation logic is unit-tested directly."""
     roll: dict[str, dict] = {}
     for r in routes:
         m = ema.get(f"{r['provider']}|{r['family']}")
         if not isinstance(m, dict):
             continue
-        mult = mult_of(r["provider"]) or 1.0
         try:
-            list_in = float(m.get("price_in")) / mult
-            list_out = float(m.get("price_out")) / mult
-        except (TypeError, ValueError, ZeroDivisionError):
+            list_in = float(m.get("price_in"))
+            list_out = float(m.get("price_out"))
+        except (TypeError, ValueError):
             continue
         if list_in < 0 or list_out < 0:        # unpriced sentinel / +inf
             continue

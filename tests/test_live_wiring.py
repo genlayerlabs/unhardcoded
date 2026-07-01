@@ -287,7 +287,10 @@ def test_marketplace_offers_rank_with_offer_prices():
     assert ("antseed", "claude-opus-4-8") in pairs
 
 
-def test_marketplace_offers_rank_with_effective_prices_when_present():
+def test_marketplace_offers_rank_with_live_price_multiplier(monkeypatch):
+    import settings
+
+    monkeypatch.setitem(settings._overrides, "openrouter.price_multiplier", 0.8)
     host = LLMRouterHost(
         router_path=ROOT / "core" / "router.lua",
         config_path=ROOT / "config.live.lua",
@@ -303,9 +306,6 @@ def test_marketplace_offers_rank_with_effective_prices_when_present():
             "seller_endpoint": "https://openrouter.ai/api/v1",
             "price_in_usd_per_mtok": 10.0,
             "price_out_usd_per_mtok": 20.0,
-            "effective_price_in_usd_per_mtok": 8.0,
-            "effective_price_out_usd_per_mtok": 16.0,
-            "ranking_price_multiplier": 0.8,
             "capabilities": {"context": 200000},
             "traits": {"bench_intelligence": 0.5},
         }],
@@ -322,9 +322,46 @@ def test_marketplace_offers_rank_with_effective_prices_when_present():
     candidate = ranked[0]["candidate"]
     assert candidate["price_in"] == 8.0
     assert candidate["price_out"] == 16.0
+    assert candidate["raw_price_in"] == 10.0
+    assert candidate["raw_price_out"] == 20.0
     assert candidate["price_multiplier"] == 0.8
     assert candidate["offer"]["price_in_usd_per_mtok"] == 10.0
-    assert candidate["offer"]["effective_price_in_usd_per_mtok"] == 8.0
+    assert "effective_price_in_usd_per_mtok" not in candidate["offer"]
+
+
+def test_static_prices_rank_with_live_price_multiplier(monkeypatch):
+    import settings
+
+    monkeypatch.setitem(settings._overrides, "openrouter.price_multiplier", 0.5)
+    host = LLMRouterHost(
+        router_path=ROOT / "core" / "router.lua",
+        config_path=ROOT / "config.live.lua",
+        metrics_path=ROOT / "metrics.live.lua",
+        env=LIVE_TEST_ENV.copy(),
+        now_ms=lambda: 1,
+    )
+    host.init()
+    host.update_metrics("openrouter", "gpt-5.5", {"price_in": 10.0, "price_out": 20.0})
+
+    term = ["policy",
+            ["and", ["meets_req"], ["provider_eq", "openrouter"], ["family_eq", "gpt-5.5"]],
+            ["neg", ["normalize", ["field", "price_in"]]],
+            ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
+
+    ranked, _ = host.rank({"policy_ir": term, "requirements": {"context": 8000}})
+    candidate = ranked[0]["candidate"]
+    assert candidate["raw_price_in"] == 10.0
+    assert candidate["raw_price_out"] == 20.0
+    assert candidate["price_in"] == 5.0
+    assert candidate["price_out"] == 10.0
+    assert candidate["price_multiplier"] == 0.5
+
+    monkeypatch.setitem(settings._overrides, "openrouter.price_multiplier", 2.0)
+    ranked, _ = host.rank({"policy_ir": term, "requirements": {"context": 8000}})
+    candidate = ranked[0]["candidate"]
+    assert candidate["raw_price_in"] == 10.0
+    assert candidate["price_in"] == 20.0
+    assert candidate["price_multiplier"] == 2.0
 
 
 def test_discovered_family_ranks_on_inline_offer_traits():

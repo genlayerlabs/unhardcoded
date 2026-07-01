@@ -263,9 +263,10 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         """Re-read operator config overrides (dashboard Config tab) so tunable
         knobs (antseed top-N, codex scarcity ramp, runway thresholds, price
         multipliers) apply without a router restart. Sources read settings.get
-        live; marketplace discovery is invalidated so effective offer prices
-        refresh immediately instead of waiting for the discovery TTL. Internal
-        — /x/* is hidden from consumers."""
+        live; marketplace discovery is invalidated so source-level filters that
+        affect offers refresh immediately instead of waiting for the discovery
+        TTL. Price multipliers are applied live at candidate assembly time.
+        Internal — /x/* is hidden from consumers."""
         import settings as _settings
         overrides = _settings.reload()
         for provider in (host.catalog().get("providers") or {}).values():
@@ -1446,22 +1447,22 @@ def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> floa
         return round(float(resp["cost_reported"]), 6)
     if basis != "computed":
         return None
-    # (3) compute from the ranker price, discounting cache-read input tokens
+    # (3) compute from the raw price, discounting cache-read input tokens
     chosen = result.get("chosen") or {}
-    pin, pout = chosen.get("price_in"), chosen.get("price_out")
-    # The ranking price can carry an effective-price multiplier — a FICTITIOUS
-    # routing lever (static prices via sources.push_prices; marketplace offers via
-    # discovery). Billing must use the RAW list/quote price, so divide it back out:
-    # cost_usd never moves with the multiplier. Reported-cost providers settle in
-    # step 2 and never reach here, so this keeps billing uniform across them.
-    import settings
-    mult = chosen.get("price_multiplier")
-    if not isinstance(mult, (int, float)) or isinstance(mult, bool):
-        mkey = f"{chosen.get('provider_id')}.price_multiplier"
-        mult = settings.get(mkey) if mkey in settings.SCHEMA else 1.0
-    if mult and mult > 0:
-        pin = pin / mult if pin is not None else pin
-        pout = pout / mult if pout is not None else pout
+    pin = chosen.get("raw_price_in", chosen.get("price_in"))
+    pout = chosen.get("raw_price_out", chosen.get("price_out"))
+    # Back-compat with engine versions that only returned the ranking price:
+    # divide out the fictitious ranking multiplier so billing stays on raw
+    # list/quote price.
+    if chosen.get("raw_price_in") is None and chosen.get("raw_price_out") is None:
+        import settings
+        mult = chosen.get("price_multiplier")
+        if not isinstance(mult, (int, float)) or isinstance(mult, bool):
+            mkey = f"{chosen.get('provider_id')}.price_multiplier"
+            mult = settings.get(mkey) if mkey in settings.SCHEMA else 1.0
+        if mult and mult > 0:
+            pin = pin / mult if pin is not None else pin
+            pout = pout / mult if pout is not None else pout
     tin = resp.get("tokens_in") or 0
     cached = resp.get("tokens_cached") or 0
     uncached = max(0, tin - cached)
