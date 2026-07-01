@@ -287,6 +287,46 @@ def test_marketplace_offers_rank_with_offer_prices():
     assert ("antseed", "claude-opus-4-8") in pairs
 
 
+def test_marketplace_offers_rank_with_effective_prices_when_present():
+    host = LLMRouterHost(
+        router_path=ROOT / "core" / "router.lua",
+        config_path=ROOT / "config.live.lua",
+        metrics_path=ROOT / "metrics.live.lua",
+        env=LIVE_TEST_ENV.copy(),
+        now_ms=lambda: 1,
+    )
+    host.set_discover_hook(lambda did: {
+        "ok": True, "fetched_at_ms": 1,
+        "offers": [{
+            "model_family": "acme/discounted",
+            "wire_model_id": "acme/discounted",
+            "seller_endpoint": "https://openrouter.ai/api/v1",
+            "price_in_usd_per_mtok": 10.0,
+            "price_out_usd_per_mtok": 20.0,
+            "effective_price_in_usd_per_mtok": 8.0,
+            "effective_price_out_usd_per_mtok": 16.0,
+            "ranking_price_multiplier": 0.8,
+            "capabilities": {"context": 200000},
+            "traits": {"bench_intelligence": 0.5},
+        }],
+    } if did == "openrouter_market" else {"ok": False, "error": "x"})
+    host.init()
+    term = ["policy",
+            ["and", ["meets_req"], ["not", ["is", "disabled"]],
+             ["family_eq", "acme/discounted"]],
+            ["neg", ["normalize", ["field", "price_in"]]],
+            ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
+
+    ranked, _ = host.rank({"policy_ir": term, "requirements": {"context": 8000}})
+
+    candidate = ranked[0]["candidate"]
+    assert candidate["price_in"] == 8.0
+    assert candidate["price_out"] == 16.0
+    assert candidate["price_multiplier"] == 0.8
+    assert candidate["offer"]["price_in_usd_per_mtok"] == 10.0
+    assert candidate["offer"]["effective_price_in_usd_per_mtok"] == 8.0
+
+
 def test_discovered_family_ranks_on_inline_offer_traits():
     """A discovered family (raw model id, absent from model_meta.lua) ranks on
     the live benchmark it carries inline on the offer (c.offer.traits) — the

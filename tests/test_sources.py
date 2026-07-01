@@ -57,7 +57,7 @@ def test_push_prices_only_pushes_cataloged_pairs():
     assert pushed == 1
     (provider, family, delta), = host.pushed
     assert (provider, family) == ("openrouter", "gpt-5.5")
-    assert delta["price_in"] == 5.0 and delta["price_out"] == 30.0   # multiplier 1.0 default
+    assert delta["price_in"] == 5.25 and delta["price_out"] == 31.5
     assert isinstance(delta["price_refreshed_at"], int)
 
 
@@ -1167,6 +1167,39 @@ def test_discover_hook_serves_antseed_offers(tmp_path):
     host_store.truncate_all_for_tests()        # empty the market book
     r2 = hook("antseed_free")
     assert r2["ok"] is False and "no offers" in r2["error"]
+
+
+def test_discover_hook_adds_effective_offer_prices_without_mutating_raw(monkeypatch):
+    import serve
+
+    monkeypatch.setitem(settings._overrides, "bedrock.price_multiplier", 0.8)
+    raw_offer = {
+        "model_family": "claude-sonnet-4-6",
+        "wire_model_id": "us.anthropic.claude-sonnet-4-6",
+        "seller_endpoint": "bedrock:us-east-1",
+        "price_in_usd_per_mtok": 3.0,
+        "price_out_usd_per_mtok": 15.0,
+    }
+
+    class FakeBedrockSource:
+        name = "bedrock"
+        provider_ids = ["bedrock_market"]
+
+        def offers_sync(self, provider_id):
+            assert provider_id == "bedrock_market"
+            return [raw_offer]
+
+    hook = serve.make_discover_hook([FakeBedrockSource()])
+    r = hook("bedrock_market")
+
+    assert r["ok"] is True
+    offer = r["offers"][0]
+    assert offer["price_in_usd_per_mtok"] == 3.0
+    assert offer["price_out_usd_per_mtok"] == 15.0
+    assert offer["effective_price_in_usd_per_mtok"] == pytest.approx(2.4)
+    assert offer["effective_price_out_usd_per_mtok"] == 12.0
+    assert offer["ranking_price_multiplier"] == 0.8
+    assert "effective_price_in_usd_per_mtok" not in raw_offer
 
 
 # ---- codex passive source ---------------------------------------------------

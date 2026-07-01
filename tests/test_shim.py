@@ -561,6 +561,20 @@ def test_executed_cost_usd_ignores_the_ranking_multiplier(monkeypatch):
               "response": {"tokens_in": 1_000_000, "tokens_out": 100_000}}
     assert _executed_cost_usd(result) == 3.0   # == raw list 2.0/10.0, not 1.5
 
+    # Marketplace providers may not have their own settings key
+    # (e.g. bedrock_market inherits bedrock.price_multiplier during discovery),
+    # so the chosen candidate carries the exact multiplier ranking used.
+    market = {
+        "chosen": {
+            "provider_id": "bedrock_market",
+            "price_in": 0.8,
+            "price_out": 8.0,
+            "price_multiplier": 0.8,
+        },
+        "response": {"tokens_in": 1_000_000, "tokens_out": 100_000},
+    }
+    assert _executed_cost_usd(market) == 2.0   # == raw quote 1.0/10.0, not 1.6
+
 
 def test_cost_basis_tiers():
     """How cost_usd was determined — the raw fact the cost-accuracy panel reads to
