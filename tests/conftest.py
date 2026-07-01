@@ -35,14 +35,23 @@ os.environ.setdefault("HOST_STORE_SYNC_WRITES", "1")
 # Suite fixtures seed fixed historical timestamps, so keep retention effectively
 # unbounded here; tests that exercise the floor/prune set _RETENTION_DAYS locally.
 os.environ.setdefault("ROUTER_DB_RETENTION_DAYS", "3650000")
+# Pure unit tests do not need operator overrides at import time. Tests that do
+# need durable settings call settings.reload() explicitly after isolating the DB.
+os.environ.setdefault("ROUTER_SKIP_SETTINGS_IMPORT_RELOAD", "1")
+# Local runs without Postgres should skip store-backed tests quickly instead of
+# waiting on psycopg_pool's 30s default connection checkout timeout.
+os.environ.setdefault("HOST_STORE_POOL_TIMEOUT", "1")
 
 import host_store  # noqa: E402
 
+_HOST_STORE_UNAVAILABLE: str | None = None
 
-@pytest.fixture
-def host_store_clean():
-    """Truncate the operational store before the test (isolation against the
-    shared Postgres). Skips the test if Postgres is unreachable."""
+
+def require_host_store():
+    """Truncate the test store or skip quickly after the first unavailable DB."""
+    global _HOST_STORE_UNAVAILABLE
+    if _HOST_STORE_UNAVAILABLE:
+        pytest.skip(f"host store Postgres unavailable: {_HOST_STORE_UNAVAILABLE}")
     try:
         # Drain pending async writes from a prior test FIRST so they can't land
         # after this truncate; don't close the pool (the background writer shares
@@ -50,8 +59,16 @@ def host_store_clean():
         host_store._write_q.join()
         host_store.truncate_all_for_tests()
     except Exception as exc:  # noqa: BLE001
+        _HOST_STORE_UNAVAILABLE = str(exc)
         pytest.skip(f"host store Postgres unavailable: {exc}")
-    yield host_store
+    return host_store
+
+
+@pytest.fixture
+def host_store_clean():
+    """Truncate the operational store before the test (isolation against the
+    shared Postgres). Skips the test if Postgres is unreachable."""
+    yield require_host_store()
 
 
 def seed_peer_offers(peers, observed_at=None):
