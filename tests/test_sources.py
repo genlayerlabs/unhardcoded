@@ -169,7 +169,12 @@ class FakeClient:
 def _or_source(routes, env=None):
     from sources.openrouter import OpenRouterSource
     env = env if env is not None else {"OPENROUTER_API_KEY": "sk-test"}
-    return OpenRouterSource(CATALOG, env_get=env.get, client=FakeClient(routes))
+    return OpenRouterSource(
+        CATALOG,
+        env_get=env.get,
+        client=FakeClient(routes),
+        route_stats=lambda: {},
+    )
 
 
 def test_openrouter_pricing_maps_and_converts():
@@ -295,7 +300,8 @@ def test_openrouter_discovery_derives_policy_families_from_raw_model_ids():
             "prompt": "0.0000005", "completion": "0.000001"}},
     ]}
     s = OpenRouterSource(catalog, env_get={"OPENROUTER_API_KEY": "sk-test"}.get,
-                         client=FakeClient({"/models": FakeResponse(200, body)}))
+                         client=FakeClient({"/models": FakeResponse(200, body)}),
+                         route_stats=lambda: {})
 
     asyncio.run(s.pricing())
 
@@ -816,19 +822,14 @@ ANTSEED_CATALOG = {
 
 def _antseed_source(tmp_path, market_body=None, pins=None, observed_at=None):
     import json as _json
-    import host_store
-    from conftest import seed_peer_offers, seed_buyer_status
+    from conftest import require_host_store, seed_peer_offers, seed_buyer_status
     from sources.antseed import AntSeedSource
     if market_body is None:
         market_body = (Path(__file__).parent / "fixtures" / "antseed_market.json").read_text()
     market = market_body if isinstance(market_body, dict) else _json.loads(market_body)
     # the market book + buyer status both live in the host store now (peer_offers
     # / buyer_status); seed them as the sidecar would. No status files.
-    try:
-        host_store.reset()
-        host_store.truncate_all_for_tests()
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"host store Postgres unavailable: {exc}")
+    require_host_store()
     seed_peer_offers(market.get("peers") or [], observed_at)
     # each buyer proxy is a session pinned to ONE peer; offers are restricted
     # to that peer (live finding: an unpinned buyer errors "no_peer_pinned")

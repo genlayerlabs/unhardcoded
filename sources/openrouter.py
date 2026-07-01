@@ -26,10 +26,12 @@ class OpenRouterSource:
     poll_interval_s = 3600
 
     def __init__(self, catalog: dict, env_get=os.environ.get,
-                 client: Any = None, base_url: str = BASE_URL):
+                 client: Any = None, base_url: str = BASE_URL,
+                 route_stats=None):
         self._env_get = env_get
         self._base_url = base_url.rstrip("/")
         self._client = client  # injected in tests; lazy httpx otherwise
+        self._route_stats = route_stats or host_store.route_stats
         # /models snapshot cached by the async pricing() refresh so the SYNC
         # discover hook (offers_sync, called inside rank) never blocks on HTTP.
         self._models_snapshot: list[dict] = []
@@ -267,7 +269,7 @@ class OpenRouterSource:
         directly comparable to a marketplace peer's."""
         # #4a: latency derived on the fly from route_observations (one query),
         # keyed on the provider itself for these peerless gateway routes.
-        stats = host_store.route_stats()
+        stats = self._route_stats()
         out = []
         for o in self._offers:
             lkey = _route_reliability.route_key(provider_id, o["model_family"], provider_id)

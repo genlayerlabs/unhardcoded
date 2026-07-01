@@ -9,6 +9,7 @@ always wins, so a bad override can never break ranking.
 """
 from __future__ import annotations
 
+import os
 import threading
 from typing import Any
 
@@ -125,4 +126,5 @@ def validate_and_write(updates: dict[str, Any]) -> tuple[dict[str, Any], list[st
     return new, []
 
 
-reload()  # load overrides at import
+if not os.getenv("ROUTER_SKIP_SETTINGS_IMPORT_RELOAD"):
+    reload()  # load overrides at import

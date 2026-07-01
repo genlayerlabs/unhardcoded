@@ -210,6 +210,14 @@ def _dsn() -> str:
     return os.getenv("DATABASE_URL", "postgresql://localhost/hoststore")
 
 
+def _pool_timeout() -> float:
+    raw = os.getenv("HOST_STORE_POOL_TIMEOUT", "30")
+    try:
+        return max(0.1, float(raw))
+    except (TypeError, ValueError):
+        return 30.0
+
+
 def _get_pool() -> ConnectionPool:
     """The process-wide connection pool, created (and schema-applied) on first
     use. The pool is thread-safe, so operations need no extra locking."""
@@ -217,7 +225,13 @@ def _get_pool() -> ConnectionPool:
     if _pool is None:
         with _pool_lock:
             if _pool is None:
-                p = ConnectionPool(_dsn(), min_size=1, max_size=8, open=True)
+                p = ConnectionPool(
+                    _dsn(),
+                    min_size=1,
+                    max_size=8,
+                    open=True,
+                    timeout=_pool_timeout(),
+                )
                 _init_schema(p)
                 _pool = p
     return _pool
