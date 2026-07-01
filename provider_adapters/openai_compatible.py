@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import time
+from contextlib import AsyncExitStack
 from typing import Awaitable, Callable, Any
 
 from provider_adapters.common import (
@@ -325,9 +326,22 @@ async def stream_openai_compatible(
         return _err("timeout", 0, _latency(),
                     f"first token timed out after {int(first_token_timeout_s * 1000)}ms")
 
+    async def _before_first_output(awaitable):
+        if first_token_timeout_s is None or saw_output:
+            return await awaitable
+        remaining = first_token_timeout_s - (time.monotonic() - t0)
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        return await asyncio.wait_for(awaitable, timeout=remaining)
+
     try:
-        async with client.stream("POST", url, json=body, headers=headers,
-                                 timeout=timeout) as resp:
+        async with AsyncExitStack() as stack:
+            try:
+                resp = await _before_first_output(stack.enter_async_context(
+                    client.stream("POST", url, json=body, headers=headers,
+                                  timeout=timeout)))
+            except (asyncio.TimeoutError, TimeoutError):
+                return _first_token_timeout_error()
             if not (200 <= resp.status_code < 300):
                 raw = (await resp.aread()).decode("utf-8", "replace")[:500]
                 kind = _classify_from_map(raw, rules.get("error_map")) \
@@ -337,13 +351,7 @@ async def stream_openai_compatible(
             lines = resp.aiter_lines().__aiter__()
             while True:
                 try:
-                    if first_token_timeout_s is not None and not saw_output:
-                        remaining = first_token_timeout_s - (time.monotonic() - t0)
-                        if remaining <= 0:
-                            return _first_token_timeout_error()
-                        line = await asyncio.wait_for(lines.__anext__(), timeout=remaining)
-                    else:
-                        line = await lines.__anext__()
+                    line = await _before_first_output(lines.__anext__())
                 except StopAsyncIteration:
                     break
                 except (asyncio.TimeoutError, TimeoutError):

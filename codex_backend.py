@@ -10,7 +10,9 @@ unit-tested; the live streaming call is not (no subscription in CI).
 """
 from __future__ import annotations
 
+import asyncio
 import json
+from contextlib import AsyncExitStack
 from typing import Any, Iterable
 
 from llm_router_host import _cached_tokens
@@ -267,6 +269,20 @@ def aggregate_codex_sse(lines: Iterable[str], latency_ms: int) -> dict:
     }
 
 
+def _codex_line_has_output_delta(line: str) -> bool:
+    line = line.strip()
+    if not line or not line.startswith("data:"):
+        return False
+    payload = line[len("data:"):].strip()
+    if payload == "[DONE]":
+        return False
+    try:
+        ev = json.loads(payload)
+    except ValueError:
+        return False
+    return ev.get("type") == "response.output_text.delta" and bool(ev.get("delta"))
+
+
 def make_codex_async_call_provider(
     auth,
     base_url: str = CODEX_BASE_URL,
@@ -309,11 +325,47 @@ def make_codex_async_call_provider(
         timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
 
         t0 = time.monotonic()
+        saw_output = False
+        status_seen = False
+        first_token_timeout_ms = request.get("first_token_timeout_ms")
+        try:
+            first_token_timeout_s = (
+                float(first_token_timeout_ms) / 1000.0
+                if first_token_timeout_ms is not None and float(first_token_timeout_ms) > 0
+                else None
+            )
+        except (TypeError, ValueError):
+            first_token_timeout_s = None
+
+        def _latency() -> int:
+            return int((time.monotonic() - t0) * 1000)
+
+        def _first_token_timeout_error() -> dict:
+            return _err("timeout", 0, _latency(),
+                        f"first token timed out after {int(first_token_timeout_s * 1000)}ms")
+
+        async def _before_first_output(awaitable):
+            if first_token_timeout_s is None or saw_output:
+                return await awaitable
+            remaining = first_token_timeout_s - (time.monotonic() - t0)
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            return await asyncio.wait_for(awaitable, timeout=remaining)
+
         try:
             async with httpx.AsyncClient(timeout=timeout) as c:
-                async with c.stream("POST", url, json=body, headers=headers) as resp:
+                async with AsyncExitStack() as stack:
+                    try:
+                        resp = await _before_first_output(stack.enter_async_context(
+                            c.stream("POST", url, json=body, headers=headers)))
+                    except (asyncio.TimeoutError, TimeoutError):
+                        if not status_seen:
+                            _notify(0)
+                        return _first_token_timeout_error()
+
                     _notify(resp.status_code, resp.headers)
-                    latency = int((time.monotonic() - t0) * 1000)
+                    status_seen = True
+                    latency = _latency()
                     if resp.status_code == 401:
                         return _err("auth_error", 401, latency, "codex token rejected")
                     if resp.status_code == 429:
@@ -321,13 +373,26 @@ def make_codex_async_call_provider(
                     if resp.status_code >= 400:
                         detail = (await resp.aread()).decode("utf-8", "replace")[:500]
                         return _err("server_error", resp.status_code, latency, detail)
-                    lines = [line async for line in resp.aiter_lines()]
-            return aggregate_codex_sse(lines, int((time.monotonic() - t0) * 1000))
+                    lines = []
+                    stream_lines = resp.aiter_lines().__aiter__()
+                    while True:
+                        try:
+                            line = await _before_first_output(stream_lines.__anext__())
+                        except StopAsyncIteration:
+                            break
+                        except (asyncio.TimeoutError, TimeoutError):
+                            if not saw_output:
+                                return _first_token_timeout_error()
+                            raise
+                        lines.append(line)
+                        if _codex_line_has_output_delta(line):
+                            saw_output = True
+            return aggregate_codex_sse(lines, _latency())
         except httpx.TimeoutException:
             _notify(0)
-            return _err("timeout", 0, int((time.monotonic() - t0) * 1000), "codex request timed out")
+            return _err("timeout", 0, _latency(), "codex request timed out")
         except (httpx.NetworkError, httpx.RequestError) as e:
             _notify(0)
-            return _err("network_error", 0, int((time.monotonic() - t0) * 1000), str(e))
+            return _err("network_error", 0, _latency(), str(e))
 
     return call

@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import json
 import re
+import asyncio
 import time
 import uuid
+from contextlib import AsyncExitStack
 from typing import Any, Awaitable, Callable
 
 from provider_adapters.common import _err
@@ -76,13 +78,39 @@ async def stream_codex(
     t0 = time.monotonic()
     emitted = False
     lines: list[str] = []
+    first_token_timeout_ms = request.get("first_token_timeout_ms")
+    try:
+        first_token_timeout_s = (
+            float(first_token_timeout_ms) / 1000.0
+            if first_token_timeout_ms is not None and float(first_token_timeout_ms) > 0
+            else None
+        )
+    except (TypeError, ValueError):
+        first_token_timeout_s = None
 
     def _latency() -> int:
         return int((time.monotonic() - t0) * 1000)
 
+    def _first_token_timeout_error() -> dict:
+        return _err("timeout", 0, _latency(),
+                    f"first token timed out after {int(first_token_timeout_s * 1000)}ms")
+
+    async def _before_first_output(awaitable):
+        if first_token_timeout_s is None or emitted:
+            return await awaitable
+        remaining = first_token_timeout_s - (time.monotonic() - t0)
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        return await asyncio.wait_for(awaitable, timeout=remaining)
+
     try:
-        async with client.stream("POST", url, json=body, headers=headers,
-                                 timeout=timeout) as resp:
+        async with AsyncExitStack() as stack:
+            try:
+                resp = await _before_first_output(stack.enter_async_context(
+                    client.stream("POST", url, json=body, headers=headers,
+                                  timeout=timeout)))
+            except (asyncio.TimeoutError, TimeoutError):
+                return _first_token_timeout_error()
             _notify(resp.status_code, resp.headers)
             if resp.status_code == 401:
                 return _err("auth_error", 401, _latency(), "codex token rejected")
@@ -91,7 +119,16 @@ async def stream_codex(
             if resp.status_code >= 400:
                 detail = (await resp.aread()).decode("utf-8", "replace")[:500]
                 return _err("server_error", resp.status_code, _latency(), detail)
-            async for line in resp.aiter_lines():
+            stream_lines = resp.aiter_lines().__aiter__()
+            while True:
+                try:
+                    line = await _before_first_output(stream_lines.__anext__())
+                except StopAsyncIteration:
+                    break
+                except (asyncio.TimeoutError, TimeoutError):
+                    if not emitted:
+                        return _first_token_timeout_error()
+                    raise
                 lines.append(line)
                 if line.startswith("data:"):
                     data = line[len("data:"):].strip()
