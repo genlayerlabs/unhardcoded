@@ -182,18 +182,45 @@ def make_discover_hook(registry):
     Called from Lua inside rank — must be fast and never raise."""
     import time
 
+    import settings
+
     by_discovery_id = {}
     for source in registry:
         offers_sync = getattr(source, "offers_sync", None)
         if offers_sync is None:
             continue
         for pid in source.provider_ids:
-            by_discovery_id[pid] = offers_sync
+            by_discovery_id[pid] = (offers_sync, source.name)
+
+    def _multiplier(provider_id: str, source_name: str) -> float:
+        for key in (f"{provider_id}.price_multiplier",
+                    f"{source_name}.price_multiplier"):
+            if key in settings.SCHEMA:
+                return settings.get(key)
+        return 1.0
+
+    def _effective_offer(offer: dict, provider_id: str, source_name: str) -> dict:
+        mult = _multiplier(provider_id, source_name)
+        if mult == 1.0:
+            return offer
+        out = dict(offer)
+        out["ranking_price_multiplier"] = mult
+        for raw_key, effective_key in (
+            ("price_in_usd_per_mtok", "effective_price_in_usd_per_mtok"),
+            ("price_out_usd_per_mtok", "effective_price_out_usd_per_mtok"),
+        ):
+            raw = offer.get(raw_key)
+            try:
+                out[effective_key] = float(raw) * mult
+            except (TypeError, ValueError):
+                pass
+        return out
 
     def hook(discovery_id):
-        fn = by_discovery_id.get(discovery_id)
-        if fn is None:
+        entry = by_discovery_id.get(discovery_id)
+        if entry is None:
             return {"ok": False, "error": "unknown discovery_id"}
+        fn, source_name = entry
         try:
             offers = fn(discovery_id)
         except Exception as exc:  # noqa: BLE001
@@ -203,6 +230,7 @@ def make_discover_hook(registry):
             # TTL — a router that starts before the first market dump should
             # pick offers up on the next rank, not minutes later.
             return {"ok": False, "error": "no offers"}
+        offers = [_effective_offer(o, discovery_id, source_name) for o in offers]
         return {"ok": True, "fetched_at_ms": int(time.time() * 1000),
                 "offers": offers}
 

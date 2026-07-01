@@ -261,11 +261,19 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     @app.post("/x/config/reload")
     def reload_config():
         """Re-read operator config overrides (dashboard Config tab) so tunable
-        knobs (antseed top-N, codex scarcity ramp, runway thresholds) apply
-        without a router restart. Sources read settings.get live, so a reload is
-        enough. Internal — /x/* is hidden from consumers."""
+        knobs (antseed top-N, codex scarcity ramp, runway thresholds, price
+        multipliers) apply without a router restart. Sources read settings.get
+        live; marketplace discovery is invalidated so effective offer prices
+        refresh immediately instead of waiting for the discovery TTL. Internal
+        — /x/* is hidden from consumers."""
         import settings as _settings
-        return {"ok": True, "overrides": _settings.reload()}
+        overrides = _settings.reload()
+        for provider in (host.catalog().get("providers") or {}).values():
+            if isinstance(provider, dict) and provider.get("discovery") == "marketplace":
+                did = provider.get("discovery_id")
+                if did:
+                    host.invalidate_discovery(did)
+        return {"ok": True, "overrides": overrides}
 
     @app.get("/x/session/{sid}")
     def session_meter(sid: str, request: Request):
@@ -1441,14 +1449,16 @@ def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> floa
     # (3) compute from the ranker price, discounting cache-read input tokens
     chosen = result.get("chosen") or {}
     pin, pout = chosen.get("price_in"), chosen.get("price_out")
-    # The ranking price carries the provider's effective-price multiplier — a
-    # FICTITIOUS routing lever (providers.price_multiplier, applied in
-    # sources.push_prices). Billing must use the RAW list price, so divide it back
-    # out: cost_usd never moves with the multiplier. Reported-cost providers settle
-    # in step 2 and never reach here, so this keeps billing uniform across them.
+    # The ranking price can carry an effective-price multiplier — a FICTITIOUS
+    # routing lever (static prices via sources.push_prices; marketplace offers via
+    # discovery). Billing must use the RAW list/quote price, so divide it back out:
+    # cost_usd never moves with the multiplier. Reported-cost providers settle in
+    # step 2 and never reach here, so this keeps billing uniform across them.
     import settings
-    mkey = f"{chosen.get('provider_id')}.price_multiplier"
-    mult = settings.get(mkey) if mkey in settings.SCHEMA else 1.0
+    mult = chosen.get("price_multiplier")
+    if not isinstance(mult, (int, float)) or isinstance(mult, bool):
+        mkey = f"{chosen.get('provider_id')}.price_multiplier"
+        mult = settings.get(mkey) if mkey in settings.SCHEMA else 1.0
     if mult and mult > 0:
         pin = pin / mult if pin is not None else pin
         pout = pout / mult if pout is not None else pout

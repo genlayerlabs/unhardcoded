@@ -254,14 +254,19 @@ def native_adapter_handlers(timeout_s: float) -> "dict[str, Any]":
 
 
 def _price_multiplier_knob(provider_id: str) -> dict:
+    # Default 1.0 (no nudge) for every provider: a routing preference is an
+    # operator decision, set + persisted from the Config tab, not hardcoded here
+    # (e.g. bedrock < 1.0 to prefer prepaid credits). A REAL per-call surcharge is
+    # NOT a multiplier — it belongs in the provider's reported/list price so it
+    # ranks AND bills; this lever is ranking-only (billing divides it back out).
     return {
         "provider": provider_id, "type": "float", "default": 1.0,
         "min": 0.1, "max": 100.0, "label": "Ranking price multiplier",
         "help": "A FICTITIOUS routing lever: scales this provider's price for "
                 "RANKING only (< 1 = prefer it, > 1 = avoid it). It does NOT change "
                 "billing — cost_usd always settles at the real reported cost or the "
-                "raw list price. 1.0 = no nudge. Marketplace/offer prices are the "
-                "live market and are not scaled."}
+                "raw list price. 1.0 = no nudge. Marketplace/offer prices keep their "
+                "raw quote and expose separate effective prices for ranking."}
 
 
 def provider_knob_schema() -> "dict[str, dict]":
