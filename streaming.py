@@ -15,11 +15,18 @@ from __future__ import annotations
 
 import json
 import re
+import asyncio
 import time
 import uuid
+from contextlib import AsyncExitStack
 from typing import Any, Awaitable, Callable
 
-from provider_adapters.common import _err
+from provider_adapters.common import (
+    _err,
+    before_first_output,
+    first_token_timeout_err,
+    first_token_timeout_s,
+)
 # The openai-compatible STREAM backend lives with its non-stream sibling in the
 # adapter leaf (it shares _prepare_openai_call); re-exported here so the dispatcher
 # and shim keep their import site. This module → provider_adapters (the allowed
@@ -76,13 +83,25 @@ async def stream_codex(
     t0 = time.monotonic()
     emitted = False
     lines: list[str] = []
+    first_timeout_s = first_token_timeout_s(request)
 
     def _latency() -> int:
         return int((time.monotonic() - t0) * 1000)
 
+    def _emitted() -> bool:
+        return emitted
+
+    def _timeout_err() -> dict:
+        return first_token_timeout_err(first_timeout_s, _latency())
+
     try:
-        async with client.stream("POST", url, json=body, headers=headers,
-                                 timeout=timeout) as resp:
+        async with AsyncExitStack() as stack:
+            try:
+                resp = await before_first_output(stack.enter_async_context(
+                    client.stream("POST", url, json=body, headers=headers,
+                                  timeout=timeout)), first_timeout_s, t0, _emitted)
+            except (asyncio.TimeoutError, TimeoutError):
+                return _timeout_err()
             _notify(resp.status_code, resp.headers)
             if resp.status_code == 401:
                 return _err("auth_error", 401, _latency(), "codex token rejected")
@@ -91,7 +110,17 @@ async def stream_codex(
             if resp.status_code >= 400:
                 detail = (await resp.aread()).decode("utf-8", "replace")[:500]
                 return _err("server_error", resp.status_code, _latency(), detail)
-            async for line in resp.aiter_lines():
+            stream_lines = resp.aiter_lines().__aiter__()
+            while True:
+                try:
+                    line = await before_first_output(
+                        stream_lines.__anext__(), first_timeout_s, t0, _emitted)
+                except StopAsyncIteration:
+                    break
+                except (asyncio.TimeoutError, TimeoutError):
+                    if not emitted:
+                        return _timeout_err()
+                    raise
                 lines.append(line)
                 if line.startswith("data:"):
                     data = line[len("data:"):].strip()

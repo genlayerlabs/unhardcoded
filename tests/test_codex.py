@@ -239,6 +239,102 @@ def test_codex_call_invokes_observer_with_filtered_headers():
     assert seen and seen[0]["status"] == 0          # auth short-circuit observed
 
 
+class _FakeCodexCallAuth:
+    def access_token(self):
+        return "tok"
+
+    def account_id(self):
+        return "acct"
+
+
+class _SlowCodexStreamResponse:
+    status_code = 200
+    headers = {}
+
+    def __init__(self, lines, open_delay=0, first_line_delay=0):
+        self._lines = lines
+        self._open_delay = open_delay
+        self._first_line_delay = first_line_delay
+
+    async def __aenter__(self):
+        if self._open_delay:
+            import asyncio
+            await asyncio.sleep(self._open_delay)
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def aiter_lines(self):
+        if self._first_line_delay:
+            import asyncio
+            await asyncio.sleep(self._first_line_delay)
+        for line in self._lines:
+            yield line
+
+    async def aread(self):
+        return b""
+
+
+def _patch_codex_async_client(monkeypatch, response):
+    import httpx
+
+    class FakeAsyncClient:
+        def __init__(self, timeout=None):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def stream(self, method, url, json=None, headers=None):
+            return response
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+
+def test_codex_call_first_token_timeout_opening_stream(monkeypatch):
+    import asyncio
+
+    response = _SlowCodexStreamResponse(
+        ['data: {"type": "response.output_text.delta", "delta": "late"}'],
+        open_delay=0.05,
+    )
+    _patch_codex_async_client(monkeypatch, response)
+
+    call = cb.make_codex_async_call_provider(_FakeCodexCallAuth())
+    r = asyncio.run(call({
+        "served_model_id": "gpt-5.5",
+        "messages": [],
+        "first_token_timeout_ms": 10,
+    }))
+    assert r["ok"] is False
+    assert r["error_kind"] == "timeout"
+    assert "first token timed out" in r["error_message"]
+
+
+def test_codex_call_first_token_timeout_before_delta(monkeypatch):
+    import asyncio
+
+    response = _SlowCodexStreamResponse(
+        ['data: {"type": "response.output_text.delta", "delta": "late"}'],
+        first_line_delay=0.05,
+    )
+    _patch_codex_async_client(monkeypatch, response)
+
+    call = cb.make_codex_async_call_provider(_FakeCodexCallAuth())
+    r = asyncio.run(call({
+        "served_model_id": "gpt-5.5",
+        "messages": [],
+        "first_token_timeout_ms": 10,
+    }))
+    assert r["ok"] is False
+    assert r["error_kind"] == "timeout"
+    assert "first token timed out" in r["error_message"]
+
+
 def test_messages_to_input_translates_tool_call_history():
     # the exact conversation shape that 400d live: every turn after the first
     # of a tool-using agent carries assistant tool_calls + tool results

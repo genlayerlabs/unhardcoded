@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import time
 from typing import Awaitable, Callable, Any
 
@@ -159,10 +160,41 @@ def elapsed_ms(t0: float) -> int:
     return int((time.monotonic() - t0) * 1000)
 
 
+def first_token_timeout_s(request: dict) -> "float | None":
+    raw = request.get("first_token_timeout_ms")
+    try:
+        seconds = float(raw) / 1000.0
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
+
+
+async def before_first_output(
+    awaitable,
+    timeout_s: "float | None",
+    t0: float,
+    saw_output: Callable[[], bool],
+):
+    if timeout_s is None or saw_output():
+        return await awaitable
+    remaining = timeout_s - (time.monotonic() - t0)
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+    return await asyncio.wait_for(awaitable, timeout=remaining)
+
+
+def first_token_timeout_err(timeout_s: float, latency_ms: int) -> dict:
+    return err("timeout", 0, latency_ms,
+               f"first token timed out after {int(timeout_s * 1000)}ms")
+
+
 # Back-compat names used by older tests/scripts that import through
 # llm_router_host's re-export layer.
 _cached_tokens = cached_tokens
 _classify_status = classify_status
 _err = err
 _elapsed_ms = elapsed_ms
+_first_token_timeout_s = first_token_timeout_s
+_before_first_output = before_first_output
+_first_token_timeout_err = first_token_timeout_err
 _provider_error_message = provider_error_message

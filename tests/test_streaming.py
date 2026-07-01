@@ -51,6 +51,16 @@ class SlowFirstLineStreamResponse(FakeStreamResponse):
             yield line
 
 
+class SlowOpenStreamResponse(FakeStreamResponse):
+    def __init__(self, delay, lines):
+        super().__init__(200, lines=lines)
+        self.delay = delay
+
+    async def __aenter__(self):
+        await asyncio.sleep(self.delay)
+        return self
+
+
 class FakeStreamClient:
     def __init__(self, response):
         self._response = response
@@ -163,6 +173,22 @@ def test_stream_openai_compatible_first_token_timeout_before_delta():
     assert "first token timed out" in resp["error_message"]
 
 
+def test_stream_openai_compatible_first_token_timeout_opening_stream():
+    deltas = []
+
+    async def emit(d):
+        deltas.append(d)
+
+    req = dict(OPENAI_REQ, first_token_timeout_ms=10)
+    client = FakeStreamClient(SlowOpenStreamResponse(
+        0.05, _openai_lines("late")))
+    resp = _collect(streaming.stream_openai_compatible(req, emit, client=client))
+    assert deltas == []
+    assert resp["ok"] is False
+    assert resp["error_kind"] == "timeout"
+    assert "first token timed out" in resp["error_message"]
+
+
 # ---- codex stream backend -----------------------------------------------------
 
 CODEX_LINES = [
@@ -211,6 +237,40 @@ def test_stream_codex_pre_delta_429_no_emit():
         emit, auth=FakeCodexAuth(), client=client))
     assert deltas == []
     assert resp["error_kind"] == "rate_limit"
+
+
+def test_stream_codex_first_token_timeout_opening_stream():
+    deltas = []
+
+    async def emit(d):
+        deltas.append(d)
+
+    client = FakeStreamClient(SlowOpenStreamResponse(0.05, CODEX_LINES))
+    resp = _collect(streaming.stream_codex(
+        {"served_model_id": "gpt-5.5", "messages": [],
+         "first_token_timeout_ms": 10},
+        emit, auth=FakeCodexAuth(), client=client))
+    assert deltas == []
+    assert resp["ok"] is False
+    assert resp["error_kind"] == "timeout"
+    assert "first token timed out" in resp["error_message"]
+
+
+def test_stream_codex_first_token_timeout_before_delta():
+    deltas = []
+
+    async def emit(d):
+        deltas.append(d)
+
+    client = FakeStreamClient(SlowFirstLineStreamResponse(0.05, CODEX_LINES))
+    resp = _collect(streaming.stream_codex(
+        {"served_model_id": "gpt-5.5", "messages": [],
+         "first_token_timeout_ms": 10},
+        emit, auth=FakeCodexAuth(), client=client))
+    assert deltas == []
+    assert resp["ok"] is False
+    assert resp["error_kind"] == "timeout"
+    assert "first token timed out" in resp["error_message"]
 
 
 # ---- SSE chunk encoding -------------------------------------------------------
