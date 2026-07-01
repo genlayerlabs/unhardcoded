@@ -12,6 +12,9 @@ from provider_adapters.common import (
     CallProviderHook,
     AsyncCallProviderHook,
     TokenProvider,
+    before_first_output,
+    first_token_timeout_err,
+    first_token_timeout_s,
     _cached_tokens,
     _classify_status,
     _elapsed_ms,
@@ -309,39 +312,25 @@ async def stream_openai_compatible(
     usage: dict = {}
     raw_model = None
     saw_output = False
-    first_token_timeout_ms = request.get("first_token_timeout_ms")
-    try:
-        first_token_timeout_s = (
-            float(first_token_timeout_ms) / 1000.0
-            if first_token_timeout_ms is not None and float(first_token_timeout_ms) > 0
-            else None
-        )
-    except (TypeError, ValueError):
-        first_token_timeout_s = None
+    first_timeout_s = first_token_timeout_s(request)
 
     def _latency() -> int:
         return int((time.monotonic() - t0) * 1000)
 
-    def _first_token_timeout_error() -> dict:
-        return _err("timeout", 0, _latency(),
-                    f"first token timed out after {int(first_token_timeout_s * 1000)}ms")
+    def _saw_output() -> bool:
+        return saw_output
 
-    async def _before_first_output(awaitable):
-        if first_token_timeout_s is None or saw_output:
-            return await awaitable
-        remaining = first_token_timeout_s - (time.monotonic() - t0)
-        if remaining <= 0:
-            raise asyncio.TimeoutError
-        return await asyncio.wait_for(awaitable, timeout=remaining)
+    def _timeout_err() -> dict:
+        return first_token_timeout_err(first_timeout_s, _latency())
 
     try:
         async with AsyncExitStack() as stack:
             try:
-                resp = await _before_first_output(stack.enter_async_context(
+                resp = await before_first_output(stack.enter_async_context(
                     client.stream("POST", url, json=body, headers=headers,
-                                  timeout=timeout)))
+                                  timeout=timeout)), first_timeout_s, t0, _saw_output)
             except (asyncio.TimeoutError, TimeoutError):
-                return _first_token_timeout_error()
+                return _timeout_err()
             if not (200 <= resp.status_code < 300):
                 raw = (await resp.aread()).decode("utf-8", "replace")[:500]
                 kind = _classify_from_map(raw, rules.get("error_map")) \
@@ -351,12 +340,13 @@ async def stream_openai_compatible(
             lines = resp.aiter_lines().__aiter__()
             while True:
                 try:
-                    line = await _before_first_output(lines.__anext__())
+                    line = await before_first_output(
+                        lines.__anext__(), first_timeout_s, t0, _saw_output)
                 except StopAsyncIteration:
                     break
                 except (asyncio.TimeoutError, TimeoutError):
                     if not saw_output:
-                        return _first_token_timeout_error()
+                        return _timeout_err()
                     raise
                 if not line or not line.startswith("data:"):
                     continue
