@@ -1,7 +1,7 @@
 """SKILL.md conformance: every Σ_pol op the authoring guide teaches must exist
 in the core signature (`core/llm_policy/sig.lua` S.ops).
 
-The guide mirrors the sigma-pol/v1 grammar for authoring convenience; the field
+The guide mirrors the sigma-pol/v2 grammar for authoring convenience; the field
 vocabulary is injected live (so it can't drift), but the *operators* are prose.
 This gate closes that gap: if an op referenced anywhere a reader copies from —
 the complete ```json examples AND the inline `[...]` snippets of the reference
@@ -98,7 +98,7 @@ def test_skill_md_examples_use_only_real_sigma_pol_ops():
     ops = _sig_ops()
     unknown = seen - ops
     assert not unknown, (
-        f"SKILL.md uses ops absent from sigma-pol/v1 (sig.lua): {sorted(unknown)}")
+        f"SKILL.md uses ops absent from sigma-pol/v2 (sig.lua): {sorted(unknown)}")
 
 
 def test_skill_md_gate_covers_reference_table_and_prose_ops():
