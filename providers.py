@@ -253,20 +253,14 @@ def native_adapter_handlers(timeout_s: float) -> "dict[str, Any]":
             if not p.special and p.api_kind and p.adapter}
 
 
-_DEFAULT_PRICE_MULTIPLIERS = {
-    # Bedrock credits are preferred over cash, but still discounted only mildly:
-    # infrastructure still has an opportunity cost and traffic falls back to
-    # cash providers when credits run out.
-    "bedrock": 0.8,
-    # OpenRouter's public model prices omit the gateway surcharge we pay.
-    "openrouter": 1.05,
-}
-
-
 def _price_multiplier_knob(provider_id: str) -> dict:
+    # Default 1.0 (no nudge) for every provider: a routing preference is an
+    # operator decision, set + persisted from the Config tab, not hardcoded here
+    # (e.g. bedrock < 1.0 to prefer prepaid credits). A REAL per-call surcharge is
+    # NOT a multiplier — it belongs in the provider's reported/list price so it
+    # ranks AND bills; this lever is ranking-only (billing divides it back out).
     return {
-        "provider": provider_id, "type": "float",
-        "default": _DEFAULT_PRICE_MULTIPLIERS.get(provider_id, 1.0),
+        "provider": provider_id, "type": "float", "default": 1.0,
         "min": 0.1, "max": 100.0, "label": "Ranking price multiplier",
         "help": "A FICTITIOUS routing lever: scales this provider's price for "
                 "RANKING only (< 1 = prefer it, > 1 = avoid it). It does NOT change "

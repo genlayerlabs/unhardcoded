@@ -57,7 +57,8 @@ def test_push_prices_only_pushes_cataloged_pairs():
     assert pushed == 1
     (provider, family, delta), = host.pushed
     assert (provider, family) == ("openrouter", "gpt-5.5")
-    assert delta["price_in"] == 5.25 and delta["price_out"] == 31.5
+    # default multiplier is 1.0 → the ranking price equals the raw list price
+    assert delta["price_in"] == 5.0 and delta["price_out"] == 30.0
     assert isinstance(delta["price_refreshed_at"], int)
 
 

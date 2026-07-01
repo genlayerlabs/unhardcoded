@@ -42,11 +42,12 @@ def test_settings_schema_merges_provider_knobs_plus_compaction():
 
 def test_priced_providers_get_an_effective_multiplier_knob():
     sch = providers.provider_knob_schema()
-    defaults = {"bedrock": 0.8, "openrouter": 1.05}
     for p in providers.PROVIDERS:
         key = f"{p.id}.price_multiplier"
         if p.source is not None:                 # only providers that push a price
-            assert key in sch and sch[key]["default"] == defaults.get(p.id, 1.0) \
+            # default is a neutral 1.0 (no nudge); a routing preference is set
+            # from the UI and persisted, never hardcoded here.
+            assert key in sch and sch[key]["default"] == 1.0 \
                 and sch[key]["type"] == "float"
         else:
             assert key not in sch                # no dead knob where it can't apply
