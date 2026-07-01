@@ -62,7 +62,7 @@ grammar is `core/docs/SIGMA-POL.md`.
 ## As an operator
 
 The `/x/*` endpoints are **operator-only** — the ingress proxy hides them from
-consumers. The **dashboard** (Analytics · Builder · Activity · Market · Settings)
+consumers. The **dashboard** (Analytics · Debugger · Activity · Catalog · SKILL.md · Config · Settings)
 wraps most of them:
 - **Keys:** mint/list consumer keys.
 - **Providers:** hot-add or re-key a provider at runtime — `POST /x/providers`,

@@ -38,7 +38,8 @@ flow_runner.py     Σ_flow scheduler (Python port of the core's flow.lua): topol
                    order, per-node policy calls, assembled multipart inputs.
 providers.py       the provider registry — the four-aspect Provider record (below).
 provider_adapters/ per-api_kind wire backends: openai_compatible (default), anthropic,
-                   bedrock, google, + the codex backend.
+                   bedrock, google.
+codex_backend.py   the Codex (ChatGPT-subscription) backend — a special provider, at the repo root.
 sources/           marketplace/pricing ProviderSource implementations (e.g. antseed).
 auth_proxy.py      ingress + the operator dashboard; strips/injects x-llm-router-caller,
                    rate limiting, synthetic probes.
