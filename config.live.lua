@@ -120,6 +120,7 @@ return {
             api_kind         = "openai_compatible",
             auth_env         = "OPENROUTER_API_KEY",
             tier             = "marketplace",
+            source           = "openrouter",
             market_price_cap = { input = 1000, output = 1000 },
             -- OpenRouter marketplace rows default `vendor/model` to the
             -- provider-neutral family `model`, while wire_model_id keeps the

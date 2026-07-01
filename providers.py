@@ -293,15 +293,15 @@ def _price_multiplier_knob(provider_id: str) -> dict:
         "help": "A FICTITIOUS routing lever: scales this provider's price for "
                 "RANKING only (< 1 = prefer it, > 1 = avoid it). It does NOT change "
                 "billing — cost_usd always settles at the real reported cost or the "
-                "raw list price. 1.0 = no nudge. Marketplace/offer prices keep their "
-                "raw quote and expose separate effective prices for ranking."}
+                "raw list price. 1.0 = no nudge. Raw source prices stay raw; the "
+                "ranking price is computed from the current multiplier at selection time."}
 
 
 def provider_knob_schema() -> "dict[str, dict]":
     """The provider knobs, namespaced `<id>.<knob>` and stamped with the provider
     group — the per-provider half of settings.SCHEMA, derived from PROVIDERS. Every
-    provider that contributes a price (has a source) also gets an effective-price
-    multiplier knob, applied centrally in sources.push_prices."""
+    provider that contributes a price (has a source) also gets a ranking-price
+    multiplier knob, applied at selection time by the host/core boundary."""
     schema: dict[str, dict] = {}
     for p in PROVIDERS:
         if p.source is not None:

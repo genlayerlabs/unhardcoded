@@ -337,6 +337,9 @@ end
                     "served_model_id": chosen.get("served_model_id"),
                     "price_in": chosen.get("price_in"),
                     "price_out": chosen.get("price_out"),
+                    "raw_price_in": chosen.get("raw_price_in"),
+                    "raw_price_out": chosen.get("raw_price_out"),
+                    "price_multiplier": chosen.get("price_multiplier"),
                     "tokens_in": resp.get("tokens_in"),
                     "tokens_out": resp.get("tokens_out"),
                     "tokens_cached": resp.get("tokens_cached"),
@@ -363,9 +366,15 @@ end
             rep = n.get("cost_reported")
             if isinstance(rep, (int, float)) and not isinstance(rep, bool) and rep >= 0:
                 return float(rep)
-            pin, pout = n.get("price_in"), n.get("price_out")
+            pin = n.get("raw_price_in", n.get("price_in"))
+            pout = n.get("raw_price_out", n.get("price_out"))
             if pin is None and pout is None:
                 return None
+            if n.get("raw_price_in") is None and n.get("raw_price_out") is None:
+                mult = n.get("price_multiplier")
+                if isinstance(mult, (int, float)) and not isinstance(mult, bool) and mult > 0:
+                    pin = pin / mult if pin is not None else pin
+                    pout = pout / mult if pout is not None else pout
             tin = n.get("tokens_in") or 0
             cached = n.get("tokens_cached") or 0
             uncached = max(0, tin - cached)
@@ -674,6 +683,7 @@ end
             "env":           self._h_env,
             "call_provider": self._h_call_provider,
             "discover":      self._h_discover,
+            "price_multiplier": self._h_price_multiplier,
             "sleep_ms":      self._h_sleep_ms,
         })
 
@@ -702,6 +712,17 @@ end
         if not self._discover_hook:
             return _to_lua(self.lua, {"ok": False, "error": "no_discover_hook"})
         return _to_lua(self.lua, self._discover_hook(discovery_id))
+
+    def _h_price_multiplier(self, provider_id, source_name=None) -> float:
+        import settings
+
+        for name in (provider_id, source_name):
+            if not name:
+                continue
+            key = f"{name}.price_multiplier"
+            if key in settings.SCHEMA:
+                return float(settings.get(key))
+        return 1.0
 
     def _h_sleep_ms(self, ms):
         time.sleep(float(ms) / 1000.0)

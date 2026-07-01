@@ -64,15 +64,9 @@ def push_prices(host: Any, catalog: dict, prices: list[Price]) -> int:
     and price-ceiling filters read). Unmapped or un-cataloged prices are
     skipped — sources never widen the catalog.
 
-    Static provider prices are scaled by the provider's
-    `<provider>.price_multiplier` knob (default 1.0) on the way in, so RANKING
-    sees a nudged price (a fictitious routing lever). Marketplace offers keep
-    raw quotes in their source cache and receive effective ranking prices in the
-    discover hook. Billing is unaffected: the raw list/quote price stays
-    untouched at the source/table, and shim._executed_cost_usd divides the same
-    multiplier back out before computing cost_usd — so the lever never distorts
-    spend."""
-    import settings  # lazy: settings -> providers, never imports sources back
+    Prices are stored raw. The host/core boundary applies the current
+    `<provider>.price_multiplier` knob at selection time so changing the
+    multiplier does not require waiting for the next source refresh."""
     pairs = _served_pairs(catalog)
     now = int(time.time())
     pushed = 0
@@ -81,11 +75,9 @@ def push_prices(host: Any, catalog: dict, prices: list[Price]) -> int:
         provider = p.get("provider_id")
         if not family or (provider, family) not in pairs:
             continue
-        key = f"{provider}.price_multiplier"
-        mult = settings.get(key) if key in settings.SCHEMA else 1.0
         host.update_metrics(provider, family, {
-            "price_in": p["price_in_usd_per_mtok"] * mult,
-            "price_out": p["price_out_usd_per_mtok"] * mult,
+            "price_in": p["price_in_usd_per_mtok"],
+            "price_out": p["price_out_usd_per_mtok"],
             "price_refreshed_at": now,
         })
         pushed += 1

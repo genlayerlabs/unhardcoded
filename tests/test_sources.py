@@ -62,9 +62,7 @@ def test_push_prices_only_pushes_cataloged_pairs():
     assert isinstance(delta["price_refreshed_at"], int)
 
 
-def test_push_prices_applies_effective_price_multiplier(monkeypatch):
-    # a 0.5 effective multiplier (e.g. a negotiated 50% discount) scales the price
-    # the ranking sees, while the source's raw list price is untouched.
+def test_push_prices_keeps_raw_prices_when_multiplier_is_configured(monkeypatch):
     monkeypatch.setitem(settings._overrides, "openrouter.price_multiplier", 0.5)
     host = FakeHost()
     src.push_prices(host, CATALOG, [
@@ -72,7 +70,7 @@ def test_push_prices_applies_effective_price_multiplier(monkeypatch):
          "model_family": "gpt-5.5",
          "price_in_usd_per_mtok": 5.0, "price_out_usd_per_mtok": 30.0}])
     (_, _, delta), = host.pushed
-    assert (delta["price_in"], delta["price_out"]) == (2.5, 15.0)
+    assert (delta["price_in"], delta["price_out"]) == (5.0, 30.0)
 
 
 class FakeSource:
@@ -1171,10 +1169,9 @@ def test_discover_hook_serves_antseed_offers(tmp_path):
     assert r2["ok"] is False and "no offers" in r2["error"]
 
 
-def test_discover_hook_adds_effective_offer_prices_without_mutating_raw(monkeypatch):
+def test_discover_hook_returns_raw_offer_prices_without_mutating_raw():
     import serve
 
-    monkeypatch.setitem(settings._overrides, "bedrock.price_multiplier", 0.8)
     raw_offer = {
         "model_family": "claude-sonnet-4-6",
         "wire_model_id": "us.anthropic.claude-sonnet-4-6",
@@ -1198,9 +1195,8 @@ def test_discover_hook_adds_effective_offer_prices_without_mutating_raw(monkeypa
     offer = r["offers"][0]
     assert offer["price_in_usd_per_mtok"] == 3.0
     assert offer["price_out_usd_per_mtok"] == 15.0
-    assert offer["effective_price_in_usd_per_mtok"] == pytest.approx(2.4)
-    assert offer["effective_price_out_usd_per_mtok"] == 12.0
-    assert offer["ranking_price_multiplier"] == 0.8
+    assert "effective_price_in_usd_per_mtok" not in offer
+    assert "ranking_price_multiplier" not in offer
     assert "effective_price_in_usd_per_mtok" not in raw_offer
 
 
