@@ -635,6 +635,88 @@ def test_dashboard_rotation_with_zero_grace_expires_old_key_not_new_key(monkeypa
         _restore_auth_maps(original_plaintext, original_hashes)
 
 
+def test_dashboard_per_key_rotation_only_expires_targeted_key(monkeypatch, tmp_path):
+    target = hashlib.sha256("crm-token".encode()).hexdigest()
+    other = hashlib.sha256("crm-other".encode()).hexdigest()
+    _, _, original_plaintext, original_hashes = _with_consumer_auth(
+        monkeypatch,
+        tmp_path,
+        issued={"status": "active", "keys": [
+            {"sha256_prefix": target[:12], "status": "active"},
+            {"sha256_prefix": other[:12], "status": "active"},
+        ]},
+    )
+    try:
+        client = _dashboard_client(monkeypatch)
+        created = client.post("/dashboard/api/keys", json={
+            "consumer": "crm", "rotate": True,
+            "sha256_prefix": target[:12], "grace_period_s": 60})
+        assert created.status_code == 200
+        issued = _issued_data()["crm"]
+        rotated = next(k for k in issued["keys"] if k["sha256_prefix"] == target[:12])
+        untouched = next(k for k in issued["keys"] if k["sha256_prefix"] == other[:12])
+        assert rotated["expires_at"] > 0
+        assert rotated["replaced_at"] > 0
+        assert "expires_at" not in untouched
+        assert "replaced_at" not in untouched
+        assert untouched["status"] == "active"
+    finally:
+        _restore_auth_maps(original_plaintext, original_hashes)
+
+
+def test_dashboard_per_key_rotation_unknown_prefix_errors(monkeypatch, tmp_path):
+    digest = hashlib.sha256("crm-token".encode()).hexdigest()
+    _, _, original_plaintext, original_hashes = _with_consumer_auth(
+        monkeypatch,
+        tmp_path,
+        issued={"status": "active", "keys": [{"sha256_prefix": digest[:12], "status": "active"}]},
+    )
+    try:
+        client = _dashboard_client(monkeypatch)
+        resp = client.post("/dashboard/api/keys", json={
+            "consumer": "crm", "rotate": True, "sha256_prefix": "deadbeef1234"})
+        assert resp.status_code == 404
+        assert resp.json()["error"]["code"] == "key_not_found"
+        # The failed rotation must not have minted a key or touched the record.
+        issued = _issued_data()["crm"]
+        assert len(issued["keys"]) == 1
+        assert "expires_at" not in issued["keys"][0]
+
+        malformed = client.post("/dashboard/api/keys", json={
+            "consumer": "crm", "rotate": True, "sha256_prefix": "XYZ"})
+        assert malformed.status_code == 400
+        assert "sha256_prefix" in malformed.json()["error"]["message"]
+    finally:
+        _restore_auth_maps(original_plaintext, original_hashes)
+
+
+def test_dashboard_rotation_without_prefix_still_expires_all_active_keys(monkeypatch, tmp_path):
+    first = hashlib.sha256("crm-token".encode()).hexdigest()
+    second = hashlib.sha256("crm-other".encode()).hexdigest()
+    _, _, original_plaintext, original_hashes = _with_consumer_auth(
+        monkeypatch,
+        tmp_path,
+        issued={"status": "active", "keys": [
+            {"sha256_prefix": first[:12], "status": "active"},
+            {"sha256_prefix": second[:12], "status": "active"},
+        ]},
+    )
+    try:
+        client = _dashboard_client(monkeypatch)
+        created = client.post("/dashboard/api/keys", json={"consumer": "crm", "rotate": True, "grace_period_s": 60})
+        assert created.status_code == 200
+        new_prefix = created.json()["sha256_prefix"]
+        issued = _issued_data()["crm"]
+        for prefix in (first[:12], second[:12]):
+            row = next(k for k in issued["keys"] if k["sha256_prefix"] == prefix)
+            assert row["expires_at"] > 0
+            assert row["replaced_at"] > 0
+        fresh = next(k for k in issued["keys"] if k["sha256_prefix"] == new_prefix)
+        assert "expires_at" not in fresh
+    finally:
+        _restore_auth_maps(original_plaintext, original_hashes)
+
+
 def test_legacy_plaintext_keys_can_be_rotated_and_revoked(monkeypatch, tmp_path):
     token = "legacy-crm-token"
     digest = hashlib.sha256(token.encode()).hexdigest()
