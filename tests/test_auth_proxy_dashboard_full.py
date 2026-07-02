@@ -190,11 +190,17 @@ def test_dashboard_key_generation_ui_has_copy_key_and_handoff_blurb(monkeypatch,
     html = resp.text
     assert "newKeyValue" in html
     assert "copyKey" in html
-    assert "Copy key only" in html
+    assert "Copy key" in html
     assert "newKeyHandoffValue" in html
     assert "copyKeyHandoff" in html
-    assert "Copy full setup blurb" in html
+    assert "Copy setup blurb" in html
     assert "buildKeyHandoff" in html
+    # Two-step new-consumer-key dialog and the scoped keys drawer.
+    assert "newKeyConsumer" in html
+    assert "Create and generate key" in html
+    assert "Shown once — copy it now" in html
+    assert "keysList" in html
+    assert "Generate new key" in html
     # The handoff base URL defaults to loopback and is configurable via PUBLIC_BASE_URL.
     assert "http://127.0.0.1:8080/v1" in html
     assert "router.ygr.ai" not in html
@@ -271,6 +277,81 @@ def test_dashboard_reveal_keys_reports_hash_only_unrecoverable(monkeypatch):
         auth_proxy.CALLER_KEYS.update(original_plaintext)
         auth_proxy.CALLER_KEY_HASHES.clear()
         auth_proxy.CALLER_KEY_HASHES.update(original_hashes)
+
+
+def test_dashboard_list_keys_requires_admin(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    unauth = TestClient(auth_proxy.app)
+    assert unauth.get("/dashboard/api/keys/list?consumer=crm").status_code == 401
+
+
+def test_dashboard_list_keys_returns_per_key_metadata_no_raw(monkeypatch, tmp_path):
+    digest = hashlib.sha256("crm-token".encode()).hexdigest()
+    old = hashlib.sha256("crm-old".encode()).hexdigest()
+    _, _, original_plaintext, original_hashes = _with_consumer_auth(
+        monkeypatch,
+        tmp_path,
+        issued={
+            "status": "active",
+            "allowed_routes": ["profile:edge"],
+            "keys": [
+                {"sha256_prefix": digest[:12], "status": "active", "created_at": 100},
+                {"sha256_prefix": old[:12], "status": "active", "created_at": 50,
+                 "expires_at": 200, "replaced_at": 90},
+            ],
+        },
+    )
+    try:
+        client = _dashboard_client(monkeypatch)
+        resp = client.get("/dashboard/api/keys/list?consumer=crm")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["consumer"] == "crm"
+        assert body["status"] == "active"
+        assert body["allowed_routes"] == ["profile:edge"]
+        prefixes = {k["sha256_prefix"] for k in body["keys"]}
+        assert digest[:12] in prefixes
+        assert old[:12] in prefixes
+        rotated = next(k for k in body["keys"] if k["sha256_prefix"] == old[:12])
+        assert rotated["expires_at"] == 200
+        assert rotated["replaced_at"] == 90
+        # No raw key material of any shape is returned.
+        assert "api_key" not in resp.text
+        assert "crm-token" not in resp.text
+        # Hash-only keys are not recoverable.
+        assert all(k["recoverable"] is False for k in body["keys"])
+    finally:
+        _restore_auth_maps(original_plaintext, original_hashes)
+
+
+def test_dashboard_list_keys_flags_recoverable_plaintext(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    monkeypatch.setattr(auth_proxy, "DASHBOARD_KEY_ENV_PATH", str(tmp_path / ".env.secrets"))
+    token = "legacy-crm-token"
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    original_plaintext = dict(auth_proxy.CALLER_KEYS)
+    original_hashes = dict(auth_proxy.CALLER_KEY_HASHES)
+    auth_proxy.CALLER_KEYS.clear()
+    auth_proxy.CALLER_KEYS.update({token: "crm"})
+    auth_proxy.CALLER_KEY_HASHES.clear()
+    try:
+        client = _dashboard_client(monkeypatch)
+        resp = client.get("/dashboard/api/keys/list?consumer=crm")
+        assert resp.status_code == 200
+        body = resp.json()
+        row = next(k for k in body["keys"] if k["sha256_prefix"] == digest[:12])
+        assert row["recoverable"] is True
+        assert token not in resp.text
+    finally:
+        _restore_auth_maps(original_plaintext, original_hashes)
+
+
+def test_dashboard_list_keys_validates_consumer(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    client = _dashboard_client(monkeypatch)
+    resp = client.get("/dashboard/api/keys/list?consumer=")
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_consumer"
 
 
 def test_dashboard_evaluate_alias_matches_full_shape(monkeypatch):
@@ -550,6 +631,88 @@ def test_dashboard_rotation_with_zero_grace_expires_old_key_not_new_key(monkeypa
         assert old.json()["error"]["code"] == "caller_key_expired"
         new = route_client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {new_token}"}, json={"model": "profile:edge", "messages": []})
         assert new.status_code == 200
+    finally:
+        _restore_auth_maps(original_plaintext, original_hashes)
+
+
+def test_dashboard_per_key_rotation_only_expires_targeted_key(monkeypatch, tmp_path):
+    target = hashlib.sha256("crm-token".encode()).hexdigest()
+    other = hashlib.sha256("crm-other".encode()).hexdigest()
+    _, _, original_plaintext, original_hashes = _with_consumer_auth(
+        monkeypatch,
+        tmp_path,
+        issued={"status": "active", "keys": [
+            {"sha256_prefix": target[:12], "status": "active"},
+            {"sha256_prefix": other[:12], "status": "active"},
+        ]},
+    )
+    try:
+        client = _dashboard_client(monkeypatch)
+        created = client.post("/dashboard/api/keys", json={
+            "consumer": "crm", "rotate": True,
+            "sha256_prefix": target[:12], "grace_period_s": 60})
+        assert created.status_code == 200
+        issued = _issued_data()["crm"]
+        rotated = next(k for k in issued["keys"] if k["sha256_prefix"] == target[:12])
+        untouched = next(k for k in issued["keys"] if k["sha256_prefix"] == other[:12])
+        assert rotated["expires_at"] > 0
+        assert rotated["replaced_at"] > 0
+        assert "expires_at" not in untouched
+        assert "replaced_at" not in untouched
+        assert untouched["status"] == "active"
+    finally:
+        _restore_auth_maps(original_plaintext, original_hashes)
+
+
+def test_dashboard_per_key_rotation_unknown_prefix_errors(monkeypatch, tmp_path):
+    digest = hashlib.sha256("crm-token".encode()).hexdigest()
+    _, _, original_plaintext, original_hashes = _with_consumer_auth(
+        monkeypatch,
+        tmp_path,
+        issued={"status": "active", "keys": [{"sha256_prefix": digest[:12], "status": "active"}]},
+    )
+    try:
+        client = _dashboard_client(monkeypatch)
+        resp = client.post("/dashboard/api/keys", json={
+            "consumer": "crm", "rotate": True, "sha256_prefix": "deadbeef1234"})
+        assert resp.status_code == 404
+        assert resp.json()["error"]["code"] == "key_not_found"
+        # The failed rotation must not have minted a key or touched the record.
+        issued = _issued_data()["crm"]
+        assert len(issued["keys"]) == 1
+        assert "expires_at" not in issued["keys"][0]
+
+        malformed = client.post("/dashboard/api/keys", json={
+            "consumer": "crm", "rotate": True, "sha256_prefix": "XYZ"})
+        assert malformed.status_code == 400
+        assert "sha256_prefix" in malformed.json()["error"]["message"]
+    finally:
+        _restore_auth_maps(original_plaintext, original_hashes)
+
+
+def test_dashboard_rotation_without_prefix_still_expires_all_active_keys(monkeypatch, tmp_path):
+    first = hashlib.sha256("crm-token".encode()).hexdigest()
+    second = hashlib.sha256("crm-other".encode()).hexdigest()
+    _, _, original_plaintext, original_hashes = _with_consumer_auth(
+        monkeypatch,
+        tmp_path,
+        issued={"status": "active", "keys": [
+            {"sha256_prefix": first[:12], "status": "active"},
+            {"sha256_prefix": second[:12], "status": "active"},
+        ]},
+    )
+    try:
+        client = _dashboard_client(monkeypatch)
+        created = client.post("/dashboard/api/keys", json={"consumer": "crm", "rotate": True, "grace_period_s": 60})
+        assert created.status_code == 200
+        new_prefix = created.json()["sha256_prefix"]
+        issued = _issued_data()["crm"]
+        for prefix in (first[:12], second[:12]):
+            row = next(k for k in issued["keys"] if k["sha256_prefix"] == prefix)
+            assert row["expires_at"] > 0
+            assert row["replaced_at"] > 0
+        fresh = next(k for k in issued["keys"] if k["sha256_prefix"] == new_prefix)
+        assert "expires_at" not in fresh
     finally:
         _restore_auth_maps(original_plaintext, original_hashes)
 
@@ -889,8 +1052,11 @@ def test_dashboard_html_escapes_consumer_names_for_js_context_and_logout_clears_
     assert "onclick=\"pickConsumer(${jsarg(r.name)})\"" in html
     assert "showLogin()" in html
     assert html.count("if(r.status===401){showLogin();return}") >= 5
+    # Logout clears any raw key material still displayed (new-key dialog + the
+    # in-drawer key-ready panel), so it never lingers after the session ends.
     assert "newKeyValue').value=''" in html
-    assert "revealKeyValue').value=''" in html
+    assert "newKeyHandoffValue').value=''" in html
+    assert "keyReady').innerHTML=''" in html
     assert "onclick=\"pickConsumer('${esc(r.name)}')\"" not in html
 
 
