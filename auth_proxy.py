@@ -1998,7 +1998,26 @@ async def dashboard_policy_backtest(request: Request) -> Response:
     first_rank_error: tuple[int, dict[str, Any]] | None = None
     unpriced_groups = 0
 
-    for group in grouped.get("groups") or []:
+    grouped_groups = grouped.get("groups") or []
+    rank_routes = list(dict.fromkeys(
+        str(group.get("route") or "unknown") for group in grouped_groups))
+    rank_results: dict[str, tuple[int, dict[str, Any]]] = {}
+    if rank_routes:
+        rank_semaphore = asyncio.Semaphore(8)
+
+        async def _rank_route(route: str) -> tuple[str, int, dict[str, Any]]:
+            async with rank_semaphore:
+                status, data = await _rank_policy_for_backtest(policy_ir, route)
+            return route, status, data
+
+        for route, status, data in await asyncio.gather(*(
+                _rank_route(route) for route in rank_routes)):
+            rank_results[route] = (status, data)
+            if status < 400:
+                rank_cache[route] = data
+                rank_successes += 1
+
+    for group in grouped_groups:
         route = str(group.get("route") or "unknown")
         requests = int(group.get("requests") or 0)
         tokens_in = int(group.get("tokens_in") or 0)
@@ -2007,37 +2026,34 @@ async def dashboard_policy_backtest(request: Request) -> Response:
         providers = group.get("providers") if isinstance(group.get("providers"), dict) else {}
         provider_latency = group.get("provider_latency_ms") \
             if isinstance(group.get("provider_latency_ms"), dict) else {}
-        if route not in rank_cache:
-            status, data = await _rank_policy_for_backtest(policy_ir, route)
-            if status >= 400:
-                if first_rank_error is None:
-                    first_rank_error = (status, data)
-                rank_error_groups += 1
-                rank_error_requests += requests
-                groups.append({
-                    "route": route,
-                    "requests": requests,
-                    "tokens_in": tokens_in,
-                    "tokens_out": tokens_out,
-                    "actual": {"cost_usd": actual_cost, "providers": providers},
-                    "backtest": {"winner_provider": None, "winner_model": None,
-                                 "cost_usd": None, "admitted": 0,
-                                 "fallbacks": []},
-                    "latency": {"actual_avg_ms": group.get("actual_avg_ms"),
-                                "winner_observed_avg_ms": None},
-                    "unroutable": False,
-                    "rank_error": True,
-                    "rank_error_status": status,
-                    "rank_error_kind": _backtest_rank_error_kind(data),
-                    "rank_error_code": (
-                        (data.get("error") or {}).get("code")
-                        if isinstance(data.get("error"), dict)
-                        else None
-                    ) or data.get("code"),
-                })
-                continue
-            rank_cache[route] = data
-            rank_successes += 1
+        status, data = rank_results[route]
+        if status >= 400:
+            if first_rank_error is None:
+                first_rank_error = (status, data)
+            rank_error_groups += 1
+            rank_error_requests += requests
+            groups.append({
+                "route": route,
+                "requests": requests,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "actual": {"cost_usd": actual_cost, "providers": providers},
+                "backtest": {"winner_provider": None, "winner_model": None,
+                             "cost_usd": None, "admitted": 0,
+                             "fallbacks": []},
+                "latency": {"actual_avg_ms": group.get("actual_avg_ms"),
+                            "winner_observed_avg_ms": None},
+                "unroutable": False,
+                "rank_error": True,
+                "rank_error_status": status,
+                "rank_error_kind": _backtest_rank_error_kind(data),
+                "rank_error_code": (
+                    (data.get("error") or {}).get("code")
+                    if isinstance(data.get("error"), dict)
+                    else None
+                ) or data.get("code"),
+            })
+            continue
         ranked = rank_cache[route].get("ranked") or []
         if not isinstance(ranked, list):
             ranked = []
@@ -4655,7 +4671,22 @@ function bDelta(v){if(v==null)return '—';const n=Number(v||0),cls=n>0?'bad':n<
 function bPct(v){if(v==null)return '—';const n=Number(v||0),cls=n>0?'bad':n<0?'ok':'muted',sign=n>0?'+':'';return `<span class="${cls}">${sign}${n.toFixed(2)}%</span>`}
 function bMs(v){return v==null?'—':fmt(Math.round(Number(v)))+' ms'}
 function bProviders(p){const rows=Object.entries(p||{});return rows.length?rows.map(([name,v])=>`<div><span class="pill">${esc(name)}</span><div class="muted small">${fmt(v.requests)} req · ${bMoney(v.cost_usd)}</div></div>`).join(''):'—'}
-function bRenderBacktest(d){const t=d.totals||{},w=d.window||{},groups=d.groups||[];const trunc=(w.groups_truncated||w.requests_truncated)?`<span class="pill warn">${fmt(w.groups_truncated)} groups · ${fmt(w.requests_truncated)} req truncated</span>`:'';const metrics=`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:14px"><div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,255,255,.02)"><div class="label">Actual cost</div><div class="metric">${bMoney(t.actual_cost_usd)}</div></div><div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,255,255,.02)"><div class="label">Backtest cost</div><div class="metric">${bMoney(t.backtest_cost_usd)}</div></div><div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,255,255,.02)"><div class="label">Delta</div><div class="metric">${bDelta(t.delta_usd)}</div><div class="statSub">${bPct(t.delta_pct)}</div></div><div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,255,255,.02)"><div class="label">Requests covered</div><div class="metric">${fmt(w.requests_covered)}</div><div class="statSub">of ${fmt(w.requests_total)} ${trunc}</div></div>${t.unroutable_requests?`<div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,92,122,.07)"><div class="label">Unroutable</div><div class="metric bad">${fmt(t.unroutable_requests)}</div></div>`:''}</div>`;if(!groups.length){$('bBacktestResult').innerHTML=metrics+'<div class="empty" style="margin-top:10px">No calls in this window.</div>';return}const body=groups.map(g=>{const a=g.actual||{},bt=g.backtest||{},lat=g.latency||{};const delta=bt.cost_usd==null?null:Number(bt.cost_usd||0)-Number(a.cost_usd||0);const winner=g.unroutable?'<span class="pill bad">unroutable</span>':`<span class="pill ok">${esc(bt.winner_provider||'—')}</span><div class="muted small">${esc(bt.winner_model||'—')} · ${fmt(bt.admitted||0)} admitted</div>`;const lnote=g.unroutable?'—':`actual ${bMs(lat.actual_avg_ms)}<br><span class="muted small">winner observed ${bMs(lat.winner_observed_avg_ms)}</span>`;return `<tr class="${g.unroutable?'bad':''}"><td><code>${esc(g.route)}</code>${g.unroutable?' <span class="pill bad">zero candidates</span>':''}</td><td class="right">${fmt(g.requests)}</td><td>${bProviders(a.providers)}</td><td>${winner}</td><td class="right">${bMoney(a.cost_usd)}</td><td class="right">${bMoney(bt.cost_usd)}</td><td class="right">${bDelta(delta)}</td><td>${lnote}</td></tr>`}).join('');const caveats=(d.caveats||[]).map(c=>esc(c)).join(' · ');$('bBacktestResult').innerHTML=metrics+`<div class="label small" style="margin-top:16px">Backtest by model family</div><table class="dataTable"><thead><tr><th>Route</th><th class="right">Requests</th><th>Actual provider(s)</th><th>→ would-be winner</th><th class="right">Actual cost</th><th class="right">Backtest cost</th><th class="right">Delta</th><th>Latency</th></tr></thead><tbody>${body}</tbody></table><div class="muted small" style="margin-top:10px">${caveats}</div>`}
+function bRenderBacktest(d){
+const t=d.totals||{},w=d.window||{},groups=d.groups||[];
+const trunc=(w.groups_truncated||w.requests_truncated)?`<span class="pill warn">${fmt(w.groups_truncated)} groups · ${fmt(w.requests_truncated)} req truncated</span>`:'';
+const metrics=`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:14px"><div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,255,255,.02)"><div class="label">Actual cost</div><div class="metric">${bMoney(t.actual_cost_usd)}</div></div><div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,255,255,.02)"><div class="label">Backtest cost</div><div class="metric">${bMoney(t.backtest_cost_usd)}</div></div><div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,255,255,.02)"><div class="label">Delta</div><div class="metric">${bDelta(t.delta_usd)}</div><div class="statSub">${bPct(t.delta_pct)}</div></div><div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,255,255,.02)"><div class="label">Requests covered</div><div class="metric">${fmt(w.requests_covered)}</div><div class="statSub">of ${fmt(w.requests_total)} ${trunc}</div></div>${t.unroutable_requests?`<div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,92,122,.07)"><div class="label">Unroutable</div><div class="metric bad">${fmt(t.unroutable_requests)}</div></div>`:''}</div>`;
+if(!groups.length){$('bBacktestResult').innerHTML=metrics+'<div class="empty" style="margin-top:10px">No calls in this window.</div>';return}
+const body=groups.map(g=>{
+const a=g.actual||{},bt=g.backtest||{},lat=g.latency||{};
+const delta=bt.cost_usd==null?null:Number(bt.cost_usd||0)-Number(a.cost_usd||0);
+const winner=g.rank_error?`<span class="pill bad">rank failed (${esc(g.rank_error_status||'error')})</span>${g.rank_error_kind?`<div class="muted small">${esc(g.rank_error_kind)}</div>`:''}`:g.unroutable?'<span class="pill bad">unroutable</span>':`<span class="pill ok">${esc(bt.winner_provider||'—')}</span><div class="muted small">${esc(bt.winner_model||'—')} · ${fmt(bt.admitted||0)} admitted</div>`;
+const lnote=(g.rank_error||g.unroutable)?'—':`actual ${bMs(lat.actual_avg_ms)}<br><span class="muted small">winner observed ${bMs(lat.winner_observed_avg_ms)}</span>`;
+const rowClass=(g.rank_error||g.unroutable)?'bad':'';
+const routePill=g.unroutable?' <span class="pill bad">zero candidates</span>':'';
+return `<tr class="${rowClass}"><td><code>${esc(g.route)}</code>${routePill}</td><td class="right">${fmt(g.requests)}</td><td>${bProviders(a.providers)}</td><td>${winner}</td><td class="right">${bMoney(a.cost_usd)}</td><td class="right">${bMoney(bt.cost_usd)}</td><td class="right">${bDelta(delta)}</td><td>${lnote}</td></tr>`}).join('');
+const caveats=(d.caveats||[]).map(c=>esc(c)).join(' · ');
+$('bBacktestResult').innerHTML=metrics+`<div class="label small" style="margin-top:16px">Backtest by model family</div><table class="dataTable"><thead><tr><th>Route</th><th class="right">Requests</th><th>Actual provider(s)</th><th>→ would-be winner</th><th class="right">Actual cost</th><th class="right">Backtest cost</th><th class="right">Delta</th><th>Latency</th></tr></thead><tbody>${body}</tbody></table><div class="muted small" style="margin-top:10px">${caveats}</div>`
+}
 async function bBacktest(){$('bError').style.display='none';const btn=$('bBacktest'),old=btn.textContent;btn.disabled=true;btn.textContent='Backtesting…';$('bBacktestResult').innerHTML='<div class="muted small" style="margin-top:12px">Running backtest…</div>';try{const term=bCurrentTerm();const r=await fetch('/dashboard/api/policy/backtest',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({policy_ir:term,timeframe:$('bBacktestWindow').value})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`backtest ${r.status}`);bRenderBacktest(d);toast('Backtest done')}catch(e){showErr(e.message);bFail(e.message)}finally{btn.disabled=false;btn.textContent=old}}
 async function bDownload(){$('bError').style.display='none';try{const term=bCurrentTerm();const d=await bNormalize(term);const blob=new Blob([JSON.stringify({version:d.version,fingerprint:d.fingerprint,policy_ir:d.policy_ir},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='sigma-pol-'+(d.fingerprint||'policy')+'.json';a.click();URL.revokeObjectURL(a.href);toast('Policy downloaded — POST it as `policy_ir` in /v1/chat/completions')}catch(e){bFail(e.message)}}
 async function bTest(){$('bError').style.display='none';$('bTestResult').innerHTML='<div class="muted small" style="margin-top:8px">Running…</div>';try{const term=bCurrentTerm();const prompt=$('bTestPrompt').value.trim()||'Reply exactly: pong';const r=await fetch('/dashboard/api/policy/test',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({policy_ir:term,prompt})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||(typeof d.error==='string'?d.error:'test '+r.status));const okc=d.ok?'':'bad';const out=d.text?`<pre class="mono small" style="white-space:pre-wrap;margin-top:8px;background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:8px;padding:8px">${esc(d.text)}</pre>`:`<div class="bad small" style="margin-top:8px">${esc(d.error||'no output')}</div>`;$('bTestResult').innerHTML=`<div class="actMeta" style="margin-top:8px"><span class="pill ${okc}">status ${esc(d.status)}</span><span class="pill">${esc(d.provider||'—')}${d.served_model_id?' · '+esc(d.served_model_id):''}</span></div><div class="label small" style="margin-top:12px">How it routed — executed live, real spend</div>${actDetail(d)}<div class="label small" style="margin-top:12px">Answer</div>${out}<div class="muted small" style="margin-top:6px">Also recorded in <b>Activity</b>.</div>`;toast('Test call done')}catch(e){bFail(e.message)}}
