@@ -1825,6 +1825,301 @@ async def _router_post_json(path: str, payload: dict) -> Response:
             "code": "upstream"}})
 
 
+def _backtest_timeframe_options(value: Any) -> dict[str, Any]:
+    timeframe = _dashboard_timeframe(value or "7d")
+    if timeframe == "runtime":
+        return {"timeframe": timeframe, "since_ts": int(_started_wall)}
+    if timeframe == "all":
+        return {"timeframe": timeframe, "since_ts": None}
+    opts = _dashboard_timeframe_options(timeframe)
+    return {"timeframe": timeframe, "since_ts": opts.get("since")}
+
+
+def _json_number(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        text = str(value).strip()
+        if text:
+            return float(text)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _rank_candidate(row: dict[str, Any]) -> dict[str, Any]:
+    cand = row.get("candidate")
+    return cand if isinstance(cand, dict) else {}
+
+
+def _rank_provider(row: dict[str, Any]) -> str | None:
+    cand = _rank_candidate(row)
+    value = row.get("provider") or row.get("provider_id") or cand.get("provider_id") or cand.get("provider")
+    return str(value) if value else None
+
+
+def _rank_family(row: dict[str, Any]) -> str | None:
+    cand = _rank_candidate(row)
+    value = row.get("model_family") or row.get("model") or cand.get("model_family") or cand.get("model")
+    return str(value) if value else None
+
+
+def _rank_model(row: dict[str, Any]) -> str | None:
+    cand = _rank_candidate(row)
+    value = row.get("served_model_id") or row.get("provider_model_id") \
+        or cand.get("served_model_id") or cand.get("provider_model_id") \
+        or _rank_family(row)
+    return str(value) if value else None
+
+
+def _rank_prices(row: dict[str, Any], family: str,
+                 provider: str | None,
+                 prices: dict[tuple[str, str], dict[str, float]]) -> tuple[float | None, float | None]:
+    cand = _rank_candidate(row)
+    offer = cand.get("offer") if isinstance(cand.get("offer"), dict) else {}
+    pin = _json_number(row.get("price_in"))
+    if pin is None:
+        pin = _json_number(cand.get("price_in"))
+    if pin is None:
+        pin = _json_number(row.get("price_in_usd_per_mtok"))
+    if pin is None:
+        pin = _json_number(cand.get("price_in_usd_per_mtok"))
+    if pin is None:
+        pin = _json_number(offer.get("price_in_usd_per_mtok"))
+    pout = _json_number(row.get("price_out"))
+    if pout is None:
+        pout = _json_number(cand.get("price_out"))
+    if pout is None:
+        pout = _json_number(row.get("price_out_usd_per_mtok"))
+    if pout is None:
+        pout = _json_number(cand.get("price_out_usd_per_mtok"))
+    if pout is None:
+        pout = _json_number(offer.get("price_out_usd_per_mtok"))
+    fallback = prices.get((family, provider or ""))
+    if fallback:
+        if pin is None:
+            pin = fallback.get("input")
+        if pout is None:
+            pout = fallback.get("output")
+    return pin, pout
+
+
+def _counterfactual_cost(tokens_in: int, tokens_out: int,
+                         price_in: float | None,
+                         price_out: float | None) -> float | None:
+    if tokens_in and price_in is None:
+        return None
+    if tokens_out and price_out is None:
+        return None
+    cost = (tokens_in / 1_000_000.0) * (price_in or 0.0) \
+        + (tokens_out / 1_000_000.0) * (price_out or 0.0)
+    return round(max(0.0, cost), 6)
+
+
+def _backtest_candidate_summary(row: dict[str, Any], family: str,
+                                prices: dict[tuple[str, str], dict[str, float]]) -> dict[str, Any]:
+    provider = _rank_provider(row)
+    pin, pout = _rank_prices(row, family, provider, prices)
+    return {
+        "provider": provider,
+        "model": _rank_model(row),
+        "price_in": pin,
+        "price_out": pout,
+        "score": row.get("score"),
+    }
+
+
+def _backtest_rank_error_kind(data: dict[str, Any]) -> str:
+    error = data.get("error") if isinstance(data.get("error"), dict) else {}
+    kind = error.get("kind") or data.get("kind") \
+        or error.get("type") or data.get("type") \
+        or error.get("code") or data.get("code") or "rank_error"
+    return str(kind)
+
+
+async def _rank_policy_for_backtest(policy_ir: list, family: str) -> tuple[int, dict[str, Any]]:
+    if _client is None:
+        return 503, {"error": {"message": "router client not ready",
+                               "type": "router_error", "code": "upstream"}}
+    payload = {"policy_ir": policy_ir,
+               "requirements": {"context": ROUTER_CONTEXT_LENGTH,
+                                "model_family": family}}
+    try:
+        r = await _client.post(f"{UPSTREAM}/x/rank", json=payload, timeout=10.0)
+        try:
+            data = r.json()
+        except Exception:  # noqa: BLE001
+            data = {"error": {"message": r.text, "type": "router_error",
+                              "code": "rank"}}
+        return r.status_code, data if isinstance(data, dict) else {}
+    except Exception as exc:  # noqa: BLE001
+        return 502, {"error": {"message": f"router /x/rank unavailable: {exc}",
+                               "type": "router_error", "code": "upstream"}}
+
+
+@app.post("/dashboard/api/policy/backtest")
+async def dashboard_policy_backtest(request: Request) -> Response:
+    ctx, error = _require_admin_dashboard_auth(request)
+    if error:
+        return error
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    if "flow_ir" in body:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "Σ_flow / flow_ir backtesting is out of scope; provide a Σ_pol policy_ir term.",
+            "type": "invalid_request_error", "code": "flow_backtest_unsupported"}})
+    policy_ir = body.get("policy_ir")
+    if isinstance(policy_ir, list) and policy_ir and policy_ir[0] == "flow":
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "Σ_flow terms are out of scope for policy backtest; provide a Σ_pol policy_ir term.",
+            "type": "invalid_request_error", "code": "flow_backtest_unsupported"}})
+    if not isinstance(policy_ir, list):
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "policy_ir must be a Σ_pol term array",
+            "type": "invalid_request_error", "code": "policy_ir_required"}})
+
+    window_opts = _backtest_timeframe_options(body.get("timeframe") or "7d")
+    consumer = str(body.get("consumer") or "").strip() or None
+    grouped = host_store.policy_backtest_groups(
+        since_ts=window_opts["since_ts"], caller=consumer, limit=50)
+    prices = _price_table()
+    rank_cache: dict[str, dict[str, Any]] = {}
+    groups = []
+    actual_total = 0.0
+    backtest_total = 0.0
+    unroutable_requests = 0
+    rank_error_requests = 0
+    rank_error_groups = 0
+    rank_successes = 0
+    first_rank_error: tuple[int, dict[str, Any]] | None = None
+    unpriced_groups = 0
+
+    for group in grouped.get("groups") or []:
+        route = str(group.get("route") or "unknown")
+        requests = int(group.get("requests") or 0)
+        tokens_in = int(group.get("tokens_in") or 0)
+        tokens_out = int(group.get("tokens_out") or 0)
+        actual_cost = round(float(group.get("actual_cost_usd") or 0.0), 6)
+        providers = group.get("providers") if isinstance(group.get("providers"), dict) else {}
+        provider_latency = group.get("provider_latency_ms") \
+            if isinstance(group.get("provider_latency_ms"), dict) else {}
+        if route not in rank_cache:
+            status, data = await _rank_policy_for_backtest(policy_ir, route)
+            if status >= 400:
+                if first_rank_error is None:
+                    first_rank_error = (status, data)
+                rank_error_groups += 1
+                rank_error_requests += requests
+                groups.append({
+                    "route": route,
+                    "requests": requests,
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "actual": {"cost_usd": actual_cost, "providers": providers},
+                    "backtest": {"winner_provider": None, "winner_model": None,
+                                 "cost_usd": None, "admitted": 0,
+                                 "fallbacks": []},
+                    "latency": {"actual_avg_ms": group.get("actual_avg_ms"),
+                                "winner_observed_avg_ms": None},
+                    "unroutable": False,
+                    "rank_error": True,
+                    "rank_error_status": status,
+                    "rank_error_kind": _backtest_rank_error_kind(data),
+                    "rank_error_code": (
+                        (data.get("error") or {}).get("code")
+                        if isinstance(data.get("error"), dict)
+                        else None
+                    ) or data.get("code"),
+                })
+                continue
+            rank_cache[route] = data
+            rank_successes += 1
+        ranked = rank_cache[route].get("ranked") or []
+        if not isinstance(ranked, list):
+            ranked = []
+        winner = ranked[0] if ranked else None
+        backtest = {"winner_provider": None, "winner_model": None,
+                    "cost_usd": None, "admitted": len(ranked), "fallbacks": []}
+        unroutable = winner is None
+        winner_latency = None
+        if unroutable:
+            unroutable_requests += requests
+        else:
+            winner_provider = _rank_provider(winner)
+            pin, pout = _rank_prices(winner, route, winner_provider, prices)
+            cf_cost = _counterfactual_cost(tokens_in, tokens_out, pin, pout)
+            if cf_cost is None:
+                unpriced_groups += 1
+            else:
+                actual_total = round(actual_total + actual_cost, 6)
+                backtest_total = round(backtest_total + cf_cost, 6)
+            winner_latency = provider_latency.get(winner_provider) if winner_provider else None
+            backtest = {
+                "winner_provider": winner_provider,
+                "winner_model": _rank_model(winner),
+                "cost_usd": cf_cost,
+                "admitted": len(ranked),
+                "fallbacks": [_backtest_candidate_summary(r, route, prices)
+                              for r in ranked[:3] if isinstance(r, dict)],
+            }
+        groups.append({
+            "route": route,
+            "requests": requests,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "actual": {"cost_usd": actual_cost, "providers": providers},
+            "backtest": backtest,
+            "latency": {"actual_avg_ms": group.get("actual_avg_ms"),
+                        "winner_observed_avg_ms": winner_latency},
+            "unroutable": unroutable,
+        })
+
+    if rank_error_groups > 0 and rank_successes == 0 and first_rank_error is not None:
+        status, data = first_rank_error
+        return JSONResponse(status_code=status, content=data)
+
+    delta = round(backtest_total - actual_total, 6)
+    delta_pct = round((delta / actual_total) * 100.0, 4) if actual_total > 0 else None
+    caveats = [
+        "Ranked against the current catalog, prices, and breaker state, not the historical state at request time.",
+        "Ranking is treated as request-independent per model family; prompts, tools, cache state, and per-request context are not replayed.",
+        "Costs use current list prices from /x/rank when present, otherwise the host price table.",
+    ]
+    if unpriced_groups:
+        caveats.append("Some admitted winners had no current list price; those groups are excluded from cost totals.")
+    if rank_error_groups:
+        family_word = "family" if rank_error_groups == 1 else "families"
+        caveats.append(
+            f"{rank_error_groups} {family_word} failed to rank; "
+            "their requests are excluded from cost totals.")
+    return JSONResponse(content={
+        "window": {
+            "timeframe": window_opts["timeframe"],
+            "since_ts": window_opts["since_ts"],
+            "groups_total": int(grouped.get("groups_total") or 0),
+            "groups_shown": int(grouped.get("groups_shown") or 0),
+            "groups_truncated": int(grouped.get("groups_truncated") or 0),
+            "requests_total": int(grouped.get("requests_total") or 0),
+            "requests_covered": int(grouped.get("requests_covered") or 0),
+            "requests_truncated": int(grouped.get("requests_truncated") or 0),
+        },
+        "totals": {
+            "actual_cost_usd": round(actual_total, 6),
+            "backtest_cost_usd": round(backtest_total, 6),
+            "delta_usd": delta,
+            "delta_pct": delta_pct,
+            "unroutable_requests": unroutable_requests,
+            "rank_error_requests": rank_error_requests,
+        },
+        "groups": groups,
+        "caveats": caveats,
+    })
+
+
 @app.post("/dashboard/api/policy/build")
 async def dashboard_policy_build(request: Request) -> Response:
     ctx, error = _require_admin_dashboard_auth(request)
@@ -4144,10 +4439,11 @@ def _dashboard_html() -> str:
         <textarea id='bRawTerm' class='mono small' spellcheck='false' style='width:100%;min-height:280px;background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:10px;padding:10px'></textarea>
       </div>
       <datalist id='familyOptions'></datalist>
-      <div class='toolbar' style='margin-top:14px'><button class='btn primary' id='bReview'>Review ranking</button><button class='btn' id='bDownload'>Download policy</button><span class='muted small mono' id='bFingerprint' style='margin-left:auto'></span></div>
+      <div class='toolbar' style='margin-top:14px'><button class='btn primary' id='bReview'>Review ranking</button><button class='btn' id='bBacktest'>Backtest</button><select class='select' id='bBacktestWindow' title='Backtest window' style='width:auto'><option value='24h'>24h</option><option value='7d' selected>7d</option><option value='30d'>30d</option></select><button class='btn' id='bDownload'>Download policy</button><span class='muted small mono' id='bFingerprint' style='margin-left:auto'></span></div>
       <div id='bError' class='empty' style='display:none'></div>
       <pre id='bTerm' class='mono small' style='overflow:auto;max-height:200px;background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:10px;padding:10px'></pre>
       <div id='bRanked'></div>
+      <div id='bBacktestResult'></div>
       <div class='toolbar' style='margin-top:16px'><div class='label'>Test call</div><span class='muted small' style='margin-left:auto'>run this policy live with a prompt — appears in Activity with its full trace</span></div>
       <div style='display:flex;gap:8px;align-items:flex-start;margin-top:6px'><textarea id='bTestPrompt' rows='2' placeholder='Reply exactly: pong' style='flex:1'></textarea><button class='btn primary' id='bTestBtn' style='flex:none'>Test call</button></div>
       <div id='bTestResult'></div>
@@ -4354,6 +4650,13 @@ function bCurrentTerm(){if(bRawMode){let v;try{v=JSON.parse($('bRawTerm').value)
 function bSetMode(m){bRawMode=(m==='raw');if(bRawMode){try{$('bRawTerm').value=JSON.stringify(bBuildTerm(),null,2)}catch(e){}}$('bStructured').style.display=bRawMode?'none':'';$('bRaw').style.display=bRawMode?'':'none';document.querySelectorAll('#bModeSeg button').forEach(x=>x.classList.toggle('active',x.dataset.mode===m))}
 async function bNormalize(term){const r=await fetch('/dashboard/api/policy/normalize',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({policy_ir:term})});if(r.status===401){showLogin();throw new Error('login required')}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`normalize ${r.status}`);lastBuiltPolicy=d;$('bTerm').textContent=JSON.stringify(d.policy_ir);$('bFingerprint').textContent='fingerprint '+d.fingerprint+' · '+d.version;return d}
 async function bReview(){$('bError').style.display='none';$('bRanked').innerHTML='';try{const term=bCurrentTerm();await bNormalize(term);const r=await fetch('/dashboard/api/policy/preview',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({policy_ir:term})});if(r.status===401){showLogin();return}const pd=await r.json();if(!r.ok)throw new Error(pd.error?.message||`preview ${r.status}`);const ranked=pd.ranked||[];const rejected=pd.rejected||[];const rankedTbl=table(ranked,[{label:'Provider',f:x=>esc(x.provider||'—')},{label:'Model',f:x=>`<code>${esc(x.model_family||x.model||'—')}</code>`},{label:'Tier',f:x=>esc(x.tier||'—')},{label:'$/Mtok in',cls:'right',f:x=>x.price_in==null?'—':esc(x.price_in)},{label:'$/Mtok out',cls:'right',f:x=>x.price_out==null?'—':esc(x.price_out)},{label:'Score',cls:'right',f:x=>x.score==null?'—':Number(x.score).toFixed(4)}])||'<div class=empty>No survivors — your filter removed every candidate.</div>';const rejTbl=rejected.length?('<div class="label small" style="margin-top:18px">Filtered out ('+rejected.length+') — why each candidate did not qualify</div>'+table(rejected,[{label:'Provider',f:x=>esc(x.provider||'—')},{label:'Model',f:x=>`<code>${esc(x.model||x.model_family||'—')}</code>`},{label:'Rejected by',f:x=>`<span class="pill"><span class="dot bad"></span>${esc(x.reason||'—')}</span>`}])):'';$('bRanked').innerHTML='<div class="label small" style="margin-top:10px">Admitted &amp; ranked ('+ranked.length+')</div>'+rankedTbl+rejTbl}catch(e){bFail(e.message)}}
+function bMoney(v){return v==null?'—':'$'+Number(v||0).toFixed(6)}
+function bDelta(v){if(v==null)return '—';const n=Number(v||0),cls=n>0?'bad':n<0?'ok':'muted',sign=n>0?'+':'';return `<span class="${cls}">${sign}${bMoney(n)}</span>`}
+function bPct(v){if(v==null)return '—';const n=Number(v||0),cls=n>0?'bad':n<0?'ok':'muted',sign=n>0?'+':'';return `<span class="${cls}">${sign}${n.toFixed(2)}%</span>`}
+function bMs(v){return v==null?'—':fmt(Math.round(Number(v)))+' ms'}
+function bProviders(p){const rows=Object.entries(p||{});return rows.length?rows.map(([name,v])=>`<div><span class="pill">${esc(name)}</span><div class="muted small">${fmt(v.requests)} req · ${bMoney(v.cost_usd)}</div></div>`).join(''):'—'}
+function bRenderBacktest(d){const t=d.totals||{},w=d.window||{},groups=d.groups||[];const trunc=(w.groups_truncated||w.requests_truncated)?`<span class="pill warn">${fmt(w.groups_truncated)} groups · ${fmt(w.requests_truncated)} req truncated</span>`:'';const metrics=`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:14px"><div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,255,255,.02)"><div class="label">Actual cost</div><div class="metric">${bMoney(t.actual_cost_usd)}</div></div><div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,255,255,.02)"><div class="label">Backtest cost</div><div class="metric">${bMoney(t.backtest_cost_usd)}</div></div><div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,255,255,.02)"><div class="label">Delta</div><div class="metric">${bDelta(t.delta_usd)}</div><div class="statSub">${bPct(t.delta_pct)}</div></div><div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,255,255,.02)"><div class="label">Requests covered</div><div class="metric">${fmt(w.requests_covered)}</div><div class="statSub">of ${fmt(w.requests_total)} ${trunc}</div></div>${t.unroutable_requests?`<div style="border:1px solid var(--line);border-radius:8px;padding:10px;background:rgba(255,92,122,.07)"><div class="label">Unroutable</div><div class="metric bad">${fmt(t.unroutable_requests)}</div></div>`:''}</div>`;if(!groups.length){$('bBacktestResult').innerHTML=metrics+'<div class="empty" style="margin-top:10px">No calls in this window.</div>';return}const body=groups.map(g=>{const a=g.actual||{},bt=g.backtest||{},lat=g.latency||{};const delta=bt.cost_usd==null?null:Number(bt.cost_usd||0)-Number(a.cost_usd||0);const winner=g.unroutable?'<span class="pill bad">unroutable</span>':`<span class="pill ok">${esc(bt.winner_provider||'—')}</span><div class="muted small">${esc(bt.winner_model||'—')} · ${fmt(bt.admitted||0)} admitted</div>`;const lnote=g.unroutable?'—':`actual ${bMs(lat.actual_avg_ms)}<br><span class="muted small">winner observed ${bMs(lat.winner_observed_avg_ms)}</span>`;return `<tr class="${g.unroutable?'bad':''}"><td><code>${esc(g.route)}</code>${g.unroutable?' <span class="pill bad">zero candidates</span>':''}</td><td class="right">${fmt(g.requests)}</td><td>${bProviders(a.providers)}</td><td>${winner}</td><td class="right">${bMoney(a.cost_usd)}</td><td class="right">${bMoney(bt.cost_usd)}</td><td class="right">${bDelta(delta)}</td><td>${lnote}</td></tr>`}).join('');const caveats=(d.caveats||[]).map(c=>esc(c)).join(' · ');$('bBacktestResult').innerHTML=metrics+`<div class="label small" style="margin-top:16px">Backtest by model family</div><table class="dataTable"><thead><tr><th>Route</th><th class="right">Requests</th><th>Actual provider(s)</th><th>→ would-be winner</th><th class="right">Actual cost</th><th class="right">Backtest cost</th><th class="right">Delta</th><th>Latency</th></tr></thead><tbody>${body}</tbody></table><div class="muted small" style="margin-top:10px">${caveats}</div>`}
+async function bBacktest(){$('bError').style.display='none';const btn=$('bBacktest'),old=btn.textContent;btn.disabled=true;btn.textContent='Backtesting…';$('bBacktestResult').innerHTML='<div class="muted small" style="margin-top:12px">Running backtest…</div>';try{const term=bCurrentTerm();const r=await fetch('/dashboard/api/policy/backtest',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({policy_ir:term,timeframe:$('bBacktestWindow').value})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`backtest ${r.status}`);bRenderBacktest(d);toast('Backtest done')}catch(e){showErr(e.message);bFail(e.message)}finally{btn.disabled=false;btn.textContent=old}}
 async function bDownload(){$('bError').style.display='none';try{const term=bCurrentTerm();const d=await bNormalize(term);const blob=new Blob([JSON.stringify({version:d.version,fingerprint:d.fingerprint,policy_ir:d.policy_ir},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='sigma-pol-'+(d.fingerprint||'policy')+'.json';a.click();URL.revokeObjectURL(a.href);toast('Policy downloaded — POST it as `policy_ir` in /v1/chat/completions')}catch(e){bFail(e.message)}}
 async function bTest(){$('bError').style.display='none';$('bTestResult').innerHTML='<div class="muted small" style="margin-top:8px">Running…</div>';try{const term=bCurrentTerm();const prompt=$('bTestPrompt').value.trim()||'Reply exactly: pong';const r=await fetch('/dashboard/api/policy/test',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({policy_ir:term,prompt})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||(typeof d.error==='string'?d.error:'test '+r.status));const okc=d.ok?'':'bad';const out=d.text?`<pre class="mono small" style="white-space:pre-wrap;margin-top:8px;background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:8px;padding:8px">${esc(d.text)}</pre>`:`<div class="bad small" style="margin-top:8px">${esc(d.error||'no output')}</div>`;$('bTestResult').innerHTML=`<div class="actMeta" style="margin-top:8px"><span class="pill ${okc}">status ${esc(d.status)}</span><span class="pill">${esc(d.provider||'—')}${d.served_model_id?' · '+esc(d.served_model_id):''}</span></div><div class="label small" style="margin-top:12px">How it routed — executed live, real spend</div>${actDetail(d)}<div class="label small" style="margin-top:12px">Answer</div>${out}<div class="muted small" style="margin-top:6px">Also recorded in <b>Activity</b>.</div>`;toast('Test call done')}catch(e){bFail(e.message)}}
 async function loadBuilderFamilies(){try{const r=await fetch('/dashboard/api/policies',{credentials:'same-origin'});if(!r.ok)return;const d=await r.json();const fams=new Set();(d.profiles||[]).forEach(p=>(p.models||[]).forEach(m=>{if(m.name)fams.add(m.name)}));$('familyOptions').innerHTML=[...fams].sort().map(f=>`<option value="${esc(f)}">`).join('')}catch(e){}}
@@ -4376,7 +4679,7 @@ async function saveConfigKnob(key){const el=$('cfg_'+key);if(!el)return;const v=
 async function postConfig(updates){try{const r=await fetch('/dashboard/api/config',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({updates})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||('config '+r.status));toast(d.applied_live?'Saved · live':(d.note?'Saved · '+d.note:'Saved'));renderConfig(d.knobs||[])}catch(e){showErr(e.message)}}
 async function selectCodexAccount(value){try{let mode=value,account=null;if(value.indexOf('account:')===0){mode='account';account=value.slice('account:'.length)}const r=await fetch('/dashboard/api/codex/select',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({mode,account})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`select ${r.status}`);toast(mode==='balanced'?'Codex: balanced across accounts':(mode==='account'?('Codex: serving '+account):'Codex: auto'));loadCodexAccounts()}catch(e){showErr(e.message)}}
 async function deleteCodexAccount(name){if(!confirm('Delete codex account '+name+'?'))return;try{const r=await fetch('/dashboard/api/codex/accounts/'+encodeURIComponent(name),{method:'DELETE',credentials:'same-origin'});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`delete ${r.status}`);toast('Codex account deleted');loadCodexAccounts()}catch(e){showErr(e.message)}}
-$('loginBtn').onclick=login;$('apiKeyLoginBtn').onclick=apiKeyLogin;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});$('apiKeyLogin').addEventListener('keydown',e=>{if(e.key==='Enter')apiKeyLogin()});$('logout').onclick=logout;$('tabOverview').onclick=()=>setTab('overview');$('tabConsumers').onclick=()=>setTab('consumers');$('tabProviderKeys').onclick=()=>setTab('providerKeys');$('tabKeyUsage').onclick=()=>setTab('keyUsage');$('tabMarket').onclick=()=>setTab('market');$('tabBuilder').onclick=()=>setTab('builder');$('tabActivity').onclick=()=>setTab('activity');$('recent').addEventListener('click',e=>{const cp=e.target.closest('[data-copyterm]');if(cp){navigator.clipboard.writeText(cp.dataset.copyterm).then(()=>toast('Policy term copied'));return}const row=e.target.closest('.actRow');if(!row)return;const det=$('recent').querySelector('.actDetail[data-d="'+row.dataset.i+'"]');if(!det)return;det.classList.toggle('hidden');const tog=row.querySelector('.actToggle');if(tog)tog.textContent=det.classList.contains('hidden')?'▸':'▾'});$('bReview').onclick=bReview;$('bDownload').onclick=bDownload;$('bTestBtn').onclick=bTest;$('bEx1').onclick=()=>bLoadExample('ex1');$('bEx2').onclick=()=>bLoadExample('ex2');$('bAddCond').onclick=()=>{bSync();bFilters.push({field:'latency_ms',rel:'le',val:''});bRender()};$('bAddOr').onclick=()=>{bSync();bFilters.push({kind:'or',subs:[{field:'latency_ms',rel:'le',val:''}]});bRender()};$('bAddScore').onclick=()=>{bSync();bScores.push({field:'field:price_in',w:'0.5',norm:true,inv:true});bRender()};$('b_selector').onchange=()=>{$('bTempWrap').style.display=$('b_selector').value==='sample'?'':'none'};document.querySelectorAll('#bModeSeg button').forEach(b=>b.onclick=()=>bSetMode(b.dataset.mode));$('bStructured').addEventListener('change',e=>{if(e.target.classList.contains('bF-field'))bSyncRender()});$('bStructured').addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b)return;bSync();const i=+b.dataset.i,j=+b.dataset.j,act=b.dataset.act;if(act==='del')bFilters.splice(i,1);else if(act==='addsub')bFilters[i].subs.push({field:'latency_ms',rel:'le',val:''});else if(act==='delsub')bFilters[i].subs.splice(j,1);else if(act==='delscore')bScores.splice(i,1);bRender()});bRender();document.querySelector('.nav').addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b){e.preventDefault();setTab(b.dataset.tab)}});$('refresh').onclick=()=>{if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else if(activeTab==='keyUsage')loadKeyUsage();else load()};$('market').addEventListener('click',e=>{const h=e.target.closest('[data-fam]');if(!h)return;const fam=h.dataset.fam;if(marketOpen.has(fam))marketOpen.delete(fam);else marketOpen.add(fam);if(lastMarket)renderMarket(lastMarket)});$('marketSearch').oninput=()=>{if(lastMarket)renderMarket(lastMarket)};$('tradableOnly').checked=localStorage.getItem('tradableOnly')==='1';$('tradableOnly').onchange=()=>{localStorage.setItem('tradableOnly',$('tradableOnly').checked?'1':'0');if(lastMarket)renderMarket(lastMarket)};$('marketCopy').onclick=()=>{if(!lastMarket){showErr('No catalog data loaded yet');return}navigator.clipboard.writeText(JSON.stringify(lastMarket,null,2)).then(()=>toast('Catalog copied to clipboard')).catch(e=>showErr(e.message))};let skillText='';async function loadSkill(){try{$('skillContent').textContent='Loading…';const r=await fetch('/dashboard/api/skill',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error('skill '+r.status);skillText=await r.text();$('skillContent').textContent=skillText}catch(e){$('skillContent').textContent='';showErr(e.message)}}function downloadSkill(){if(!skillText){toast('Still loading…');return}const blob=new Blob([skillText],{type:'text/markdown'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='SKILL.md';a.click();URL.revokeObjectURL(a.href);toast('SKILL.md downloaded')}$('skillDownload').onclick=downloadSkill;$('tabSkill').onclick=()=>setTab('skill');$('toggleAddProvider').onclick=()=>{const c=$('addProviderCard');c.style.display=c.style.display==='none'?'':'none'};$('addProvCancel').onclick=()=>{$('addProviderCard').style.display='none'};$('addProvSubmit').onclick=addProvider;$('toggleAddCodex').onclick=()=>{const c=$('addCodexCard');c.style.display=c.style.display==='none'?'':'none'};$('addCodexCancel').onclick=()=>{$('addCodexCard').style.display='none'};$('addCodexSubmit').onclick=addCodexAccount;$('addProvId').addEventListener('blur',()=>{if(!$('addProvEnv').value.trim()&&$('addProvId').value.trim())$('addProvEnv').value=$('addProvId').value.trim().toUpperCase().replace(/[^A-Z0-9]+/g,'_')+'_API_KEY'});$('loadKeyUsage').onclick=loadKeyUsage;$('consumer').onchange=load;$('timeframe').onchange=load;$('consumerSearch').oninput=()=>renderConsumers(lastStats.keys||[]);document.querySelectorAll('#consumerStatusSeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#consumerStatusSeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');consumerFilterStatus=b.dataset.status;renderConsumers(lastStats.keys||[])});document.querySelectorAll('#activitySeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#activitySeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');activityKind=b.dataset.kind;render(lastStats)});$('newConsumerKey').onclick=openNewKey;$('closeDrawer').onclick=closeDrawer;$('drawerShade').addEventListener('click',e=>{if(e.target===$('drawerShade'))closeDrawer()});$('drawerGenerateKey').onclick=()=>{closeDrawer();openNewKey();if(drawerConsumer)$('newKeyConsumer').value=drawerConsumer};$('saveConsumerSettings').onclick=saveConsumerSettings;$('closeNewKey').onclick=closeNewKey;$('newKeyShade').addEventListener('click',e=>{if(e.target===$('newKeyShade'))closeNewKey()});$('newKeyDone').onclick=closeNewKey;$('createKey').onclick=createKey;$('newKeyConsumer').addEventListener('keydown',e=>{if(e.key==='Enter')createKey()});$('copyKey').onclick=()=>navigator.clipboard.writeText($('newKeyValue').value).then(()=>toast('Key copied'));$('copyKeyHandoff').onclick=()=>navigator.clipboard.writeText($('newKeyHandoffValue').value).then(()=>toast('Setup blurb copied'));$('anProvider').onchange=load;$('anModel').onchange=load;setTab(tabFromLocation(),{silent:true});setInterval(()=>{const ds=$('drawerShade');if(ds&&ds.classList.contains('open'))return;const nk=$('newKeyShade');if(nk&&nk.classList.contains('open'))return;const ap=$('addProviderCard'),ac=$('addCodexCard');if((ap&&ap.style.display&&ap.style.display!=='none')||(ac&&ac.style.display&&ac.style.display!=='none'))return;if(document.querySelector('#recent .actDetail:not(.hidden)'))return;if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else load()},15000);
+$('loginBtn').onclick=login;$('apiKeyLoginBtn').onclick=apiKeyLogin;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});$('apiKeyLogin').addEventListener('keydown',e=>{if(e.key==='Enter')apiKeyLogin()});$('logout').onclick=logout;$('tabOverview').onclick=()=>setTab('overview');$('tabConsumers').onclick=()=>setTab('consumers');$('tabProviderKeys').onclick=()=>setTab('providerKeys');$('tabKeyUsage').onclick=()=>setTab('keyUsage');$('tabMarket').onclick=()=>setTab('market');$('tabBuilder').onclick=()=>setTab('builder');$('tabActivity').onclick=()=>setTab('activity');$('recent').addEventListener('click',e=>{const cp=e.target.closest('[data-copyterm]');if(cp){navigator.clipboard.writeText(cp.dataset.copyterm).then(()=>toast('Policy term copied'));return}const row=e.target.closest('.actRow');if(!row)return;const det=$('recent').querySelector('.actDetail[data-d="'+row.dataset.i+'"]');if(!det)return;det.classList.toggle('hidden');const tog=row.querySelector('.actToggle');if(tog)tog.textContent=det.classList.contains('hidden')?'▸':'▾'});$('bReview').onclick=bReview;$('bBacktest').onclick=bBacktest;$('bDownload').onclick=bDownload;$('bTestBtn').onclick=bTest;$('bEx1').onclick=()=>bLoadExample('ex1');$('bEx2').onclick=()=>bLoadExample('ex2');$('bAddCond').onclick=()=>{bSync();bFilters.push({field:'latency_ms',rel:'le',val:''});bRender()};$('bAddOr').onclick=()=>{bSync();bFilters.push({kind:'or',subs:[{field:'latency_ms',rel:'le',val:''}]});bRender()};$('bAddScore').onclick=()=>{bSync();bScores.push({field:'field:price_in',w:'0.5',norm:true,inv:true});bRender()};$('b_selector').onchange=()=>{$('bTempWrap').style.display=$('b_selector').value==='sample'?'':'none'};document.querySelectorAll('#bModeSeg button').forEach(b=>b.onclick=()=>bSetMode(b.dataset.mode));$('bStructured').addEventListener('change',e=>{if(e.target.classList.contains('bF-field'))bSyncRender()});$('bStructured').addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b)return;bSync();const i=+b.dataset.i,j=+b.dataset.j,act=b.dataset.act;if(act==='del')bFilters.splice(i,1);else if(act==='addsub')bFilters[i].subs.push({field:'latency_ms',rel:'le',val:''});else if(act==='delsub')bFilters[i].subs.splice(j,1);else if(act==='delscore')bScores.splice(i,1);bRender()});bRender();document.querySelector('.nav').addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b){e.preventDefault();setTab(b.dataset.tab)}});$('refresh').onclick=()=>{if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else if(activeTab==='keyUsage')loadKeyUsage();else load()};$('market').addEventListener('click',e=>{const h=e.target.closest('[data-fam]');if(!h)return;const fam=h.dataset.fam;if(marketOpen.has(fam))marketOpen.delete(fam);else marketOpen.add(fam);if(lastMarket)renderMarket(lastMarket)});$('marketSearch').oninput=()=>{if(lastMarket)renderMarket(lastMarket)};$('tradableOnly').checked=localStorage.getItem('tradableOnly')==='1';$('tradableOnly').onchange=()=>{localStorage.setItem('tradableOnly',$('tradableOnly').checked?'1':'0');if(lastMarket)renderMarket(lastMarket)};$('marketCopy').onclick=()=>{if(!lastMarket){showErr('No catalog data loaded yet');return}navigator.clipboard.writeText(JSON.stringify(lastMarket,null,2)).then(()=>toast('Catalog copied to clipboard')).catch(e=>showErr(e.message))};let skillText='';async function loadSkill(){try{$('skillContent').textContent='Loading…';const r=await fetch('/dashboard/api/skill',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error('skill '+r.status);skillText=await r.text();$('skillContent').textContent=skillText}catch(e){$('skillContent').textContent='';showErr(e.message)}}function downloadSkill(){if(!skillText){toast('Still loading…');return}const blob=new Blob([skillText],{type:'text/markdown'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='SKILL.md';a.click();URL.revokeObjectURL(a.href);toast('SKILL.md downloaded')}$('skillDownload').onclick=downloadSkill;$('tabSkill').onclick=()=>setTab('skill');$('toggleAddProvider').onclick=()=>{const c=$('addProviderCard');c.style.display=c.style.display==='none'?'':'none'};$('addProvCancel').onclick=()=>{$('addProviderCard').style.display='none'};$('addProvSubmit').onclick=addProvider;$('toggleAddCodex').onclick=()=>{const c=$('addCodexCard');c.style.display=c.style.display==='none'?'':'none'};$('addCodexCancel').onclick=()=>{$('addCodexCard').style.display='none'};$('addCodexSubmit').onclick=addCodexAccount;$('addProvId').addEventListener('blur',()=>{if(!$('addProvEnv').value.trim()&&$('addProvId').value.trim())$('addProvEnv').value=$('addProvId').value.trim().toUpperCase().replace(/[^A-Z0-9]+/g,'_')+'_API_KEY'});$('loadKeyUsage').onclick=loadKeyUsage;$('consumer').onchange=load;$('timeframe').onchange=load;$('consumerSearch').oninput=()=>renderConsumers(lastStats.keys||[]);document.querySelectorAll('#consumerStatusSeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#consumerStatusSeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');consumerFilterStatus=b.dataset.status;renderConsumers(lastStats.keys||[])});document.querySelectorAll('#activitySeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#activitySeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');activityKind=b.dataset.kind;render(lastStats)});$('newConsumerKey').onclick=openNewKey;$('closeDrawer').onclick=closeDrawer;$('drawerShade').addEventListener('click',e=>{if(e.target===$('drawerShade'))closeDrawer()});$('drawerGenerateKey').onclick=()=>{closeDrawer();openNewKey();if(drawerConsumer)$('newKeyConsumer').value=drawerConsumer};$('saveConsumerSettings').onclick=saveConsumerSettings;$('closeNewKey').onclick=closeNewKey;$('newKeyShade').addEventListener('click',e=>{if(e.target===$('newKeyShade'))closeNewKey()});$('newKeyDone').onclick=closeNewKey;$('createKey').onclick=createKey;$('newKeyConsumer').addEventListener('keydown',e=>{if(e.key==='Enter')createKey()});$('copyKey').onclick=()=>navigator.clipboard.writeText($('newKeyValue').value).then(()=>toast('Key copied'));$('copyKeyHandoff').onclick=()=>navigator.clipboard.writeText($('newKeyHandoffValue').value).then(()=>toast('Setup blurb copied'));$('anProvider').onchange=load;$('anModel').onchange=load;setTab(tabFromLocation(),{silent:true});setInterval(()=>{const ds=$('drawerShade');if(ds&&ds.classList.contains('open'))return;const nk=$('newKeyShade');if(nk&&nk.classList.contains('open'))return;const ap=$('addProviderCard'),ac=$('addCodexCard');if((ap&&ap.style.display&&ap.style.display!=='none')||(ac&&ac.style.display&&ac.style.display!=='none'))return;if(document.querySelector('#recent .actDetail:not(.hidden)'))return;if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else load()},15000);
 /* ---- Flow builder: a DAG of nodes, each reusing the policy builder ---- */
 let fNodes=[];let fSeq=0;let fOutput=null;
 const F_DEFAULT_POLICY=()=>['policy',['and',['meets_req'],['not',['is','disabled']]],['add',['scale',0.5,['field','bench_intelligence']],['scale',0.5,['neg',['normalize',['field','price_in']]]]],['argmax'],['id'],['always',{action:'next_candidate'}]];
