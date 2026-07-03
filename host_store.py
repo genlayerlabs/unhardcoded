@@ -912,6 +912,111 @@ def usage_aggregate(since_ts: "int | None" = None, caller: "str | None" = None,
         return _empty_usage_aggregate()
 
 
+def policy_backtest_groups(since_ts: "int | None" = None,
+                           caller: "str | None" = None,
+                           limit: int = 50) -> dict[str, Any]:
+    """Top model-family groups for the Σ_pol backtester.
+
+    The policy debugger's /x/rank surface ranks candidates by `model_family`.
+    `calls.route_key` is provider|family|served and `requested_model` is the
+    caller-facing alias/profile, so grouping here uses model_family: it maps 1:1
+    to the `requirements.model_family` rank constraint.
+    """
+    try:
+        limit = max(1, min(int(limit), 50))
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        where, params = _usage_where(since_ts=since_ts, caller=caller)
+        sql = (
+            "WITH base AS ("
+            " -- Intentionally includes failed/error calls; unlike route_stats, this reflects actual traffic cost.\n"
+            " SELECT COALESCE(NULLIF(model_family,''),'unknown') AS family_k,"
+            " COALESCE(NULLIF(provider_id,''),'unknown') AS provider_k,"
+            " tokens_in, tokens_out, cost_usd, latency_ms"
+            f" FROM calls{where}"
+            "), families AS ("
+            " SELECT family_k, count(*) AS requests,"
+            " COALESCE(sum(COALESCE(tokens_in,0)),0) AS tokens_in,"
+            " COALESCE(sum(COALESCE(tokens_out,0)),0) AS tokens_out,"
+            " round(COALESCE(sum(GREATEST(cost_usd,0)),0)::numeric,6)::float8 AS cost_usd,"
+            " avg(latency_ms) AS latency_ms_avg"
+            " FROM base GROUP BY family_k"
+            "), ranked_families AS ("
+            " SELECT family_k, requests, tokens_in, tokens_out, cost_usd,"
+            " latency_ms_avg, count(*) OVER() AS groups_total,"
+            " COALESCE(sum(requests) OVER(),0) AS requests_total,"
+            " row_number() OVER (ORDER BY requests DESC, family_k ASC) AS rn"
+            " FROM families"
+            "), shown AS ("
+            " SELECT * FROM ranked_families WHERE rn <= %s"
+            "), providers AS ("
+            " SELECT b.family_k, b.provider_k, count(*) AS requests,"
+            " round(COALESCE(sum(GREATEST(b.cost_usd,0)),0)::numeric,6)::float8 AS cost_usd,"
+            " avg(b.latency_ms) AS latency_ms_avg"
+            " FROM base b JOIN shown s ON s.family_k = b.family_k"
+            " GROUP BY b.family_k, b.provider_k"
+            ")"
+            " SELECT s.family_k, s.requests, s.tokens_in, s.tokens_out,"
+            " s.cost_usd, s.latency_ms_avg, s.groups_total, s.requests_total,"
+            " p.provider_k, p.requests, p.cost_usd, p.latency_ms_avg"
+            " FROM shown s LEFT JOIN providers p ON p.family_k = s.family_k"
+            " ORDER BY s.requests DESC, s.family_k ASC,"
+            " p.requests DESC NULLS LAST, p.provider_k ASC"
+        )
+        groups: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        groups_total = 0
+        requests_total = 0
+        with _get_pool().connection() as conn:
+            for row in conn.execute(sql, params + [limit]):
+                family, requests, tin, tout, cost, lat, gtotal, rtotal, \
+                    provider, prequests, pcost, plat = row
+                groups_total = int(gtotal or 0)
+                requests_total = int(rtotal or 0)
+                family = str(family)
+                if family not in groups:
+                    groups[family] = {
+                        "route": family,
+                        "requests": int(requests or 0),
+                        "tokens_in": int(tin or 0),
+                        "tokens_out": int(tout or 0),
+                        "actual_cost_usd": round(float(cost or 0.0), 6),
+                        "actual_avg_ms": float(lat) if lat is not None else None,
+                        "providers": {},
+                        "provider_latency_ms": {},
+                    }
+                    order.append(family)
+                if provider is not None:
+                    pkey = str(provider)
+                    groups[family]["providers"][pkey] = {
+                        "requests": int(prequests or 0),
+                        "cost_usd": round(float(pcost or 0.0), 6),
+                    }
+                    groups[family]["provider_latency_ms"][pkey] = (
+                        float(plat) if plat is not None else None
+                    )
+        shown = [groups[name] for name in order]
+        requests_covered = sum(int(g["requests"]) for g in shown)
+        return {
+            "groups_total": groups_total,
+            "groups_shown": len(shown),
+            "requests_total": requests_total,
+            "requests_covered": requests_covered,
+            "groups_truncated": max(0, groups_total - len(shown)),
+            "requests_truncated": max(0, requests_total - requests_covered),
+            "groups": shown,
+        }
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store policy_backtest_groups failed: %s", exc)
+        return {
+            "groups_total": 0, "groups_shown": 0,
+            "requests_total": 0, "requests_covered": 0,
+            "groups_truncated": 0, "requests_truncated": 0,
+            "groups": [],
+        }
+
+
 def usage_count(since_ts: "int | None" = None) -> int:
     """Row count in the window (the dashboard's history_events_all). Fail-soft -> 0."""
     try:
