@@ -137,12 +137,48 @@ def _new_stats() -> dict[str, Any]:
 
 _stats: dict[str, Any] = _new_stats()
 
+# Short TTL cache over the SQL-derived dashboard snapshots (stats bundle, the
+# logins/provider-keys rollups) so the dashboard's 15s auto-refresh and multiple
+# concurrent viewers don't re-run the window aggregation per request. Keyed by
+# the full query tuple; invalidated by TTL only (freshness lag <= the TTL, less
+# than the frontend's own refresh period). Never used for timeframe="runtime"
+# (that path is in-memory and already O(1)).
+_SNAPSHOT_TTL_S = float(os.getenv("DASHBOARD_STATS_TTL_S", "12"))
+_snapshot_cache: dict[tuple, tuple[float, Any]] = {}
+_snapshot_cache_lock = RLock()
+
+
+def _snapshot_cache_get(key: tuple) -> Any:
+    if _SNAPSHOT_TTL_S <= 0:
+        return None
+    with _snapshot_cache_lock:
+        hit = _snapshot_cache.get(key)
+        if hit and (time.monotonic() - hit[0]) < _SNAPSHOT_TTL_S:
+            return hit[1]
+    return None
+
+
+def _snapshot_cache_put(key: tuple, value: Any) -> None:
+    if _SNAPSHOT_TTL_S <= 0:
+        return
+    with _snapshot_cache_lock:
+        if len(_snapshot_cache) > 256:  # bound the key space (bad params etc.)
+            _snapshot_cache.clear()
+        _snapshot_cache[key] = (time.monotonic(), value)
+
+
+def _snapshot_cache_clear() -> None:
+    with _snapshot_cache_lock:
+        _snapshot_cache.clear()
+
 
 def _reset_stats_for_tests() -> None:
     """Reset in-memory counters. Drains the host-store write queue first so a
     just-recorded call has landed in the `calls` ledger before the test reads the
-    derived stats back (the persistent store now backs them, #5)."""
+    derived stats back (the persistent store now backs them, #5). Also drops the
+    snapshot TTL cache so the next read reflects the reset."""
     host_store._write_q.join()
+    _snapshot_cache_clear()
     with _stats_lock:
         _stats.clear()
         _stats.update(_new_stats())
@@ -688,19 +724,34 @@ def _provider_credentials_snapshot(*, timeframe: str = "all", viewer_role: str =
         cfg = {"providers": {}}
     providers = cfg.get("providers") or {}
 
-    usage_rows = _read_usage_history(since=since) if timeframe != "runtime" else []
-    with _stats_lock:
-        usage_rows.extend([dict(r) for r in _stats["recent"] if r.get("event") == "request"])
-        runtime_by_provider = {k: _counter_snapshot(v) for k, v in sorted(_stats["by_provider"].items())}
-    usage_rows = _dedup_usage_rows(usage_rows)
-    if since is not None:
-        usage_rows = [r for r in usage_rows if int(r.get("ts") or 0) >= since]
-
     prices = _price_table()
     counters: dict[str, dict[str, Any]] = defaultdict(_counter)
     last_event: dict[str, dict[str, Any]] = {}
     cost_by_provider: dict[str, float] = defaultdict(float)
-    for row in usage_rows:
+    if timeframe != "runtime":
+        # SQL per-provider rollup over the window (was: load every retained row
+        # and fold in Python), TTL-cached; only the not-yet-landed runtime rows
+        # get folded on top — the old merge deduped landed rows anyway.
+        cached = _snapshot_cache_get(("provider_stats", timeframe))
+        if cached is None:
+            cached = host_store.usage_provider_stats(since_ts=since)
+            _snapshot_cache_put(("provider_stats", timeframe), cached)
+        for name, c in cached.items():
+            counters[name] = _counter_from_sql(c)
+            if int(c.get("priced") or 0):
+                cost_by_provider[name] = round(float(c.get("cost_usd") or 0.0), 6)
+            last_event[name] = {"ts": c.get("last_ts"), "status": c.get("last_status"),
+                                "requested_model": c.get("last_route"),
+                                "model_family": c.get("last_model_family")}
+        overlay = _unlanded_recent_requests(since)
+    else:
+        with _stats_lock:
+            overlay = [dict(r) for r in _stats["recent"] if r.get("event") == "request"]
+        if since is not None:
+            overlay = [r for r in overlay if int(r.get("ts") or 0) >= since]
+    with _stats_lock:
+        runtime_by_provider = {k: _counter_snapshot(v) for k, v in sorted(_stats["by_provider"].items())}
+    for row in overlay:
         provider = str(row.get("provider") or "unknown")
         cost, _meta = _cost_for_event(row, prices)
         _add_counter(counters[provider], row, cost)
@@ -819,15 +870,32 @@ def _login_connections_snapshot(*, timeframe: str = "all", consumer: str | None 
     if consumer:
         dashboard_rows = [r for r in dashboard_rows if r.get("consumer") == consumer or r.get("viewer") == f"consumer:{consumer}"]
 
-    usage_rows = _read_usage_history(since=since, caller=consumer) if timeframe != "runtime" else []
-    usage_rows.extend([r for r in runtime_recent if r.get("event") == "request"])
-    usage_rows = _dedup_usage_rows(usage_rows)
-    if since is not None:
-        usage_rows = [r for r in usage_rows if int(r.get("ts") or 0) >= since]
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    if timeframe != "runtime":
+        # SQL per-(caller, key-prefix) rollup over the window (was: load every
+        # retained row), TTL-cached; the not-yet-landed runtime rows fold on top.
+        cached = _snapshot_cache_get(("connections", timeframe, consumer))
+        if cached is None:
+            cached = host_store.usage_connections(since_ts=since, caller=consumer)
+            _snapshot_cache_put(("connections", timeframe, consumer), cached)
+        for c in cached:
+            prefix = str(c.get("prefix") or "unknown")
+            name = str(c.get("caller") or "unknown")
+            grouped[(name, prefix)] = {
+                "kind": "api_key", "identity": name, "consumer": name,
+                "key_sha256_prefix": prefix if prefix != "unknown" else None,
+                "first_seen": c.get("first_seen"), "last_seen": c.get("last_seen"),
+                "requests": int(c.get("requests") or 0), "errors": int(c.get("errors") or 0),
+                "last_status": c.get("last_status"), "last_route": c.get("last_route"),
+                "last_provider": c.get("last_provider")}
+        usage_rows = _unlanded_recent_requests(since)
+    else:
+        usage_rows = [dict(r) for r in runtime_recent if r.get("event") == "request"]
+        if since is not None:
+            usage_rows = [r for r in usage_rows if int(r.get("ts") or 0) >= since]
     if consumer:
         usage_rows = [r for r in usage_rows if r.get("caller") == consumer]
 
-    grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for row in usage_rows:
         caller = str(row.get("caller") or "unknown")
         prefix = str(row.get("key_sha256_prefix") or "").strip() or "unknown"
@@ -864,15 +932,35 @@ def _login_connections_snapshot(*, timeframe: str = "all", consumer: str | None 
         },
     }
 
+def _run_cost_backfill() -> int:
+    """One-time (idempotent) stamping of cost_usd on unpriced `calls` rows so the
+    SQL aggregates can trust SUM(cost_usd) — before this, every dashboard read
+    re-priced those rows per row per load. Safe to run at every startup: rows the
+    price table can't price stay NULL (they sum as 0, same as before)."""
+    try:
+        n = host_store.backfill_call_costs(_price_table())
+        if n:
+            _log({"event": "cost_backfill", "rows_stamped": n})
+        return n
+    except Exception as exc:  # noqa: BLE001 — best-effort telemetry, never blocks startup
+        logging.getLogger("auth_proxy").warning("cost backfill failed: %s", exc)
+        return 0
+
+
+_backfill_task: "asyncio.Task | None" = None
+
+
 @app.on_event("startup")
 async def startup() -> None:
-    global _client, _probe_task
+    global _client, _probe_task, _backfill_task
     # The ingress is the owner of the operational store (consumer keys, the ledger,
     # operator-config writes); all operator state lives in Postgres now (the legacy
     # JSON backfill was retired once prod confirmed the tables were populated).
     _client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0))
     if SYNTHETIC_PROBES_ENABLED and ROUTE_HEALTH_ROUTES:
         _probe_task = asyncio.create_task(_synthetic_probe_loop())
+    # Off the event loop: batched UPDATEs, potentially many rows on first deploy.
+    _backfill_task = asyncio.create_task(asyncio.to_thread(_run_cost_backfill))
 
 
 @app.on_event("shutdown")
@@ -3011,22 +3099,6 @@ def _read_usage_history(*, since: int | None = None, caller: str | None = None,
     return host_store.usage_rows(since_ts=since, caller=caller)
 
 
-def _dedup_usage_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # The persistent (calls) and runtime (recent) sources overlap: the same request
-    # is in both once its async ledger write lands. Keep one per usage_event_id
-    # (runtime wins — appended later, richer fields); rows without an id stay as-is.
-    out: list[dict[str, Any]] = []
-    by_id: dict[str, dict[str, Any]] = {}
-    for r in rows:
-        ev = r.get("usage_event_id")
-        if ev is None:
-            out.append(r)
-        else:
-            by_id[ev] = r
-    out.extend(by_id.values())
-    return out
-
-
 _SSE_TAIL_HARD_CAP = 4 * 1024 * 1024  # 4 MiB backstop if no event boundary appears
 
 
@@ -3401,10 +3473,22 @@ def _usage_query_options(source: Any) -> dict[str, Any]:
     return {"since": since, "until": until, "window": window_label, "limit": limit or 100, "offset": offset}
 
 
+_price_table_cache: "tuple[tuple[str, float], dict[tuple[str, str], dict[str, float]]] | None" = None
+
+
 def _price_table() -> dict[tuple[str, str], dict[str, float]]:
+    # Memoized on (path, mtime): this used to re-read and regex-parse the price
+    # file on EVERY call (once per aggregated row set, several times per
+    # dashboard load). Still consulted at write time and by the cost backfill.
+    global _price_table_cache
     path = _resolved_path(DASHBOARD_POLICY_METRICS_PATH)
-    if not path.exists():
+    try:
+        stamp = (str(path), path.stat().st_mtime)
+    except OSError:
         return {}
+    cached = _price_table_cache
+    if cached and cached[0] == stamp:
+        return cached[1]
     try:
         text = path.read_text()
     except Exception:
@@ -3417,6 +3501,7 @@ def _price_table() -> dict[tuple[str, str], dict[str, float]]:
         pout = re.search(r"price_out_usd_per_mtok\s*=\s*([0-9.]+)", body)
         if pin and pout:
             prices[(match.group("family"), match.group("provider"))] = {"input": float(pin.group(1)), "output": float(pout.group(1))}
+    _price_table_cache = (stamp, prices)
     return prices
 
 
@@ -3638,18 +3723,135 @@ def _dashboard_timeframe_options(timeframe: str) -> dict[str, Any]:
     return {"since": since, "until": None, "window": window_label, "limit": RECENT_LIMIT, "offset": 0, "timeframe": timeframe}
 
 
-def _dashboard_history_rows(*, timeframe: str, consumer: str | None = None) -> list[dict[str, Any]]:
-    opts = _dashboard_timeframe_options(timeframe)
-    rows = _windowed_usage_events(
-        _read_usage_history(since=opts.get("since"), caller=consumer,
-                            events=("request", "reject")), opts)
-    if consumer:
-        rows = [r for r in rows if r.get("caller") == consumer]
-    rows.sort(key=lambda r: int(r.get("ts") or 0), reverse=True)
-    return rows
+def _counter_from_sql(c: dict[str, Any]) -> dict[str, Any]:
+    """A host_store.usage_aggregate raw counter -> the _counter() shape the
+    dashboard snapshots. The persistent history path never carried latency
+    (host_store.usage_rows doesn't select latency_ms), so latency stays 0.0 —
+    exactly what the old Python fold over those rows reported. The cost_usd key
+    appears only when at least one row was priced, matching _add_counter."""
+    out = {"requests": int(c.get("requests") or 0), "errors": int(c.get("errors") or 0),
+           "tokens_in": int(c.get("tokens_in") or 0), "tokens_out": int(c.get("tokens_out") or 0),
+           "tokens_total": int(c.get("tokens_total") or 0),
+           "latency_ms_total": 0.0, "latency_ms_max": 0.0,
+           "last_seen": c.get("last_seen") or None}
+    if int(c.get("priced") or 0):
+        out["cost_usd"] = round(float(c.get("cost_usd") or 0.0), 6)
+    return out
+
+
+def _agg_from_sql(sql_agg: dict[str, Any], recent_rows: list[dict[str, Any]], *,
+                  selected: str | None = None) -> dict[str, Any]:
+    """Assemble the _aggregate_usage_rows output shape from the SQL aggregates
+    plus a LIMIT'd recent page — same keys, same bucket semantics, without
+    materializing the window. rejects are always 0 here: they were never
+    persisted to `calls` (see _record_reject), so the old Python fold over
+    history rows also always counted 0."""
+    t = sql_agg["totals"]
+    totals = {"requests": int(t["requests"]), "rejects": 0, "errors": int(t["errors"]),
+              "tokens_in": int(t["tokens_in"]), "tokens_out": int(t["tokens_out"]),
+              "tokens_total": int(t["tokens_total"]),
+              "cost_usd": round(float(t["cost_usd"] or 0.0), 6)}
+
+    def snap(bucket: dict[str, Any]) -> dict[str, Any]:
+        return {k: _counter_snapshot(_counter_from_sql(v)) for k, v in sorted(bucket.items())}
+
+    by_caller_snap = snap(sql_agg["by_caller"])
+    return {
+        "totals": totals,
+        "by_caller": {selected: by_caller_snap.get(selected, _counter_snapshot(_counter()))} if selected else by_caller_snap,
+        "by_caller_all": by_caller_snap,
+        "by_provider": snap(sql_agg["by_provider"]),
+        "by_model_family": snap(sql_agg["by_model_family"]),
+        "by_route": snap(sql_agg["by_route"]),
+        "by_served_model": snap(sql_agg["by_served_model"]),
+        "by_status": {k: int(v) for k, v in sorted(sql_agg["by_status"].items())},
+        "recent": [{k: v for k, v in r.items() if k != "key_sha256"} for r in recent_rows],
+    }
+
+
+def _daily_totals_from_sql(by_day: dict[str, Any]) -> list[dict[str, Any]]:
+    """The _period_totals(monthly=False) shape from the SQL day buckets (UTC
+    calendar dates, newest first, last_seen dropped)."""
+    out = []
+    for date, c in sorted(by_day.items(), reverse=True):
+        row = {k: v for k, v in _counter_snapshot(_counter_from_sql(c)).items() if k != "last_seen"}
+        row["date"] = date
+        out.append(row)
+    return out
+
+
+def _stats_history_bundle(*, since: int | None, selected: str | None,
+                          key_filter: str | None, provider: str | None,
+                          model: str | None) -> dict[str, Any]:
+    """Everything the persistent-timeframe stats snapshot derives from the store,
+    via SQL aggregation (was: load every retained row and fold in Python, TWICE).
+
+    Filter semantics replicate the old Python row filters exactly:
+      * key_filter -> caller == selected AND key_sha256 == key_filter (when the
+        key's consumer is unknown the old code compared caller against None, so
+        we match caller IS NULL);
+      * else caller == selected when a consumer is selected;
+      * provider/model -> raw-column equality, applied to the aggregated set only.
+    The "table" pass (consumer key rows + filter options) matches the old
+    table_rows: the caller+key-filtered set under a key filter, the whole window
+    otherwise — never narrowed by provider/model."""
+    caller = selected
+    caller_is_null = bool(key_filter) and selected is None
+    filtered = host_store.usage_aggregate(
+        since_ts=since, caller=caller, caller_is_null=caller_is_null,
+        consumer_sha=key_filter, provider=provider, model_family=model)
+    plain = not provider and not model
+    if key_filter:
+        table = filtered if plain else host_store.usage_aggregate(
+            since_ts=since, caller=caller, caller_is_null=caller_is_null,
+            consumer_sha=key_filter)
+        events_all = host_store.usage_count(since_ts=since)
+    elif selected is None and plain:
+        table = filtered
+        events_all = int(table["totals"]["requests"])
+    else:
+        table = host_store.usage_aggregate(since_ts=since)
+        events_all = int(table["totals"]["requests"])
+    recent = host_store.usage_rows_page(
+        since_ts=since, caller=caller, caller_is_null=caller_is_null,
+        consumer_sha=key_filter, provider=provider, model_family=model,
+        limit=RECENT_LIMIT)
+    return {
+        "agg": _agg_from_sql(filtered, recent, selected=selected),
+        "keys_by_caller": {k: _counter_snapshot(_counter_from_sql(v))
+                           for k, v in sorted(table["by_caller"].items())},
+        "filter_options": {"providers": sorted(table["by_provider"].keys()),
+                           "models": sorted(table["by_model_family"].keys())},
+        "daily_totals": _daily_totals_from_sql(filtered["by_day"]),
+        "history_events": int(filtered["totals"]["requests"]),
+        "history_events_all": events_all,
+    }
+
+
+def _unlanded_recent_requests(since: int | None) -> list[dict[str, Any]]:
+    """Runtime `recent` request rows whose async ledger write has NOT landed yet.
+    The old code merged the whole history read with the runtime deque and
+    deduped on usage_event_id; with the aggregation in SQL, only the not-yet-
+    persisted complement needs folding in. Rows without an id are kept as-is
+    (they were never deduped before either)."""
+    with _stats_lock:
+        live = [dict(r) for r in _stats["recent"] if r.get("event") == "request"]
+    if since is not None:
+        live = [r for r in live if int(r.get("ts") or 0) >= since]
+    ids = [str(r.get("usage_event_id")) for r in live if r.get("usage_event_id")]
+    if not ids:
+        return live
+    floor = min(int(r.get("ts") or 0) for r in live) - 60
+    landed = host_store.usage_event_ids_present(ids, since_ts=floor)
+    return [r for r in live
+            if not r.get("usage_event_id") or str(r.get("usage_event_id")) not in landed]
 
 
 def _aggregate_usage_rows(rows: list[dict[str, Any]], *, selected: str | None = None) -> dict[str, Any]:
+    # The reference Python aggregation. The dashboard stats path now computes the
+    # same shape in SQL (_stats_history_bundle / host_store.usage_aggregate) —
+    # tests/test_dashboard_stats_sql.py asserts the two stay identical. Keep the
+    # semantics here and there in lockstep.
     totals = {"requests": 0, "rejects": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0, "tokens_total": 0, "cost_usd": 0.0}
     prices = _price_table()
     by_caller: dict[str, dict[str, Any]] = defaultdict(_counter)
@@ -3707,21 +3909,19 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
     key_filter = key_sha256 if re.fullmatch(r"[a-f0-9]{64}", key_sha256) else None
     timeframe = _dashboard_timeframe(timeframe)
     if timeframe != "runtime":
-        all_rows = _dashboard_history_rows(timeframe=timeframe)
-        if key_filter:
-            rows = [r for r in all_rows if r.get("caller") == selected and r.get("key_sha256") == key_filter]
-            table_rows = rows
-        else:
-            rows = [r for r in all_rows if r.get("caller") == selected] if selected else all_rows
-            table_rows = all_rows
-        # Analytics filters (provider / model family) narrow the aggregated rows
-        # so totals, breakdowns and the time series all reflect the selection.
-        if provider:
-            rows = [r for r in rows if r.get("provider") == provider]
-        if model:
-            rows = [r for r in rows if r.get("model_family") == model]
-        agg = _aggregate_usage_rows(rows, selected=selected)
-        all_agg = _aggregate_usage_rows(table_rows)
+        # The window aggregation runs in SQL (GROUP BY over `calls` on
+        # idx_calls_ts) and is TTL-cached per query tuple — the 15s dashboard
+        # auto-refresh and concurrent viewers reuse one aggregation instead of
+        # re-scanning the window per request.
+        since = _dashboard_timeframe_options(timeframe).get("since")
+        cache_key = ("stats", timeframe, selected, key_filter, provider, model)
+        bundle = _snapshot_cache_get(cache_key)
+        if bundle is None:
+            bundle = _stats_history_bundle(since=since, selected=selected,
+                                           key_filter=key_filter,
+                                           provider=provider, model=model)
+            _snapshot_cache_put(cache_key, bundle)
+        agg = bundle["agg"]
         # Surface live in-memory events (dashboard test calls, probes, just-served
         # requests) that are not persisted to billing history, so Activity always
         # shows the latest activity regardless of timeframe. Display-only: counters
@@ -3742,11 +3942,11 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
             "viewer_role": viewer_role,
             "selected_consumer": selected,
             "selected_key_sha256_prefix": key_filter[:12] if key_filter else None,
-            "timeframe": {"selected": timeframe, "source": "persistent_history", "history_path_configured": True, "history_events": len(rows), "history_events_all": len(all_rows)},
+            "timeframe": {"selected": timeframe, "source": "persistent_history", "history_path_configured": True, "history_events": bundle["history_events"], "history_events_all": bundle["history_events_all"]},
             "rate_limit": {"rate_per_min": RATE_PER_MIN, "burst": BURST, "effective_per_min": max(RATE_PER_MIN, BURST)},
             "upstream": {"status": upstream_status, "health": upstream_health},
             "consumers": [{"name": name, "configured": True} for name in _consumers()],
-            "keys": [row for row in _consumer_key_rows(all_agg["by_caller_all"]) if row.get("consumer") == selected] if key_filter and selected else _consumer_key_rows(all_agg["by_caller_all"]),
+            "keys": [row for row in _consumer_key_rows(bundle["keys_by_caller"]) if row.get("consumer") == selected] if key_filter and selected else _consumer_key_rows(bundle["keys_by_caller"]),
             "totals": agg["totals"],
             "by_caller": agg["by_caller"],
             "by_provider": agg["by_provider"],
@@ -3755,9 +3955,8 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
             "by_served_model": agg["by_served_model"],
             "by_status": agg["by_status"],
             "recent": merged_recent,
-            "filter_options": {"providers": sorted((all_agg.get("by_provider") or {}).keys()),
-                               "models": sorted((all_agg.get("by_model_family") or {}).keys())},
-            "daily_totals": _period_totals(rows, monthly=False),
+            "filter_options": bundle["filter_options"],
+            "daily_totals": bundle["daily_totals"],
             "route_health": route_health,
             "health_summary": health_summary,
             "logins": _login_connections_snapshot(timeframe=timeframe, consumer=selected, viewer_role=viewer_role),

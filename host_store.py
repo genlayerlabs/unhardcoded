@@ -724,47 +724,334 @@ _USAGE_COLS = ("ts", "caller", "provider_id", "model_family", "served_model_id",
                "consumer_sha", "usage_event_id")
 
 
+def _usage_where(since_ts: "int | None" = None, caller: "str | None" = None,
+                 caller_is_null: bool = False, consumer_sha: "str | None" = None,
+                 provider: "str | None" = None,
+                 model_family: "str | None" = None) -> "tuple[str, list[Any]]":
+    """The shared WHERE for every calls-derived usage read. "all" (since_ts=None)
+    is still bounded to the retention horizon so the read is ALWAYS time-bounded
+    (never a bare table scan): rows older than retention are pruned anyway, so the
+    floor only drops not-yet-pruned slack. A caller-supplied since_ts narrows
+    further (it can't widen past what we retain). The optional filters mirror the
+    dashboard's Python row filters EXACTLY (raw-column equality; `caller_is_null`
+    covers the key-filter-without-known-consumer case, where the old Python
+    compared `row.get("caller") == None`)."""
+    floor = int(time.time()) - _RETENTION_DAYS * 86400
+    if since_ts is not None:
+        floor = max(int(since_ts), floor)
+    clauses, params = ["ts >= %s"], [floor]
+    if caller is not None:
+        clauses.append("caller = %s"); params.append(caller)
+    elif caller_is_null:
+        clauses.append("caller IS NULL")
+    if consumer_sha is not None:
+        clauses.append("consumer_sha = %s"); params.append(consumer_sha)
+    if provider is not None:
+        clauses.append("provider_id = %s"); params.append(provider)
+    if model_family is not None:
+        clauses.append("model_family = %s"); params.append(model_family)
+    return " WHERE " + " AND ".join(clauses), params
+
+
+def _map_usage_row(r: tuple) -> dict[str, Any]:
+    """Map a `calls` row to the usage-history row keys the aggregation expects."""
+    d = dict(zip(_USAGE_COLS, r))
+    return {
+        "event": "request", "ts": d["ts"], "caller": d["caller"],
+        "provider": d["provider_id"], "model_family": d["model_family"],
+        "served_model_id": d["served_model_id"], "served_by": d["served_by"],
+        "status": d["status"], "error_type": d["error_type"],
+        "tokens_in": d["tokens_in"], "tokens_out": d["tokens_out"],
+        "tokens_total": d["tokens_total"], "tokens_cached": d["tokens_cached"],
+        "cost_usd": d["cost_usd"], "requested_model": d["requested_model"],
+        "key_sha256": d["consumer_sha"],
+        "key_sha256_prefix": (d["consumer_sha"] or "")[:12] or None,
+        "usage_event_id": d.get("usage_event_id")}
+
+
 def usage_rows(since_ts: "int | None" = None,
                caller: "str | None" = None) -> list[dict[str, Any]]:
     """Calls in the legacy usage-history ROW SHAPE (#5: replaces usage-history.jsonl),
     so the dashboard timeframe aggregation consumes them unchanged. Optionally
     filtered by ts >= since_ts and/or caller. ts in SECONDS. Fail-soft -> []."""
     try:
-        # "all" (since_ts=None) is still bounded to the retention horizon so the
-        # read is ALWAYS time-bounded (never a bare table scan): rows older than
-        # retention are pruned anyway, so the floor only drops not-yet-pruned
-        # slack. A caller-supplied since_ts narrows further (it can't widen past
-        # what we retain).
-        floor = int(time.time()) - _RETENTION_DAYS * 86400
-        if since_ts is not None:
-            floor = max(int(since_ts), floor)
-        clauses, params = ["ts >= %s"], [floor]
-        if caller is not None:
-            clauses.append("caller = %s"); params.append(caller)
-        where = " WHERE " + " AND ".join(clauses)
+        where, params = _usage_where(since_ts=since_ts, caller=caller)
         with _get_pool().connection() as conn:
             cur = conn.execute(
                 f"SELECT {', '.join(_USAGE_COLS)} FROM calls{where} ORDER BY ts",
                 params)
-            rows = []
-            for r in cur.fetchall():
-                d = dict(zip(_USAGE_COLS, r))
-                # map to the usage-history row keys the aggregation expects
-                rows.append({
-                    "event": "request", "ts": d["ts"], "caller": d["caller"],
-                    "provider": d["provider_id"], "model_family": d["model_family"],
-                    "served_model_id": d["served_model_id"], "served_by": d["served_by"],
-                    "status": d["status"], "error_type": d["error_type"],
-                    "tokens_in": d["tokens_in"], "tokens_out": d["tokens_out"],
-                    "tokens_total": d["tokens_total"], "tokens_cached": d["tokens_cached"],
-                    "cost_usd": d["cost_usd"], "requested_model": d["requested_model"],
-                    "key_sha256": d["consumer_sha"],
-                    "key_sha256_prefix": (d["consumer_sha"] or "")[:12] or None,
-                    "usage_event_id": d.get("usage_event_id")})
-            return rows
+            return [_map_usage_row(r) for r in cur.fetchall()]
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store usage_rows failed: %s", exc)
         return []
+
+
+def usage_rows_page(since_ts: "int | None" = None, caller: "str | None" = None,
+                    caller_is_null: bool = False, consumer_sha: "str | None" = None,
+                    provider: "str | None" = None, model_family: "str | None" = None,
+                    limit: int = 200) -> list[dict[str, Any]]:
+    """The newest `limit` usage rows in the window (dashboard Activity), newest
+    first — a LIMIT'd query instead of loading the whole window to slice it.
+    Tie order (ts DESC, id ASC) matches the old stable reverse sort over an
+    ascending read. Fail-soft -> []."""
+    try:
+        where, params = _usage_where(since_ts=since_ts, caller=caller,
+                                     caller_is_null=caller_is_null,
+                                     consumer_sha=consumer_sha, provider=provider,
+                                     model_family=model_family)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                f"SELECT {', '.join(_USAGE_COLS)} FROM calls{where}"
+                " ORDER BY ts DESC, id ASC LIMIT %s", params + [int(limit)])
+            return [_map_usage_row(r) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store usage_rows_page failed: %s", exc)
+        return []
+
+
+# ---- dashboard analytics (SQL aggregation over `calls`) ------------------------
+#
+# The dashboard stats used to load EVERY retained row and aggregate in Python —
+# O(all rows) per page load. These push the aggregation into Postgres (one
+# GROUPING SETS scan over idx_calls_ts) while replicating the Python semantics of
+# auth_proxy._aggregate_usage_rows / _period_totals EXACTLY:
+#   * error        = COALESCE(status,0) >= 400
+#   * bucket keys  = NULL or '' -> 'unknown' (caller/provider/family/route/served)
+#   * by_status    = COALESCE(status,0) as text
+#   * tokens_total = row tokens_total unless NULL/0, else tokens_in + tokens_out
+#   * cost         = GREATEST(cost_usd, 0) when stamped, else NOT counted (NULL);
+#                    `priced` counts stamped rows so callers can preserve the
+#                    "cost_usd key present only if any row was priced" behavior
+#   * day bucket   = UTC calendar date of ts (Python used fromtimestamp(tz=utc))
+#   * rejects are never persisted to `calls`, so they don't appear here.
+
+_AGG_INNER = (
+    "SELECT id, ts, status, tokens_in, tokens_out, tokens_total, cost_usd,"
+    " requested_model, model_family, provider_id,"
+    " COALESCE(NULLIF(caller,''),'unknown') AS caller_k,"
+    " COALESCE(NULLIF(provider_id,''),'unknown') AS provider_k,"
+    " COALESCE(NULLIF(model_family,''),'unknown') AS family_k,"
+    " COALESCE(NULLIF(requested_model,''),'unknown') AS route_k,"
+    " COALESCE(NULLIF(served_model_id,''),'unknown') AS served_k,"
+    " COALESCE(NULLIF(substr(consumer_sha,1,12),''),'unknown') AS prefix_k,"
+    " COALESCE(status,0)::text AS status_k,"
+    " to_char(to_timestamp(ts) AT TIME ZONE 'UTC','YYYY-MM-DD') AS day_k"
+    " FROM calls"
+)
+
+_AGG_MEASURES = (
+    " count(*) AS requests,"
+    " count(*) FILTER (WHERE COALESCE(status,0) >= 400) AS errors,"
+    " COALESCE(sum(COALESCE(tokens_in,0)),0) AS tokens_in,"
+    " COALESCE(sum(COALESCE(tokens_out,0)),0) AS tokens_out,"
+    " COALESCE(sum(CASE WHEN COALESCE(tokens_total,0) <> 0 THEN tokens_total"
+    " ELSE COALESCE(tokens_in,0)+COALESCE(tokens_out,0) END),0) AS tokens_total,"
+    " round(COALESCE(sum(GREATEST(cost_usd,0)),0)::numeric,6)::float8 AS cost_usd,"
+    " count(cost_usd) AS priced,"
+    " max(ts) AS last_seen"
+)
+
+
+def _agg_counter(row: tuple) -> dict[str, Any]:
+    requests, errors, tin, tout, ttotal, cost, priced, last_seen = row
+    return {"requests": int(requests), "errors": int(errors),
+            "tokens_in": int(tin), "tokens_out": int(tout),
+            "tokens_total": int(ttotal), "cost_usd": float(cost),
+            "priced": int(priced),
+            "last_seen": int(last_seen) if last_seen is not None else None}
+
+
+def _empty_usage_aggregate() -> dict[str, Any]:
+    return {"totals": {"requests": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0,
+                       "tokens_total": 0, "cost_usd": 0.0, "priced": 0,
+                       "last_seen": None},
+            "by_caller": {}, "by_provider": {}, "by_model_family": {},
+            "by_route": {}, "by_served_model": {}, "by_status": {}, "by_day": {}}
+
+
+def usage_aggregate(since_ts: "int | None" = None, caller: "str | None" = None,
+                    caller_is_null: bool = False, consumer_sha: "str | None" = None,
+                    provider: "str | None" = None,
+                    model_family: "str | None" = None) -> dict[str, Any]:
+    """Every dashboard stats aggregate in ONE window scan: overall totals plus
+    the by_caller / by_provider / by_model_family / by_route / by_served_model /
+    by_status / by_day breakdowns, as raw counters (see _agg_counter). Fail-soft
+    -> the empty shape (same as aggregating zero rows)."""
+    try:
+        where, params = _usage_where(since_ts=since_ts, caller=caller,
+                                     caller_is_null=caller_is_null,
+                                     consumer_sha=consumer_sha, provider=provider,
+                                     model_family=model_family)
+        sql = ("SELECT grouping(caller_k, provider_k, family_k, route_k,"
+               " served_k, status_k, day_k) AS gset,"
+               " caller_k, provider_k, family_k, route_k, served_k, status_k,"
+               " day_k," + _AGG_MEASURES +
+               f" FROM ({_AGG_INNER}{where}) c"
+               " GROUP BY GROUPING SETS ((), (caller_k), (provider_k),"
+               " (family_k), (route_k), (served_k), (status_k), (day_k))")
+        # grouping() bitmask -> which single-column set the row belongs to
+        # (leftmost argument is the most significant bit; () = all bits set).
+        sets = {63: ("by_caller", 1), 95: ("by_provider", 2),
+                111: ("by_model_family", 3), 119: ("by_route", 4),
+                123: ("by_served_model", 5), 126: ("by_day", 7)}
+        out = _empty_usage_aggregate()
+        with _get_pool().connection() as conn:
+            for row in conn.execute(sql, params):
+                gset = int(row[0])
+                counter = _agg_counter(row[8:])
+                if gset == 127:                      # () — overall totals
+                    out["totals"] = counter
+                elif gset == 125:                    # (status_k) — counts only
+                    out["by_status"][str(row[6])] = counter["requests"]
+                else:
+                    bucket, idx = sets[gset]
+                    out[bucket][str(row[idx])] = counter
+        return out
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store usage_aggregate failed: %s", exc)
+        return _empty_usage_aggregate()
+
+
+def usage_count(since_ts: "int | None" = None) -> int:
+    """Row count in the window (the dashboard's history_events_all). Fail-soft -> 0."""
+    try:
+        where, params = _usage_where(since_ts=since_ts)
+        with _get_pool().connection() as conn:
+            return int(conn.execute(
+                f"SELECT count(*) FROM calls{where}", params).fetchone()[0])
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store usage_count failed: %s", exc)
+        return 0
+
+
+def usage_provider_stats(since_ts: "int | None" = None) -> dict[str, dict[str, Any]]:
+    """Per-provider usage counters + the latest event's fields in the window (the
+    provider-credentials panel): {provider: counter + last_ts/last_status/
+    last_route/last_model_family}. Tie order for "latest" (ts DESC, id DESC)
+    matches the old ascending fold's `ts >= best` (last writer wins).
+    Fail-soft -> {}."""
+    try:
+        where, params = _usage_where(since_ts=since_ts)
+        out: dict[str, dict[str, Any]] = {}
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT provider_k," + _AGG_MEASURES +
+                f" FROM ({_AGG_INNER}{where}) c GROUP BY provider_k", params)
+            for row in cur.fetchall():
+                out[str(row[0])] = _agg_counter(row[1:])
+            cur = conn.execute(
+                "SELECT DISTINCT ON (provider_k) provider_k, ts, status,"
+                " requested_model, model_family"
+                f" FROM ({_AGG_INNER}{where}) c"
+                " ORDER BY provider_k, ts DESC, id DESC", params)
+            for provider_k, ts, status, route, family in cur.fetchall():
+                item = out.setdefault(str(provider_k), _agg_counter((0,) * 7 + (None,)))
+                item.update({"last_ts": ts, "last_status": status,
+                             "last_route": route, "last_model_family": family})
+        return out
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store usage_provider_stats failed: %s", exc)
+        return {}
+
+
+def usage_connections(since_ts: "int | None" = None,
+                      caller: "str | None" = None) -> list[dict[str, Any]]:
+    """Per (caller, key prefix) usage rollup in the window (the Connections
+    panel): requests/errors/first_seen/last_seen plus the latest event's
+    status/route/provider. Fail-soft -> []."""
+    try:
+        where, params = _usage_where(since_ts=since_ts, caller=caller)
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT caller_k, prefix_k, count(*),"
+                " count(*) FILTER (WHERE COALESCE(status,0) >= 400),"
+                " min(ts), max(ts)"
+                f" FROM ({_AGG_INNER}{where}) c GROUP BY caller_k, prefix_k",
+                params)
+            for caller_k, prefix_k, requests, errors, first_seen, last_seen in cur.fetchall():
+                grouped[(str(caller_k), str(prefix_k))] = {
+                    "caller": str(caller_k), "prefix": str(prefix_k),
+                    "requests": int(requests), "errors": int(errors),
+                    "first_seen": int(first_seen), "last_seen": int(last_seen),
+                    "last_status": None, "last_route": None, "last_provider": None}
+            cur = conn.execute(
+                "SELECT DISTINCT ON (caller_k, prefix_k) caller_k, prefix_k,"
+                " status, requested_model, provider_id"
+                f" FROM ({_AGG_INNER}{where}) c"
+                " ORDER BY caller_k, prefix_k, ts DESC, id DESC", params)
+            for caller_k, prefix_k, status, route, prov in cur.fetchall():
+                item = grouped.get((str(caller_k), str(prefix_k)))
+                if item is not None:
+                    item.update({"last_status": status, "last_route": route,
+                                 "last_provider": prov})
+        return list(grouped.values())
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store usage_connections failed: %s", exc)
+        return []
+
+
+def usage_event_ids_present(ids: list[str],
+                            since_ts: "int | None" = None) -> "set[str]":
+    """Which of these usage_event_ids have already landed in `calls` — lets the
+    dashboard fold in ONLY the not-yet-persisted runtime events instead of
+    deduping the whole window in Python. `since_ts` (the oldest candidate's ts)
+    keeps the probe on idx_calls_ts. Fail-soft -> set() (worst case a just-landed
+    event is counted from the runtime feed too, exactly the pre-SQL behavior for
+    id-less rows)."""
+    if not ids:
+        return set()
+    try:
+        where, params = _usage_where(since_ts=since_ts)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                f"SELECT usage_event_id FROM calls{where}"
+                " AND usage_event_id = ANY(%s)", params + [list(ids)])
+            return {str(r[0]) for r in cur.fetchall()}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store usage_event_ids_present failed: %s", exc)
+        return set()
+
+
+def backfill_call_costs(prices: "dict[tuple[str, str], dict[str, float]]",
+                        batch_size: int = 1000) -> int:
+    """One-time (idempotent) cost stamping: price every `calls` row with
+    cost_usd IS NULL from the list-price table, exactly as the read-time
+    fallback (auth_proxy._cost_for_event) did on every dashboard load — after
+    this, SUM(cost_usd) is authoritative and the read path never re-prices.
+    Rows with no price entry stay NULL (they summed as 0 before and still do).
+    cost_basis follows the existing convention: 'computed' = derived from the
+    list price (only set where it was NULL). Batched keyset loop; safe to run
+    at every startup. Returns the number of rows stamped."""
+    stamped = 0
+    last_id = 0
+    try:
+        while True:
+            with _get_pool().connection() as conn:
+                rows = conn.execute(
+                    "SELECT id, provider_id, model_family, tokens_in, tokens_out"
+                    " FROM calls WHERE cost_usd IS NULL AND id > %s"
+                    " ORDER BY id LIMIT %s", (last_id, int(batch_size))).fetchall()
+                if not rows:
+                    return stamped
+                updates = []
+                for id_, prov, fam, tin, tout in rows:
+                    price = prices.get((str(fam or ""), str(prov or "")))
+                    if not price:
+                        continue
+                    cost = round((int(tin or 0) / 1_000_000.0) * price["input"]
+                                 + (int(tout or 0) / 1_000_000.0) * price["output"], 6)
+                    updates.append((max(0.0, cost), id_))
+                if updates:
+                    conn.cursor().executemany(
+                        "UPDATE calls SET cost_usd = %s,"
+                        " cost_basis = COALESCE(cost_basis, 'computed')"
+                        " WHERE id = %s AND cost_usd IS NULL", updates)
+                stamped += len(updates)
+                last_id = rows[-1][0]
+    except Exception as exc:  # noqa: BLE001 — telemetry backfill must never break startup
+        _log.warning("host_store backfill_call_costs failed: %s", exc)
+        return stamped
 
 
 def insert_login(row: dict[str, Any]) -> None:
