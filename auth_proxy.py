@@ -22,7 +22,9 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
+import control_plane_client
 import host_store
+import internal_api
 from env_secrets import load_env_secrets
 from shim import _CACHE_READ_FACTOR   # the billing cache-read discount — one source
 
@@ -63,6 +65,10 @@ SYNTHETIC_PROBE_INTERVAL_S = float(os.getenv("DASHBOARD_SYNTHETIC_PROBE_INTERVAL
 SYNTHETIC_PROBE_INITIAL_DELAY_S = float(os.getenv("DASHBOARD_SYNTHETIC_PROBE_INITIAL_DELAY_S", "45"))
 SYNTHETIC_PROBE_TIMEOUT_S = float(os.getenv("DASHBOARD_SYNTHETIC_PROBE_TIMEOUT_S", "45"))
 SYNTHETIC_PROBE_CALLER = os.getenv("DASHBOARD_SYNTHETIC_PROBE_CALLER", "dashboard-probe")
+# Optional namespace for control-plane-resolved callers (e.g. "cp:") so tenant
+# slugs can't merge attribution with operator-minted consumer names. Default off:
+# calls.caller == tenant slug, which is what the control plane's usage reads key on.
+CONTROL_PLANE_CALLER_PREFIX = os.getenv("CONTROL_PLANE_CALLER_PREFIX", "")
 
 
 
@@ -84,6 +90,10 @@ CALLER_KEY_HASHES: Dict[str, str] = _load_caller_map(CALLER_KEYS_SHA256_JSON, "C
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
 log = logging.getLogger("llm-router-auth-proxy")
 app = FastAPI(title="llm-router auth proxy", docs_url=None, redoc_url=None)
+# Control-plane metering surface (/internal/usage[/recent]). Registered before
+# any route definition below so Starlette matches it ahead of the catch-all
+# proxy; hidden (404) unless CONTROL_PLANE_INTERNAL_SECRET is configured.
+app.include_router(internal_api.router)
 _client: httpx.AsyncClient | None = None
 _probe_task: asyncio.Task[None] | None = None
 _windows: dict[str, deque[float]] = defaultdict(deque)
@@ -477,8 +487,44 @@ def _caller_auth(token: str | None) -> dict[str, Any]:
     return {"ok": True, "caller": caller, "digest": digest, "storage": storage, "meta": meta}
 
 
-def _rate_ok(caller: str) -> bool:
+async def _caller_auth_async(token: str | None) -> dict[str, Any]:
+    """_caller_auth plus the external-control-plane fallback.
+
+    Local key stores stay authoritative: a locally known key — including a
+    revoked/inactive one — never falls through to the control plane; only a
+    pure local miss consults it (and only when the feature is configured, see
+    control_plane_client.enabled()). On a resolve hit the caller becomes the
+    control-plane consumer name (tenant slug) and the plan's rate limits ride
+    the returned meta; an explicit local record for that same name keeps
+    precedence (operator kill-switch: mark the slug inactive locally)."""
+    auth = _caller_auth(token)
+    if auth.get("ok") or auth.get("caller") or not token or not control_plane_client.enabled():
+        return auth
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    resolved = await control_plane_client.resolve_key(digest)
+    if resolved is None or not resolved.active or not resolved.consumer:
+        return auth
+    caller = f"{CONTROL_PLANE_CALLER_PREFIX}{resolved.consumer}"
     meta = _consumer_meta(caller)
+    if meta.get("keys"):
+        # A local consumer already answers to this name — attribution merges.
+        control_plane_client.log_collision_once(caller)
+    if meta.get("status") != "active":
+        return {"ok": False, "caller": caller, "digest": digest,
+                "storage": "control_plane", "error_code": "caller_inactive"}
+    if meta.get("rate_per_min") is None:
+        meta["rate_per_min"] = resolved.rate_per_min
+    if meta.get("burst") is None:
+        meta["burst"] = resolved.burst
+    out = {"ok": True, "caller": caller, "digest": digest,
+           "storage": "control_plane", "meta": meta}
+    if resolved.tenant_id is not None:
+        out["tenant_id"] = resolved.tenant_id
+    return out
+
+
+def _rate_ok(caller: str, meta: dict[str, Any] | None = None) -> bool:
+    meta = meta if meta is not None else _consumer_meta(caller)
     rate_per_min = int(meta.get("rate_per_min") or RATE_PER_MIN)
     burst = int(meta.get("burst") or BURST)
     now = time.monotonic()
@@ -517,8 +563,10 @@ def _route_matches(pattern: str, route: str) -> bool:
     return False
 
 
-def _route_allowed(caller: str, route: str | None) -> bool:
-    allowed_routes = _consumer_meta(caller).get("allowed_routes") or []
+def _route_allowed(caller: str, route: str | None,
+                   meta: dict[str, Any] | None = None) -> bool:
+    meta = meta if meta is not None else _consumer_meta(caller)
+    allowed_routes = meta.get("allowed_routes") or []
     if not allowed_routes:
         return True
     if not route:
@@ -973,6 +1021,7 @@ async def shutdown() -> None:
         _probe_task = None
     if _client:
         await _client.aclose()
+    await control_plane_client.close()
 
 
 @app.get("/healthz")
@@ -1730,7 +1779,7 @@ async def consumer_skill(request: Request) -> Response:
     and the same key auth (revoked/expired/inactive keys are rejected)."""
     auth = request.headers.get("authorization") or ""
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else auth.strip()
-    if not _caller_auth(token).get("ok"):
+    if not (await _caller_auth_async(token)).get("ok"):
         return JSONResponse(status_code=401, content={"error": {
             "message": "invalid or inactive API key",
             "type": "auth_error", "code": "consumer_auth"}})
@@ -1749,7 +1798,7 @@ async def consumer_skill(request: Request) -> Response:
 # or mutate state: they admit/normalize a term, preview the ranking, or list the
 # field vocabulary — all derived from the live catalog the skill already shows.
 async def _consumer_x_proxy(request: Request, method: str, path: str) -> Response:
-    if not _caller_auth(_extract_token(request)).get("ok"):
+    if not (await _caller_auth_async(_extract_token(request))).get("ok"):
         return JSONResponse(status_code=401, content={"error": {
             "message": "invalid or inactive API key",
             "type": "auth_error", "code": "consumer_auth"}})
@@ -2376,7 +2425,7 @@ async def dashboard_key_usage(request: Request) -> Response:
 @app.get("/api/usage")
 async def key_usage(request: Request) -> Response:
     token = _extract_token(request)
-    auth = _caller_auth(token)
+    auth = await _caller_auth_async(token)
     if not auth.get("ok"):
         code = auth.get("error_code") or "caller_auth"
         status_code = 403 if code in {"caller_inactive", "caller_key_revoked", "caller_key_expired"} else 401
@@ -2404,7 +2453,7 @@ async def session_view(sid: str, request: Request) -> Response:
     itself sends as X-Unhardcoded-Session. Lets a harness (e.g. the opencode
     plugin) show live router economics without operator access to /x/*."""
     token = _extract_token(request)
-    auth = _caller_auth(token)
+    auth = await _caller_auth_async(token)
     if not auth.get("ok"):
         code = auth.get("error_code") or "caller_auth"
         status_code = 403 if code in {"caller_inactive", "caller_key_revoked", "caller_key_expired"} else 401
@@ -3207,7 +3256,7 @@ async def proxy(path: str, request: Request) -> Response:
         return JSONResponse(status_code=404, content={"error": {"message": "not found", "type": "invalid_request_error", "code": None}})
     started = time.perf_counter()
     token = _extract_token(request)
-    auth = _caller_auth(token)
+    auth = await _caller_auth_async(token)
     caller = auth.get("caller")
     if not auth.get("ok"):
         code = auth.get("error_code") or "caller_auth"
@@ -3223,13 +3272,14 @@ async def proxy(path: str, request: Request) -> Response:
         return JSONResponse(status_code=status_code, content={"error": {"message": messages.get(code, "caller not authorized"), "type": "auth_error", "code": code}})
 
     caller = str(caller)
+    auth_meta = auth.get("meta")
     body = await request.body()
     requested_route = _requested_route_from(path, body)
-    if not _route_allowed(caller, requested_route):
+    if not _route_allowed(caller, requested_route, meta=auth_meta):
         _record_reject(reason="route_not_allowed", path="/" + path, caller=caller, status=403, route=requested_route)
         _log({"event": "reject", "reason": "route_not_allowed", "caller": caller, "path": "/" + path, "route": requested_route})
         return JSONResponse(status_code=403, content={"error": {"message": "caller is not allowed to use this route", "type": "auth_error", "code": "caller_route_not_allowed"}})
-    if not _rate_ok(caller):
+    if not _rate_ok(caller, meta=auth_meta):
         _record_reject(reason="rate_limit", path="/" + path, caller=caller, status=429)
         _log({"event": "reject", "reason": "rate_limit", "caller": caller, "path": "/" + path})
         return JSONResponse(status_code=429, content={"error": {"message": "caller rate limit exceeded", "type": "rate_limit_error", "code": "caller_rate_limit"}})
@@ -3255,9 +3305,15 @@ async def proxy(path: str, request: Request) -> Response:
 
     headers = {
         k: v for k, v in request.headers.items()
-        if k.lower() not in {"authorization", "host", "connection", "content-length"}
+        if k.lower() not in {"authorization", "host", "connection", "content-length",
+                             "x-llm-router-tenant", "x-internal-secret"}
     }
     headers["x-llm-router-caller"] = caller
+    # Tenant identity for per-tenant provider credentials (BYO keys): set ONLY
+    # from the authenticated resolve — the client-sent header is stripped above,
+    # so it can never be smuggled past auth.
+    if auth.get("tenant_id") is not None:
+        headers["x-llm-router-tenant"] = str(auth["tenant_id"])
 
     status = 502
     provider = None

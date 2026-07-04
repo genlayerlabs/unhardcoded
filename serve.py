@@ -135,10 +135,17 @@ def main() -> None:
     # The native api_kind adapters (anthropic/bedrock/google) come from the
     # modular provider registry; codex is wired here because its backend takes
     # the `observe` hook that feeds its scarcity-price source.
-    _native = providers.native_adapter_handlers(args.timeout_s)
+    # Credential lookup for env-auth adapters: control_plane_client.env_get
+    # consults the request-scoped tenant BYO map first (set by the shim from the
+    # trusted x-llm-router-tenant header), then the process env — identical to
+    # os.environ.get while the control-plane feature is off.
+    import control_plane_client
+    _native = providers.native_adapter_handlers(args.timeout_s,
+                                                env_get=control_plane_client.env_get)
     call_async = make_api_kind_dispatcher(
         default=make_async_call_provider(timeout_s=args.timeout_s,
-                                         provider_rules=provider_rules),
+                                         provider_rules=provider_rules,
+                                         env_get=control_plane_client.env_get),
         handlers={**_native,
                   "openai_codex": make_codex_async_call_provider(codex_auth, observe=observe)},
     )
@@ -152,11 +159,13 @@ def main() -> None:
         stream_codex,
         stream_openai_compatible,
     )
-    _native_streaming = providers.native_streaming_adapter_handlers(args.timeout_s)
+    _native_streaming = providers.native_streaming_adapter_handlers(
+        args.timeout_s, env_get=control_plane_client.env_get)
     streaming_call = make_streaming_dispatcher(
         default=functools.partial(stream_openai_compatible,
                                   timeout_s=args.timeout_s,
-                                  provider_rules=provider_rules),
+                                  provider_rules=provider_rules,
+                                  env_get=control_plane_client.env_get),
         # Native providers and Codex have real streaming twins; Codex also feeds
         # `observe` for quota/scarcity pricing.
         handlers={**_native_streaming,

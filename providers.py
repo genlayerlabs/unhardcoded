@@ -80,34 +80,45 @@ def _bedrock_source(catalog, env_get):
     return BedrockSource(catalog, env_get=env_get)
 
 
-def _anthropic_adapter(timeout_s):
+def _anthropic_adapter(timeout_s, env_get=None):
     from provider_adapters.anthropic import make_anthropic_async_call_provider
-    return make_anthropic_async_call_provider(timeout_s=timeout_s)
+    if env_get is None:
+        return make_anthropic_async_call_provider(timeout_s=timeout_s)
+    return make_anthropic_async_call_provider(timeout_s=timeout_s, env_get=env_get)
 
 
-def _anthropic_stream_adapter(timeout_s):
+def _anthropic_stream_adapter(timeout_s, env_get=None):
     from provider_adapters.anthropic import stream_anthropic
-    return functools.partial(stream_anthropic, timeout_s=timeout_s)
+    if env_get is None:
+        return functools.partial(stream_anthropic, timeout_s=timeout_s)
+    return functools.partial(stream_anthropic, timeout_s=timeout_s, env_get=env_get)
 
 
-def _bedrock_adapter(timeout_s):
+def _bedrock_adapter(timeout_s, env_get=None):
+    # env_get intentionally ignored: bedrock auths via the AWS chain, and tenant
+    # BYO credentials never apply to it (platform-only provider).
     from provider_adapters.bedrock import make_bedrock_async_call_provider
     return make_bedrock_async_call_provider(timeout_s=timeout_s)
 
 
-def _bedrock_stream_adapter(timeout_s):
+def _bedrock_stream_adapter(timeout_s, env_get=None):
+    # env_get intentionally ignored (see _bedrock_adapter).
     from provider_adapters.bedrock import stream_bedrock
     return functools.partial(stream_bedrock, timeout_s=timeout_s)
 
 
-def _google_adapter(timeout_s):
+def _google_adapter(timeout_s, env_get=None):
     from provider_adapters.google import make_google_async_call_provider
-    return make_google_async_call_provider(timeout_s=timeout_s)
+    if env_get is None:
+        return make_google_async_call_provider(timeout_s=timeout_s)
+    return make_google_async_call_provider(timeout_s=timeout_s, env_get=env_get)
 
 
-def _google_stream_adapter(timeout_s):
+def _google_stream_adapter(timeout_s, env_get=None):
     from provider_adapters.google import stream_google
-    return functools.partial(stream_google, timeout_s=timeout_s)
+    if env_get is None:
+        return functools.partial(stream_google, timeout_s=timeout_s)
+    return functools.partial(stream_google, timeout_s=timeout_s, env_get=env_get)
 
 
 def _codex_source(catalog, env_get):
@@ -265,18 +276,21 @@ def build_source_registry(catalog: dict, env_get=os.environ.get) -> list:
     return out
 
 
-def native_adapter_handlers(timeout_s: float) -> "dict[str, Any]":
+def native_adapter_handlers(timeout_s: float, env_get=None) -> "dict[str, Any]":
     """api_kind -> wire backend for the providers with a dedicated adapter
-    (codex is wired separately in serve.py because it needs `observe`)."""
-    return {p.api_kind: p.adapter(timeout_s)
+    (codex is wired separately in serve.py because it needs `observe`).
+    `env_get` threads a request-scoped credential lookup (per-tenant BYO keys)
+    into the adapters that resolve auth from env; platform-only adapters
+    (bedrock) ignore it."""
+    return {p.api_kind: p.adapter(timeout_s, env_get)
             for p in PROVIDERS
             if not p.special and p.api_kind and p.adapter}
 
 
-def native_streaming_adapter_handlers(timeout_s: float) -> "dict[str, Any]":
+def native_streaming_adapter_handlers(timeout_s: float, env_get=None) -> "dict[str, Any]":
     """api_kind -> true streaming backend for native providers that support it
     (codex remains wired separately in serve.py because it needs `observe`)."""
-    return {p.api_kind: p.stream_adapter(timeout_s)
+    return {p.api_kind: p.stream_adapter(timeout_s, env_get)
             for p in PROVIDERS
             if not p.special and p.api_kind and p.stream_adapter}
 
