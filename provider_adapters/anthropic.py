@@ -116,6 +116,10 @@ def _parse_anthropic_response(data: dict, status: int, latency: int) -> dict:
                 (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
                 if usage else None
             ),
+            # cache reads bill at a fraction — without this the meter (and
+            # the cost discount) is blind to the cache the router now
+            # requests via cache_control (#74)
+            "tokens_cached": usage.get("cache_read_input_tokens"),
             "raw_model": data.get("model"),
         },
     }
@@ -274,6 +278,9 @@ async def stream_anthropic(
                 (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
                 if usage else None
             ),
+            # cache_read_input_tokens rides message_start's usage and
+            # survives the acc merge — read it or the stream path loses it
+            "tokens_cached": usage.get("cache_read_input_tokens"),
             "raw_model": acc.raw_model,
         },
     }

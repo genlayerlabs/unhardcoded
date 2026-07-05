@@ -104,3 +104,33 @@ def test_breakpoints_cap_at_two_marks():
         if isinstance(m.get("content"), list)
         and any(isinstance(p, dict) and p.get("cache_control") for p in m["content"]))
     assert marked == 2
+
+
+# ── read-back: every adapter must surface its provider's cache counters ──────
+# (bedrock and openai-compat/codex already did; anthropic-native and google
+# were BLIND — the meter and the cost discount never saw the hits)
+
+def test_every_usage_shape_reaches_tokens_cached():
+    from provider_adapters.anthropic import _parse_anthropic_response
+    from provider_adapters.google import _parse_gemini_response
+    from provider_adapters.common import cached_tokens
+
+    anth = _parse_anthropic_response({
+        "content": [{"type": "text", "text": "ok"}],
+        "usage": {"input_tokens": 100, "output_tokens": 5,
+                  "cache_read_input_tokens": 90},
+    }, 200, 10)
+    assert anth["response"]["tokens_cached"] == 90
+
+    gem = _parse_gemini_response({
+        "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+        "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 5,
+                          "totalTokenCount": 105, "cachedContentTokenCount": 40},
+    }, 200, 10)
+    assert gem["response"]["tokens_cached"] == 40
+
+    # the shared helper covers openai-compat, codex-responses and raw anthropic
+    assert cached_tokens({"prompt_tokens_details": {"cached_tokens": 7}}) == 7
+    assert cached_tokens({"input_tokens_details": {"cached_tokens": 8}}) == 8
+    assert cached_tokens({"cache_read_input_tokens": 9}) == 9
+    assert cached_tokens({"prompt_tokens": 5}) is None

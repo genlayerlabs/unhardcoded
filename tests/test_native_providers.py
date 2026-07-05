@@ -311,7 +311,7 @@ async def test_anthropic_native_stream_emits_and_aggregates():
     client = FakeStreamClient(FakeStreamResponse(200, [
         _sse({"type": "message_start", "message": {
             "model": "claude-sonnet-4-6",
-            "usage": {"input_tokens": 11},
+            "usage": {"input_tokens": 11, "cache_read_input_tokens": 6},
         }}),
         _sse({"type": "content_block_delta", "index": 0,
               "delta": {"type": "text_delta", "text": "Use the tool."}}),
@@ -340,6 +340,8 @@ async def test_anthropic_native_stream_emits_and_aggregates():
     assert result["ok"] is True
     assert result["response"]["text"] == "Use the tool."
     assert result["response"]["tokens_total"] == 18
+    # cache_read_input_tokens rides message_start and must survive to the end
+    assert result["response"]["tokens_cached"] == 6
     assert result["response"]["tool_calls"][0]["function"] == {
         "name": "lookup",
         "arguments": '{"id": "abc"}',
@@ -361,6 +363,7 @@ async def test_google_native_stream_emits_and_aggregates():
                   "promptTokenCount": 13,
                   "candidatesTokenCount": 5,
                   "totalTokenCount": 18,
+                  "cachedContentTokenCount": 4,
               }}),
     ]))
 
@@ -380,6 +383,8 @@ async def test_google_native_stream_emits_and_aggregates():
     assert result["response"]["text"] == "Done."
     assert result["response"]["raw_model"] == "gemini-3.1-pro-preview"
     assert result["response"]["tokens_total"] == 18
+    # Gemini implicit-cache hits (usageMetadata.cachedContentTokenCount)
+    assert result["response"]["tokens_cached"] == 4
     assert result["response"]["tool_calls"][0]["function"] == {
         "name": "lookup",
         "arguments": '{"id": "abc"}',
