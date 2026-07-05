@@ -178,8 +178,12 @@ async def test_anthropic_native_handler_translates_openai_shape():
     assert req["headers"]["anthropic-version"] == "2023-06-01"
     assert req["timeout"] == 12
     assert req["json"]["model"] == "claude-sonnet-4-6"
-    assert req["json"]["system"] == "Be terse."
-    assert req["json"]["messages"] == [{"role": "user", "content": "hi"}]
+    # system + last message carry prompt-cache breakpoints (#74): anthropic
+    # caching is opt-in per request; the router injects the markers
+    assert req["json"]["system"] == [{"type": "text", "text": "Be terse.",
+                                      "cache_control": {"type": "ephemeral"}}]
+    assert req["json"]["messages"] == [{"role": "user", "content": [
+        {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]}]
     assert req["json"]["tools"][0]["input_schema"]["required"] == ["id"]
 
 
@@ -307,7 +311,7 @@ async def test_anthropic_native_stream_emits_and_aggregates():
     client = FakeStreamClient(FakeStreamResponse(200, [
         _sse({"type": "message_start", "message": {
             "model": "claude-sonnet-4-6",
-            "usage": {"input_tokens": 11},
+            "usage": {"input_tokens": 11, "cache_read_input_tokens": 6},
         }}),
         _sse({"type": "content_block_delta", "index": 0,
               "delta": {"type": "text_delta", "text": "Use the tool."}}),
@@ -336,6 +340,8 @@ async def test_anthropic_native_stream_emits_and_aggregates():
     assert result["ok"] is True
     assert result["response"]["text"] == "Use the tool."
     assert result["response"]["tokens_total"] == 18
+    # cache_read_input_tokens rides message_start and must survive to the end
+    assert result["response"]["tokens_cached"] == 6
     assert result["response"]["tool_calls"][0]["function"] == {
         "name": "lookup",
         "arguments": '{"id": "abc"}',
@@ -357,6 +363,7 @@ async def test_google_native_stream_emits_and_aggregates():
                   "promptTokenCount": 13,
                   "candidatesTokenCount": 5,
                   "totalTokenCount": 18,
+                  "cachedContentTokenCount": 4,
               }}),
     ]))
 
@@ -376,6 +383,8 @@ async def test_google_native_stream_emits_and_aggregates():
     assert result["response"]["text"] == "Done."
     assert result["response"]["raw_model"] == "gemini-3.1-pro-preview"
     assert result["response"]["tokens_total"] == 18
+    # Gemini implicit-cache hits (usageMetadata.cachedContentTokenCount)
+    assert result["response"]["tokens_cached"] == 4
     assert result["response"]["tool_calls"][0]["function"] == {
         "name": "lookup",
         "arguments": '{"id": "abc"}',
@@ -564,9 +573,14 @@ async def test_anthropic_native_tool_roundtrip():
     assert sent[1]["content"][0] == {
         "type": "tool_use", "id": "call_1", "name": "lookup",
         "input": {"id": "abc"}}
-    # ...and the result is a tool_result keyed by that same id, not plain text.
+    # ...and the result is a tool_result keyed by that same id, not plain
+    # text. As the LAST message it carries the rolling prompt-cache
+    # breakpoint (#74) — in agentic loops the newest turn is almost always a
+    # tool result, which is precisely where the next call's cached prefix
+    # must end.
     assert sent[2] == {"role": "user", "content": [{
-        "type": "tool_result", "tool_use_id": "call_1", "content": "value=42"}]}
+        "type": "tool_result", "tool_use_id": "call_1", "content": "value=42",
+        "cache_control": {"type": "ephemeral"}}]}
 
 
 @pytest.mark.asyncio
