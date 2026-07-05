@@ -9,9 +9,11 @@ from contextlib import AsyncExitStack
 from typing import Awaitable, Callable, Any
 
 from provider_adapters.common import (
+    CACHE_CONTROL,
     CallProviderHook,
     AsyncCallProviderHook,
     TokenProvider,
+    anthropic_cache_family,
     before_first_output,
     first_token_timeout_err,
     first_token_timeout_s,
@@ -72,6 +74,34 @@ def _resolve_ollama_cloud_auth(
     return None
 
 
+def _with_cache_breakpoints(messages: list[dict]) -> list[dict]:
+    """COPY of `messages` with cache_control on the first system message and
+    on the last message (rolling breakpoint — the next call re-reads its
+    whole history from cache). Never mutates the caller's list: the request
+    dict is shared with retries and other rank candidates."""
+
+    def _tag(msg: dict) -> dict:
+        tagged = dict(msg)
+        content = tagged.get("content")
+        if isinstance(content, str):
+            tagged["content"] = [{"type": "text", "text": content,
+                                  "cache_control": dict(CACHE_CONTROL)}]
+        elif isinstance(content, list) and content and isinstance(content[-1], dict):
+            parts = [dict(p) for p in content]
+            parts[-1]["cache_control"] = dict(CACHE_CONTROL)
+            tagged["content"] = parts
+        return tagged
+
+    out = list(messages or [])
+    for i, msg in enumerate(out):
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            out[i] = _tag(msg)
+            break
+    if out and isinstance(out[-1], dict):
+        out[-1] = _tag(out[-1])
+    return out
+
+
 def _prepare_openai_call(
     request: dict,
     env_get: Callable[[str], str | None],
@@ -93,6 +123,17 @@ def _prepare_openai_call(
         v = request.get(field)
         if v is not None:
             body[field] = v
+
+    # Prompt-cache breakpoints for anthropic-class routes (#74), on surfaces
+    # known to RELAY cache_control in OpenAI-format content parts (openrouter
+    # documents this). Anthropic caching is opt-in per request: without the
+    # markers an agentic session re-buys its whole prefix at full input price
+    # on every call. Gated fail-safe: unknown surfaces are left untouched.
+    if anthropic_cache_family(request) and (request.get("provider_id") or "") in (
+        "openrouter",
+        "openrouter_market",
+    ):
+        body["messages"] = _with_cache_breakpoints(body["messages"])
 
     url = (request.get("base_url") or "").rstrip("/") + "/chat/completions"
     base_url = request.get("base_url") or ""

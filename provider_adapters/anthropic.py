@@ -7,6 +7,7 @@ import time
 from typing import Any, Callable
 
 from provider_adapters.common import (
+    CACHE_CONTROL,
     AsyncCallProviderHook,
     StreamAcc,
     auth_token,
@@ -120,6 +121,23 @@ def _parse_anthropic_response(data: dict, status: int, latency: int) -> dict:
     }
 
 
+def _tag_last_message(messages: list[dict]) -> None:
+    """Rolling prompt-cache breakpoint on the LAST message (#74): the next
+    call's prefix then matches everything up to and including this turn, so
+    an agentic loop re-reads its history from cache instead of re-buying it.
+    Two breakpoints total with the system block — well under Anthropic's 4.
+    Safe to mutate: `messages` is freshly built by the translator above."""
+    if not messages:
+        return
+    last = messages[-1]
+    content = last.get("content")
+    if isinstance(content, str):
+        last["content"] = [{"type": "text", "text": content,
+                            "cache_control": dict(CACHE_CONTROL)}]
+    elif isinstance(content, list) and content and isinstance(content[-1], dict):
+        content[-1]["cache_control"] = dict(CACHE_CONTROL)
+
+
 def _anthropic_request(request: dict, token: str, extra_headers: dict) -> tuple[str, dict, dict]:
     messages, system = _openai_messages_to_anthropic(
         request.get("messages") or [])
@@ -130,7 +148,12 @@ def _anthropic_request(request: dict, token: str, extra_headers: dict) -> tuple[
         "max_tokens": request.get("max_tokens") or 4096,
     }
     if system:
-        body["system"] = system
+        # Prompt-cache breakpoint on the system block (#74): anthropic caching
+        # is opt-in per request — without markers every call re-pays the whole
+        # conversation prefix at full input price (cache reads bill ~10%).
+        body["system"] = [{"type": "text", "text": system,
+                           "cache_control": dict(CACHE_CONTROL)}]
+    _tag_last_message(messages)
     if request.get("temperature") is not None:
         body["temperature"] = request["temperature"]
     tools = _openai_tools_to_anthropic(request.get("tools"))

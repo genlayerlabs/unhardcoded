@@ -178,8 +178,12 @@ async def test_anthropic_native_handler_translates_openai_shape():
     assert req["headers"]["anthropic-version"] == "2023-06-01"
     assert req["timeout"] == 12
     assert req["json"]["model"] == "claude-sonnet-4-6"
-    assert req["json"]["system"] == "Be terse."
-    assert req["json"]["messages"] == [{"role": "user", "content": "hi"}]
+    # system + last message carry prompt-cache breakpoints (#74): anthropic
+    # caching is opt-in per request; the router injects the markers
+    assert req["json"]["system"] == [{"type": "text", "text": "Be terse.",
+                                      "cache_control": {"type": "ephemeral"}}]
+    assert req["json"]["messages"] == [{"role": "user", "content": [
+        {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]}]
     assert req["json"]["tools"][0]["input_schema"]["required"] == ["id"]
 
 
@@ -564,9 +568,14 @@ async def test_anthropic_native_tool_roundtrip():
     assert sent[1]["content"][0] == {
         "type": "tool_use", "id": "call_1", "name": "lookup",
         "input": {"id": "abc"}}
-    # ...and the result is a tool_result keyed by that same id, not plain text.
+    # ...and the result is a tool_result keyed by that same id, not plain
+    # text. As the LAST message it carries the rolling prompt-cache
+    # breakpoint (#74) — in agentic loops the newest turn is almost always a
+    # tool result, which is precisely where the next call's cached prefix
+    # must end.
     assert sent[2] == {"role": "user", "content": [{
-        "type": "tool_result", "tool_use_id": "call_1", "content": "value=42"}]}
+        "type": "tool_result", "tool_use_id": "call_1", "content": "value=42",
+        "cache_control": {"type": "ephemeral"}}]}
 
 
 @pytest.mark.asyncio
