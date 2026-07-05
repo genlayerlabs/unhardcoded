@@ -83,3 +83,26 @@ def test_session_owner_binds_first_writer_wins(host_store_clean):
     seed_call(session="sidA", caller="keyB", ts=200)
     assert host_store.session_owner("sidA") == "keyA"
     assert host_store.session_owner(None) is None           # no session -> None, never raises
+
+
+def test_ingress_record_carries_session_to_the_ledger(host_store_clean):
+    """The per-session meter DERIVES from the ingress call ledger: a request
+    recorded with a session must make the sid resolvable (owner + totals).
+    Regression: the proxy built its event without `session`, every row landed
+    with session=NULL, and /v1/session/{sid} answered 404 for every consumer
+    even though the shim had pinned the session fine."""
+    import auth_proxy
+    import host_store
+
+    auth_proxy._record_request(
+        caller="keyZ", method="POST", path="/v1/chat/completions", status=200,
+        latency_ms=1.0, session="sid-ledger", provider="p", model_family="f",
+        served_model_id="m", served_by="p", requested_model=None,
+        tokens_in=5, tokens_out=2, tokens_total=7, tokens_cached=0,
+        cost_usd=0.001, key_sha256="ab" * 32)
+
+    assert host_store.session_owner("sid-ledger") == "keyZ"
+    totals = host_store.session_totals("sid-ledger")
+    assert totals["calls"] == 1
+    assert totals["tokens_in"] == 5
+    assert totals["tokens_out"] == 2

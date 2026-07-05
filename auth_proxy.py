@@ -3272,10 +3272,16 @@ async def proxy(path: str, request: Request) -> Response:
     decision_trace = None
     error_type = error_code = error_message = None
     record_in_finally = True
+    # The per-session meter DERIVES from this ledger (host_store.calls.session):
+    # without the sid recorded here, /v1/session/{sid} answers 404 for everyone
+    # even though the shim pinned the session fine. Same precedence as the shim:
+    # an explicit body `session` wins (szc sends it there); the
+    # X-Unhardcoded-Session header covers header-only clients (opencode plugin).
+    session_id = request.headers.get("x-unhardcoded-session")
 
     def _finish():
         latency_ms = round((time.perf_counter() - started) * 1000, 1)
-        _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
+        _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
         _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
 
     try:
@@ -3284,6 +3290,8 @@ async def proxy(path: str, request: Request) -> Response:
                 parsed_body = json.loads(body.decode("utf-8"))
                 if isinstance(parsed_body, dict):
                     requested_model = parsed_body.get("model")
+                    if parsed_body.get("session"):
+                        session_id = str(parsed_body.get("session"))
             except Exception:
                 pass
         upstream_req = _client.build_request(request.method, upstream_url, content=body, headers=headers)
