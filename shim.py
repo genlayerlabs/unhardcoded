@@ -37,6 +37,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
+import control_plane_client
 import host_store
 
 _log = logging.getLogger("unhardcoded.shim")
@@ -839,9 +840,31 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         sealed = {"role": "system", "content": _SEAL_PREFIX + summary}
         return {"messages": frozen + [sealed] + recent, "compacted": True}
 
+    async def _activate_tenant(request: Request) -> None:
+        """Load the caller tenant's BYO provider env into the request context.
+
+        The tenant id rides x-llm-router-tenant, stamped by the ingress ONLY
+        after key auth (client copies are stripped there). The fetched map is
+        activated on a ContextVar in THIS request's task context: asyncio tasks
+        created later in the request (streaming, flow nodes) copy it, and the
+        context dies with the request task, so no reset is needed and requests
+        can't see each other's credentials. Fail-soft: no/invalid header or a
+        fetch failure leaves the platform env in force."""
+        raw = request.headers.get("x-llm-router-tenant")
+        if not raw or not control_plane_client.enabled():
+            return
+        try:
+            tenant_id = int(raw)
+        except ValueError:
+            return
+        env = await control_plane_client.tenant_env(tenant_id)
+        if env:
+            control_plane_client.activate_tenant_env(env)
+
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest, request: Request):
         _session_from_header(req, request)
+        await _activate_tenant(request)
         return await _handle_chat(req)
 
     @app.post("/{profile_name}/v1/chat/completions")
@@ -854,6 +877,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         instead of a `profile:` model prefix.
         """
         _session_from_header(req, request)
+        await _activate_tenant(request)
         return await _handle_chat(req, profile_name=profile_name)
 
     def _session_from_header(req: ChatRequest, request: Request) -> None:
@@ -882,12 +906,14 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     @app.post("/v1/responses")
     async def responses(req: ResponsesRequest, request: Request):
         _session_from_header(req, request)
+        await _activate_tenant(request)
         return await _handle_responses(req)
 
     @app.post("/{profile_name}/v1/responses")
     async def responses_profiled(profile_name: str, req: ResponsesRequest,
                                  request: Request):
         _session_from_header(req, request)
+        await _activate_tenant(request)
         return await _handle_responses(req, profile_name=profile_name)
 
     def _responses_object_with_router(result: dict, req: ResponsesRequest,

@@ -378,13 +378,15 @@ def observe_route_call_async(row: dict[str, Any]) -> None:
     _enqueue(lambda: _insert_route_observation(snap))
 
 
-def recent_calls(limit: int = 100) -> list[dict[str, Any]]:
-    """The most recent calls, newest first (operator view / verification)."""
+def recent_calls(limit: int = 100, caller: "str | None" = None) -> list[dict[str, Any]]:
+    """The most recent calls, newest first (operator view / verification).
+    Optionally scoped to one caller (control-plane activity feed)."""
     try:
+        where, params = ("", []) if caller is None else (" WHERE caller = %s", [caller])
         with _get_pool().connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SELECT * FROM calls ORDER BY id DESC LIMIT %s",
-                            (int(limit),))
+                cur.execute(f"SELECT * FROM calls{where} ORDER BY id DESC LIMIT %s",
+                            params + [int(limit)])
                 return cur.fetchall()
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store recent_calls failed: %s", exc)
@@ -910,6 +912,38 @@ def usage_aggregate(since_ts: "int | None" = None, caller: "str | None" = None,
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store usage_aggregate failed: %s", exc)
         return _empty_usage_aggregate()
+
+
+def usage_totals(since_ts: "int | None" = None,
+                 caller: "str | None" = None) -> dict[str, Any]:
+    """One-row window totals over `calls`, including cached tokens (which the
+    dashboard aggregate doesn't sum) — the control-plane metering read.
+    Fail-soft -> zeros (same keys)."""
+    zeros = {"requests": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0,
+             "tokens_cached": 0, "tokens_total": 0, "cost_usd": 0.0, "priced": 0}
+    try:
+        where, params = _usage_where(since_ts=since_ts, caller=caller)
+        sql = (
+            "SELECT count(*),"
+            " count(*) FILTER (WHERE COALESCE(status,0) >= 400),"
+            " COALESCE(sum(COALESCE(tokens_in,0)),0),"
+            " COALESCE(sum(COALESCE(tokens_out,0)),0),"
+            " COALESCE(sum(COALESCE(tokens_cached,0)),0),"
+            " COALESCE(sum(CASE WHEN COALESCE(tokens_total,0) <> 0 THEN tokens_total"
+            " ELSE COALESCE(tokens_in,0)+COALESCE(tokens_out,0) END),0),"
+            " round(COALESCE(sum(GREATEST(cost_usd,0)),0)::numeric,6)::float8,"
+            " count(cost_usd)"
+            f" FROM calls{where}")
+        with _get_pool().connection() as conn:
+            row = conn.execute(sql, params).fetchone()
+        requests, errors, tin, tout, tcached, ttotal, cost, priced = row
+        return {"requests": int(requests), "errors": int(errors),
+                "tokens_in": int(tin), "tokens_out": int(tout),
+                "tokens_cached": int(tcached), "tokens_total": int(ttotal),
+                "cost_usd": float(cost), "priced": int(priced)}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store usage_totals failed: %s", exc)
+        return zeros
 
 
 def policy_backtest_groups(since_ts: "int | None" = None,

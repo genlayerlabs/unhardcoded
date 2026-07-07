@@ -27,6 +27,11 @@ services:
       ANTSEED_CONTROL_TOKEN: ${ANTSEED_CONTROL_TOKEN:-}
       # Operational store (router reads operator config from it). Prod = RDS.
       DATABASE_URL: ${DATABASE_URL:-postgresql://hoststore:hoststore@postgres:5432/hoststore}
+      # Optional external control plane: per-tenant BYO provider credentials
+      # (fetched by tenant id from the trusted x-llm-router-tenant header the
+      # ingress stamps). Both unset -> feature off, platform keys only.
+      CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-}
+      CONTROL_PLANE_INTERNAL_SECRET: ${CONTROL_PLANE_INTERNAL_SECRET:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -84,6 +89,11 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql://hoststore:hoststore@postgres:5432/hoststore}
       RATE_PER_MIN: ${RATE_PER_MIN:-600}
       BURST: ${BURST:-200}
+      # Optional external control plane: consumer-key resolve fallback plus the
+      # /internal/usage metering surface. Both unset -> feature off (/internal/*
+      # answers 404, unknown keys just 401).
+      CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-}
+      CONTROL_PLANE_INTERNAL_SECRET: ${CONTROL_PLANE_INTERNAL_SECRET:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DASHBOARD_KEY_ENV_PATH: /run/llm-router/.env.secrets
       # env_file carries the HOST path; inside the container the file is the

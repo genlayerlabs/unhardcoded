@@ -250,3 +250,44 @@ def test_route_stats_window_excludes_old_observations(store):
     seed_route_obs("p", "m", "stale", ok=True, ts=now - 20 * 60 * 1000)  # 20 min ago
     assert set(store.route_stats(window_ms=15 * 60 * 1000)) == {"p|m|fresh"}
     assert set(store.route_stats(window_ms=30 * 60 * 1000)) == {"p|m|fresh", "p|m|stale"}
+
+
+# ---- control-plane metering helpers ---------------------------------------
+
+def test_usage_totals_window_and_caller(store):
+    store.insert_call(_row(usage_event_id="a", caller="acme", ts=2_000_000,
+                           tokens_in=70, tokens_out=30, tokens_total=100,
+                           cost_usd=0.01))
+    store.insert_call(_row(usage_event_id="b", caller="acme", ts=2_000_100,
+                           status=500, tokens_in=10, tokens_out=0,
+                           tokens_total=0, cost_usd=None))
+    store.insert_call(_row(usage_event_id="c", caller="other", ts=2_000_100,
+                           tokens_in=999, tokens_out=999, tokens_total=1998,
+                           cost_usd=5.0))
+    store.insert_call(_row(usage_event_id="old", caller="acme", ts=1_000))
+    t = store.usage_totals(since_ts=1_500_000, caller="acme")
+    assert t["requests"] == 2 and t["errors"] == 1
+    assert t["tokens_in"] == 80 and t["tokens_out"] == 30
+    # tokens_total falls back to in+out when the stamped total is 0
+    assert t["tokens_total"] == 110
+    assert t["cost_usd"] == pytest.approx(0.01)
+    assert t["priced"] == 1        # the NULL-cost row is not counted as priced
+
+
+def test_usage_totals_includes_cached_tokens_and_fails_soft(store, monkeypatch):
+    store.insert_call(_row(tokens_cached=40, caller="acme"))
+    assert store.usage_totals(caller="acme")["tokens_cached"] == 40
+    monkeypatch.setattr(hs, "_get_pool", lambda: (_ for _ in ()).throw(RuntimeError("down")))
+    zeros = store.usage_totals(caller="acme")
+    assert zeros["requests"] == 0 and zeros["cost_usd"] == 0.0
+    assert set(zeros) == {"requests", "errors", "tokens_in", "tokens_out",
+                          "tokens_cached", "tokens_total", "cost_usd", "priced"}
+
+
+def test_recent_calls_caller_filter(store):
+    store.insert_call(_row(usage_event_id="a", caller="acme", ts=1))
+    store.insert_call(_row(usage_event_id="b", caller="other", ts=2))
+    store.insert_call(_row(usage_event_id="c", caller="acme", ts=3))
+    rows = store.recent_calls(caller="acme")
+    assert [r["usage_event_id"] for r in rows] == ["c", "a"]   # newest first
+    assert [r["usage_event_id"] for r in store.recent_calls()][0] == "c"
