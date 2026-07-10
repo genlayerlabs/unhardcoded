@@ -447,6 +447,12 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     async def wallet_reclaim_scan():
         return await _wallet_reclaim("scan", 95.0, with_wallet=False)
 
+    @app.post("/x/wallet/reclaim/set-operator")
+    async def wallet_reclaim_set_operator():
+        # One-time: assign the buyer wallet as its own deposits operator so
+        # requestClose/withdraw stop reverting NotAuthorized(). Moves no funds.
+        return await _wallet_reclaim("set-operator", 250.0, with_wallet=False)
+
     @app.post("/x/wallet/reclaim/request-close")
     async def wallet_reclaim_request_close():
         return await _wallet_reclaim("request-close", 250.0, with_wallet=False)
