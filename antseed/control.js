@@ -151,10 +151,11 @@ const server = http.createServer(async (req, res) => {
     return send(res, r.data.ok ? 200 : 502, r.data);
   }
 
-  // On-chain, one tx per eligible channel. Serialized with deposits/withdraws:
-  // concurrent buyer wallet txs would race the nonce.
-  if (req.method === 'POST' && (url === '/reclaim/request-close' || url === '/reclaim/withdraw')) {
-    const phase = url === '/reclaim/request-close' ? 'request-close' : 'withdraw';
+  // On-chain, one tx per eligible channel (set-operator is a single tx).
+  // Serialized with deposits/withdraws: concurrent buyer wallet txs race the nonce.
+  if (req.method === 'POST' && (url === '/reclaim/set-operator' || url === '/reclaim/request-close' || url === '/reclaim/withdraw')) {
+    const phase = url === '/reclaim/set-operator' ? 'set-operator'
+      : url === '/reclaim/request-close' ? 'request-close' : 'withdraw';
     return serialize(async () => {
       const r = await runReclaim(phase, RECLAIM_TX_TIMEOUT_MS);
       if (!r.data) {
