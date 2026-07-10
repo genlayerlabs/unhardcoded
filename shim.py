@@ -382,6 +382,15 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         return {"ok": True, "action": op, "amount": amount,
                 "wallet": await _refresh_antseed_wallet()}
 
+    @app.get("/x/wallet")
+    async def wallet_view():
+        # Read-only balance snapshot for the dashboard wallet panel (no on-chain
+        # tx). Falls back to a live refresh if the source cache is empty.
+        w = _antseed_wallet_view()
+        if w is None:
+            w = await _refresh_antseed_wallet()
+        return {"ok": True, "wallet": w}
+
     @app.post("/x/wallet/deposit")
     async def wallet_deposit(body: dict):
         return await _wallet_mutate("deposit", body)
