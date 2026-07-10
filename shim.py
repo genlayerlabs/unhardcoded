@@ -412,6 +412,49 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 pass
         return {"ok": True, "wallet": await _refresh_antseed_wallet()}
 
+    async def _wallet_reclaim(op: str, timeout: float, with_wallet: bool):
+        # Channel reclaim: recover USDC reserved in idle payment channels.
+        #   scan          read-only enumeration of on-chain reclaimable funds
+        #   request-close start the ~15-min on-chain challenge (one tx/channel)
+        #   withdraw      pull funds from channels whose window has elapsed
+        url, token = _wallet_control()
+        if not url:
+            return JSONResponse(status_code=503, content={"error": {
+                "message": "antseed wallet control not configured",
+                "type": "wallet_error", "code": "wallet_control_unavailable"}})
+        import httpx
+        try:
+            async with httpx.AsyncClient() as c:
+                r = await c.post(f"{url}/reclaim/{op}",
+                                 headers={"x-antseed-control-token": token}, timeout=timeout)
+        except httpx.HTTPError as e:
+            return JSONResponse(status_code=502, content={"error": {
+                "message": f"wallet control unreachable: {e}",
+                "type": "wallet_error", "code": "wallet_control_unreachable"}})
+        try:
+            payload = r.json() or {}
+        except Exception:  # noqa: BLE001
+            payload = {}
+        if r.status_code != 200:
+            detail = payload.get("error") or (r.text or "")[:300]
+            return JSONResponse(status_code=502, content={"error": {
+                "message": str(detail), "type": "wallet_error", "code": "reclaim_failed"}})
+        if with_wallet:
+            payload["wallet"] = await _refresh_antseed_wallet()
+        return payload
+
+    @app.post("/x/wallet/reclaim/scan")
+    async def wallet_reclaim_scan():
+        return await _wallet_reclaim("scan", 95.0, with_wallet=False)
+
+    @app.post("/x/wallet/reclaim/request-close")
+    async def wallet_reclaim_request_close():
+        return await _wallet_reclaim("request-close", 250.0, with_wallet=False)
+
+    @app.post("/x/wallet/reclaim/withdraw")
+    async def wallet_reclaim_withdraw():
+        return await _wallet_reclaim("withdraw", 250.0, with_wallet=True)
+
     @app.get("/healthz")
     def healthz():
         info = host.info()
