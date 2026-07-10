@@ -16,11 +16,19 @@ const { Pool } = require('pg');
 const { pgConfig } = require('./db.js');
 const { UPSERT_BUYER_STATUS, buyerStatusRow } = require('./store.js');
 
+const path = require('path');
+
 const PORT = parseInt(process.env.ANTSEED_CONTROL_PORT || '8379', 10);
 const TOKEN = process.env.ANTSEED_CONTROL_TOKEN || '';
 const PID = process.env.ANTSEED_BUYER_PID || 'antseed';
 const DEPOSIT_TIMEOUT_MS = 120000; // on-chain tx
 const STATUS_TIMEOUT_MS = 30000;
+// Channel reclaim runs @antseed/node's ChannelsClient via reclaim.mjs (no CLI
+// verb exists). Scans are read-only RPC; request-close/withdraw send one tx per
+// channel, so the on-chain phases get the longer, deposit-grade budget.
+const RECLAIM_PATH = path.join(__dirname, 'reclaim.mjs');
+const RECLAIM_SCAN_TIMEOUT_MS = 90000;
+const RECLAIM_TX_TIMEOUT_MS = 240000;
 
 // One pool for the long-lived control server (write-status.js, the poll-loop
 // twin, is one-shot and uses a plain Client instead).
@@ -43,6 +51,21 @@ function run(args, timeout) {
       (err, stdout, stderr) => {
         resolve({ code: err ? (err.code || 1) : 0,
                   stdout: String(stdout || ''), stderr: String(stderr || '') });
+      });
+  });
+}
+
+// Run reclaim.mjs <phase> and parse its single-JSON-object stdout. The script
+// always emits a JSON envelope (even on error), so a non-JSON stdout means the
+// node process itself died (import/crash) — surfaced as a 502 by the caller.
+function runReclaim(phase, timeout) {
+  return new Promise((resolve) => {
+    execFile('node', [RECLAIM_PATH, phase], { timeout, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        let data = null;
+        try { data = JSON.parse(String(stdout || '')); } catch (_) {}
+        resolve({ code: err ? (err.code || 1) : 0, data,
+                  stderr: String(stderr || ''), stdout: String(stdout || '') });
       });
   });
 }
@@ -117,6 +140,30 @@ const server = http.createServer(async (req, res) => {
     const status = await refreshStatus();
     if (!status) return send(res, 502, { ok: false, error: 'status unavailable' });
     return send(res, 200, { ok: true, status });
+  }
+
+  // Read-only: enumerate payment channels and their on-chain reclaimable USDC.
+  if (req.method === 'POST' && url === '/reclaim/scan') {
+    const r = await runReclaim('list', RECLAIM_SCAN_TIMEOUT_MS);
+    if (!r.data) {
+      return send(res, 502, { ok: false, error: (r.stderr || 'reclaim scan failed').slice(0, 600) });
+    }
+    return send(res, r.data.ok ? 200 : 502, r.data);
+  }
+
+  // On-chain, one tx per eligible channel. Serialized with deposits/withdraws:
+  // concurrent buyer wallet txs would race the nonce.
+  if (req.method === 'POST' && (url === '/reclaim/request-close' || url === '/reclaim/withdraw')) {
+    const phase = url === '/reclaim/request-close' ? 'request-close' : 'withdraw';
+    return serialize(async () => {
+      const r = await runReclaim(phase, RECLAIM_TX_TIMEOUT_MS);
+      if (!r.data) {
+        return send(res, 502, { ok: false, error: (r.stderr || 'reclaim ' + phase + ' failed').slice(0, 600) });
+      }
+      // A fresh status write so the router picks up the freed escrow on withdraw.
+      if (phase === 'withdraw') { try { await refreshStatus(); } catch (_) {} }
+      return send(res, r.data.ok ? 200 : 502, r.data);
+    });
   }
 
   return send(res, 404, { ok: false, error: 'not found' });
