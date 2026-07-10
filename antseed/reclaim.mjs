@@ -54,6 +54,12 @@ async function main() {
 
   const channels = [];
   let reclaimableTotal = 0n;
+  // On-chain channel status (AntseedChannels enum): 0 missing, 1 active,
+  // 2 settled, 3 timeout. Only ACTIVE channels still hold reservable buyer
+  // funds; settled/timeout channels already returned their remainder to
+  // depositsAvailable, so their historical deposit-settled is NOT reclaimable
+  // (a requestClose/withdraw there just reverts). Count them for transparency.
+  const skipped = { settled: 0, timeout: 0, other: 0 };
 
   for (const s of sessions) {
     const id = s.sessionId;
@@ -68,20 +74,24 @@ async function main() {
       continue;
     }
 
+    const status = Number(info.status);
+    if (status !== 1) {
+      if (status === 2) skipped.settled++;
+      else if (status === 3) skipped.timeout++;
+      else skipped.other++;
+      continue;
+    }
+
     const deposit = big(info.deposit);
     const settled = big(info.settled);
     const closeRequestedAt = big(info.closeRequestedAt);
     const remaining = deposit > settled ? deposit - settled : 0n; // buyer's reclaimable upper bound
 
-    // Nothing left on-chain (already withdrawn / never funded) and no pending
-    // close — drop it from the view entirely.
-    if (deposit === 0n && closeRequestedAt === 0n) continue;
-
     rec.deposit = formatUsdc(deposit);
     rec.settled = formatUsdc(settled);
     rec.reclaimable = formatUsdc(remaining);
     rec.closeRequested = closeRequestedAt > 0n;
-    rec.onchainStatus = Number(info.status);
+    rec.onchainStatus = status;
     reclaimableTotal += remaining;
 
     if (PHASE === 'request-close') {
@@ -125,6 +135,7 @@ async function main() {
     address,
     reclaimableTotal: formatUsdc(reclaimableTotal),
     count: channels.length,
+    skipped, // settled/timeout channels: already returned funds, not reclaimable
     channels,
   });
 }
