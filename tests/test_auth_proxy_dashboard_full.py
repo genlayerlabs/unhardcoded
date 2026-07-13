@@ -8,7 +8,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -99,6 +101,164 @@ def test_route_allowed_accepts_all_alias(monkeypatch):
     monkeypatch.setattr(auth_proxy, "_consumer_meta", lambda caller: {"allowed_routes": ["all"]})
     assert auth_proxy._route_allowed("admin2", "profile:edge") is True
     assert auth_proxy._route_allowed("admin2", "openai/gpt-5.5") is True
+    assert auth_proxy._route_allowed("admin2", "operation:compact") is True
+
+
+def test_compaction_has_server_owned_operation_route(monkeypatch):
+    body = json.dumps({"model": "profile:edge"}).encode()
+    assert auth_proxy._requested_route_from("v1/compact", body) == "operation:compact"
+    assert auth_proxy._requested_route_from("/v1/compact", body) == "operation:compact"
+
+    monkeypatch.setattr(
+        auth_proxy,
+        "_consumer_meta",
+        lambda caller: {"allowed_routes": ["operation:compact"]},
+    )
+    assert auth_proxy._route_allowed("runtime", "operation:compact") is True
+    assert auth_proxy._route_allowed("runtime", "profile:edge") is False
+
+
+def _streaming_request(chunks, *, content_length=None, observed=None):
+    pending = list(chunks)
+
+    async def receive():
+        if observed is not None:
+            observed.append("receive")
+        chunk = pending.pop(0)
+        return {
+            "type": "http.request",
+            "body": chunk,
+            "more_body": bool(pending),
+        }
+
+    headers = []
+    if content_length is not None:
+        headers.append((b"content-length", str(content_length).encode("ascii")))
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/compact",
+        "raw_path": b"/v1/compact",
+        "query_string": b"",
+        "headers": headers,
+        "client": ("test", 1),
+        "server": ("test", 80),
+    }
+    return Request(scope, receive)
+
+
+@pytest.mark.asyncio
+async def test_ingress_body_limit_accepts_exact_declared_and_chunked_size(monkeypatch):
+    monkeypatch.setattr(auth_proxy, "MAX_REQUEST_BODY_BYTES", 5)
+    declared = _streaming_request([b"12345"], content_length=5)
+    chunked = _streaming_request([b"12", b"345"])
+
+    assert await auth_proxy._read_request_body(declared) == b"12345"
+    assert await auth_proxy._read_request_body(chunked) == b"12345"
+
+
+@pytest.mark.asyncio
+async def test_ingress_body_limit_rejects_declared_and_chunked_overflow(monkeypatch):
+    monkeypatch.setattr(auth_proxy, "MAX_REQUEST_BODY_BYTES", 5)
+    declared = _streaming_request([b"ignored"], content_length=6)
+    chunked = _streaming_request([b"12", b"3456"])
+
+    with pytest.raises(auth_proxy._RequestBodyTooLarge):
+        await auth_proxy._read_request_body(declared)
+    with pytest.raises(auth_proxy._RequestBodyTooLarge):
+        await auth_proxy._read_request_body(chunked)
+
+
+@pytest.mark.asyncio
+async def test_server_owned_route_denial_does_not_consume_request_stream(monkeypatch):
+    observed = []
+    request = _streaming_request([b'{"messages":[]}'], observed=observed)
+    monkeypatch.setattr(
+        auth_proxy, "_caller_auth",
+        lambda _token: {"ok": True, "caller": "restricted", "digest": "a" * 64})
+    monkeypatch.setattr(auth_proxy, "_route_allowed", lambda _caller, _route: False)
+    monkeypatch.setattr(
+        auth_proxy, "_rate_ok",
+        lambda _caller: pytest.fail("a denied operation must not consume rate"))
+    monkeypatch.setattr(auth_proxy, "_record_reject", lambda **_row: None)
+    monkeypatch.setattr(auth_proxy, "_log", lambda _row: None)
+
+    response = await auth_proxy.proxy("v1/compact", request)
+
+    assert response.status_code == 403
+    assert observed == []
+
+
+@pytest.mark.parametrize("path", ["v1/compact", "v1/chat/completions"])
+@pytest.mark.asyncio
+async def test_rate_limited_request_does_not_consume_request_stream(
+    monkeypatch, path,
+):
+    observed = []
+    request = _streaming_request([b'{"model":"profile:edge"}'], observed=observed)
+    monkeypatch.setattr(
+        auth_proxy, "_caller_auth",
+        lambda _token: {"ok": True, "caller": "limited", "digest": "b" * 64})
+    monkeypatch.setattr(auth_proxy, "_route_allowed", lambda _caller, _route: True)
+    monkeypatch.setattr(auth_proxy, "_rate_ok", lambda _caller: False)
+    monkeypatch.setattr(auth_proxy, "_record_reject", lambda **_row: None)
+    monkeypatch.setattr(auth_proxy, "_log", lambda _row: None)
+
+    response = await auth_proxy.proxy(path, request)
+
+    assert response.status_code == 429
+    assert observed == []
+
+
+def test_ingress_body_limit_returns_structured_413(monkeypatch):
+    recorded = []
+    monkeypatch.setattr(auth_proxy, "MAX_REQUEST_BODY_BYTES", 5)
+    monkeypatch.setattr(
+        auth_proxy,
+        "_caller_auth",
+        lambda _token: {"ok": True, "caller": "runtime", "digest": "abc"},
+    )
+    monkeypatch.setattr(auth_proxy, "_record_reject", lambda **row: recorded.append(row))
+    monkeypatch.setattr(auth_proxy, "_log", lambda _row: None)
+
+    response = TestClient(auth_proxy.app).post(
+        "/v1/compact",
+        headers={"authorization": "Bearer test"},
+        content=b"123456",
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_body_too_large"
+    assert recorded == [{
+        "reason": "request_body_too_large",
+        "path": "/v1/compact",
+        "caller": "runtime",
+        "status": 413,
+    }]
+
+
+def test_compact_ingress_uses_the_smaller_server_owned_body_limit(monkeypatch):
+    monkeypatch.setattr(auth_proxy, "MAX_REQUEST_BODY_BYTES", 100)
+    monkeypatch.setattr(auth_proxy, "_MAX_COMPACT_REQUEST_BYTES", 5)
+    monkeypatch.setattr(
+        auth_proxy, "_caller_auth",
+        lambda _token: {"ok": True, "caller": "runtime", "digest": "c" * 64})
+    monkeypatch.setattr(auth_proxy, "_route_allowed", lambda _caller, _route: True)
+    monkeypatch.setattr(auth_proxy, "_rate_ok", lambda _caller: True)
+    monkeypatch.setattr(auth_proxy, "_record_reject", lambda **_row: None)
+    monkeypatch.setattr(auth_proxy, "_log", lambda _row: None)
+
+    response = TestClient(auth_proxy.app).post(
+        "/v1/compact",
+        headers={"authorization": "Bearer test"},
+        content=b"123456",
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_body_too_large"
 
 
 def test_dashboard_health_summary_uses_synthetic_route_health_when_no_chat_requests():
@@ -372,15 +532,16 @@ def test_policy_catalog_uses_policy_files_and_router_rank():
     catalog = auth_proxy._policy_catalog_snapshot()
     profiles = {row["name"]: row for row in catalog["profiles"]}
 
-    # No tiers: the catalog has only the declarative `default` fallback policy
-    # (callers send their own per-call policy_ir). It is declarative, not a
-    # closure file, so there are no policy_files.
-    assert list(profiles) == ["default"]
+    # Both operator-owned profiles are declarative config entries rather than
+    # closure files, so there are no policy_files.
+    assert set(profiles) == {"compact", "default"}
     assert catalog["source"].endswith("config.live.lua")
     assert catalog["metrics_source"].endswith("metrics.live.lua")
     assert catalog["policy_files"] == []
     assert profiles["default"]["candidate_count"] > 0
     assert "router.rank" in profiles["default"]["selection_note"]
+    assert profiles["compact"]["candidate_count"] > 0
+    assert "router.rank" in profiles["compact"]["selection_note"]
 
 
 class _FakeRouteResponse:
@@ -524,6 +685,12 @@ def test_host_enforces_consumer_inactive_allowed_routes_and_rate_limits(monkeypa
         assert blocked.status_code == 403
         assert blocked.json()["error"]["code"] == "caller_route_not_allowed"
 
+        # A body-addressed denial is known only after its upload was consumed,
+        # so it spends the rate slot. Path-owned operations such as compact are
+        # rejected before body/rate in the dedicated test above.
+        spent = client.post("/v1/chat/completions", headers=headers, json={"model": "profile:edge", "messages": []})
+        assert spent.status_code == 429
+        auth_proxy._windows.clear()
         ok = client.post("/v1/chat/completions", headers=headers, json={"model": "profile:edge", "messages": []})
         assert ok.status_code == 200
         limited = client.post("/v1/chat/completions", headers=headers, json={"model": "profile:edge", "messages": []})
@@ -1443,6 +1610,213 @@ def test_proxy_records_tokens_and_cost_from_streamed_response(monkeypatch):
     assert rows[0]["cost_usd"] == 0.002
     assert rows[0]["provider"] == "openrouter"
     assert counter["cost_usd"] == 0.002
+
+
+def test_proxy_records_v3_compaction_usage_and_router_metadata_in_ledger(
+        monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    payload = {
+        "contract_version": 3,
+        "compacted": True,
+        "reason": "compacted",
+        "summary": "sealed",
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "prompt_tokens_details": {"cached_tokens": 80},
+        },
+        "x_router": {
+            "provider": "openrouter",
+            "model_family": "summarizer",
+            "served_model_id": "provider/summarizer",
+            "served_by": "peer-1",
+            "tokens_cached": 80,
+            "cost_usd": 0.002,
+            "cost_basis": "reported",
+        },
+    }
+
+    class FakeUpstreamResponse:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        async def aread(self):
+            return json.dumps(payload).encode()
+
+        async def aclose(self):
+            pass
+
+    class FakeClient:
+        def __init__(self):
+            self.request = None
+
+        def build_request(self, method, url, content=None, headers=None):
+            self.request = method, url, content, headers
+            return self.request
+
+        async def send(self, req, stream=True):
+            return FakeUpstreamResponse()
+
+    ledger_rows = []
+    digest = "a" * 64
+    fake_client = FakeClient()
+    monkeypatch.setattr(
+        auth_proxy, "_caller_auth",
+        lambda _token: {"ok": True, "caller": "compact-spender", "digest": digest})
+    monkeypatch.setattr(
+        auth_proxy,
+        "_consumer_meta",
+        lambda _caller: {"allowed_routes": ["operation:compact"]},
+    )
+    monkeypatch.setattr(auth_proxy, "_rate_ok", lambda *_args: True)
+    monkeypatch.setattr(auth_proxy, "_client", fake_client)
+
+    def persist(row):
+        ledger_rows.append(dict(row))
+        host_store.insert_call(row)
+
+    monkeypatch.setattr(host_store, "insert_call_async", persist)
+
+    client = TestClient(auth_proxy.app)
+    r = client.post(
+        "/v1/compact",
+        headers={
+            "Authorization": "Bearer k",
+            "X-LLM-Router-Caller": "attacker-controlled",
+        },
+        json={
+            "contract_version": 3,
+            "messages": [
+                {"role": "user", "content": "compact"},
+                {"role": "assistant", "content": "ready"},
+            ],
+            "session": "sid-compact",
+        },
+    )
+
+    assert r.status_code == 200
+    assert r.json() == payload
+    assert len(ledger_rows) == 1
+    row = ledger_rows[0]
+    assert row["event"] == "request"
+    assert row["path"] == "/v1/compact"
+    assert row["route"] == "operation:compact"
+    assert row["requested_model"] == "operation:compact"
+    assert row["caller"] == "compact-spender"
+    assert row["session"] == "sid-compact"
+    assert row["tokens_in"] == 100
+    assert row["tokens_out"] == 20
+    assert row["tokens_total"] == 120
+    assert row["tokens_cached"] == 80
+    assert row["provider"] == "openrouter"
+    assert row["model_family"] == "summarizer"
+    assert row["served_model_id"] == "provider/summarizer"
+    assert row["served_by"] == "peer-1"
+    assert row["cost_usd"] == 0.002
+    assert row["cost_basis"] == "reported"
+    assert row["key_sha256"] == digest
+    assert fake_client.request[3]["x-llm-router-caller"] == "compact-spender"
+
+    [persisted] = host_store.usage_rows(caller="compact-spender")
+    assert persisted["requested_model"] == "operation:compact"
+    assert persisted["tokens_total"] == 120
+    assert persisted["cost_usd"] == 0.002
+
+
+def test_proxy_records_http_200_compaction_noop_as_durable_error(
+        monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    payload = {
+        "contract_version": 3,
+        "compacted": False,
+        "reason": "router_failed",
+        "usage": None,
+        "x_router": {
+            "provider": "openrouter",
+            "model_family": "summarizer",
+            "served_model_id": "provider/summarizer",
+            "served_by": "openrouter",
+            "cost_usd": 0.001,
+            "cost_basis": "computed",
+            "decision_trace": {"policy_fingerprint": "compact-policy"},
+        },
+    }
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        async def aread(self):
+            return json.dumps(payload).encode()
+
+        async def aclose(self):
+            pass
+
+    class Client:
+        def build_request(self, method, url, content=None, headers=None):
+            return method, url, content, headers
+
+        async def send(self, _request, stream=True):
+            return Response()
+
+    digest = "c" * 64
+    monkeypatch.setattr(
+        auth_proxy, "_caller_auth",
+        lambda _token: {"ok": True, "caller": "compact-failure", "digest": digest})
+    monkeypatch.setattr(
+        auth_proxy, "_consumer_meta",
+        lambda _caller: {"allowed_routes": ["operation:compact"]})
+    monkeypatch.setattr(auth_proxy, "_rate_ok", lambda *_args: True)
+    monkeypatch.setattr(auth_proxy, "_client", Client())
+    monkeypatch.setattr(host_store, "insert_call_async", host_store.insert_call)
+
+    response = TestClient(auth_proxy.app).post(
+        "/v1/compact",
+        headers={"Authorization": "Bearer k"},
+        json={
+            "contract_version": 3,
+            "messages": [
+                {"role": "user", "content": "old request"},
+                {"role": "assistant", "content": "old answer"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == payload
+    [row] = host_store.usage_rows(caller="compact-failure")
+    assert row["status"] == 200
+    assert row["error_type"] == "compact:router_failed"
+    assert row["cost_usd"] == 0.001
+    assert host_store.usage_aggregate()["totals"]["errors"] == 1
+    with auth_proxy._stats_lock:
+        recent = next(row for row in auth_proxy._stats["recent"]
+                      if row.get("caller") == "compact-failure")
+        counter = auth_proxy._stats["by_caller"]["compact-failure"]
+    assert recent["error_code"] == "router_failed"
+    assert recent["decision_trace"] == {"policy_fingerprint": "compact-policy"}
+    assert counter["errors"] == 1
+
+
+def test_record_request_prefers_server_owned_operation_route(monkeypatch):
+    rows = []
+    monkeypatch.setattr(host_store, "insert_call_async", rows.append)
+
+    auth_proxy._record_request(
+        caller="compact-spender",
+        method="POST",
+        path="/v1/compact",
+        route="operation:compact",
+        requested_model="profile:attacker-label",
+        status=422,
+        latency_ms=1,
+        key_sha256="b" * 64,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["route"] == "operation:compact"
+    assert rows[0]["requested_model"] == "operation:compact"
 
 
 # ---- provider key reveal -----------------------------------------------------

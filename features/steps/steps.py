@@ -462,53 +462,44 @@ def step_rankings_identical(context, a, b):
 
 # ---- agent compaction steps (11_agent_compact.feature) --------------------
 
-def _seal_via_ollama_policy():
-    # route the summary to the local ollama model: free, reliable, no rate-limit
-    return ["policy",
-            ["and", ["meets_req"], ["not", ["is", "disabled"]],
-                    ["family_eq", OLLAMA_LOCAL_MODEL]],
-            ["neg", ["normalize", ["field", "price_in"]]],
-            ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
-
-
-@given('a long agent conversation sealable by the local model')
+@given('newly-aged complete interactions sealable by the local model')
 def step_long_convo(context):
     # skip unless the local ollama route is actually serving (sidecar up + model)
     _chat_family(context, OLLAMA_LOCAL_MODEL)
     if _no_ollama_route(context):
-        context.scenario.skip("local Ollama not serving (needed as the seal model)")
-    sys0 = {"role": "system", "content": "You are a coding agent. <skill + tools + rules>"}
+        reason = "local Ollama not serving (needed as the seal model)"
+        if _os.getenv("REQUIRE_COMPACT_BDD") == "1":
+            raise AssertionError(
+                reason + "; REQUIRE_COMPACT_BDD=1 forbids skipping this flow")
+        context.scenario.skip(reason)
     convo = []
-    for i in range(10):
+    for i in range(6):
         convo.append({"role": "user", "content": f"step {i}: please continue the task"})
         convo.append({"role": "assistant", "content": f"did step {i}"})
-    context.compact_input = [sys0] + convo
+    context.compact_input = convo
 
 
-@when('the agent compacts its context keeping the last {keep:d} turns')
-def step_compact(context, keep):
-    context.compact_keep = keep
+@when('the agent requests an aged-context summary')
+def step_compact(context):
     _do(context, "POST", "/v1/compact", auth="consumer", body={
+        "contract_version": 3,
         "messages": context.compact_input,
-        "keep_recent": keep,
-        "policy_ir": _seal_via_ollama_policy(),
+        # The Compose router owns a zero-price Ollama-only compact profile. This
+        # request only narrows that profile to the same documented test family.
+        "requirements": {"model_family": OLLAMA_LOCAL_MODEL},
     })
     assert context.resp.status_code == 200, context.resp_text[:300]
 
 
-@then('the context is compacted')
+@then('the summary is compacted')
 def step_is_compacted(context):
     j = context.json or {}
     assert j.get("compacted") is True, f"not compacted: {context.resp_text[:300]}"
-    assert len(j["messages"]) < len(context.compact_input), "no length reduction"
 
 
-@then('the system prefix is preserved')
-def step_prefix_preserved(context):
-    assert context.json["messages"][0] == context.compact_input[0], "prefix changed"
-
-
-@then('the last {keep:d} turns are preserved verbatim')
-def step_tail_preserved(context, keep):
-    assert context.json["messages"][-keep:] == context.compact_input[-keep:], \
-        "recent tail not verbatim"
+@then('the response contains only raw summary output')
+def step_summary_only(context):
+    j = context.json or {}
+    assert isinstance(j.get("summary"), str) and j["summary"].strip(), j
+    assert "messages" not in j, "router reconstructed caller context"
+    assert "manifest" not in j, "obsolete layout manifest returned"

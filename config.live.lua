@@ -30,6 +30,21 @@ local function mfield(name, sort, default)
              end }
 end
 
+-- The compact profile's hard cost ceiling must observe the quoted billing
+-- price, not a ranking price after operator scarcity/multiplier adjustments.
+-- Subscription-backed Codex routes bill per request at zero; other routes use
+-- the raw quote stamped by the host, with the effective price only as a legacy
+-- fallback for candidates produced by older hosts.
+local function billing_price(name)
+    return { sort = "Num", default = 1e9, group = "route",
+             get = function(c)
+                 if c.api_kind == "openai_codex" then return 0 end
+                 local raw = c["raw_" .. name]
+                 if raw ~= nil then return raw end
+                 return c[name]
+             end }
+end
+
 return {
 
     providers = {
@@ -402,6 +417,42 @@ return {
             selector     = "argmax",
             retry_policy = "balanced",
         },
+
+        -- Auxiliary summaries are routed by an operator-owned profile. The
+        -- public compact contract may narrow requirements but cannot supply a
+        -- policy term that escapes this cost envelope.
+        compact = {
+            policy_ir = { "policy",
+                { "and",
+                    { "meets_req" },
+                    { "not", { "is", "disabled" } },
+                    { "cmp", "bench_intelligence", "ge", 0.35 },
+                    { "cmp", "billing_price_in", "ge", 0.0 },
+                    { "cmp", "billing_price_in", "le", 1.0 },
+                    { "cmp", "billing_price_out", "ge", 0.0 },
+                    { "cmp", "billing_price_out", "le", 5.0 },
+                    -- Marketplace summaries carry conversation history. A
+                    -- generic operator profile admits AntSeed only after its
+                    -- route has earned a high reputation; deployments may
+                    -- replace this whole server-side profile with a stricter
+                    -- vetted-peer policy.
+                    { "or",
+                        { "not", { "provider_eq", "antseed" } },
+                        { "cmp", "reputation_score", "gt", 95 },
+                    },
+                },
+                { "add",
+                    { "scale", 0.75, { "neg", { "normalize", { "field", "price_in" } } } },
+                    { "scale", 0.15, { "neg", { "normalize", { "field", "price_out" } } } },
+                    { "scale", 0.10, { "field", "success_rate" } },
+                },
+                { "argmax" },
+                { "id" },
+                -- One auxiliary summary means at most one provider attempt.
+                -- Ordinary chat keeps its richer fallback policy.
+                { "always", { action = "abort" } },
+            },
+        },
     },
 
     retry_policies = {
@@ -441,6 +492,8 @@ return {
     -- cmp(bench_intelligence, ge, 0.6), is(in_image), field(bench_coding).
     -- Missing family/trait falls back to the conservative default.
     fields = {
+        billing_price_in       = billing_price("price_in"),
+        billing_price_out      = billing_price("price_out"),
         bench_intelligence     = mfield("bench_intelligence",     "Num",  0),
         bench_coding           = mfield("bench_coding",           "Num",  0),
         bench_agentic          = mfield("bench_agentic",          "Num",  0),

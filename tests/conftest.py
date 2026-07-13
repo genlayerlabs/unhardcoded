@@ -112,7 +112,7 @@ def seed_peer_offers(peers, observed_at=None):
 
 def seed_call(session=None, provider=None, family=None, served_by=None, status=200,
               caller=None, tokens_in=0, tokens_out=0, tokens_cached=0, cost_usd=0.0,
-              ts=None):
+              ts=None, route=None, error_type=None):
     """Insert one per-request `calls` row (as the ingress would), the raw the
     per-session views (hot_route / session_*) derive from. ts in SECONDS."""
     import time
@@ -120,6 +120,7 @@ def seed_call(session=None, provider=None, family=None, served_by=None, status=2
         "ts": int(time.time()) if ts is None else ts,
         "session": session, "provider": provider, "model_family": family,
         "served_by": served_by, "served_model_id": served_by, "status": status,
+        "route": route, "error_type": error_type,
         "caller": caller, "key_sha256": None, "tokens_in": tokens_in,
         "tokens_out": tokens_out, "tokens_total": tokens_in + tokens_out,
         "tokens_cached": tokens_cached, "cost_usd": cost_usd})

@@ -266,12 +266,17 @@ def insert_call(row: dict[str, Any]) -> None:
         family = row.get("model_family")
         served = row.get("served_model_id")
         sha = row.get("key_sha256")
+        # `route` is the caller-facing, ingress-authorized identity. Reuse the
+        # existing requested_model column rather than adding a second durable
+        # field; auxiliary operations therefore survive restarts without storing
+        # another copy of the request or trusting a body-supplied model label.
+        requested_route = row.get("route") or row.get("requested_model")
         values = (
             int(row.get("ts") or time.time()),
             row.get("usage_event_id"), row.get("session"),
             sha if isinstance(sha, str) else None,
             row.get("caller"), _route_key(provider, family, served),
-            provider, family, served, row.get("requested_model"),
+            provider, family, served, requested_route,
             int(row["status"]) if str(row.get("status") or "").isdigit() else None,
             row.get("error_type"),
             float(row["latency_ms"]) if row.get("latency_ms") is not None else None,
@@ -613,6 +618,7 @@ def hot_route(session: "str | None") -> "str | None":
             row = conn.execute(
                 "SELECT provider_id, model_family, served_by FROM calls"
                 " WHERE session_id = %s AND status < 400 AND served_by IS NOT NULL"
+                " AND (requested_model IS NULL OR requested_model NOT LIKE 'operation:%%')"
                 " ORDER BY ts DESC, id DESC LIMIT 1", (session,)).fetchone()
             return f"{row[0]}|{row[1]}|{row[2]}" if row else None
     except Exception as exc:  # noqa: BLE001
@@ -650,6 +656,7 @@ def session_warm(session: "str | None") -> list[dict[str, Any]]:
                 "SELECT DISTINCT ON (model_family) model_family, provider_id, served_by"
                 " FROM calls WHERE session_id = %s AND status < 400"
                 " AND model_family IS NOT NULL"
+                " AND (requested_model IS NULL OR requested_model NOT LIKE 'operation:%%')"
                 " ORDER BY model_family, ts DESC, id DESC", (session,))
             return [{"family": f, "provider": p, "served_by": s or p}
                     for f, p, s in cur.fetchall()]
@@ -826,7 +833,7 @@ def usage_rows_page(since_ts: "int | None" = None, caller: "str | None" = None,
 #   * rejects are never persisted to `calls`, so they don't appear here.
 
 _AGG_INNER = (
-    "SELECT id, ts, status, tokens_in, tokens_out, tokens_total, cost_usd,"
+    "SELECT id, ts, status, error_type, tokens_in, tokens_out, tokens_total, cost_usd,"
     " requested_model, model_family, provider_id,"
     " COALESCE(NULLIF(caller,''),'unknown') AS caller_k,"
     " COALESCE(NULLIF(provider_id,''),'unknown') AS provider_k,"
@@ -841,7 +848,8 @@ _AGG_INNER = (
 
 _AGG_MEASURES = (
     " count(*) AS requests,"
-    " count(*) FILTER (WHERE COALESCE(status,0) >= 400) AS errors,"
+    " count(*) FILTER (WHERE COALESCE(status,0) >= 400"
+    " OR NULLIF(error_type,'') IS NOT NULL) AS errors,"
     " COALESCE(sum(COALESCE(tokens_in,0)),0) AS tokens_in,"
     " COALESCE(sum(COALESCE(tokens_out,0)),0) AS tokens_out,"
     " COALESCE(sum(CASE WHEN COALESCE(tokens_total,0) <> 0 THEN tokens_total"
@@ -1070,7 +1078,8 @@ def usage_connections(since_ts: "int | None" = None,
         with _get_pool().connection() as conn:
             cur = conn.execute(
                 "SELECT caller_k, prefix_k, count(*),"
-                " count(*) FILTER (WHERE COALESCE(status,0) >= 400),"
+                " count(*) FILTER (WHERE COALESCE(status,0) >= 400"
+                " OR NULLIF(error_type,'') IS NOT NULL),"
                 " min(ts), max(ts)"
                 f" FROM ({_AGG_INNER}{where}) c GROUP BY caller_k, prefix_k",
                 params)

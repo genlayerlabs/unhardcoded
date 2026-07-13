@@ -59,6 +59,7 @@ def _seed(n: int = 300) -> None:
         cost = {"stamped": round(rng.uniform(0.0, 0.01), 6),
                 "neg": -1.0, "none": None}[kind]
         tin, tout = rng.randrange(0, 5000), rng.randrange(0, 3000)
+        status = 200 if i == 0 else rng.choice([200, 200, 200, 200, 400, 500, 429])
         host_store.insert_call({
             "ts": BASE_TS + i * 3517,  # ~12 days of spread
             "usage_event_id": f"ev-{i}",
@@ -67,7 +68,8 @@ def _seed(n: int = 300) -> None:
             "model_family": fam,
             "served_model_id": f"{fam}-served" if fam else None,
             "requested_model": rng.choice(["profile:edge", "profile:medium", None]),
-            "status": rng.choice([200, 200, 200, 200, 400, 500, 429]),
+            "status": status,
+            "error_type": "compact:router_failed" if i == 0 else None,
             "latency_ms": rng.uniform(1, 250),
             "tokens_in": tin, "tokens_out": tout,
             "tokens_total": rng.choice([tin + tout, 0, None]),
@@ -222,7 +224,7 @@ def test_provider_and_connection_rollups_match_python_fold(host_store_clean, mon
             "last_status": None, "last_route": None, "last_provider": None})
         ts = int(row.get("ts") or 0)
         item["requests"] += 1
-        if int(row.get("status") or 0) >= 400:
+        if auth_proxy._request_is_error(row):
             item["errors"] += 1
         item["first_seen"] = ts if not item["first_seen"] else min(item["first_seen"], ts)
         if not item["last_seen"] or ts >= item["last_seen"]:

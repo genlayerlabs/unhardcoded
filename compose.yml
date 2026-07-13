@@ -34,11 +34,13 @@ services:
       - python
       - serve.py
       - --config
-      - config.live.lua
+      - config.compose.lua
       - --metrics
       - metrics.live.lua
       - --default-profile
       - default
+      - --compact-profile
+      - ${COMPACT_PROFILE:-compact}
       - --host
       - 0.0.0.0
       - --port

@@ -56,6 +56,22 @@ def test_latest_successful_route_wins(host_store_clean):
     assert host_store.hot_route("s1") == rr.route_key("openrouter", "minimax-m2.7", "openrouter")
 
 
+def test_auxiliary_call_counts_but_never_replaces_chat_affinity(host_store_clean):
+    seed_call(session="s1", provider="openrouter", family="chat-family",
+              served_by="chat-route", route="profile:default", ts=100)
+    seed_call(session="s1", provider="openai", family="summarizer",
+              served_by="compact-route", route="operation:compact", ts=200)
+
+    assert host_store.hot_route("s1") == rr.route_key(
+        "openrouter", "chat-family", "chat-route")
+    assert host_store.session_warm("s1") == [{
+        "family": "chat-family",
+        "provider": "openrouter",
+        "served_by": "chat-route",
+    }]
+    assert host_store.session_totals("s1")["calls"] == 2
+
+
 def test_sessions_are_independent(host_store_clean):
     seed_call(session="s1", provider="antseed", family="glm-5.2", served_by="peerA")
     assert host_store.hot_route("s2") is None

@@ -23,10 +23,10 @@ LIVE_TEST_ENV = {
 }
 
 
-def _build_client(default_handler, codex_handler):
+def _build_host(default_handler, codex_handler, *, config="config.live.lua"):
     host = LLMRouterHost(
         router_path=ROOT / "core" / "router.lua",
-        config_path=Path(__file__).resolve().parents[1] / "config.live.lua",
+        config_path=Path(__file__).resolve().parents[1] / config,
         metrics_path=Path(__file__).resolve().parents[1] / "metrics.live.lua",
         call_provider_async=make_api_kind_dispatcher(
             default=default_handler,
@@ -36,6 +36,11 @@ def _build_client(default_handler, codex_handler):
         now_ms=lambda: 1,
     )
     host.init()
+    return host
+
+
+def _build_client(default_handler, codex_handler):
+    host = _build_host(default_handler, codex_handler)
     return TestClient(create_app(host, default_profile="default"))
 
 
@@ -102,6 +107,236 @@ def test_default_profile_cascades_off_a_failing_provider():
     assert body["choices"][0]["message"]["content"].startswith("served-by-")
     assert body["x_router"]["provider"] != "openai_codex", \
         "cascaded off the failing codex provider"
+
+
+def test_compact_uses_live_server_profile_without_caller_policy():
+    async def summarize(req):
+        assert req["max_tokens"] == 512
+        return {
+            "ok": True,
+            "latency_ms": 5,
+            "response": {
+                "text": "server-owned summary",
+                "finish_reason": "stop",
+                "tokens_in": 100,
+                "tokens_out": 3,
+            },
+        }
+
+    client = _build_client(summarize, summarize)
+    messages = []
+    for i in range(3):
+        messages += [
+            {"role": "user", "content": f"u{i} " * 200},
+            {"role": "assistant", "content": f"a{i} " * 200},
+        ]
+    body = {
+        "contract_version": 3,
+        "messages": messages,
+    }
+
+    response = client.post("/v1/compact", json=body)
+    assert response.status_code == 200, response.text
+    assert response.json()["compacted"] is True
+    assert response.json()["summary"] == "server-owned summary"
+    assert "messages" not in response.json()
+
+    body["policy_ir"] = ["policy"]
+    assert client.post("/v1/compact", json=body).status_code == 422
+
+    body.pop("policy_ir")
+    body["requirements"] = {
+        "pin": {"provider": "openrouter", "model": "gpt-5.5"},
+    }
+    assert client.post("/v1/compact", json=body).status_code == 422
+
+
+def test_live_compact_profile_enforces_envelope_and_model_family_narrowing():
+    async def no_call(_req):
+        return {"ok": False, "error_kind": "unexpected_call"}
+
+    host = _build_host(no_call, no_call)
+
+    ranked, _ = host.rank({"profile": "compact"})
+    assert ranked
+    assert all(row["candidate"].get("api_kind") == "openai_codex"
+               or (row["candidate"].get("raw_price_in") is not None
+                   and row["candidate"]["raw_price_in"] <= 1.0)
+               for row in ranked)
+    assert all(row["candidate"].get("api_kind") == "openai_codex"
+               or (row["candidate"].get("raw_price_out") is not None
+                   and row["candidate"]["raw_price_out"] <= 5.0)
+               for row in ranked)
+
+    narrowed, _ = host.rank({
+        "profile": "compact",
+        "requirements": {"model_family": "minimax-m2.7"},
+    })
+    assert narrowed
+    assert {row["candidate"]["model_family"] for row in narrowed} == {
+        "minimax-m2.7"}
+
+    def extra(provider, *, price_in=0.1, price_out=0.5, reputation=100):
+        return {
+            "provider_id": provider,
+            "model_family": f"compact-test-{provider}",
+            "served_model_id": f"compact-test-{provider}",
+            "served_by": provider,
+            "api_kind": "openai_compatible",
+            "base_url": "https://example.invalid/v1",
+            "tier": "marketplace",
+            "price_in": price_in,
+            "price_out": price_out,
+            "capabilities": {"context": 32000},
+            "offer": {
+                "reputation_score": reputation,
+                "traits": {"bench_intelligence": 0.9},
+            },
+        }
+
+    expensive, _ = host.rank({
+        "profile": "compact",
+        "extra_candidates": [extra("cost-test", price_out=5.01)],
+        "requirements": {"model_family": "compact-test-cost-test"},
+    })
+    assert expensive == []
+
+    multiplier_bypass, _ = host.rank({
+        "profile": "compact",
+        "extra_candidates": [{
+            **extra("raw-cost-test", price_in=0.5, price_out=2.5),
+            "raw_price_in": 2.0,
+            "raw_price_out": 10.0,
+        }],
+        "requirements": {"model_family": "compact-test-raw-cost-test"},
+    })
+    assert multiplier_bypass == []
+
+    negative_quote, _ = host.rank({
+        "profile": "compact",
+        "extra_candidates": [{
+            **extra("negative-cost-test", price_in=-0.1, price_out=-0.1),
+            "raw_price_in": -0.1,
+            "raw_price_out": -0.1,
+        }],
+        "requirements": {"model_family": "compact-test-negative-cost-test"},
+    })
+    assert negative_quote == []
+
+    low_trust, _ = host.rank({
+        "profile": "compact",
+        "extra_candidates": [extra("antseed", reputation=95)],
+        "requirements": {"model_family": "compact-test-antseed"},
+    })
+    assert low_trust == []
+
+    high_trust, _ = host.rank({
+        "profile": "compact",
+        "extra_candidates": [extra("antseed", reputation=96)],
+        "requirements": {"model_family": "compact-test-antseed"},
+    })
+    assert [row["candidate"]["provider_id"] for row in high_trust] == ["antseed"]
+
+    state = host.dump_state()
+    state["disabled_providers"] = {
+        **(state.get("disabled_providers") or {}),
+        "openrouter": {"kind": "auth_error", "at_ms": 1},
+    }
+    host.restore_state(state)
+    after_disable, _ = host.rank({"profile": "compact"})
+    assert all(row["candidate"]["provider_id"] != "openrouter"
+               for row in after_disable)
+
+
+def test_compose_compact_profile_is_hermetic_free_local_ollama():
+    async def no_call(_req):
+        return {"ok": False, "error_kind": "unexpected_call"}
+
+    host = _build_host(no_call, no_call, config="config.compose.lua")
+
+    def candidate(provider="ollama", family="qwen2.5:0.5b", price=0.0):
+        return {
+            "provider_id": provider,
+            "model_family": family,
+            "served_model_id": family,
+            "served_by": provider,
+            "api_kind": "openai_compatible",
+            "base_url": "http://ollama:11434/v1",
+            "tier": "partner",
+            "price_in": price,
+            "price_out": price,
+            "capabilities": {"context": 32000},
+        }
+
+    contract = {
+        "profile": "compact_bdd_ollama",
+        "requirements": {"model_family": "qwen2.5:0.5b"},
+    }
+    ranked, _ = host.rank({
+        **contract,
+        "extra_candidates": [candidate()],
+    })
+    assert [(row["candidate"]["provider_id"],
+             row["candidate"]["model_family"]) for row in ranked] == [
+        ("ollama", "qwen2.5:0.5b")]
+
+    wrong_provider, _ = host.rank({
+        **contract,
+        "extra_candidates": [candidate(provider="openrouter")],
+    })
+    assert wrong_provider == []
+
+    wrong_family, _ = host.rank({
+        **contract,
+        "extra_candidates": [candidate(family="other-local")],
+    })
+    assert wrong_family == []
+
+    nonzero_price, _ = host.rank({
+        **contract,
+        "extra_candidates": [candidate(price=0.01)],
+    })
+    assert nonzero_price == []
+
+
+def test_compose_wires_the_compaction_overlay_and_profile():
+    compose = (ROOT / "compose.yml").read_text()
+    router_service = compose.split("\n  ingress:", 1)[0]
+
+    assert (ROOT / "config.compose.lua").is_file()
+    assert "\n      - --config\n      - config.compose.lua\n" in router_service
+    assert ("\n      - --compact-profile\n"
+            "      - ${COMPACT_PROFILE:-compact}\n") in router_service
+
+
+def test_compact_profile_aborts_after_one_provider_attempt():
+    calls = []
+
+    async def fail(req):
+        calls.append((req["provider_id"], req["model_family"]))
+        return {"ok": False, "error_kind": "server_error", "latency_ms": 1}
+
+    host = _build_host(fail, fail)
+    assert len(host.rank({"profile": "compact"})[0]) > 1
+    client = TestClient(create_app(host, compact_profile="compact"))
+    out = client.post("/v1/compact", json={
+        "contract_version": 3,
+        "messages": [
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+        ],
+    }).json()
+
+    assert out["compacted"] is False
+    assert out["reason"] == "router_failed"
+    assert len(calls) == 1
+
+
+def test_compact_bdd_has_an_explicit_non_skipping_acceptance_mode():
+    steps = (ROOT / "features" / "steps" / "steps.py").read_text()
+
+    assert 'if _os.getenv("REQUIRE_COMPACT_BDD") == "1":' in steps
+    assert "REQUIRE_COMPACT_BDD=1 forbids skipping this flow" in steps
 
 
 def test_antseed_is_marketplace_with_no_static_rows():

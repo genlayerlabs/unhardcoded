@@ -45,6 +45,9 @@ def main() -> None:
                    help="max_tokens supplied when a request omits it (some "
                         "upstreams reject requests without it). Set to 0 to "
                         "forward nothing (strict OpenAI-spec behaviour).")
+    p.add_argument("--compact-profile", default="compact",
+                   help="operator-owned profile used by POST /v1/compact "
+                        "(default: compact)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--timeout-s", type=float, default=30.0,
@@ -170,7 +173,8 @@ def main() -> None:
     app = create_app(host, default_profile=args.default_profile,
                      streaming_call=streaming_call,
                      default_max_tokens=args.default_max_tokens or None,
-                     codex_store=codex_auth)
+                     codex_store=codex_auth,
+                     compact_profile=args.compact_profile)
     attach_sources(app, host, catalog=catalog, registry=registry)
 
     import uvicorn

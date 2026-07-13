@@ -120,6 +120,90 @@ benchmarks/modalities/capabilities (`bench_intelligence`, `in_image`,
 `cap_tools`, …). See the core's `core/docs/SIGMA-POL.md` for the algebra;
 `config.live.lua` declares the host fields and the `default` policy.
 
+## Stateless context compaction (contract v3)
+
+`POST /v1/compact` is an auxiliary routed transform for agent runtimes. The
+caller owns context layout and sends only the records it has already selected
+for summarization: optional raw `previous_summary` memory plus complete
+newly-aged interaction groups. Client-specific seal markers, authority and the
+retained recent tail never cross this boundary. The router retains no
+conversation content and never constructs a replacement message array. Ordinary
+request/routing/usage metadata is still handled by the same ingress ledger as
+other API calls.
+
+Ingress authorizes and meters this endpoint as the server-owned route
+`operation:compact`. Consumer keys with a route allowlist must include that
+route (or a matching wildcard such as `operation:*`); an empty allowlist or
+`all` continues to permit every route. A `model` value in the request cannot
+relabel the operation. The summarizer always uses the operator-owned `compact`
+profile (`--compact-profile` may select another server-side profile); callers
+cannot provide `policy_ir`. Optional `requirements` can only narrow the
+profile's candidates, while its hard cost/trust envelope remains in force. The
+accepted narrowing keys are `needs`, `min_context`, `model_family`, `tier`,
+`privacy`, `min_quality`, and `min_tok_s`; unknown keys and `pin` are rejected.
+
+Version 3 is explicit and fail-closed:
+
+```json
+{
+  "contract_version": 3,
+  "previous_summary": "raw semantic memory from an earlier compaction",
+  "messages": [
+    {"role": "user", "content": "newly aged request"},
+    {"role": "assistant", "content": "newly aged answer"}
+  ],
+  "max_tokens": 512
+}
+```
+
+`previous_summary` is optional, unframed text and is encoded as its own typed
+data record; at least one newly-aged message is required. `system` and
+`developer` roles, orphaned tool results, split tool calls and mixed
+modern/legacy tool protocols are rejected before any provider call. Records are
+framed as canonical JSONL data, not interpolated as instructions. The
+server-owned `compact` profile supplies the summarizer policy.
+
+A successful response contains raw summary text, not a sealed message or a
+candidate context:
+
+```json
+{
+  "contract_version": 3,
+  "compacted": true,
+  "reason": "compacted",
+  "summary": "dense factual summary",
+  "usage": {},
+  "x_router": {}
+}
+```
+
+`summary` is present only when `compacted` is true. The client adds its local
+seal framing, checks that applying the summary reduces the same current
+snapshot, and atomically replaces only the aged slice it selected. Failed,
+truncated, empty or malformed summarizer responses return `compacted: false`
+without summary text. The response deliberately has no candidate `messages`,
+layout manifest, authority/tail echo, grouping counts or reduction decision.
+
+The ingress defaults to a 32 MiB generic request limit (configurable from 1–64
+MiB with `MAX_REQUEST_BODY_BYTES`). Compact requests have a smaller,
+server-owned 2 MiB ceiling, enforced both on the ingress body and on canonical
+message JSON; no individual message or `previous_summary` may exceed 1 MiB. This leaves ample room
+for typical snapshots at the default 24k-token compaction trigger without
+granting the generic upload allowance to conversation snapshots. The contract
+accepts at most 10,000 messages and 2,048 summary output tokens.
+
+The `compact` profile's `$1/M` input and `$5/M` output predicates use the raw
+billing quote before ranking multipliers (subscription-backed routes count as
+zero), so a scarcity or preference multiplier cannot widen the spend envelope.
+The profile makes at most one provider attempt. These remain unit-price
+ceilings, not a promised per-call dollar budget: tokenizer and provider
+accounting vary. The byte/output caps bound exposure, while consumer rate limits
+and any operator quotas remain separate controls.
+
+Contract v2 and its `keep_recent_interactions`, `min_reduction_percent`,
+`operation_id` and `snapshot_hash` fields are rejected with HTTP 422. Deploy the
+v3 router and runtime together; there is no permanent dual-semantics shim.
+
 ## Dashboard
 
 `auth_proxy` serves an operator console at `/dashboard`:
@@ -158,6 +242,14 @@ catalogue of flows it covers is [`user_flows.json`](./user_flows.json):
 ```bash
 behave
 ```
+
+The normal Compose stack uses the production-style `compact` profile. The local
+compact scenario normally skips when the optional Ollama model has not been
+pulled. Acceptance/CI runs that intend to prove compaction must provision
+`qwen2.5:0.5b`, start Compose with
+`COMPACT_PROFILE=compact_bdd_ollama`, and run Behave with
+`REQUIRE_COMPACT_BDD=1`; in that mode an unavailable route fails the scenario
+instead of reporting a skip.
 
 *(Nix users: `nix-shell -p ...` with the same packages — plus `chromium
 chromedriver` for the browser pass — works as before.)*

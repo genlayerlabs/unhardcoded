@@ -24,7 +24,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 
 import host_store
 from env_secrets import load_env_secrets
-from shim import _CACHE_READ_FACTOR   # the billing cache-read discount — one source
+from shim import (  # one source for billing and the compact contract boundary
+    _CACHE_READ_FACTOR,
+    _MAX_COMPACT_REQUEST_BYTES,
+    _MAX_SESSION_ID_CHARS,
+)
 
 # Operator-managed keys/consumer-hashes live on the PVC (.env.secrets) and are
 # the source of truth — load them over the container env BEFORE reading any of
@@ -63,6 +67,10 @@ SYNTHETIC_PROBE_INTERVAL_S = float(os.getenv("DASHBOARD_SYNTHETIC_PROBE_INTERVAL
 SYNTHETIC_PROBE_INITIAL_DELAY_S = float(os.getenv("DASHBOARD_SYNTHETIC_PROBE_INITIAL_DELAY_S", "45"))
 SYNTHETIC_PROBE_TIMEOUT_S = float(os.getenv("DASHBOARD_SYNTHETIC_PROBE_TIMEOUT_S", "45"))
 SYNTHETIC_PROBE_CALLER = os.getenv("DASHBOARD_SYNTHETIC_PROBE_CALLER", "dashboard-probe")
+MAX_REQUEST_BODY_BYTES = min(
+    64 * 1024 * 1024,
+    max(1 * 1024 * 1024, int(os.getenv("MAX_REQUEST_BODY_BYTES", str(32 * 1024 * 1024)))),
+)
 
 
 
@@ -493,7 +501,18 @@ def _rate_ok(caller: str) -> bool:
     return True
 
 
+_AUXILIARY_OPERATION_ROUTES = {
+    "v1/compact": "operation:compact",
+}
+
+
 def _requested_route_from(path: str, body: bytes | None) -> str | None:
+    normalized_path = path.strip("/")
+    operation_route = _AUXILIARY_OPERATION_ROUTES.get(normalized_path)
+    if operation_route:
+        # Auxiliary endpoint authorization is owned by the ingress. Never let a
+        # caller-supplied `model` relabel an operation to bypass its allowlist.
+        return operation_route
     route = None
     if body:
         try:
@@ -502,7 +521,7 @@ def _requested_route_from(path: str, body: bytes | None) -> str | None:
                 route = parsed.get("model") or parsed.get("name")
         except Exception:
             route = None
-    parts = [p for p in path.strip("/").split("/") if p]
+    parts = [p for p in normalized_path.split("/") if p]
     if len(parts) >= 3 and parts[1:] == ["v1", "chat", "completions"] and parts[0] != "v1":
         route = route or f"profile:{parts[0]}"
     return str(route).strip() if route else None
@@ -903,7 +922,7 @@ def _login_connections_snapshot(*, timeframe: str = "all", consumer: str | None 
         item = grouped.setdefault(key, {"kind": "api_key", "identity": caller, "consumer": caller, "key_sha256_prefix": prefix if prefix != "unknown" else None, "first_seen": None, "last_seen": None, "requests": 0, "errors": 0, "last_status": None, "last_route": None, "last_provider": None})
         ts = int(row.get("ts") or 0)
         item["requests"] += 1
-        if int(row.get("status") or 0) >= 400:
+        if _request_is_error(row):
             item["errors"] += 1
         item["first_seen"] = ts if not item["first_seen"] else min(int(item["first_seen"]), ts)
         if not item["last_seen"] or ts >= int(item["last_seen"]):
@@ -3245,6 +3264,32 @@ async def _synthetic_probe_loop() -> None:
             await _synthetic_probe_once(route)
         await asyncio.sleep(max(SYNTHETIC_PROBE_INTERVAL_S, 1.0))
 
+
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
+async def _read_request_body(request: Request, *, limit: int | None = None) -> bytes:
+    """Read an ingress body without allowing an unbounded Starlette buffer."""
+    max_bytes = MAX_REQUEST_BODY_BYTES if limit is None else min(
+        MAX_REQUEST_BODY_BYTES, max(1, int(limit)))
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > max_bytes:
+                raise _RequestBodyTooLarge
+        except ValueError:
+            # The ASGI server owns malformed header handling. Still enforce the
+            # byte count below for requests without a usable declared length.
+            pass
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > max_bytes:
+            raise _RequestBodyTooLarge
+        body.extend(chunk)
+    return bytes(body)
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def proxy(path: str, request: Request) -> Response:
     if path == "x" or path.startswith("x/"):
@@ -3268,17 +3313,48 @@ async def proxy(path: str, request: Request) -> Response:
         return JSONResponse(status_code=status_code, content={"error": {"message": messages.get(code, "caller not authorized"), "type": "auth_error", "code": code}})
 
     caller = str(caller)
-    body = await request.body()
-    requested_route = _requested_route_from(path, body)
+    # Path-owned auxiliary operations can be authorized without touching an
+    # attacker-controlled body. Body-addressed model routes still need parsing,
+    # but every authenticated request consumes its rate slot first so a limited
+    # key cannot allocate the full upload allowance concurrently.
+    requested_route = _requested_route_from(path, None)
+    if requested_route and not _route_allowed(caller, requested_route):
+        _record_reject(reason="route_not_allowed", path="/" + path, caller=caller,
+                       status=403, route=requested_route)
+        _log({"event": "reject", "reason": "route_not_allowed", "caller": caller,
+              "path": "/" + path, "route": requested_route})
+        return JSONResponse(status_code=403, content={"error": {
+            "message": "caller is not allowed to use this route",
+            "type": "auth_error", "code": "caller_route_not_allowed"}})
+    if not _rate_ok(caller):
+        _record_reject(reason="rate_limit", path="/" + path, caller=caller,
+                       status=429)
+        _log({"event": "reject", "reason": "rate_limit", "caller": caller,
+              "path": "/" + path})
+        return JSONResponse(status_code=429, content={"error": {
+            "message": "caller rate limit exceeded", "type": "rate_limit_error",
+            "code": "caller_rate_limit"}})
+
+    body_limit = (_MAX_COMPACT_REQUEST_BYTES
+                  if requested_route == "operation:compact" else None)
+    try:
+        body = await _read_request_body(request, limit=body_limit)
+    except _RequestBodyTooLarge:
+        _record_reject(reason="request_body_too_large", path="/" + path,
+                       caller=caller, status=413)
+        _log({"event": "reject", "reason": "request_body_too_large",
+              "caller": caller, "path": "/" + path})
+        return JSONResponse(status_code=413, content={"error": {
+            "message": "request body exceeds the configured limit",
+            "type": "invalid_request_error",
+            "code": "request_body_too_large",
+        }})
+    if requested_route is None:
+        requested_route = _requested_route_from(path, body)
     if not _route_allowed(caller, requested_route):
         _record_reject(reason="route_not_allowed", path="/" + path, caller=caller, status=403, route=requested_route)
         _log({"event": "reject", "reason": "route_not_allowed", "caller": caller, "path": "/" + path, "route": requested_route})
         return JSONResponse(status_code=403, content={"error": {"message": "caller is not allowed to use this route", "type": "auth_error", "code": "caller_route_not_allowed"}})
-    if not _rate_ok(caller):
-        _record_reject(reason="rate_limit", path="/" + path, caller=caller, status=429)
-        _log({"event": "reject", "reason": "rate_limit", "caller": caller, "path": "/" + path})
-        return JSONResponse(status_code=429, content={"error": {"message": "caller rate limit exceeded", "type": "rate_limit_error", "code": "caller_rate_limit"}})
-
     if path == "api/show" and request.method.upper() == "POST":
         requested_model = None
         if body:
@@ -3323,10 +3399,12 @@ async def proxy(path: str, request: Request) -> Response:
     # an explicit body `session` wins (szc sends it there); the
     # X-Unhardcoded-Session header covers header-only clients (opencode plugin).
     session_id = request.headers.get("x-unhardcoded-session")
+    if session_id and len(session_id) > _MAX_SESSION_ID_CHARS:
+        session_id = None
 
     def _finish():
         latency_ms = round((time.perf_counter() - started) * 1000, 1)
-        _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
+        _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, route=requested_route, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
         _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
 
     try:
@@ -3336,7 +3414,10 @@ async def proxy(path: str, request: Request) -> Response:
                 if isinstance(parsed_body, dict):
                     requested_model = parsed_body.get("model")
                     if parsed_body.get("session"):
-                        session_id = str(parsed_body.get("session"))
+                        candidate_session = str(parsed_body.get("session"))
+                        session_id = (candidate_session
+                                      if len(candidate_session) <= _MAX_SESSION_ID_CHARS
+                                      else None)
             except Exception:
                 pass
         upstream_req = _client.build_request(request.method, upstream_url, content=body, headers=headers)
@@ -3415,6 +3496,18 @@ async def proxy(path: str, request: Request) -> Response:
                         error_type = err.get("type")
                         error_code = err.get("code")
                         error_message = err.get("message")
+                    elif (requested_route == "operation:compact"
+                          and parsed.get("compacted") is False):
+                        reason = parsed.get("reason")
+                        if not (isinstance(reason, str)
+                                and re.fullmatch(r"[a-z][a-z0-9_]{0,79}", reason)):
+                            reason = "not_applied"
+                        # The public contract intentionally returns a safe no-op
+                        # as HTTP 200. Persist the semantic failure so runtime and
+                        # durable analytics do not report it as a success.
+                        error_type = f"compact:{reason}"
+                        error_code = reason
+                        error_message = "compaction not applied"
                 if isinstance(usage, dict):
                     tokens_in = int(usage.get("prompt_tokens") or 0)
                     tokens_out = int(usage.get("completion_tokens") or 0)
@@ -3527,13 +3620,18 @@ def _parse_stream_tail(tail: bytes) -> dict[str, Any]:
     return out
 
 
+def _request_is_error(row: dict[str, Any]) -> bool:
+    return (int(row.get("status") or 0) >= 400
+            or bool(row.get("error_type") or row.get("error_code")))
+
+
 def _record_request(**event: Any) -> None:
     status = int(event.get("status") or 0)
     latency_ms = float(event.get("latency_ms") or 0)
     tokens_in = int(event.get("tokens_in") or 0)
     tokens_out = int(event.get("tokens_out") or 0)
     tokens_total = int(event.get("tokens_total") or 0)
-    is_error = status >= 400
+    is_error = _request_is_error(event)
     now = int(event.get("ts") or time.time())
     try:
         cost_usd = float(event["cost_usd"]) if event.get("cost_usd") is not None else None
@@ -3543,6 +3641,11 @@ def _record_request(**event: Any) -> None:
         cost_usd = max(0.0, cost_usd)  # a call's cost is >= 0; never accumulate negative spend
     key_sha256 = str(event.get("key_sha256") or "").strip().lower()
     key_sha256_prefix = key_sha256[:12] if re.fullmatch(r"[a-f0-9]{64}", key_sha256) else None
+    # `route` is the server-owned identity used for authorization. It normally
+    # equals the body model, but auxiliary operations (for example compact)
+    # intentionally override any caller-supplied model. Keep that same identity
+    # in runtime counters and the durable legacy `requested_model` column.
+    canonical_route = event.get("route") or event.get("requested_model")
     with _stats_lock:
         _stats["total_requests"] += 1
         if is_error:
@@ -3551,7 +3654,7 @@ def _record_request(**event: Any) -> None:
         _stats["total_tokens_out"] += tokens_out
         _stats["total_tokens"] += tokens_total
         _stats["by_status"][str(status)] += 1
-        route_key = event.get("requested_model") or event.get("route") or "unknown"
+        route_key = canonical_route or "unknown"
         served_key = event.get("served_model_id") or "unknown"
         for group_name, key in (("by_caller", event.get("caller")), ("by_provider", event.get("provider") or "unknown"), ("by_model_family", event.get("model_family") or "unknown"), ("by_route", route_key), ("by_served_model", served_key)):
             c = _stats[group_name][str(key or "unknown")]
@@ -3608,6 +3711,7 @@ def _record_request(**event: Any) -> None:
                 kc["last_seen"] = now
             _stats["by_key_status"][key_sha256][str(status)] += 1
         recent_event = {k: v for k, v in event.items() if k != "key_sha256"}
+        recent_event["requested_model"] = canonical_route
         recent_event["usage_event_id"] = str(event.get("usage_event_id") or secrets.token_hex(12))
         recent_event["key_sha256"] = key_sha256 if key_sha256_prefix else None
         if key_sha256_prefix:
@@ -3897,7 +4001,7 @@ def _add_counter(counter: dict[str, Any], row: dict[str, Any], cost: float | Non
     latency_ms = float(row.get("latency_ms") or 0)
     ts = int(row.get("ts") or 0)
     counter["requests"] += 1
-    if status >= 400:
+    if _request_is_error(row):
         counter["errors"] += 1
     counter["tokens_in"] += tokens_in
     counter["tokens_out"] += tokens_out
@@ -4235,7 +4339,7 @@ def _aggregate_usage_rows(rows: list[dict[str, Any]], *, selected: str | None = 
         status = int(row.get("status") or 0)
         cost, _ = _cost_for_event(row, prices)
         totals["requests"] += 1
-        if status >= 400:
+        if _request_is_error(row):
             totals["errors"] += 1
         totals["tokens_in"] += int(row.get("tokens_in") or 0)
         totals["tokens_out"] += int(row.get("tokens_out") or 0)
