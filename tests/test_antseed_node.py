@@ -21,10 +21,12 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_antseed_node_unit_tests():
-    """`node --test antseed/` — the sidecar's DATABASE_URL parser (db.js) handles
+    """The sidecar's DATABASE_URL parser (db.js) handles
     both the compose `postgres://` URL and the prod libpq kv conninfo."""
     proc = subprocess.run(
-        ["node", "--test", "antseed/"],
+        # Pin the actual test file. Node 26 stopped resolving a directory passed
+        # to `--test` even though older releases discovered db.test.js there.
+        ["node", "--test", "antseed/db.test.js"],
         cwd=_REPO_ROOT, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, (
         f"antseed node tests failed:\n{proc.stdout}\n{proc.stderr}")
