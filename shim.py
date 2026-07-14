@@ -861,7 +861,15 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         message array into one cheaply-routed summary and splice it back so the
         frozen prefix and the recent tail are byte-identical — keeping everything
         upstream cache-hot. Returns {messages, compacted}. The agent owns its
-        context; the host stores nothing."""
+        context; the host stores nothing.
+
+        Cost accounting (additive wire contract): the seal is a real billable
+        LLM leg, so every response that FOLLOWS host.execute_async — the sealed
+        success AND the compacted:false seal-failure — also carries "usage"
+        (OpenAI token shape, the summarizer call's tokens) and "x_router" (the
+        same block _build_x_router puts on chat responses), so a metering proxy
+        in front can record the seal's spend instead of a $0 row. Early returns
+        that precede execution made no call and carry neither key."""
         msgs = req.messages or []
         keep = max(1, req.keep_recent)
         # frozen prefix = a leading system message (the skill/tools/rules), if any
@@ -891,11 +899,19 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             if admission is not None:
                 return _invalid_policy_response(admission)
             raise
+
+        def _costed(body: dict) -> dict:
+            usage = _openai_usage(res.get("response") or {})
+            if usage:
+                body["usage"] = usage
+            body["x_router"] = _build_x_router(res, subscription_providers)
+            return body
+
         summary = ((res.get("response") or {}).get("text") or "").strip()
         if not summary:                     # seal failed -> never lose content
-            return {"messages": msgs, "compacted": False}
+            return _costed({"messages": msgs, "compacted": False})
         sealed = {"role": "system", "content": _SEAL_PREFIX + summary}
-        return {"messages": frozen + [sealed] + recent, "compacted": True}
+        return _costed({"messages": frozen + [sealed] + recent, "compacted": True})
 
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest, request: Request):
@@ -1163,15 +1179,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     def _final_chunk_parts(result: dict, session: str | None = None,
                            owner: str | None = None):
         resp = result.get("response") or {}
-        usage = {}
-        for src_key, dst_key in (("tokens_in", "prompt_tokens"),
-                                 ("tokens_out", "completion_tokens"),
-                                 ("tokens_total", "total_tokens")):
-            if resp.get(src_key) is not None:
-                usage[dst_key] = resp[src_key]
-        # Standard OpenAI cache field so clients parse cache reads natively.
-        if resp.get("tokens_cached"):
-            usage["prompt_tokens_details"] = {"cached_tokens": resp["tokens_cached"]}
+        usage = _openai_usage(resp)
         # x_router + the per-session fold are shared with the unary path; the
         # streaming final chunk folds the session here so stream:true clients
         # (e.g. opencode) still accumulate into the session total.
@@ -1533,6 +1541,24 @@ def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> floa
     return max(0.0, round(cost, 6))
 
 
+def _openai_usage(response: dict) -> dict:
+    """OpenAI-shape `usage` block from a router response — the single builder
+    shared by the unary chat body, the streaming final chunk and /v1/compact.
+    Empty dict when the provider reported no token counts (caller omits the
+    key, per the additive wire contract)."""
+    usage: dict = {}
+    for src_key, dst_key in (("tokens_in", "prompt_tokens"),
+                             ("tokens_out", "completion_tokens"),
+                             ("tokens_total", "total_tokens")):
+        if response.get(src_key) is not None:
+            usage[dst_key] = response[src_key]
+    # Standard OpenAI cache field so clients (opencode, etc.) parse cache reads
+    # natively — not just our x_router.
+    if response.get("tokens_cached"):
+        usage["prompt_tokens_details"] = {"cached_tokens": response["tokens_cached"]}
+    return usage
+
+
 def _build_x_router(result: dict, subscription_providers=frozenset(),
                     session: str | None = None, owner: str | None = None) -> dict:
     """The `x_router` metadata block shared by every response surface (chat
@@ -1601,17 +1627,7 @@ def _router_response_to_openai(result: dict, requested_model: str,
         }],
     }
 
-    usage = {}
-    if response.get("tokens_in") is not None:
-        usage["prompt_tokens"] = response["tokens_in"]
-    if response.get("tokens_out") is not None:
-        usage["completion_tokens"] = response["tokens_out"]
-    if response.get("tokens_total") is not None:
-        usage["total_tokens"] = response["tokens_total"]
-    # Standard OpenAI cache field so clients (opencode, etc.) parse cache reads
-    # natively — not just our x_router. Mirrors usage.prompt_tokens_details.
-    if response.get("tokens_cached"):
-        usage["prompt_tokens_details"] = {"cached_tokens": response["tokens_cached"]}
+    usage = _openai_usage(response)
     if usage:
         out["usage"] = usage
 
