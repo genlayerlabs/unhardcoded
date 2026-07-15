@@ -175,6 +175,24 @@ def test_compact_partial_failure_still_carries_cost(client, host):
     assert out["x_router"]["cost_usd"] == 0.00005
 
 
+def test_compact_tokenless_provider_omits_usage_but_keeps_x_router(client, host):
+    # A provider that reports no token counts: "usage" must be OMITTED (never
+    # an empty {}), while x_router still carries the billed cost — the exact
+    # shape the metering proxy's legacy/costed distinction keys on.
+    host.set_mock_response("comput3", "hermes-3-405b",
+                           {"ok": True, "latency_ms": 5,
+                            "response": {"text": "SEALED.",
+                                         "cost_reported": 0.000123}})
+    msgs = _long_convo()
+    r = client.post("/v1/compact",
+                    json={"messages": msgs, "keep_recent": 4, "policy_ir": _PIN})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["compacted"] is True
+    assert "usage" not in out
+    assert out["x_router"]["cost_usd"] == 0.000123
+
+
 def test_compact_early_return_has_no_cost_keys(client):
     # Nothing worth sealing -> no LLM call was made -> no usage, no x_router.
     msgs = [{"role": "system", "content": "s"},
