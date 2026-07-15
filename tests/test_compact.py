@@ -193,6 +193,17 @@ def test_compact_tokenless_provider_omits_usage_but_keeps_x_router(client, host)
     assert out["x_router"]["cost_usd"] == 0.000123
 
 
+def test_openai_usage_preserves_explicit_zero_cached_tokens():
+    # tokens_cached: 0 = caching evaluated, no hits — must survive as an
+    # explicit cached_tokens: 0 (x_router passes the 0 through; the OpenAI
+    # block has to agree). Absent = provider never reported it: no details key.
+    from shim import _openai_usage
+    zero = _openai_usage({"tokens_in": 5, "tokens_out": 3, "tokens_cached": 0})
+    assert zero["prompt_tokens_details"] == {"cached_tokens": 0}
+    absent = _openai_usage({"tokens_in": 5, "tokens_out": 3})
+    assert "prompt_tokens_details" not in absent
+
+
 def test_compact_early_return_has_no_cost_keys(client):
     # Nothing worth sealing -> no LLM call was made -> no usage, no x_router.
     msgs = [{"role": "system", "content": "s"},

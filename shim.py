@@ -1553,8 +1553,10 @@ def _openai_usage(response: dict) -> dict:
         if response.get(src_key) is not None:
             usage[dst_key] = response[src_key]
     # Standard OpenAI cache field so clients (opencode, etc.) parse cache reads
-    # natively — not just our x_router.
-    if response.get("tokens_cached"):
+    # natively — not just our x_router. `is not None`, not truthiness: an
+    # explicit tokens_cached: 0 means caching was evaluated with no hits, and
+    # x_router already passes that 0 through — the OpenAI block must agree.
+    if response.get("tokens_cached") is not None:
         usage["prompt_tokens_details"] = {"cached_tokens": response["tokens_cached"]}
     return usage
 
