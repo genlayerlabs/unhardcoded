@@ -830,7 +830,11 @@ _AGG_INNER = (
     " requested_model, model_family, provider_id,"
     " COALESCE(NULLIF(caller,''),'unknown') AS caller_k,"
     " COALESCE(NULLIF(provider_id,''),'unknown') AS provider_k,"
-    " COALESCE(NULLIF(model_family,''),'unknown') AS family_k,"
+    # Error/aux rows carry no served model_family (it comes from the upstream
+    # x_router, absent on failure) — fall back to the model the caller ASKED
+    # for so failures attribute to a real model instead of piling into a single
+    # opaque "unknown" bucket. Served family stays the primary key for 2xx rows.
+    " COALESCE(NULLIF(model_family,''),NULLIF(requested_model,''),'unknown') AS family_k,"
     " COALESCE(NULLIF(requested_model,''),'unknown') AS route_k,"
     " COALESCE(NULLIF(served_model_id,''),'unknown') AS served_k,"
     " COALESCE(NULLIF(substr(consumer_sha,1,12),''),'unknown') AS prefix_k,"
