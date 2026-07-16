@@ -3553,7 +3553,11 @@ def _record_request(**event: Any) -> None:
         _stats["by_status"][str(status)] += 1
         route_key = event.get("requested_model") or event.get("route") or "unknown"
         served_key = event.get("served_model_id") or "unknown"
-        for group_name, key in (("by_caller", event.get("caller")), ("by_provider", event.get("provider") or "unknown"), ("by_model_family", event.get("model_family") or "unknown"), ("by_route", route_key), ("by_served_model", served_key)):
+        # Error/aux rows lack a served model_family — attribute to the requested
+        # model instead of a single opaque "unknown" bucket (mirrors host_store
+        # usage_aggregate's family_k fallback for the persistent view).
+        family_key = event.get("model_family") or route_key
+        for group_name, key in (("by_caller", event.get("caller")), ("by_provider", event.get("provider") or "unknown"), ("by_model_family", family_key), ("by_route", route_key), ("by_served_model", served_key)):
             c = _stats[group_name][str(key or "unknown")]
             c["requests"] += 1
             if is_error:
@@ -3567,7 +3571,7 @@ def _record_request(**event: Any) -> None:
             if cost_usd is not None:
                 c["cost_usd"] = round(float(c.get("cost_usd") or 0.0) + cost_usd, 6)
         caller = str(event.get("caller") or "unknown")
-        for group_name, key in (("by_caller_provider", event.get("provider") or "unknown"), ("by_caller_model_family", event.get("model_family") or "unknown"), ("by_caller_route", route_key), ("by_caller_served_model", served_key)):
+        for group_name, key in (("by_caller_provider", event.get("provider") or "unknown"), ("by_caller_model_family", family_key), ("by_caller_route", route_key), ("by_caller_served_model", served_key)):
             c = _stats[group_name][caller][str(key or "unknown")]
             c["requests"] += 1
             if is_error:
@@ -3595,7 +3599,7 @@ def _record_request(**event: Any) -> None:
             c["last_seen"] = now
             if cost_usd is not None:
                 c["cost_usd"] = round(float(c.get("cost_usd") or 0.0) + cost_usd, 6)
-            for group_name, key in (("by_key_provider", event.get("provider") or "unknown"), ("by_key_model_family", event.get("model_family") or "unknown"), ("by_key_route", route_key), ("by_key_served_model", served_key)):
+            for group_name, key in (("by_key_provider", event.get("provider") or "unknown"), ("by_key_model_family", family_key), ("by_key_route", route_key), ("by_key_served_model", served_key)):
                 kc = _stats[group_name][key_sha256][str(key or "unknown")]
                 kc["requests"] += 1
                 if is_error:
@@ -4246,7 +4250,9 @@ def _aggregate_usage_rows(rows: list[dict[str, Any]], *, selected: str | None = 
         for bucket, key in (
             (by_caller, row.get("caller") or "unknown"),
             (by_provider, row.get("provider") or "unknown"),
-            (by_model_family, row.get("model_family") or "unknown"),
+            # error/aux rows lack a served family — fall back to the requested
+            # model (matches host_store usage_aggregate + the live _stats fold)
+            (by_model_family, row.get("model_family") or row.get("requested_model") or row.get("route") or "unknown"),
             (by_route, row.get("requested_model") or row.get("route") or "unknown"),
             (by_served_model, row.get("served_model_id") or "unknown"),
         ):
