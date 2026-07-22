@@ -34,6 +34,18 @@ from typing import Any
 OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
+# Device-code login (mirrors `codex login --device-auth`): mint a user code,
+# have the user approve it at DEVICE_VERIFY_URL, poll for the authorization
+# code, then exchange it. The /api/accounts prefix is required — the bare
+# /deviceauth/* paths are blocked.
+DEVICE_AUTH_BASE_URL = "https://auth.openai.com/api/accounts/deviceauth"
+DEVICE_VERIFY_URL = "https://auth.openai.com/codex/device"
+DEVICE_CALLBACK_URL = "https://auth.openai.com/deviceauth/callback"
+
+
+class DeviceAuthError(RuntimeError):
+    """Fatal failure in the device-code flow (not the pending state)."""
+
 # Refresh proactively once the token is within this margin of expiry. The Codex
 # access token is a JWT; we read its `exp` when present, else fall back to a
 # fixed TTL after the last refresh.
@@ -368,8 +380,8 @@ def _extract_tokens(raw: dict) -> dict:
     return out
 
 
-def _jwt_exp(token: str | None) -> float | None:
-    """Best-effort extraction of the `exp` claim from a JWT access token."""
+def _jwt_payload(token: str | None) -> dict | None:
+    """Best-effort decode of a JWT's payload segment (no signature check)."""
     if not token or token.count(".") != 2:
         return None
     import base64
@@ -379,10 +391,99 @@ def _jwt_exp(token: str | None) -> float | None:
         payload = json.loads(base64.urlsafe_b64decode(payload_b64))
     except Exception:
         return None
-    exp = payload.get("exp")
+    return payload if isinstance(payload, dict) else None
+
+
+def _jwt_exp(token: str | None) -> float | None:
+    """Best-effort extraction of the `exp` claim from a JWT access token."""
+    exp = (_jwt_payload(token) or {}).get("exp")
     return float(exp) if isinstance(exp, (int, float)) else None
+
+
+def id_token_account_id(id_token: str | None) -> str | None:
+    """chatgpt_account_id from the id_token's https://api.openai.com/auth claim."""
+    payload = _jwt_payload(id_token) or {}
+    auth = payload.get("https://api.openai.com/auth")
+    if isinstance(auth, dict) and auth.get("chatgpt_account_id"):
+        return str(auth["chatgpt_account_id"])
+    return None
+
+
+def device_usercode_request(*, http_post=None, client_id: str = CODEX_CLIENT_ID) -> dict:
+    """Step 1 of the device flow: mint a one-time user code."""
+    post = http_post or _default_http_post
+    resp = post(f"{DEVICE_AUTH_BASE_URL}/usercode", json={"client_id": client_id})
+    status = getattr(resp, "status_code", 0)
+    if status != 200:
+        raise DeviceAuthError(f"device usercode request failed with status {status}")
+    data = resp.json()
+    device_auth_id = data.get("device_auth_id")
+    user_code = data.get("user_code") or data.get("usercode")
+    if not device_auth_id or not user_code:
+        raise DeviceAuthError("device usercode response missing device_auth_id/user_code")
+    try:
+        interval = int(str(data.get("interval") or "5").strip())
+    except ValueError:
+        interval = 5
+    return {"device_auth_id": str(device_auth_id), "user_code": str(user_code),
+            "interval": max(1, interval)}
+
+
+def device_token_poll(device_auth_id: str, user_code: str, *, http_post=None) -> dict | None:
+    """One poll of /deviceauth/token. None while the user hasn't approved
+    (403/404, per the CLI); the authorization code + server-generated PKCE
+    verifier once they have; DeviceAuthError on anything else."""
+    post = http_post or _default_http_post
+    resp = post(f"{DEVICE_AUTH_BASE_URL}/token",
+                json={"device_auth_id": device_auth_id, "user_code": user_code})
+    status = getattr(resp, "status_code", 0)
+    if status in (403, 404):
+        return None
+    if status != 200:
+        raise DeviceAuthError(f"device auth poll failed with status {status}")
+    data = resp.json()
+    if not data.get("authorization_code") or not data.get("code_verifier"):
+        raise DeviceAuthError("device auth token response missing authorization_code/code_verifier")
+    return {"authorization_code": data["authorization_code"],
+            "code_verifier": data["code_verifier"]}
+
+
+def device_code_exchange(authorization_code: str, code_verifier: str, *,
+                         http_post_form=None, client_id: str = CODEX_CLIENT_ID) -> dict:
+    """Exchange the device-flow authorization code for tokens and return an
+    auth.json-shaped dict ready for CodexAuthStore.add_account(). The token
+    endpoint requires form encoding here (unlike the JSON refresh call)."""
+    post = http_post_form or _default_http_post_form
+    resp = post(OAUTH_TOKEN_URL, data={
+        "grant_type":    "authorization_code",
+        "code":          authorization_code,
+        "redirect_uri":  DEVICE_CALLBACK_URL,
+        "client_id":     client_id,
+        "code_verifier": code_verifier,
+    })
+    status = getattr(resp, "status_code", 0)
+    if status != 200:
+        raise DeviceAuthError(f"token exchange failed with status {status}")
+    data = resp.json()
+    if not data.get("access_token"):
+        raise DeviceAuthError("token exchange response has no access_token")
+    from datetime import datetime, timezone
+    return {
+        "tokens": {
+            "access_token":  data["access_token"],
+            "refresh_token": data.get("refresh_token"),
+            "id_token":      data.get("id_token"),
+            "account_id":    id_token_account_id(data.get("id_token")),
+        },
+        "last_refresh": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _default_http_post(url: str, json: dict):  # pragma: no cover - needs network
     import httpx
     return httpx.post(url, json=json, timeout=30.0)
+
+
+def _default_http_post_form(url: str, data: dict):  # pragma: no cover - needs network
+    import httpx
+    return httpx.post(url, data=data, timeout=30.0)
