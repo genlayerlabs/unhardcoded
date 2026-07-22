@@ -14,6 +14,8 @@ device_auth_id/user_code pair (useless without the user's in-browser approval).
 from __future__ import annotations
 
 import json
+import logging
+import os
 import secrets
 import threading
 import time
@@ -22,12 +24,20 @@ from pathlib import Path
 INVITE_TTL_S = 24 * 3600        # invite link lifetime
 DEVICE_CODE_TTL_S = 15 * 60     # OpenAI device codes expire after 15 minutes
 
+log = logging.getLogger(__name__)
+
+# Module-level lock: callers construct short-lived store instances per request,
+# so a per-instance lock would give zero cross-request exclusion over the
+# shared read-modify-write of _invites.json (e.g. a /status poll could write
+# back an invite the dashboard just revoked).
+_lock = threading.Lock()
+
 
 class CodexInviteStore:
     def __init__(self, accounts_dir: str | Path, *, now=None):
         self._path = Path(accounts_dir) / "_invites.json"
         self._now = now or time.time
-        self._lock = threading.Lock()
+        self._lock = _lock
 
     # ---- persistence ---------------------------------------------------
 
@@ -35,16 +45,21 @@ class CodexInviteStore:
         try:
             raw = json.loads(self._path.read_text())
             return raw if isinstance(raw, dict) else {}
-        except (OSError, ValueError):
+        except OSError:
+            return {}
+        except ValueError:
+            log.warning("codex invites file %s is corrupt; treating as empty", self._path)
             return {}
 
     def _save(self, invites: dict) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(invites, indent=2))
+        tmp = self._path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(invites, indent=2))
         try:
-            self._path.chmod(0o600)
+            tmp.chmod(0o600)
         except OSError:
             pass
+        os.replace(tmp, self._path)
 
     def _mutate(self, token: str, fn) -> bool:
         """Apply fn(invite) to one invite under the lock; False if unknown."""

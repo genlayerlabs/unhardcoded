@@ -91,3 +91,19 @@ def test_exchange_failure_and_missing_token_raise():
     with pytest.raises(DeviceAuthError):
         device_code_exchange("c", "v",
                              http_post_form=lambda u, data=None: _Resp(200, {"id_token": "x"}))
+    # access_token present but id_token missing the account claim -> fail fast
+    with pytest.raises(DeviceAuthError):
+        device_code_exchange("c", "v",
+                             http_post_form=lambda u, data=None: _Resp(200, {"access_token": "at"}))
+
+
+def test_network_errors_surface_as_device_auth_error():
+    def down(url, json=None, data=None):
+        raise ConnectionError("boom")
+
+    with pytest.raises(DeviceAuthError):
+        device_usercode_request(http_post=down)
+    with pytest.raises(DeviceAuthError):
+        device_token_poll("da", "UC", http_post=down)
+    with pytest.raises(DeviceAuthError):
+        device_code_exchange("c", "v", http_post_form=down)

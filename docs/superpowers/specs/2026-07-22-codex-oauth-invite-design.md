@@ -84,8 +84,9 @@ Privileged (existing dashboard auth, same guard as other
   (`pending` / `awaiting sign-in` / `used` / `expired`) and copyable URLs.
 - `DELETE /dashboard/api/codex/invites/{token}` → revoke.
 
-Public, token-gated (no dashboard auth; unknown/expired/used token → friendly
-"link expired" page / 404 JSON):
+Public, token-gated (no dashboard auth; unknown and expired tokens return
+byte-identical 404s on all three endpoints — no oracle distinguishing them;
+used tokens show/report the connected state):
 
 - `GET /codex/onboard/{token}` → onboarding HTML page.
 - `POST /codex/onboard/{token}/start` → runs step 1, stores device state on

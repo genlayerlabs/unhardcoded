@@ -3006,12 +3006,11 @@ async def codex_onboard_start(token: str) -> Response:
 async def codex_onboard_status(token: str) -> Response:
     import codex_auth
     store, inv, status = _live_invite(token)
-    if inv is None:
+    if inv is None or status == "expired":
+        # Same shape as an unknown token: no oracle distinguishing the two.
         return JSONResponse(status_code=404, content={"error": {"message": "invite link expired", "type": "not_found", "code": "codex_onboard"}})
     if status == "used":
         return JSONResponse(content={"status": "connected", "name": inv["name"]})
-    if status == "expired":
-        return JSONResponse(content={"status": "expired"})
     if status == "pending":
         if inv.get("device_auth_id"):
             store.clear_device(token)   # device code timed out; allow a fresh start
@@ -3090,7 +3089,9 @@ if(!r.ok)throw new Error(d.error&&d.error.message||('start failed ('+r.status+')
 $('verifyLink').href=d.verification_url;$('userCode').textContent=d.user_code;
 $('idle').classList.add('hidden');$('steps').classList.remove('hidden');poll()}}
 catch(e){{show(e.message)}}}}
-async function poll(){{clearTimeout(timer);try{{const r=await fetch(S.status);const d=await r.json();
+async function poll(){{clearTimeout(timer);try{{const r=await fetch(S.status);
+if(r.status===404){{$('steps').classList.add('hidden');$('idle').classList.add('hidden');show('This link is no longer valid — ask for a new one.');return}}
+const d=await r.json();
 if(d.status==='connected'){{$('steps').classList.add('hidden');$('done').classList.remove('hidden');return}}
 if(d.status==='error'){{$('steps').classList.add('hidden');$('idle').classList.remove('hidden');show(d.message||'sign-in failed — try again');return}}
 if(d.status==='pending'&&!$('steps').classList.contains('hidden')){{$('steps').classList.add('hidden');$('idle').classList.remove('hidden');show('The sign-in expired — start again.');return}}

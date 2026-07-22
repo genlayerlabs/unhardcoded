@@ -66,7 +66,10 @@ python -m hosts.python_shim --config hosts/python_shim/config.live.lua \
 
 `--codex-auth` defaults to `~/.codex/auth.json`. Treat that file — and invite
 links — like passwords: the file holds bearer tokens, and a link lets whoever
-opens it bind a ChatGPT account to your router.
+opens it bind a ChatGPT account to your router. The invite token travels in
+the URL path, so it will appear in ingress/uvicorn access logs; links are
+single-use and expire after 24 h, but scrub or restrict those logs if that
+matters in your deployment.
 
 ## Caveats
 

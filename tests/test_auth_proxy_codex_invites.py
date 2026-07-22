@@ -120,6 +120,42 @@ def test_onboard_page_content(monkeypatch, tmp_path):
         assert needle in html, needle
 
 
+def test_onboard_status_respects_poll_interval(monkeypatch, tmp_path):
+    _wire(monkeypatch, tmp_path)
+    admin = _admin(monkeypatch)
+    url = admin.post("/dashboard/api/codex/invites", json={"name": "t1"}).json()["url"]
+    token = url.rsplit("/", 1)[1]
+    anon = TestClient(auth_proxy.app)
+    monkeypatch.setattr(codex_auth, "device_usercode_request", lambda **kw: {
+        "device_auth_id": "da-1", "user_code": "AB-12", "interval": 5})
+    anon.post(f"/codex/onboard/{token}/start")
+
+    calls = []
+    monkeypatch.setattr(codex_auth, "device_token_poll",
+                        lambda *a, **kw: calls.append(1) or None)
+    assert anon.get(f"/codex/onboard/{token}/status").json()["status"] == "awaiting"
+    assert anon.get(f"/codex/onboard/{token}/status").json()["status"] == "awaiting"
+    assert len(calls) == 1  # second request inside the 5s interval: no upstream poll
+
+
+def test_onboard_status_expired_matches_unknown(monkeypatch, tmp_path):
+    accounts_dir = _wire(monkeypatch, tmp_path)
+    admin = _admin(monkeypatch)
+    url = admin.post("/dashboard/api/codex/invites", json={"name": "t1"}).json()["url"]
+    token = url.rsplit("/", 1)[1]
+    anon = TestClient(auth_proxy.app)
+
+    invites_path = accounts_dir / "_invites.json"
+    invites = json.loads(invites_path.read_text())
+    invites[token]["expires_at"] = 1.0
+    invites_path.write_text(json.dumps(invites))
+
+    expired = anon.get(f"/codex/onboard/{token}/status")
+    unknown = anon.get("/codex/onboard/not-a-token/status")
+    assert expired.status_code == unknown.status_code == 404
+    assert expired.json() == unknown.json()  # no oracle distinguishing the two
+
+
 def test_onboard_poll_error_resets_device_state(monkeypatch, tmp_path):
     _wire(monkeypatch, tmp_path)
     admin = _admin(monkeypatch)

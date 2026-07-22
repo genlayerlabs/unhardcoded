@@ -412,7 +412,10 @@ def id_token_account_id(id_token: str | None) -> str | None:
 def device_usercode_request(*, http_post=None, client_id: str = CODEX_CLIENT_ID) -> dict:
     """Step 1 of the device flow: mint a one-time user code."""
     post = http_post or _default_http_post
-    resp = post(f"{DEVICE_AUTH_BASE_URL}/usercode", json={"client_id": client_id})
+    try:
+        resp = post(f"{DEVICE_AUTH_BASE_URL}/usercode", json={"client_id": client_id})
+    except Exception as exc:
+        raise DeviceAuthError(f"device usercode request failed: {exc}") from exc
     status = getattr(resp, "status_code", 0)
     if status != 200:
         raise DeviceAuthError(f"device usercode request failed with status {status}")
@@ -434,8 +437,11 @@ def device_token_poll(device_auth_id: str, user_code: str, *, http_post=None) ->
     (403/404, per the CLI); the authorization code + server-generated PKCE
     verifier once they have; DeviceAuthError on anything else."""
     post = http_post or _default_http_post
-    resp = post(f"{DEVICE_AUTH_BASE_URL}/token",
-                json={"device_auth_id": device_auth_id, "user_code": user_code})
+    try:
+        resp = post(f"{DEVICE_AUTH_BASE_URL}/token",
+                    json={"device_auth_id": device_auth_id, "user_code": user_code})
+    except Exception as exc:
+        raise DeviceAuthError(f"device auth poll failed: {exc}") from exc
     status = getattr(resp, "status_code", 0)
     if status in (403, 404):
         return None
@@ -454,26 +460,34 @@ def device_code_exchange(authorization_code: str, code_verifier: str, *,
     auth.json-shaped dict ready for CodexAuthStore.add_account(). The token
     endpoint requires form encoding here (unlike the JSON refresh call)."""
     post = http_post_form or _default_http_post_form
-    resp = post(OAUTH_TOKEN_URL, data={
-        "grant_type":    "authorization_code",
-        "code":          authorization_code,
-        "redirect_uri":  DEVICE_CALLBACK_URL,
-        "client_id":     client_id,
-        "code_verifier": code_verifier,
-    })
+    try:
+        resp = post(OAUTH_TOKEN_URL, data={
+            "grant_type":    "authorization_code",
+            "code":          authorization_code,
+            "redirect_uri":  DEVICE_CALLBACK_URL,
+            "client_id":     client_id,
+            "code_verifier": code_verifier,
+        })
+    except Exception as exc:
+        raise DeviceAuthError(f"token exchange failed: {exc}") from exc
     status = getattr(resp, "status_code", 0)
     if status != 200:
         raise DeviceAuthError(f"token exchange failed with status {status}")
     data = resp.json()
     if not data.get("access_token"):
         raise DeviceAuthError("token exchange response has no access_token")
+    account_id = id_token_account_id(data.get("id_token"))
+    if not account_id:
+        # The codex backend needs the chatgpt-account-id header; refuse to
+        # write a half-usable account file rather than fail at call time.
+        raise DeviceAuthError("token exchange id_token has no chatgpt_account_id claim")
     from datetime import datetime, timezone
     return {
         "tokens": {
             "access_token":  data["access_token"],
             "refresh_token": data.get("refresh_token"),
             "id_token":      data.get("id_token"),
-            "account_id":    id_token_account_id(data.get("id_token")),
+            "account_id":    account_id,
         },
         "last_refresh": datetime.now(timezone.utc).isoformat(),
     }
