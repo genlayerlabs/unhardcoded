@@ -3039,13 +3039,65 @@ async def codex_onboard_status(token: str) -> Response:
 
 
 def _onboard_dead_html() -> str:
-    # Task 4 replaces this stub with the real page.
-    return "<html><meta name='robots' content='noindex'/>This invite link has expired.</html>"
+    return """<!doctype html><html lang='en'><head><meta charset='utf-8'/>
+<meta name='viewport' content='width=device-width,initial-scale=1'/>
+<meta name='robots' content='noindex,nofollow,noarchive'/><title>Link expired</title>
+<style>body{margin:0;background:#08090a;color:#f7f8f8;font:15px/1.5 Inter,ui-sans-serif,system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}main{max-width:420px;padding:32px;text-align:center}h1{font-size:22px}p{color:#8a8f98}</style>
+</head><body><main><h1>This link is no longer valid</h1>
+<p>The invite has expired or was already used. Ask the person who sent it for a new link.</p>
+</main></body></html>"""
 
 
 def _onboard_html(name: str, connected: bool = False) -> str:
-    # Task 4 replaces this stub with the real page.
-    return f"<html><meta name='robots' content='noindex'/>Sign in with ChatGPT ({name})</html>"
+    import html as _html
+    safe = _html.escape(name)
+    idle_cls = "hidden" if connected else ""
+    done_cls = "" if connected else "hidden"
+    return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'/>
+<meta name='viewport' content='width=device-width,initial-scale=1'/>
+<meta name='robots' content='noindex,nofollow,noarchive'/><title>Connect ChatGPT — {safe}</title>
+<style>
+body{{margin:0;background:radial-gradient(circle at 20% -10%,rgba(113,112,255,.18),transparent 34%),#08090a;color:#f7f8f8;font:15px/1.55 Inter,ui-sans-serif,system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}}
+main{{max-width:460px;padding:34px;border:1px solid rgba(255,255,255,.075);border-radius:18px;background:rgba(15,16,17,.92);box-shadow:0 24px 80px rgba(0,0,0,.42)}}
+h1{{font-size:21px;letter-spacing:-.3px;margin:0 0 6px}}p{{color:#8a8f98;margin:10px 0}}
+.btn{{display:inline-block;border:0;border-radius:10px;background:linear-gradient(180deg,#7170ff,#5e6ad2);color:#fff;font:inherit;font-weight:590;padding:11px 18px;cursor:pointer;text-decoration:none}}
+.code{{font:600 30px/1 'JetBrains Mono',ui-monospace,monospace;letter-spacing:.14em;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:14px 18px;text-align:center;margin:14px 0;user-select:all}}
+.muted{{font-size:13px;color:#62666d}}.ok{{color:#27a644}}.err{{color:#ff5c7a}}
+.hidden{{display:none}}.copy{{margin-left:10px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);color:#f7f8f8;border-radius:8px;padding:6px 10px;cursor:pointer}}
+</style></head><body><main>
+<h1>Connect your ChatGPT account</h1>
+<p>This links your ChatGPT subscription to the <b>unhardcoded</b> router as account <b>{safe}</b>. Only continue if a person you trust sent you this link.</p>
+<div id='idle' class='{idle_cls}'>
+  <button class='btn' id='startBtn'>Sign in with ChatGPT</button>
+  <p class='muted'>You'll sign in on openai.com and enter a one-time code. OpenAI's page warns about codes given to you by websites — that warning refers to this flow; continue only because your operator sent you this link, otherwise cancel.</p>
+</div>
+<div id='steps' class='hidden'>
+  <p>1 · Open <a id='verifyLink' class='btn' target='_blank' rel='noopener'>openai.com sign-in</a></p>
+  <p>2 · Enter this one-time code <button class='copy' id='copyBtn'>copy</button></p>
+  <div class='code' id='userCode'></div>
+  <p class='muted' id='waitMsg'>Waiting for you to finish signing in… this page updates automatically.</p>
+</div>
+<div id='done' class='{done_cls}'>
+  <p class='ok'>✓ Connected as <b>{safe}</b>. You can close this page.</p>
+</div>
+<p class='err hidden' id='errMsg'></p>
+</main><script>
+const S={{start:location.pathname+'/start',status:location.pathname+'/status'}};
+const $=id=>document.getElementById(id);let timer=null;
+function show(err){{$('errMsg').textContent=err||'';$('errMsg').classList.toggle('hidden',!err)}}
+async function start(){{show('');try{{const r=await fetch(S.start,{{method:'POST'}});const d=await r.json();
+if(!r.ok)throw new Error(d.error&&d.error.message||('start failed ('+r.status+')'));
+$('verifyLink').href=d.verification_url;$('userCode').textContent=d.user_code;
+$('idle').classList.add('hidden');$('steps').classList.remove('hidden');poll()}}
+catch(e){{show(e.message)}}}}
+async function poll(){{clearTimeout(timer);try{{const r=await fetch(S.status);const d=await r.json();
+if(d.status==='connected'){{$('steps').classList.add('hidden');$('done').classList.remove('hidden');return}}
+if(d.status==='error'){{$('steps').classList.add('hidden');$('idle').classList.remove('hidden');show(d.message||'sign-in failed — try again');return}}
+if(d.status==='pending'&&!$('steps').classList.contains('hidden')){{$('steps').classList.add('hidden');$('idle').classList.remove('hidden');show('The sign-in expired — start again.');return}}
+}}catch(e){{}}timer=setTimeout(poll,5000)}}
+$('startBtn').onclick=start;
+$('copyBtn').onclick=()=>navigator.clipboard.writeText($('userCode').textContent);
+</script></body></html>"""
 
 
 def _cost_accuracy_rows(routes, ema, _mult_of, *, min_calls=20, threshold=0.15):

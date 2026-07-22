@@ -109,6 +109,17 @@ def test_onboard_full_flow(monkeypatch, tmp_path):
     assert admin.get("/dashboard/api/codex/invites").json()["invites"][0]["status"] == "used"
 
 
+def test_onboard_page_content(monkeypatch, tmp_path):
+    _wire(monkeypatch, tmp_path)
+    admin = _admin(monkeypatch)
+    url = admin.post("/dashboard/api/codex/invites", json={"name": "t1"}).json()["url"]
+    token = url.rsplit("/", 1)[1]
+    html = TestClient(auth_proxy.app).get(f"/codex/onboard/{token}").text
+    for needle in ("Sign in with ChatGPT", "noindex", "t1",
+                   "/start", "/status", "cancel", "one-time code"):
+        assert needle in html, needle
+
+
 def test_onboard_poll_error_resets_device_state(monkeypatch, tmp_path):
     _wire(monkeypatch, tmp_path)
     admin = _admin(monkeypatch)
