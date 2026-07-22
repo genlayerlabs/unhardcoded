@@ -39,8 +39,9 @@ public client id `app_EMoamEEZ73f0CkXaXp7hrann` (already in `codex_auth.py`).
    `{"device_auth_id", "user_code"}`. 403/404 = pending (keep polling at
    `interval`); 200 → `{"authorization_code", "code_challenge",
    "code_verifier"}` (OpenAI generates the PKCE pair server-side).
-4. Exchange at `{issuer}/oauth/token` (standard authorization-code grant):
-   `grant_type=authorization_code`, `code=authorization_code`,
+4. Exchange at `{issuer}/oauth/token` — **form-encoded**
+   (`application/x-www-form-urlencoded`, matching the CLI; unlike the JSON
+   refresh call): `grant_type=authorization_code`, `code=authorization_code`,
    `redirect_uri={issuer}/deviceauth/callback`, `client_id`, `code_verifier`
    → `{access_token, refresh_token, id_token}`.
 5. `account_id` = `chatgpt_account_id` from the id_token's
@@ -63,8 +64,10 @@ New module-level functions (it already owns `OAUTH_TOKEN_URL` and
 
 ### Invite store + endpoints — `auth_proxy.py`
 
-Invites persisted to `{CODEX_ACCOUNTS_DIR}/invites.json` (same PVC as
-accounts). Invite record: `{token, name, created_at, expires_at, status,
+Invites persisted to `{CODEX_ACCOUNTS_DIR}/_invites.json` (same PVC as
+accounts; the underscore prefix is required — `CodexAuthStore.reload()` treats
+non-underscore `*.json` files in that dir as accounts, so `invites.json`
+would surface as a bogus account named "invites"). Invite record: `{token, name, created_at, expires_at, status,
 device_auth_id?, user_code?, interval?, device_started_at?, last_poll_at?}`.
 Token: `secrets.token_urlsafe(32)`, single use, 24 h expiry.
 
@@ -102,6 +105,7 @@ Public, token-gated (no dashboard auth; unknown/expired/used token → friendly
 One button: **Sign in with ChatGPT**. After start: shows the one-time code
 (large, copy button) + link to OpenAI's sign-in page; polls `/status` every
 ~5 s; success state: "Connected as `<name>` — you can close this page."
+`noindex,nofollow` robots meta, like the dashboard.
 
 Transparency copy (required): the page states it connects the visitor's
 ChatGPT account to this router, and warns that OpenAI's page shows a
