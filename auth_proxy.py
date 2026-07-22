@@ -2902,6 +2902,152 @@ async def dashboard_delete_codex_account(request: Request, name: str) -> Respons
     return JSONResponse(content={"ok": True, "account": name, "applied_live": applied_live})
 
 
+# ---- Codex onboarding invites (server-side OAuth device flow) --------------
+# Spec: docs/superpowers/specs/2026-07-22-codex-oauth-invite-design.md
+
+def _invite_store():
+    from codex_invites import CodexInviteStore
+    return CodexInviteStore(CODEX_ACCOUNTS_DIR)
+
+
+def _request_origin(request: Request) -> str:
+    """Public origin for links we hand out, honoring the ingress's
+    X-Forwarded-* headers; falls back to the request's own scheme/host."""
+    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http")
+    host = (request.headers.get("x-forwarded-host") or request.headers.get("host")
+            or request.url.netloc)
+    return f"{proto.split(',')[0].strip()}://{host.split(',')[0].strip()}"
+
+
+def _invite_view(inv: dict, origin: str) -> dict:
+    return {"name": inv["name"], "status": inv.get("status"),
+            "url": f"{origin}/codex/onboard/{inv['token']}",
+            "created_at": inv.get("created_at"), "expires_at": inv.get("expires_at"),
+            "used_at": inv.get("used_at")}
+
+
+@app.post("/dashboard/api/codex/invites")
+async def dashboard_create_codex_invite(request: Request) -> Response:
+    """Mint a single-use onboarding link that lets a teammate OAuth their
+    ChatGPT account into the named Codex slot. Admin-only."""
+    caller, error = _require_admin_dashboard_caller(request)
+    if error:
+        return error
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {"message": "invalid JSON body", "type": "invalid_request", "code": "codex_invite"}})
+    try:
+        inv = _invite_store().create(str(body.get("name") or ""))
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": {"message": str(exc), "type": "invalid_request", "code": "codex_invite"}})
+    _log({"event": "dashboard_codex_invite_created", "account": inv["name"], "viewer": caller})
+    return JSONResponse(content={"ok": True, **_invite_view({**inv, "status": "pending"}, _request_origin(request))})
+
+
+@app.get("/dashboard/api/codex/invites")
+async def dashboard_list_codex_invites(request: Request) -> Response:
+    caller, error = _require_admin_dashboard_caller(request)
+    if error:
+        return error
+    origin = _request_origin(request)
+    return JSONResponse(content={"invites": [_invite_view(i, origin) for i in _invite_store().list()]})
+
+
+@app.delete("/dashboard/api/codex/invites/{token}")
+async def dashboard_revoke_codex_invite(request: Request, token: str) -> Response:
+    caller, error = _require_admin_dashboard_caller(request)
+    if error:
+        return error
+    if not _invite_store().revoke(token):
+        return JSONResponse(status_code=404, content={"error": {"message": "invite not found", "type": "not_found", "code": "codex_invite_not_found"}})
+    _log({"event": "dashboard_codex_invite_revoked", "viewer": caller})
+    return JSONResponse(content={"ok": True})
+
+
+def _live_invite(token: str):
+    """(store, invite, status). Unknown and expired links both present to the
+    visitor as a dead link (no oracle distinguishing them)."""
+    store = _invite_store()
+    inv = store.get(token)
+    if inv is None:
+        return store, None, "missing"
+    return store, inv, store.status_of(inv)
+
+
+@app.get("/codex/onboard/{token}")
+async def codex_onboard_page(token: str) -> Response:
+    store, inv, status = _live_invite(token)
+    if inv is None or status == "expired":
+        return HTMLResponse(_onboard_dead_html(), status_code=404)
+    return HTMLResponse(_onboard_html(inv["name"], connected=(status == "used")))
+
+
+@app.post("/codex/onboard/{token}/start")
+async def codex_onboard_start(token: str) -> Response:
+    import codex_auth
+    store, inv, status = _live_invite(token)
+    if inv is None or status == "expired":
+        return JSONResponse(status_code=404, content={"error": {"message": "invite link expired", "type": "not_found", "code": "codex_onboard"}})
+    if status == "used":
+        return JSONResponse(status_code=409, content={"error": {"message": "invite already used", "type": "invalid_request", "code": "codex_onboard_used"}})
+    try:
+        device = await asyncio.to_thread(codex_auth.device_usercode_request)
+    except codex_auth.DeviceAuthError as exc:
+        return JSONResponse(status_code=502, content={"error": {"message": str(exc), "type": "device_auth_error", "code": "codex_onboard_start"}})
+    store.set_device(token, device)
+    _log({"event": "codex_invite_signin_started", "account": inv["name"]})
+    return JSONResponse(content={"user_code": device["user_code"],
+                                 "verification_url": codex_auth.DEVICE_VERIFY_URL,
+                                 "interval": device["interval"]})
+
+
+@app.get("/codex/onboard/{token}/status")
+async def codex_onboard_status(token: str) -> Response:
+    import codex_auth
+    store, inv, status = _live_invite(token)
+    if inv is None:
+        return JSONResponse(status_code=404, content={"error": {"message": "invite link expired", "type": "not_found", "code": "codex_onboard"}})
+    if status == "used":
+        return JSONResponse(content={"status": "connected", "name": inv["name"]})
+    if status == "expired":
+        return JSONResponse(content={"status": "expired"})
+    if status == "pending":
+        if inv.get("device_auth_id"):
+            store.clear_device(token)   # device code timed out; allow a fresh start
+        return JSONResponse(content={"status": "pending"})
+    # status == "awaiting": at most one upstream poll per interval
+    if not store.due_for_poll(token):
+        return JSONResponse(content={"status": "awaiting"})
+    try:
+        result = await asyncio.to_thread(
+            codex_auth.device_token_poll, inv["device_auth_id"], inv["user_code"])
+        if result is None:
+            return JSONResponse(content={"status": "awaiting"})
+        auth_json = await asyncio.to_thread(
+            codex_auth.device_code_exchange,
+            result["authorization_code"], result["code_verifier"])
+    except codex_auth.DeviceAuthError as exc:
+        store.clear_device(token)
+        _log({"event": "codex_invite_device_error", "account": inv["name"], "error": str(exc)})
+        return JSONResponse(content={"status": "error", "message": str(exc)})
+    slug = _codex_store().add_account(inv["name"], auth_json)
+    applied_live, _ = await _reload_codex_router()
+    store.mark_used(token)
+    _log({"event": "codex_invite_connected", "account": slug, "applied_live": applied_live})
+    return JSONResponse(content={"status": "connected", "name": slug, "applied_live": applied_live})
+
+
+def _onboard_dead_html() -> str:
+    # Task 4 replaces this stub with the real page.
+    return "<html><meta name='robots' content='noindex'/>This invite link has expired.</html>"
+
+
+def _onboard_html(name: str, connected: bool = False) -> str:
+    # Task 4 replaces this stub with the real page.
+    return f"<html><meta name='robots' content='noindex'/>Sign in with ChatGPT ({name})</html>"
+
+
 def _cost_accuracy_rows(routes, ema, _mult_of, *, min_calls=20, threshold=0.15):
     """Per-provider measured-vs-list cost, joining the ledger aggregate (`routes`,
     from host_store.cost_by_route) with the live ranked prices (`ema`,
