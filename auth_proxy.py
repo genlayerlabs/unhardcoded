@@ -1466,7 +1466,16 @@ async def dashboard_stats(request: Request) -> Response:
     consumer = str(ctx.get("consumer") or "").strip() or requested_consumer
     key_sha256 = str(ctx.get("key_sha256") or "").strip() or None
     role = str(ctx.get("role") or "admin")
-    snap = _stats_snapshot(viewer=caller, upstream_status=upstream_status, upstream_health=upstream_health, consumer=consumer, timeframe=_dashboard_timeframe(request.query_params.get("timeframe") or request.query_params.get("window")), key_sha256=key_sha256, viewer_role=role, provider=request.query_params.get("provider"), model=request.query_params.get("model"))
+    # _stats_snapshot performs synchronous PostgreSQL aggregation. Keep it off
+    # Uvicorn's event loop so a slow query cannot stall health checks and all
+    # proxied traffic handled by this worker.
+    snap = await asyncio.to_thread(
+        _stats_snapshot, viewer=caller, upstream_status=upstream_status,
+        upstream_health=upstream_health, consumer=consumer,
+        timeframe=_dashboard_timeframe(request.query_params.get("timeframe") or request.query_params.get("window")),
+        key_sha256=key_sha256, viewer_role=role,
+        provider=request.query_params.get("provider"),
+        model=request.query_params.get("model"))
     await _attach_antseed_wallet(snap.get("provider_keys"))
     return JSONResponse(content=snap)
 
@@ -1495,7 +1504,11 @@ async def _dashboard_full_snapshot(request: Request) -> Response:
     consumer = str(ctx.get("consumer") or "").strip() or requested_consumer
     key_sha256 = str(ctx.get("key_sha256") or "").strip() or None
     role = str(ctx.get("role") or "admin")
-    stats = _stats_snapshot(viewer=caller, upstream_status=upstream_status, upstream_health=upstream_health, consumer=consumer, timeframe=_dashboard_timeframe(request.query_params.get("timeframe") or request.query_params.get("window")), key_sha256=key_sha256, viewer_role=role)
+    stats = await asyncio.to_thread(
+        _stats_snapshot, viewer=caller, upstream_status=upstream_status,
+        upstream_health=upstream_health, consumer=consumer,
+        timeframe=_dashboard_timeframe(request.query_params.get("timeframe") or request.query_params.get("window")),
+        key_sha256=key_sha256, viewer_role=role)
     try:
         policies = _policy_catalog_snapshot() if role == "admin" else {"providers": [], "models": [], "profiles": [], "retry_policies": {}, "consumer_visible": False, "generated_at": int(time.time())}
         policy_error = None

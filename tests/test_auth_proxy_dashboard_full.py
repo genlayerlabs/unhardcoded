@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -21,6 +26,45 @@ os.environ["DASHBOARD_TRUSTED_USER_HEADER"] = ""
 
 import auth_proxy  # noqa: E402
 import host_store  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_dashboard_stats_keeps_event_loop_responsive_during_slow_store_query(monkeypatch):
+    """A slow synchronous stats query must not take down health/proxy traffic."""
+    _install_test_state(monkeypatch)
+    monkeypatch.setattr(
+        auth_proxy, "_require_dashboard_context",
+        lambda _request: {"viewer": "admin", "role": "admin"})
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_snapshot(**_kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        return {}
+
+    monkeypatch.setattr(auth_proxy, "_stats_snapshot", slow_snapshot)
+    request = Request({
+        "type": "http", "method": "GET", "path": "/dashboard/api/stats",
+        "query_string": b"timeframe=all", "headers": [],
+        "client": ("test", 1), "server": ("test", 80), "scheme": "http",
+    })
+
+    # A timer releases the fake DB query even on the broken implementation,
+    # preventing a deadlock while making event-loop blocking measurable.
+    timer = threading.Timer(0.5, release.set)
+    timer.start()
+    before = time.monotonic()
+    task = asyncio.create_task(auth_proxy.dashboard_stats(request))
+    await asyncio.to_thread(started.wait, 1)
+    await asyncio.sleep(0.05)
+    elapsed = time.monotonic() - before
+    release.set()
+    await task
+    timer.cancel()
+
+    assert elapsed < 0.25, "synchronous stats work blocked the event loop"
 
 
 def _use_db(monkeypatch, tmp_path):
