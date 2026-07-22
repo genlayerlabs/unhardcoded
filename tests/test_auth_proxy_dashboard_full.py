@@ -955,7 +955,7 @@ def test_usage_history_survives_stats_reset_and_supports_windows_pagination_and_
         auth_proxy._reset_stats_for_tests()
 
 
-def test_dashboard_stats_default_all_history_and_consumer_rows(monkeypatch, tmp_path):
+def test_dashboard_stats_defaults_to_latest_events_and_consumer_rows(monkeypatch, tmp_path):
     history_path = tmp_path / "usage-history.jsonl"
     monkeypatch.setenv("ROUTER_USAGE_HISTORY_PATH", str(history_path))
     token = "dashboard-history-token"
@@ -972,7 +972,7 @@ def test_dashboard_stats_default_all_history_and_consumer_rows(monkeypatch, tmp_
         resp = dashboard.get("/dashboard/api/stats")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["timeframe"]["selected"] == "all"
+        assert body["timeframe"]["selected"] == "recent"
         assert body["timeframe"]["source"] == "persistent_history"
         assert body["totals"]["requests"] == 3
         assert body["by_caller"]["crm"]["requests"] == 2
@@ -989,9 +989,13 @@ def test_dashboard_stats_default_all_history_and_consumer_rows(monkeypatch, tmp_
         assert selected_body["selected_consumer"] == "crm"
         assert selected_body["totals"]["requests"] == 2
         selected_crm_row = next(row for row in selected_body["keys"] if row["consumer"] == "crm")
-        selected_wing_row = next(row for row in selected_body["keys"] if row["consumer"] == "wingston")
         assert selected_crm_row["stats"]["requests"] == 2
-        assert selected_wing_row["stats"]["requests"] == 1
+        selected_wing_row = next(row for row in selected_body["keys"] if row["consumer"] == "wingston")
+        assert selected_wing_row["stats"]["requests"] == 0
+
+        legacy_all = dashboard.get("/dashboard/api/stats?timeframe=all")
+        assert legacy_all.status_code == 200
+        assert legacy_all.json()["timeframe"]["selected"] == "recent"
 
         runtime = dashboard.get("/dashboard/api/stats?timeframe=runtime")
         assert runtime.status_code == 200
@@ -1076,6 +1080,10 @@ def test_openapi_and_dashboard_document_key_usage_controls():
     assert "loadKeyUsage" in html
     assert "cost_estimate" in html
     assert "recentOffset" in html
+    assert "Latest 100 events" in html
+    assert "value='all' selected" not in html
+    assert "dashboardLoading" in html
+    assert "AbortController" in html
     spec = TestClient(auth_proxy.app).get("/openapi.json")
     assert spec.status_code == 200
     paths = spec.json()["paths"]

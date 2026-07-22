@@ -50,6 +50,17 @@ _PRUNE_EVERY = 500          # run a retention sweep once per this many inserts
 _WRITE_QUEUE_MAX = 10_000   # cap the background ledger-write backlog
 
 
+def _set_dashboard_statement_timeout(conn: Any) -> None:
+    """Bound dashboard reads inside the current transaction at PostgreSQL level."""
+    raw = os.getenv("DASHBOARD_DB_STATEMENT_TIMEOUT_MS", "10000")
+    try:
+        timeout_ms = max(100, min(int(raw), 60_000))
+    except (TypeError, ValueError):
+        timeout_ms = 10_000
+    conn.execute("SELECT set_config('statement_timeout', %s, true)",
+                 [str(timeout_ms)])
+
+
 def _retention_days() -> int:
     """Validated retention window — a non-integer or < 1 env value must not crash
     import or compute a future cutoff that prunes the whole ledger."""
@@ -800,6 +811,7 @@ def usage_rows_page(since_ts: "int | None" = None, caller: "str | None" = None,
                                      consumer_sha=consumer_sha, provider=provider,
                                      model_family=model_family)
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             cur = conn.execute(
                 f"SELECT {', '.join(_USAGE_COLS)} FROM calls{where}"
                 " ORDER BY ts DESC, id ASC LIMIT %s", params + [int(limit)])
@@ -900,6 +912,7 @@ def usage_aggregate(since_ts: "int | None" = None, caller: "str | None" = None,
                 123: ("by_served_model", 5), 126: ("by_day", 7)}
         out = _empty_usage_aggregate()
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             for row in conn.execute(sql, params):
                 gset = int(row[0])
                 counter = _agg_counter(row[8:])
@@ -1026,6 +1039,7 @@ def usage_count(since_ts: "int | None" = None) -> int:
     try:
         where, params = _usage_where(since_ts=since_ts)
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             return int(conn.execute(
                 f"SELECT count(*) FROM calls{where}", params).fetchone()[0])
     except Exception as exc:  # noqa: BLE001
@@ -1043,6 +1057,7 @@ def usage_provider_stats(since_ts: "int | None" = None) -> dict[str, dict[str, A
         where, params = _usage_where(since_ts=since_ts)
         out: dict[str, dict[str, Any]] = {}
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             cur = conn.execute(
                 "SELECT provider_k," + _AGG_MEASURES +
                 f" FROM ({_AGG_INNER}{where}) c GROUP BY provider_k", params)
@@ -1072,6 +1087,7 @@ def usage_connections(since_ts: "int | None" = None,
         where, params = _usage_where(since_ts=since_ts, caller=caller)
         grouped: dict[tuple[str, str], dict[str, Any]] = {}
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             cur = conn.execute(
                 "SELECT caller_k, prefix_k, count(*),"
                 " count(*) FILTER (WHERE COALESCE(status,0) >= 400),"

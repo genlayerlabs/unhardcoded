@@ -14,6 +14,8 @@ import hashlib
 import os
 import random
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -288,4 +290,40 @@ def test_stats_snapshot_ttl_cache_reuses_window_aggregation(host_store_clean, mo
     auth_proxy._stats_snapshot(viewer="t", upstream_status=200,
                                upstream_health={"ok": True}, timeframe="7d")
     assert calls["n"] > first
+    auth_proxy._reset_stats_for_tests()
+
+
+def test_recent_dashboard_is_bounded_and_single_flight(host_store_clean, monkeypatch, tmp_path):
+    _use_prices(monkeypatch, tmp_path)
+    _seed(150)
+    real = host_store.usage_rows_page
+    calls = {"n": 0}
+
+    def slow_page(*args, **kwargs):
+        calls["n"] += 1
+        time.sleep(0.05)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(host_store, "usage_rows_page", slow_page)
+    monkeypatch.setattr(auth_proxy, "_provider_credentials_snapshot", lambda **kwargs: {"rows": []})
+    monkeypatch.setattr(auth_proxy, "_login_connections_snapshot", lambda **kwargs: {"rows": []})
+    monkeypatch.setattr(auth_proxy, "_SNAPSHOT_TTL_S", 60.0)
+    auth_proxy._reset_stats_for_tests()
+    results = []
+
+    def load():
+        results.append(auth_proxy._stats_snapshot(
+            viewer="t", upstream_status=200, upstream_health={"ok": True}))
+
+    threads = [threading.Thread(target=load) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert calls["n"] == 1
+    assert len(results) == 4
+    assert all(result["timeframe"]["selected"] == "recent" for result in results)
+    assert all(len(result["recent"]) <= 100 for result in results)
+    assert all(result["totals"]["requests"] == 100 for result in results)
     auth_proxy._reset_stats_for_tests()

@@ -15,7 +15,7 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any, Dict
 
 import httpx
@@ -37,6 +37,7 @@ CALLER_KEYS_SHA256_JSON = os.getenv("CALLER_KEYS_SHA256_JSON", "{}")
 RATE_PER_MIN = int(os.getenv("RATE_PER_MIN", "600"))
 BURST = int(os.getenv("BURST", "200"))
 RECENT_LIMIT = int(os.getenv("DASHBOARD_RECENT_LIMIT", "200"))
+DASHBOARD_STATS_RECENT_LIMIT = max(1, min(int(os.getenv("DASHBOARD_STATS_RECENT_LIMIT", "100")), 100))
 DASHBOARD_TRUSTED_USER_HEADER = os.getenv("DASHBOARD_TRUSTED_USER_HEADER", "").strip()
 DASHBOARD_TRUSTED_USER_SECRET = os.getenv("DASHBOARD_TRUSTED_USER_SECRET", "")
 DASHBOARD_PASSWORD_SHA256 = os.getenv("DASHBOARD_PASSWORD_SHA256", "")
@@ -146,6 +147,7 @@ _stats: dict[str, Any] = _new_stats()
 _SNAPSHOT_TTL_S = float(os.getenv("DASHBOARD_STATS_TTL_S", "12"))
 _snapshot_cache: dict[tuple, tuple[float, Any]] = {}
 _snapshot_cache_lock = RLock()
+_snapshot_compute_locks: dict[tuple, Lock] = {}
 
 
 def _snapshot_cache_get(key: tuple) -> Any:
@@ -165,6 +167,21 @@ def _snapshot_cache_put(key: tuple, value: Any) -> None:
         if len(_snapshot_cache) > 256:  # bound the key space (bad params etc.)
             _snapshot_cache.clear()
         _snapshot_cache[key] = (time.monotonic(), value)
+
+
+def _snapshot_cached_compute(key: tuple, compute: Any) -> Any:
+    """Compute a missing snapshot once, even with concurrent dashboard loads."""
+    value = _snapshot_cache_get(key)
+    if value is not None:
+        return value
+    with _snapshot_cache_lock:
+        lock = _snapshot_compute_locks.setdefault(key, Lock())
+    with lock:
+        value = _snapshot_cache_get(key)
+        if value is None:
+            value = compute()
+            _snapshot_cache_put(key, value)
+        return value
 
 
 def _snapshot_cache_clear() -> None:
@@ -728,7 +745,11 @@ def _provider_credentials_snapshot(*, timeframe: str = "all", viewer_role: str =
     counters: dict[str, dict[str, Any]] = defaultdict(_counter)
     last_event: dict[str, dict[str, Any]] = {}
     cost_by_provider: dict[str, float] = defaultdict(float)
-    if timeframe != "runtime":
+    if timeframe == "recent":
+        overlay = _snapshot_cached_compute(
+            ("provider_recent",),
+            lambda: host_store.usage_rows_page(limit=DASHBOARD_STATS_RECENT_LIMIT))
+    elif timeframe != "runtime":
         # SQL per-provider rollup over the window (was: load every retained row
         # and fold in Python), TTL-cached; only the not-yet-landed runtime rows
         # get folded on top — the old merge deduped landed rows anyway.
@@ -781,7 +802,7 @@ def _provider_credentials_snapshot(*, timeframe: str = "all", viewer_role: str =
         elif auth_kind:
             status = "configured"
         counter = _counter_snapshot(counters.get(name, _counter()))
-        if timeframe == "runtime" and not counter.get("requests"):
+        if timeframe in {"runtime", "recent"} and not counter.get("requests"):
             counter = runtime_by_provider.get(name, counter)
         latest = last_event.get(name, {})
         rows.append({
@@ -871,7 +892,12 @@ def _login_connections_snapshot(*, timeframe: str = "all", consumer: str | None 
         dashboard_rows = [r for r in dashboard_rows if r.get("consumer") == consumer or r.get("viewer") == f"consumer:{consumer}"]
 
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
-    if timeframe != "runtime":
+    if timeframe == "recent":
+        usage_rows = _snapshot_cached_compute(
+            ("connections_recent", consumer),
+            lambda: host_store.usage_rows_page(
+                caller=consumer, limit=DASHBOARD_STATS_RECENT_LIMIT))
+    elif timeframe != "runtime":
         # SQL per-(caller, key-prefix) rollup over the window (was: load every
         # retained row), TTL-cached; the not-yet-landed runtime rows fold on top.
         cached = _snapshot_cache_get(("connections", timeframe, consumer))
@@ -1477,7 +1503,8 @@ async def dashboard_stats(request: Request) -> Response:
         provider=request.query_params.get("provider"),
         model=request.query_params.get("model"))
     await _attach_antseed_wallet(snap.get("provider_keys"))
-    return JSONResponse(content=snap)
+    payload = await asyncio.to_thread(json.dumps, snap, separators=(",", ":"))
+    return Response(content=payload, media_type="application/json")
 
 
 async def _dashboard_full_snapshot(request: Request) -> Response:
@@ -4084,24 +4111,24 @@ def _key_usage_snapshot(*, viewer: str, key_sha256: str, caller: str | None = No
 
 
 
-DASHBOARD_TIMEFRAMES = {"runtime", "1h", "24h", "7d", "30d", "all"}
+DASHBOARD_TIMEFRAMES = {"recent", "runtime", "1h", "24h", "7d", "30d"}
 
 
 def _dashboard_timeframe(value: Any) -> str:
-    text = str(value or "all").strip().lower()
-    if text in {"", "history"}:
-        return "all"
+    text = str(value or "recent").strip().lower()
+    if text in {"", "history", "all"}:
+        return "recent"
     if text not in DASHBOARD_TIMEFRAMES:
-        return "all"
+        return "recent"
     return text
 
 
 def _dashboard_timeframe_options(timeframe: str) -> dict[str, Any]:
     timeframe = _dashboard_timeframe(timeframe)
-    if timeframe == "runtime" or timeframe == "all":
-        return {"since": None, "until": None, "window": None, "limit": RECENT_LIMIT, "offset": 0, "timeframe": timeframe}
+    if timeframe in {"recent", "runtime"}:
+        return {"since": None, "until": None, "window": None, "limit": DASHBOARD_STATS_RECENT_LIMIT, "offset": 0, "timeframe": timeframe}
     since, window_label = _parse_usage_window(timeframe)
-    return {"since": since, "until": None, "window": window_label, "limit": RECENT_LIMIT, "offset": 0, "timeframe": timeframe}
+    return {"since": since, "until": None, "window": window_label, "limit": DASHBOARD_STATS_RECENT_LIMIT, "offset": 0, "timeframe": timeframe}
 
 
 def _counter_from_sql(c: dict[str, Any]) -> dict[str, Any]:
@@ -4163,7 +4190,7 @@ def _daily_totals_from_sql(by_day: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _stats_history_bundle(*, since: int | None, selected: str | None,
                           key_filter: str | None, provider: str | None,
-                          model: str | None) -> dict[str, Any]:
+                          model: str | None, recent_only: bool = False) -> dict[str, Any]:
     """Everything the persistent-timeframe stats snapshot derives from the store,
     via SQL aggregation (was: load every retained row and fold in Python, TWICE).
 
@@ -4178,6 +4205,20 @@ def _stats_history_bundle(*, since: int | None, selected: str | None,
     otherwise — never narrowed by provider/model."""
     caller = selected
     caller_is_null = bool(key_filter) and selected is None
+    if recent_only:
+        rows = host_store.usage_rows_page(
+            caller=caller, caller_is_null=caller_is_null,
+            consumer_sha=key_filter, provider=provider, model_family=model,
+            limit=DASHBOARD_STATS_RECENT_LIMIT)
+        agg = _aggregate_usage_rows(rows, selected=selected)
+        return {
+            "agg": agg,
+            "keys_by_caller": agg["by_caller_all"],
+            "filter_options": {"providers": sorted(agg["by_provider"]),
+                               "models": sorted(agg["by_model_family"])},
+            "daily_totals": _period_totals(rows, monthly=False),
+            "history_events": len(rows), "history_events_all": len(rows),
+        }
     filtered = host_store.usage_aggregate(
         since_ts=since, caller=caller, caller_is_null=caller_is_null,
         consumer_sha=key_filter, provider=provider, model_family=model)
@@ -4284,7 +4325,7 @@ def _aggregate_usage_rows(rows: list[dict[str, Any]], *, selected: str | None = 
     }
 
 
-def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[str, Any], consumer: str | None = None, timeframe: str = "all", key_sha256: str | None = None, viewer_role: str = "admin", provider: str | None = None, model: str | None = None) -> dict[str, Any]:
+def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[str, Any], consumer: str | None = None, timeframe: str = "recent", key_sha256: str | None = None, viewer_role: str = "admin", provider: str | None = None, model: str | None = None) -> dict[str, Any]:
     selected = consumer if consumer in _consumers() else None
     provider = (provider or "").strip() or None
     model = (model or "").strip() or None
@@ -4298,12 +4339,9 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
         # re-scanning the window per request.
         since = _dashboard_timeframe_options(timeframe).get("since")
         cache_key = ("stats", timeframe, selected, key_filter, provider, model)
-        bundle = _snapshot_cache_get(cache_key)
-        if bundle is None:
-            bundle = _stats_history_bundle(since=since, selected=selected,
-                                           key_filter=key_filter,
-                                           provider=provider, model=model)
-            _snapshot_cache_put(cache_key, bundle)
+        bundle = _snapshot_cached_compute(cache_key, lambda: _stats_history_bundle(
+            since=since, selected=selected, key_filter=key_filter,
+            provider=provider, model=model, recent_only=timeframe == "recent"))
         agg = bundle["agg"]
         # Surface live in-memory events (dashboard test calls, probes, just-served
         # requests) that are not persisted to billing history, so Activity always
@@ -4315,7 +4353,8 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
                     if (not selected or r.get("caller") == selected)
                     and (not key_filter or r.get("key_sha256_prefix") == (key_filter[:12] if key_filter else None))]
         seen_ids = {r.get("usage_event_id") for r in agg["recent"] if r.get("usage_event_id")}
-        merged_recent = [r for r in live if r.get("usage_event_id") not in seen_ids] + agg["recent"]
+        merged_recent = ([r for r in live if r.get("usage_event_id") not in seen_ids] + agg["recent"])
+        merged_recent = merged_recent[:DASHBOARD_STATS_RECENT_LIMIT]
         route_health = _route_health_snapshot(agg["recent"], synthetic)
         health_summary = _health_summary(agg["recent"], route_health)
         return {
@@ -4467,9 +4506,10 @@ def _dashboard_html() -> str:
   <main class='content'>
     <div class='topbar'>
       <div class='pageTitle'><h1 id='pageTitle'>Analytics</h1><div class='sub' id='pageSub'>Spend, traffic and errors — filter by timeframe, consumer, provider and model.</div></div>
-      <div class='topActions'><select class='select' id='consumer'><option value=''>All consumers</option></select><select class='select' id='timeframe' title='Usage timeframe'><option value='all' selected>All history</option><option value='runtime'>Since restart</option><option value='1h'>Last hour</option><option value='24h'>Last 24h</option><option value='7d'>Last 7d</option><option value='30d'>Last 30d</option></select><button class='btn' id='refresh'>Refresh</button><button class='btn' id='logout'>Log out</button></div>
+      <div class='topActions'><select class='select' id='consumer'><option value=''>All consumers</option></select><select class='select' id='timeframe' title='Usage scope'><option value='recent' selected>Latest 100 events</option></select><button class='btn' id='refresh'>Refresh</button><button class='btn' id='logout'>Log out</button></div>
     </div>
     <div id='err' class='errorbox'></div>
+    <div id='dashboardLoading' class='card cardPad' style='display:flex;align-items:center;gap:12px;margin-bottom:14px'><span aria-hidden='true' style='font-size:24px'>◌</span><div><b>Loading recent activity…</b><div class='muted small'>Applying the selected filters.</div></div></div>
     <section id='login' class='card login hidden'><div class='label'>Dashboard login</div><h2>Welcome back</h2><p class='muted'>Admins can use the dashboard password. Consumers can paste their router API key to see only their own usage.</p><div class='formGrid' style='margin-top:14px'><label>Admin password<input id='password' type='password' placeholder='Dashboard password' autocomplete='current-password' /></label><button class='btn primary' id='loginBtn'>Admin log in</button><label>Consumer API key<input id='apiKeyLogin' type='password' placeholder='Router API key' autocomplete='off' /></label><button class='btn' id='apiKeyLoginBtn'>View my usage</button></div></section>
 
     <section class='grid hidden page' id='app'>
@@ -4593,7 +4633,8 @@ function renderKeysList(d){const keys=d.keys||[];$('keysList').innerHTML=keys.le
 async function loadDrawerKeys(){try{const r=await fetch('/dashboard/api/keys/list?consumer='+encodeURIComponent(drawerConsumer),{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`keys ${r.status}`);const d=await r.json();renderKeysList(d);$('settingsStatus').value=d.status==='active'?'active':(d.status||'inactive');$('settingsAllowedRoutes').value=(d.allowed_routes||[]).filter(x=>x!=='all').join(', ');$('settingsRate').value=d.rate_per_min||'';$('settingsBurst').value=d.burst||''}catch(e){$('keysList').innerHTML=`<div class="bad small">${esc(e.message)}</div>`}}
 function openDrawer(c,mode){drawerConsumer=c||'';const row=(lastStats.keys||[]).find(k=>k.consumer===c)||{};const status=row.status||'inactive';const routes=row.allowed_routes&&row.allowed_routes!=='all'?row.allowed_routes:'all routes';$('drawerTitle').textContent=c||'Consumer';$('drawerMeta').innerHTML=`<span class="pill"><span class="dot ${status==='active'?'ok':'warn'}"></span>${esc(status)}</span><span class="pill">${esc(routes)}</span>${row.rate_per_min?`<span class="pill">${esc(row.rate_per_min)}/min</span>`:''}`;$('keyReady').style.display='none';$('keyReady').innerHTML='';$('keysList').innerHTML='<div class="muted small">Loading…</div>';$('settingsFold').open=(mode==='settings');$('drawerShade').classList.add('open');loadDrawerKeys();if(mode==='settings')setTimeout(()=>$('settingsStatus').focus(),0)}
 function closeDrawer(){$('drawerShade').classList.remove('open')}
-async function load(){try{clearErr();const c=$('consumer').value;const tf=$('timeframe').value||'all';const qs=new URLSearchParams();if(c)qs.set('consumer',c);qs.set('timeframe',tf);const pv=$('anProvider')?$('anProvider').value:'';const md=$('anModel')?$('anModel').value:'';if(pv)qs.set('provider',pv);if(md)qs.set('model',md);const r=await fetch('/dashboard/api/stats?'+qs.toString(),{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`stats ${r.status}`);const d=await r.json();lastStats=d;render(d);loadCostAccuracy()}catch(e){showErr(e.message)}}
+let statsAbort=null;
+async function load(){if(statsAbort)statsAbort.abort();statsAbort=new AbortController();const mine=statsAbort;$('dashboardLoading').style.display='flex';$('refresh').disabled=true;try{clearErr();const c=$('consumer').value;const tf=$('timeframe').value||'recent';const qs=new URLSearchParams();if(c)qs.set('consumer',c);qs.set('timeframe',tf);const pv=$('anProvider')?$('anProvider').value:'';const md=$('anModel')?$('anModel').value:'';if(pv)qs.set('provider',pv);if(md)qs.set('model',md);const r=await fetch('/dashboard/api/stats?'+qs.toString(),{credentials:'same-origin',signal:mine.signal});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`stats ${r.status}`);const d=await r.json();lastStats=d;render(d);loadCostAccuracy()}catch(e){if(e.name!=='AbortError')showErr(e.message)}finally{if(statsAbort===mine){$('dashboardLoading').style.display='none';$('refresh').disabled=false;statsAbort=null}}}
 function applyViewerMode(d){const consumerMode=d.viewer_role==='consumer';$('consumer').classList.toggle('hidden',consumerMode);$('newConsumerKey').classList.toggle('hidden',consumerMode);$('tabMarket').classList.toggle('hidden',consumerMode);$('tabProviderKeys').classList.toggle('hidden',consumerMode);$('tabKeyUsage').classList.add('hidden');if(consumerMode&&(activeTab==='policies'||activeTab==='market'||activeTab==='providerKeys'))activeTab='consumers';if(consumerMode)$('pageSub').textContent='Your API-key-scoped usage and activity.'}
 function renderProviderKeys(d){const pk=d.provider_keys||{};const rows=(pk.rows||[]).map(r=>({...r,last_seen_text:ts(r.last_seen),requests:r.usage?.requests||0,errors:r.usage?.errors||0,tokens:r.usage?.tokens_total||0,latency:r.usage?.latency_ms_avg||0,cost:r.estimated_cost_usd||0}));$('providerKeys').innerHTML=table(rows,[{label:'Provider',f:r=>`<div class="rowTitle">${esc(r.provider)}</div><div class="rowMeta">${esc(r.api_kind||'—')} · ${esc(r.tier||'—')}</div>`},{label:'Credential / wallet',f:r=>r.wallet?walletCell(r.wallet):`<span class="pill ${r.credential_status==='missing'?'bad':'ok'}">${esc(r.credential_status)}</span><div class="rowMeta">${esc(r.auth_env||r.auth_kind||'none')}${r.key_fingerprint?' · '+esc(r.key_fingerprint):''}</div>${(r.key_present||r.credential_status==='oauth_configured'||r.auth_env)?`<div class="actions" style="margin-top:4px">${(r.key_present||r.credential_status==='oauth_configured')?`<button class="btn iconBtn ghost" title="Reveal key" onclick="revealProviderKey(${jsarg(r.provider)},this)">👁</button><button class="btn iconBtn ghost" title="Copy key to clipboard" onclick="copyProviderKey(${jsarg(r.provider)})">⧉</button>`:''}${r.auth_env?`<button class="btn iconBtn ghost" title="Set/replace key" onclick="editProviderKey(${jsarg(r.provider)})">✎</button>`:''}</div>`:''}`},{label:'Requests',cls:'right',f:r=>fmt(r.requests)},{label:'Errors',cls:'right',f:r=>fmt(r.errors)},{label:'Tokens',cls:'right',f:r=>fmt(r.tokens)},{label:'Est. cost',cls:'right',f:r=>r.cost?('$'+Number(r.cost).toFixed(4)):'—'},{label:'Last seen',f:r=>esc(r.last_seen_text)},{label:'Last route/model',f:r=>`${esc(r.last_route||'—')}<div class="rowMeta">${esc(r.last_model_family||'')}</div>`}])}
 function actStep(e,n){const skip=e.event==='skipped';const ok=!skip&&!e.error_kind;const err=`${esc(e.error_kind||'')}${e.http_status?` (${esc(e.http_status)})`:''}${e.error_message?': '+esc(String(e.error_message).slice(0,200)):''}`;const dot=skip?'<span class="dot"></span>':`<span class="dot ${ok?'ok':'bad'}"></span>`;const tag=skip?'<span class="muted small">skipped</span>':ok?'<span class="ok small">ok ✓</span>':`<span class="bad small">${err}</span>`;return `<div class="actStep"><span class="stepN">${n}</span>${dot}<code>${esc(e.provider_id||e.provider||'—')}</code>${e.model_family?`<span class="muted small">${esc(e.model_family)}</span>`:''}${tag}</div>`}
