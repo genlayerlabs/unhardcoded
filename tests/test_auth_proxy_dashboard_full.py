@@ -1620,7 +1620,9 @@ def test_codex_accounts_admin_add_list_delete(monkeypatch, tmp_path):
 def test_dashboard_html_has_codex_account_ui(monkeypatch):
     html = _dashboard_client(monkeypatch).get("/dashboard").text
     for needle in ("Codex accounts", "/dashboard/api/codex/accounts",
-                   "addCodexAccount", "loadCodexAccounts"):
+                   "addCodexAccount", "loadCodexAccounts",
+                   "/dashboard/api/codex/invites", "generateCodexInvite",
+                   "revokeCodexInvite", "codexInvites", "Invite via link"):
         assert needle in html, needle
 
 

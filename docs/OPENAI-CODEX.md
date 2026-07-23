@@ -41,17 +41,35 @@ router (api_kind="openai_codex")
 
 ## Setup
 
+**Invite flow (recommended — no CLI needed):** in the dashboard's *Provider
+keys* tab → *Codex accounts* → **Invite via link**, name the account (e.g.
+`team-1`) and send the generated single-use link (valid 24 h) to the account
+holder. They click **Sign in with ChatGPT**, sign in on openai.com, and enter
+the one-time code shown; the router captures the tokens via OpenAI's device
+authorization flow (`POST auth.openai.com/api/accounts/deviceauth/usercode` →
+poll `/deviceauth/token` → form-encoded code exchange at `/oauth/token`),
+stores the account under `$CODEX_ACCOUNTS_DIR/<name>.json`, and hot-reloads.
+Note: OpenAI's device page warns about codes supplied by websites — this flow
+is that case by design; it is for trusted operators only.
+
+**Manual fallback (CLI):**
+
 ```bash
 # 1. Authenticate (opens a browser; "Sign in with ChatGPT")
 codex login                       # writes ~/.codex/auth.json
 
-# 2. Start the shim; it picks up auth.json lazily on the first codex call
+# 2. Paste ~/.codex/auth.json into the dashboard's "Add codex account" form,
+#    or start the shim directly against the file:
 python -m hosts.python_shim --config hosts/python_shim/config.live.lua \
     --codex-auth ~/.codex/auth.json
 ```
 
-`--codex-auth` defaults to `~/.codex/auth.json`. Treat that file like a
-password — it holds bearer tokens.
+`--codex-auth` defaults to `~/.codex/auth.json`. Treat that file — and invite
+links — like passwords: the file holds bearer tokens, and a link lets whoever
+opens it bind a ChatGPT account to your router. The invite token travels in
+the URL path, so it will appear in ingress/uvicorn access logs; links are
+single-use and expire after 24 h, but scrub or restrict those logs if that
+matters in your deployment.
 
 ## Caveats
 

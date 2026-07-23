@@ -2942,6 +2942,205 @@ async def dashboard_delete_codex_account(request: Request, name: str) -> Respons
     return JSONResponse(content={"ok": True, "account": name, "applied_live": applied_live})
 
 
+# ---- Codex onboarding invites (server-side OAuth device flow) --------------
+# Spec: docs/superpowers/specs/2026-07-22-codex-oauth-invite-design.md
+
+def _invite_store():
+    from codex_invites import CodexInviteStore
+    return CodexInviteStore(CODEX_ACCOUNTS_DIR)
+
+
+def _request_origin(request: Request) -> str:
+    """Public origin for links we hand out, honoring the ingress's
+    X-Forwarded-* headers; falls back to the request's own scheme/host."""
+    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http")
+    host = (request.headers.get("x-forwarded-host") or request.headers.get("host")
+            or request.url.netloc)
+    return f"{proto.split(',')[0].strip()}://{host.split(',')[0].strip()}"
+
+
+def _invite_view(inv: dict, origin: str) -> dict:
+    return {"name": inv["name"], "status": inv.get("status"),
+            "url": f"{origin}/codex/onboard/{inv['token']}",
+            "created_at": inv.get("created_at"), "expires_at": inv.get("expires_at"),
+            "used_at": inv.get("used_at")}
+
+
+@app.post("/dashboard/api/codex/invites")
+async def dashboard_create_codex_invite(request: Request) -> Response:
+    """Mint a single-use onboarding link that lets a teammate OAuth their
+    ChatGPT account into the named Codex slot. Admin-only."""
+    caller, error = _require_admin_dashboard_caller(request)
+    if error:
+        return error
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {"message": "invalid JSON body", "type": "invalid_request", "code": "codex_invite"}})
+    try:
+        inv = _invite_store().create(str(body.get("name") or ""))
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": {"message": str(exc), "type": "invalid_request", "code": "codex_invite"}})
+    _log({"event": "dashboard_codex_invite_created", "account": inv["name"], "viewer": caller})
+    return JSONResponse(content={"ok": True, **_invite_view({**inv, "status": "pending"}, _request_origin(request))})
+
+
+@app.get("/dashboard/api/codex/invites")
+async def dashboard_list_codex_invites(request: Request) -> Response:
+    caller, error = _require_admin_dashboard_caller(request)
+    if error:
+        return error
+    origin = _request_origin(request)
+    return JSONResponse(content={"invites": [_invite_view(i, origin) for i in _invite_store().list()]})
+
+
+@app.delete("/dashboard/api/codex/invites/{token}")
+async def dashboard_revoke_codex_invite(request: Request, token: str) -> Response:
+    caller, error = _require_admin_dashboard_caller(request)
+    if error:
+        return error
+    if not _invite_store().revoke(token):
+        return JSONResponse(status_code=404, content={"error": {"message": "invite not found", "type": "not_found", "code": "codex_invite_not_found"}})
+    _log({"event": "dashboard_codex_invite_revoked", "viewer": caller})
+    return JSONResponse(content={"ok": True})
+
+
+def _live_invite(token: str):
+    """(store, invite, status). Unknown and expired links both present to the
+    visitor as a dead link (no oracle distinguishing them)."""
+    store = _invite_store()
+    inv = store.get(token)
+    if inv is None:
+        return store, None, "missing"
+    return store, inv, store.status_of(inv)
+
+
+@app.get("/codex/onboard/{token}")
+async def codex_onboard_page(token: str) -> Response:
+    store, inv, status = _live_invite(token)
+    if inv is None or status == "expired":
+        return HTMLResponse(_onboard_dead_html(), status_code=404)
+    return HTMLResponse(_onboard_html(inv["name"], connected=(status == "used")))
+
+
+@app.post("/codex/onboard/{token}/start")
+async def codex_onboard_start(token: str) -> Response:
+    import codex_auth
+    store, inv, status = _live_invite(token)
+    if inv is None or status == "expired":
+        return JSONResponse(status_code=404, content={"error": {"message": "invite link expired", "type": "not_found", "code": "codex_onboard"}})
+    if status == "used":
+        return JSONResponse(status_code=409, content={"error": {"message": "invite already used", "type": "invalid_request", "code": "codex_onboard_used"}})
+    try:
+        device = await asyncio.to_thread(codex_auth.device_usercode_request)
+    except codex_auth.DeviceAuthError as exc:
+        return JSONResponse(status_code=502, content={"error": {"message": str(exc), "type": "device_auth_error", "code": "codex_onboard_start"}})
+    store.set_device(token, device)
+    _log({"event": "codex_invite_signin_started", "account": inv["name"]})
+    return JSONResponse(content={"user_code": device["user_code"],
+                                 "verification_url": codex_auth.DEVICE_VERIFY_URL,
+                                 "interval": device["interval"]})
+
+
+@app.get("/codex/onboard/{token}/status")
+async def codex_onboard_status(token: str) -> Response:
+    import codex_auth
+    store, inv, status = _live_invite(token)
+    if inv is None or status == "expired":
+        # Same shape as an unknown token: no oracle distinguishing the two.
+        return JSONResponse(status_code=404, content={"error": {"message": "invite link expired", "type": "not_found", "code": "codex_onboard"}})
+    if status == "used":
+        return JSONResponse(content={"status": "connected", "name": inv["name"]})
+    if status == "pending":
+        if inv.get("device_auth_id"):
+            store.clear_device(token)   # device code timed out; allow a fresh start
+        return JSONResponse(content={"status": "pending"})
+    # status == "awaiting": at most one upstream poll per interval
+    if not store.due_for_poll(token):
+        return JSONResponse(content={"status": "awaiting"})
+    try:
+        result = await asyncio.to_thread(
+            codex_auth.device_token_poll, inv["device_auth_id"], inv["user_code"])
+        if result is None:
+            return JSONResponse(content={"status": "awaiting"})
+        auth_json = await asyncio.to_thread(
+            codex_auth.device_code_exchange,
+            result["authorization_code"], result["code_verifier"])
+    except codex_auth.DeviceAuthError as exc:
+        store.clear_device(token)
+        _log({"event": "codex_invite_device_error", "account": inv["name"], "error": str(exc)})
+        return JSONResponse(content={"status": "error", "message": str(exc)})
+    slug = _codex_store().add_account(inv["name"], auth_json)
+    applied_live, _ = await _reload_codex_router()
+    store.mark_used(token)
+    _log({"event": "codex_invite_connected", "account": slug, "applied_live": applied_live})
+    return JSONResponse(content={"status": "connected", "name": slug, "applied_live": applied_live})
+
+
+def _onboard_dead_html() -> str:
+    return """<!doctype html><html lang='en'><head><meta charset='utf-8'/>
+<meta name='viewport' content='width=device-width,initial-scale=1'/>
+<meta name='robots' content='noindex,nofollow,noarchive'/><title>Link expired</title>
+<style>body{margin:0;background:#08090a;color:#f7f8f8;font:15px/1.5 Inter,ui-sans-serif,system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}main{max-width:420px;padding:32px;text-align:center}h1{font-size:22px}p{color:#8a8f98}</style>
+</head><body><main><h1>This link is no longer valid</h1>
+<p>The invite has expired or was already used. Ask the person who sent it for a new link.</p>
+</main></body></html>"""
+
+
+def _onboard_html(name: str, connected: bool = False) -> str:
+    import html as _html
+    safe = _html.escape(name)
+    idle_cls = "hidden" if connected else ""
+    done_cls = "" if connected else "hidden"
+    return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'/>
+<meta name='viewport' content='width=device-width,initial-scale=1'/>
+<meta name='robots' content='noindex,nofollow,noarchive'/><title>Connect ChatGPT — {safe}</title>
+<style>
+body{{margin:0;background:radial-gradient(circle at 20% -10%,rgba(113,112,255,.18),transparent 34%),#08090a;color:#f7f8f8;font:15px/1.55 Inter,ui-sans-serif,system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}}
+main{{max-width:460px;padding:34px;border:1px solid rgba(255,255,255,.075);border-radius:18px;background:rgba(15,16,17,.92);box-shadow:0 24px 80px rgba(0,0,0,.42)}}
+h1{{font-size:21px;letter-spacing:-.3px;margin:0 0 6px}}p{{color:#8a8f98;margin:10px 0}}
+.btn{{display:inline-block;border:0;border-radius:10px;background:linear-gradient(180deg,#7170ff,#5e6ad2);color:#fff;font:inherit;font-weight:590;padding:11px 18px;cursor:pointer;text-decoration:none}}
+.code{{font:600 30px/1 'JetBrains Mono',ui-monospace,monospace;letter-spacing:.14em;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:14px 18px;text-align:center;margin:14px 0;user-select:all}}
+.muted{{font-size:13px;color:#62666d}}.ok{{color:#27a644}}.err{{color:#ff5c7a}}
+.hidden{{display:none}}.copy{{margin-left:10px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);color:#f7f8f8;border-radius:8px;padding:6px 10px;cursor:pointer}}
+</style></head><body><main>
+<h1>Connect your ChatGPT account</h1>
+<p>This links your ChatGPT subscription to the <b>unhardcoded</b> router as account <b>{safe}</b>. Only continue if a person you trust sent you this link.</p>
+<div id='idle' class='{idle_cls}'>
+  <button class='btn' id='startBtn'>Sign in with ChatGPT</button>
+  <p class='muted'>You'll sign in on openai.com and enter a one-time code. OpenAI's page warns about codes given to you by websites — that warning refers to this flow; continue only because your operator sent you this link, otherwise cancel.</p>
+</div>
+<div id='steps' class='hidden'>
+  <p>1 · Open <a id='verifyLink' class='btn' target='_blank' rel='noopener'>openai.com sign-in</a></p>
+  <p>2 · Enter this one-time code <button class='copy' id='copyBtn'>copy</button></p>
+  <div class='code' id='userCode'></div>
+  <p class='muted' id='waitMsg'>Waiting for you to finish signing in… this page updates automatically.</p>
+</div>
+<div id='done' class='{done_cls}'>
+  <p class='ok'>✓ Connected as <b>{safe}</b>. You can close this page.</p>
+</div>
+<p class='err hidden' id='errMsg'></p>
+</main><script>
+const S={{start:location.pathname+'/start',status:location.pathname+'/status'}};
+const $=id=>document.getElementById(id);let timer=null;
+function show(err){{$('errMsg').textContent=err||'';$('errMsg').classList.toggle('hidden',!err)}}
+async function start(){{show('');try{{const r=await fetch(S.start,{{method:'POST'}});const d=await r.json();
+if(!r.ok)throw new Error(d.error&&d.error.message||('start failed ('+r.status+')'));
+$('verifyLink').href=d.verification_url;$('userCode').textContent=d.user_code;
+$('idle').classList.add('hidden');$('steps').classList.remove('hidden');poll()}}
+catch(e){{show(e.message)}}}}
+async function poll(){{clearTimeout(timer);try{{const r=await fetch(S.status);
+if(r.status===404){{$('steps').classList.add('hidden');$('idle').classList.add('hidden');show('This link is no longer valid — ask for a new one.');return}}
+const d=await r.json();
+if(d.status==='connected'){{$('steps').classList.add('hidden');$('done').classList.remove('hidden');return}}
+if(d.status==='error'){{$('steps').classList.add('hidden');$('idle').classList.remove('hidden');show(d.message||'sign-in failed — try again');return}}
+if(d.status==='pending'&&!$('steps').classList.contains('hidden')){{$('steps').classList.add('hidden');$('idle').classList.remove('hidden');show('The sign-in expired — start again.');return}}
+}}catch(e){{}}timer=setTimeout(poll,5000)}}
+$('startBtn').onclick=start;
+$('copyBtn').onclick=()=>navigator.clipboard.writeText($('userCode').textContent);
+</script></body></html>"""
+
+
 def _cost_accuracy_rows(routes, ema, _mult_of, *, min_calls=20, threshold=0.15):
     """Per-provider measured-vs-list cost, joining the ledger aggregate (`routes`,
     from host_store.cost_by_route) with the live ranked prices (`ema`,
@@ -4537,7 +4736,8 @@ def _dashboard_html() -> str:
     <section class='grid hidden page' id='providerKeysPage'>
       <div class='card span12'><div class='toolbar'><div><div class='label'>LLM provider credentials</div><div class='muted small'>Privatized view: env names and 12-char key fingerprints only. No raw provider keys or full hashes.</div></div><div class='toolbarRight'><button class='btn primary' id='toggleAddProvider'>Add provider</button></div></div><div id='providerKeys'></div></div>
       <div class='card span12' id='addProviderCard' style='display:none'><div class='toolbar'><div><div class='label'>Add provider</div><div class='muted small'>OpenAI-compatible endpoints only. The key is stored in .env.secrets under the env var; the provider definition persists in the host store and goes live immediately.</div></div></div><div class='cardPad'><div class='formGrid'><label>Provider id<input id='addProvId' placeholder='groq' /></label><label>Base URL<input id='addProvBaseUrl' placeholder='https://api.groq.com/openai/v1' /></label><label>Tier<select id='addProvTier' class='select'><option value='partner'>partner</option><option value='fallback'>fallback</option></select></label><label>Key env var<input id='addProvEnv' placeholder='GROQ_API_KEY' /></label><label>API key<input id='addProvKey' type='password' placeholder='sk-…' autocomplete='off' /></label><label>Served models (one per line: family or family=provider_model_id)<textarea id='addProvModels' rows='3' placeholder='llama-3.3-70b=llama-3.3-70b-versatile'></textarea></label></div><div class='actions' style='margin-top:10px'><button class='btn primary' id='addProvSubmit'>Add provider</button><button class='btn' id='addProvCancel'>Cancel</button></div><div id='addProvResult' class='muted small' style='margin-top:8px'></div></div></div>
-      <div class='card span12'><div class='toolbar'><div><div class='label'>Codex accounts</div><div class='muted small'>ChatGPT-subscription auth.json accounts (paste the output of `codex login`). Stored on the PVC, applied live. Token fingerprints only — never the raw token.</div></div><div class='toolbarRight'><button class='btn primary' id='toggleAddCodex'>Add codex account</button></div></div><div id='codexAccounts'></div></div>
+      <div class='card span12'><div class='toolbar'><div><div class='label'>Codex accounts</div><div class='muted small'>ChatGPT-subscription auth.json accounts (paste the output of `codex login`). Stored on the PVC, applied live. Token fingerprints only — never the raw token.</div></div><div class='toolbarRight'><button class='btn' id='toggleInviteCodex'>Invite via link</button><button class='btn primary' id='toggleAddCodex'>Add codex account</button></div></div><div id='codexAccounts'></div><div id='codexInvites'></div></div>
+      <div class='card span12' id='inviteCodexCard' style='display:none'><div class='cardPad'><div class='formGrid'><label>Account name<input id='inviteCodexName' placeholder='team-1' /></label></div><div class='actions' style='margin-top:10px'><button class='btn primary' id='inviteCodexSubmit'>Generate invite link</button><button class='btn' id='inviteCodexCancel'>Cancel</button></div><div id='inviteCodexResult' class='muted small' style='margin-top:8px'></div></div></div>
       <div class='card span12' id='addCodexCard' style='display:none'><div class='cardPad'><div class='formGrid'><label>Account name<input id='addCodexName' placeholder='team-1' /></label><label>auth.json<textarea id='addCodexJson' rows='6' placeholder='{&quot;tokens&quot;:{&quot;access_token&quot;:&quot;...&quot;,&quot;refresh_token&quot;:&quot;...&quot;,&quot;account_id&quot;:&quot;...&quot;}}'></textarea></label></div><div class='actions' style='margin-top:10px'><button class='btn primary' id='addCodexSubmit'>Save account</button><button class='btn' id='addCodexCancel'>Cancel</button></div><div id='addCodexResult' class='muted small' style='margin-top:8px'></div></div></div>
     </section>
 
@@ -4814,7 +5014,11 @@ async function copyProviderKey(p){try{await navigator.clipboard.writeText(await 
 async function editProviderKey(p){try{const key=prompt('New API key for '+p+' (replaces the current one, takes effect live):');if(key===null)return;const k=key.trim();if(!k){showErr('key is empty');return}const r=await fetch('/dashboard/api/provider-keys/update',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({provider:p,key:k})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`update ${r.status}`);toast(d.applied_live?'Key updated (live)':'Key saved');load()}catch(e){showErr(e.message)}}
 function parseServedModels(text){return text.split('\\n').map(s=>s.trim()).filter(Boolean).map(line=>{const i=line.indexOf('=');if(i<0)return {family:line};return {family:line.slice(0,i).trim(),provider_model_id:line.slice(i+1).trim()}})}
 async function addProvider(){try{const payload={id:$('addProvId').value.trim().toLowerCase(),base_url:$('addProvBaseUrl').value.trim(),tier:$('addProvTier').value,auth_env:$('addProvEnv').value.trim(),key:$('addProvKey').value.trim(),served_models:parseServedModels($('addProvModels').value)};const r=await fetch('/dashboard/api/provider-keys/add',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify(payload)});if(r.status===401){$('addProvResult').textContent='Session expired — log in and submit again (your form values are kept).';showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`add ${r.status}`);$('addProvResult').textContent=d.applied_live?`${d.provider} added and live.`:(d.note||'saved');$('addProvKey').value='';toast(d.applied_live?'Provider live':'Provider saved');load()}catch(e){$('addProvResult').textContent=e.message;showErr(e.message)}}
-async function loadCodexAccounts(){try{const r=await fetch('/dashboard/api/codex/accounts',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(r.status===403){$('codexAccounts').innerHTML='<div class="muted small">Admin session required to manage codex accounts.</div>';return}if(!r.ok)throw new Error('codex '+r.status);renderCodexAccounts(await r.json())}catch(e){showErr(e.message)}}
+async function loadCodexAccounts(){try{const r=await fetch('/dashboard/api/codex/accounts',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(r.status===403){$('codexAccounts').innerHTML='<div class="muted small">Admin session required to manage codex accounts.</div>';return}if(!r.ok)throw new Error('codex '+r.status);renderCodexAccounts(await r.json());loadCodexInvites()}catch(e){showErr(e.message)}}
+async function loadCodexInvites(){try{const r=await fetch('/dashboard/api/codex/invites',{credentials:'same-origin'});if(!r.ok){$('codexInvites').innerHTML='';return}renderCodexInvites((await r.json()).invites||[])}catch(e){}}
+function renderCodexInvites(list){if(!list.length){$('codexInvites').innerHTML='';return}const pill=s=>s==='used'?'<span class="pill ok">used</span>':s==='expired'?'<span class="pill bad">expired</span>':s==='awaiting'?'<span class="pill warn">awaiting sign-in</span>':'<span class="pill">pending</span>';$('codexInvites').innerHTML='<div class="label" style="padding:12px 14px 4px">Onboarding invites</div>'+table(list,[{label:'Account',f:r=>`<div class="rowTitle">${esc(r.name)}</div>`},{label:'Status',f:r=>pill(r.status)},{label:'Expires',f:r=>r.expires_at?new Date(r.expires_at*1000).toLocaleString():'—'},{label:'',cls:'right',f:r=>`<button class="btn ghost small" onclick="navigator.clipboard.writeText(${jsarg(r.url)}).then(()=>toast('Invite link copied'))">Copy link</button> <button class="btn iconBtn ghost" title="Revoke invite" onclick="revokeCodexInvite(${jsarg(r.url.split('/').pop())})">🗑</button>`}])}
+async function generateCodexInvite(){try{const name=$('inviteCodexName').value.trim();if(!name){$('inviteCodexResult').textContent='account name required';return}const r=await fetch('/dashboard/api/codex/invites',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({name})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`invite ${r.status}`);await navigator.clipboard.writeText(d.url).catch(()=>{});$('inviteCodexResult').innerHTML='Invite for <b>'+esc(d.name)+'</b> copied to clipboard — send it to the teammate. Valid 24h, single use.<br><code>'+esc(d.url)+'</code>';toast('Invite link copied');loadCodexInvites()}catch(e){$('inviteCodexResult').textContent=e.message;showErr(e.message)}}
+async function revokeCodexInvite(token){if(!confirm('Revoke this invite link?'))return;try{const r=await fetch('/dashboard/api/codex/invites/'+encodeURIComponent(token),{method:'DELETE',credentials:'same-origin'});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`revoke ${r.status}`);toast('Invite revoked');loadCodexInvites()}catch(e){showErr(e.message)}}
 function renderCodexAccounts(d){const accts=(d&&d.accounts)||[];const a=(d&&d.activity)||{};const pr=a.scarcity_price_in;const summary=`<div class="rowMeta" style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px"><span>requests <b>${a.requests??0}</b></span><span>errors <b>${a.errors??0}</b>${a.error_rate?` · ${(a.error_rate*100).toFixed(1)}%`:''}</span><span>quota used <b>${a.used_percent==null?'—':a.used_percent+'%'}</b></span><span>recent 429 <b>${a.recent_429==null?'—':a.recent_429}</b></span><span>scarcity price <b>${pr==null?'—':'$'+Number(pr).toFixed(2)+'/Mtok'}</b></span></div>`;if(!accts.length){$('codexAccounts').innerHTML=summary+'<div class="muted small">No codex accounts yet — add one to enable the ChatGPT-subscription provider.</div>';return}const sel=(d&&d.selection)||{mode:'auto',account:null};const cur=sel.mode==='account'?('account:'+(sel.account||'')):sel.mode;const selOpts=['<option value="auto"'+(cur==='auto'?' selected':'')+'>Auto · first account</option>','<option value="balanced"'+(cur==='balanced'?' selected':'')+'>Balanced · round-robin across all</option>'].concat(accts.map(r=>{const v='account:'+r.name;return '<option value="'+esc(v)+'"'+(cur===v?' selected':'')+'>'+esc(r.name)+'</option>'})).join('');const selector='<div class="rowMeta" style="display:flex;gap:8px;align-items:center;margin-bottom:10px"><span class="muted small">Serving account</span><select id="codexSelect" onchange="selectCodexAccount(this.value)">'+selOpts+'</select><span class="muted small">balanced spreads calls across all accounts</span></div>';$('codexAccounts').innerHTML=summary+selector+table(accts,[{label:'Account',f:r=>`<div class="rowTitle">${esc(r.name)} ${r.active?'<span class="pill ok">active</span>':''}</div>`},{label:'account_id',f:r=>esc(r.account_id||'—')},{label:'Token',f:r=>r.fingerprint?esc(r.fingerprint):'<span class="pill bad">no token</span>'},{label:'',cls:'right',f:r=>`<button class="btn iconBtn ghost" title="Delete account" onclick="deleteCodexAccount(${jsarg(r.name)})">🗑</button>`}])}
 async function addCodexAccount(){try{const name=$('addCodexName').value.trim();const auth_json=$('addCodexJson').value.trim();if(!name){$('addCodexResult').textContent='account name required';return}if(!auth_json){$('addCodexResult').textContent='paste the auth.json';return}const r=await fetch('/dashboard/api/codex/accounts',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({name,auth_json})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`add ${r.status}`);$('addCodexResult').textContent=d.applied_live?`${d.account} added and live.`:(d.note||'saved');$('addCodexJson').value='';toast(d.applied_live?'Codex account live':'Codex account saved');loadCodexAccounts()}catch(e){$('addCodexResult').textContent=e.message;showErr(e.message)}}
 async function loadConfig(){try{clearErr();const r=await fetch('/dashboard/api/config',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(r.status===403){$('config').innerHTML='<div class="muted small">Admin session required to edit config.</div>';return}if(!r.ok)throw new Error('config '+r.status);try{const wr=await fetch('/dashboard/api/wallet',{credentials:'same-origin'});lastWallet=wr.ok?((await wr.json()).wallet||null):lastWallet}catch(_){}renderConfig((await r.json()).knobs||[])}catch(e){showErr(e.message)}}
@@ -4831,7 +5035,7 @@ async function saveConfigKnob(key){const el=$('cfg_'+key);if(!el)return;const v=
 async function postConfig(updates){try{const r=await fetch('/dashboard/api/config',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({updates})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||('config '+r.status));toast(d.applied_live?'Saved · live':(d.note?'Saved · '+d.note:'Saved'));renderConfig(d.knobs||[])}catch(e){showErr(e.message)}}
 async function selectCodexAccount(value){try{let mode=value,account=null;if(value.indexOf('account:')===0){mode='account';account=value.slice('account:'.length)}const r=await fetch('/dashboard/api/codex/select',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({mode,account})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`select ${r.status}`);toast(mode==='balanced'?'Codex: balanced across accounts':(mode==='account'?('Codex: serving '+account):'Codex: auto'));loadCodexAccounts()}catch(e){showErr(e.message)}}
 async function deleteCodexAccount(name){if(!confirm('Delete codex account '+name+'?'))return;try{const r=await fetch('/dashboard/api/codex/accounts/'+encodeURIComponent(name),{method:'DELETE',credentials:'same-origin'});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`delete ${r.status}`);toast('Codex account deleted');loadCodexAccounts()}catch(e){showErr(e.message)}}
-$('loginBtn').onclick=login;$('apiKeyLoginBtn').onclick=apiKeyLogin;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});$('apiKeyLogin').addEventListener('keydown',e=>{if(e.key==='Enter')apiKeyLogin()});$('logout').onclick=logout;$('tabOverview').onclick=()=>setTab('overview');$('tabConsumers').onclick=()=>setTab('consumers');$('tabProviderKeys').onclick=()=>setTab('providerKeys');$('tabKeyUsage').onclick=()=>setTab('keyUsage');$('tabMarket').onclick=()=>setTab('market');$('tabBuilder').onclick=()=>setTab('builder');$('tabActivity').onclick=()=>setTab('activity');$('recent').addEventListener('click',e=>{const cp=e.target.closest('[data-copyterm]');if(cp){navigator.clipboard.writeText(cp.dataset.copyterm).then(()=>toast('Policy term copied'));return}const row=e.target.closest('.actRow');if(!row)return;const det=$('recent').querySelector('.actDetail[data-d="'+row.dataset.i+'"]');if(!det)return;det.classList.toggle('hidden');const tog=row.querySelector('.actToggle');if(tog)tog.textContent=det.classList.contains('hidden')?'▸':'▾'});$('bReview').onclick=bReview;$('bBacktest').onclick=bBacktest;$('bDownload').onclick=bDownload;$('bTestBtn').onclick=bTest;$('bEx1').onclick=()=>bLoadExample('ex1');$('bEx2').onclick=()=>bLoadExample('ex2');$('bAddCond').onclick=()=>{bSync();bFilters.push({field:'latency_ms',rel:'le',val:''});bRender()};$('bAddOr').onclick=()=>{bSync();bFilters.push({kind:'or',subs:[{field:'latency_ms',rel:'le',val:''}]});bRender()};$('bAddScore').onclick=()=>{bSync();bScores.push({field:'field:price_in',w:'0.5',norm:true,inv:true});bRender()};$('b_selector').onchange=()=>{$('bTempWrap').style.display=$('b_selector').value==='sample'?'':'none'};document.querySelectorAll('#bModeSeg button').forEach(b=>b.onclick=()=>bSetMode(b.dataset.mode));$('bStructured').addEventListener('change',e=>{if(e.target.classList.contains('bF-field'))bSyncRender()});$('bStructured').addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b)return;bSync();const i=+b.dataset.i,j=+b.dataset.j,act=b.dataset.act;if(act==='del')bFilters.splice(i,1);else if(act==='addsub')bFilters[i].subs.push({field:'latency_ms',rel:'le',val:''});else if(act==='delsub')bFilters[i].subs.splice(j,1);else if(act==='delscore')bScores.splice(i,1);bRender()});bRender();document.querySelector('.nav').addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b){e.preventDefault();setTab(b.dataset.tab)}});$('refresh').onclick=()=>{if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else if(activeTab==='keyUsage')loadKeyUsage();else load()};$('market').addEventListener('click',e=>{const h=e.target.closest('[data-fam]');if(!h)return;const fam=h.dataset.fam;if(marketOpen.has(fam))marketOpen.delete(fam);else marketOpen.add(fam);if(lastMarket)renderMarket(lastMarket)});$('marketSearch').oninput=()=>{if(lastMarket)renderMarket(lastMarket)};$('tradableOnly').checked=localStorage.getItem('tradableOnly')==='1';$('tradableOnly').onchange=()=>{localStorage.setItem('tradableOnly',$('tradableOnly').checked?'1':'0');if(lastMarket)renderMarket(lastMarket)};$('marketCopy').onclick=()=>{if(!lastMarket){showErr('No catalog data loaded yet');return}navigator.clipboard.writeText(JSON.stringify(lastMarket,null,2)).then(()=>toast('Catalog copied to clipboard')).catch(e=>showErr(e.message))};let skillText='';async function loadSkill(){try{$('skillContent').textContent='Loading…';const r=await fetch('/dashboard/api/skill',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error('skill '+r.status);skillText=await r.text();$('skillContent').textContent=skillText}catch(e){$('skillContent').textContent='';showErr(e.message)}}function downloadSkill(){if(!skillText){toast('Still loading…');return}const blob=new Blob([skillText],{type:'text/markdown'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='SKILL.md';a.click();URL.revokeObjectURL(a.href);toast('SKILL.md downloaded')}$('skillDownload').onclick=downloadSkill;$('tabSkill').onclick=()=>setTab('skill');$('toggleAddProvider').onclick=()=>{const c=$('addProviderCard');c.style.display=c.style.display==='none'?'':'none'};$('addProvCancel').onclick=()=>{$('addProviderCard').style.display='none'};$('addProvSubmit').onclick=addProvider;$('toggleAddCodex').onclick=()=>{const c=$('addCodexCard');c.style.display=c.style.display==='none'?'':'none'};$('addCodexCancel').onclick=()=>{$('addCodexCard').style.display='none'};$('addCodexSubmit').onclick=addCodexAccount;$('addProvId').addEventListener('blur',()=>{if(!$('addProvEnv').value.trim()&&$('addProvId').value.trim())$('addProvEnv').value=$('addProvId').value.trim().toUpperCase().replace(/[^A-Z0-9]+/g,'_')+'_API_KEY'});$('loadKeyUsage').onclick=loadKeyUsage;$('consumer').onchange=load;$('timeframe').onchange=load;$('consumerSearch').oninput=()=>renderConsumers(lastStats.keys||[]);document.querySelectorAll('#consumerStatusSeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#consumerStatusSeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');consumerFilterStatus=b.dataset.status;renderConsumers(lastStats.keys||[])});document.querySelectorAll('#activitySeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#activitySeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');activityKind=b.dataset.kind;render(lastStats)});$('newConsumerKey').onclick=openNewKey;$('closeDrawer').onclick=closeDrawer;$('drawerShade').addEventListener('click',e=>{if(e.target===$('drawerShade'))closeDrawer()});$('drawerGenerateKey').onclick=()=>{closeDrawer();openNewKey();if(drawerConsumer)$('newKeyConsumer').value=drawerConsumer};$('saveConsumerSettings').onclick=saveConsumerSettings;$('closeNewKey').onclick=closeNewKey;$('newKeyShade').addEventListener('click',e=>{if(e.target===$('newKeyShade'))closeNewKey()});$('newKeyDone').onclick=closeNewKey;$('createKey').onclick=createKey;$('newKeyConsumer').addEventListener('keydown',e=>{if(e.key==='Enter')createKey()});$('copyKey').onclick=()=>navigator.clipboard.writeText($('newKeyValue').value).then(()=>toast('Key copied'));$('copyKeyHandoff').onclick=()=>navigator.clipboard.writeText($('newKeyHandoffValue').value).then(()=>toast('Setup blurb copied'));$('anProvider').onchange=load;$('anModel').onchange=load;setTab(tabFromLocation(),{silent:true});setInterval(()=>{const ds=$('drawerShade');if(ds&&ds.classList.contains('open'))return;const nk=$('newKeyShade');if(nk&&nk.classList.contains('open'))return;const ap=$('addProviderCard'),ac=$('addCodexCard');if((ap&&ap.style.display&&ap.style.display!=='none')||(ac&&ac.style.display&&ac.style.display!=='none'))return;if(document.querySelector('#recent .actDetail:not(.hidden)'))return;if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else load()},15000);
+$('loginBtn').onclick=login;$('apiKeyLoginBtn').onclick=apiKeyLogin;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});$('apiKeyLogin').addEventListener('keydown',e=>{if(e.key==='Enter')apiKeyLogin()});$('logout').onclick=logout;$('tabOverview').onclick=()=>setTab('overview');$('tabConsumers').onclick=()=>setTab('consumers');$('tabProviderKeys').onclick=()=>setTab('providerKeys');$('tabKeyUsage').onclick=()=>setTab('keyUsage');$('tabMarket').onclick=()=>setTab('market');$('tabBuilder').onclick=()=>setTab('builder');$('tabActivity').onclick=()=>setTab('activity');$('recent').addEventListener('click',e=>{const cp=e.target.closest('[data-copyterm]');if(cp){navigator.clipboard.writeText(cp.dataset.copyterm).then(()=>toast('Policy term copied'));return}const row=e.target.closest('.actRow');if(!row)return;const det=$('recent').querySelector('.actDetail[data-d="'+row.dataset.i+'"]');if(!det)return;det.classList.toggle('hidden');const tog=row.querySelector('.actToggle');if(tog)tog.textContent=det.classList.contains('hidden')?'▸':'▾'});$('bReview').onclick=bReview;$('bBacktest').onclick=bBacktest;$('bDownload').onclick=bDownload;$('bTestBtn').onclick=bTest;$('bEx1').onclick=()=>bLoadExample('ex1');$('bEx2').onclick=()=>bLoadExample('ex2');$('bAddCond').onclick=()=>{bSync();bFilters.push({field:'latency_ms',rel:'le',val:''});bRender()};$('bAddOr').onclick=()=>{bSync();bFilters.push({kind:'or',subs:[{field:'latency_ms',rel:'le',val:''}]});bRender()};$('bAddScore').onclick=()=>{bSync();bScores.push({field:'field:price_in',w:'0.5',norm:true,inv:true});bRender()};$('b_selector').onchange=()=>{$('bTempWrap').style.display=$('b_selector').value==='sample'?'':'none'};document.querySelectorAll('#bModeSeg button').forEach(b=>b.onclick=()=>bSetMode(b.dataset.mode));$('bStructured').addEventListener('change',e=>{if(e.target.classList.contains('bF-field'))bSyncRender()});$('bStructured').addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b)return;bSync();const i=+b.dataset.i,j=+b.dataset.j,act=b.dataset.act;if(act==='del')bFilters.splice(i,1);else if(act==='addsub')bFilters[i].subs.push({field:'latency_ms',rel:'le',val:''});else if(act==='delsub')bFilters[i].subs.splice(j,1);else if(act==='delscore')bScores.splice(i,1);bRender()});bRender();document.querySelector('.nav').addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b){e.preventDefault();setTab(b.dataset.tab)}});$('refresh').onclick=()=>{if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else if(activeTab==='keyUsage')loadKeyUsage();else load()};$('market').addEventListener('click',e=>{const h=e.target.closest('[data-fam]');if(!h)return;const fam=h.dataset.fam;if(marketOpen.has(fam))marketOpen.delete(fam);else marketOpen.add(fam);if(lastMarket)renderMarket(lastMarket)});$('marketSearch').oninput=()=>{if(lastMarket)renderMarket(lastMarket)};$('tradableOnly').checked=localStorage.getItem('tradableOnly')==='1';$('tradableOnly').onchange=()=>{localStorage.setItem('tradableOnly',$('tradableOnly').checked?'1':'0');if(lastMarket)renderMarket(lastMarket)};$('marketCopy').onclick=()=>{if(!lastMarket){showErr('No catalog data loaded yet');return}navigator.clipboard.writeText(JSON.stringify(lastMarket,null,2)).then(()=>toast('Catalog copied to clipboard')).catch(e=>showErr(e.message))};let skillText='';async function loadSkill(){try{$('skillContent').textContent='Loading…';const r=await fetch('/dashboard/api/skill',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error('skill '+r.status);skillText=await r.text();$('skillContent').textContent=skillText}catch(e){$('skillContent').textContent='';showErr(e.message)}}function downloadSkill(){if(!skillText){toast('Still loading…');return}const blob=new Blob([skillText],{type:'text/markdown'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='SKILL.md';a.click();URL.revokeObjectURL(a.href);toast('SKILL.md downloaded')}$('skillDownload').onclick=downloadSkill;$('tabSkill').onclick=()=>setTab('skill');$('toggleAddProvider').onclick=()=>{const c=$('addProviderCard');c.style.display=c.style.display==='none'?'':'none'};$('addProvCancel').onclick=()=>{$('addProviderCard').style.display='none'};$('addProvSubmit').onclick=addProvider;$('toggleAddCodex').onclick=()=>{const c=$('addCodexCard');c.style.display=c.style.display==='none'?'':'none'};$('addCodexCancel').onclick=()=>{$('addCodexCard').style.display='none'};$('addCodexSubmit').onclick=addCodexAccount;$('toggleInviteCodex').onclick=()=>{const c=$('inviteCodexCard');c.style.display=c.style.display==='none'?'':'none'};$('inviteCodexCancel').onclick=()=>{$('inviteCodexCard').style.display='none'};$('inviteCodexSubmit').onclick=generateCodexInvite;$('addProvId').addEventListener('blur',()=>{if(!$('addProvEnv').value.trim()&&$('addProvId').value.trim())$('addProvEnv').value=$('addProvId').value.trim().toUpperCase().replace(/[^A-Z0-9]+/g,'_')+'_API_KEY'});$('loadKeyUsage').onclick=loadKeyUsage;$('consumer').onchange=load;$('timeframe').onchange=load;$('consumerSearch').oninput=()=>renderConsumers(lastStats.keys||[]);document.querySelectorAll('#consumerStatusSeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#consumerStatusSeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');consumerFilterStatus=b.dataset.status;renderConsumers(lastStats.keys||[])});document.querySelectorAll('#activitySeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#activitySeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');activityKind=b.dataset.kind;render(lastStats)});$('newConsumerKey').onclick=openNewKey;$('closeDrawer').onclick=closeDrawer;$('drawerShade').addEventListener('click',e=>{if(e.target===$('drawerShade'))closeDrawer()});$('drawerGenerateKey').onclick=()=>{closeDrawer();openNewKey();if(drawerConsumer)$('newKeyConsumer').value=drawerConsumer};$('saveConsumerSettings').onclick=saveConsumerSettings;$('closeNewKey').onclick=closeNewKey;$('newKeyShade').addEventListener('click',e=>{if(e.target===$('newKeyShade'))closeNewKey()});$('newKeyDone').onclick=closeNewKey;$('createKey').onclick=createKey;$('newKeyConsumer').addEventListener('keydown',e=>{if(e.key==='Enter')createKey()});$('copyKey').onclick=()=>navigator.clipboard.writeText($('newKeyValue').value).then(()=>toast('Key copied'));$('copyKeyHandoff').onclick=()=>navigator.clipboard.writeText($('newKeyHandoffValue').value).then(()=>toast('Setup blurb copied'));$('anProvider').onchange=load;$('anModel').onchange=load;setTab(tabFromLocation(),{silent:true});setInterval(()=>{const ds=$('drawerShade');if(ds&&ds.classList.contains('open'))return;const nk=$('newKeyShade');if(nk&&nk.classList.contains('open'))return;const ap=$('addProviderCard'),ac=$('addCodexCard'),ic=$('inviteCodexCard');if((ap&&ap.style.display&&ap.style.display!=='none')||(ac&&ac.style.display&&ac.style.display!=='none')||(ic&&ic.style.display&&ic.style.display!=='none'))return;if(document.querySelector('#recent .actDetail:not(.hidden)'))return;if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else load()},15000);
 /* ---- Flow builder: a DAG of nodes, each reusing the policy builder ---- */
 let fNodes=[];let fSeq=0;let fOutput=null;
 const F_DEFAULT_POLICY=()=>['policy',['and',['meets_req'],['not',['is','disabled']]],['add',['scale',0.5,['field','bench_intelligence']],['scale',0.5,['neg',['normalize',['field','price_in']]]]],['argmax'],['id'],['always',{action:'next_candidate'}]];
