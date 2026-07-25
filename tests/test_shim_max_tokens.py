@@ -50,3 +50,12 @@ def test_first_token_timeout_is_forwarded_to_contract():
         default_max_tokens=4096,
     )
     assert c["first_token_timeout_ms"] == 2500
+
+
+def test_provider_timeout_is_forwarded_to_contract():
+    c = _request_to_contract(
+        _req(timeout_ms=20_000),
+        "default",
+        default_max_tokens=4096,
+    )
+    assert c["timeout_ms"] == 20_000

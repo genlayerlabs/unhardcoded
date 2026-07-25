@@ -72,6 +72,20 @@ def test_responses_nonstream_returns_response_object(client, host):
     assert body["x_router"]["provider"] is not None
 
 
+def test_responses_forwards_provider_timeout(client, host, monkeypatch):
+    seen = {}
+
+    async def _capture(contract):
+        seen.update(contract)
+        return _ok("timeout forwarded")
+
+    monkeypatch.setattr(host, "execute_async", _capture)
+    r = client.post("/v1/responses", json={
+        "model": "", "input": "hi", "timeout_ms": 20_000})
+    assert r.status_code == 200
+    assert seen["timeout_ms"] == 20_000
+
+
 def test_responses_input_items_and_instructions(client, host):
     _seed(host, _ok("ok"))
     r = client.post("/v1/responses", json={
