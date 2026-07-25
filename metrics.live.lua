@@ -32,6 +32,8 @@ return {
     models = {
         -- codex: sunk cost → 0 marginal (the pivot that puts it first).
         ["gpt-5.5@openai_codex"]            = { price_in_usd_per_mtok = 0.0,  price_out_usd_per_mtok = 0.0,  success_rate_24h = 0.99, last_quality_eval = 0.95 },
+        ["gpt-5.4@openai_codex"]            = { price_in_usd_per_mtok = 0.0,  price_out_usd_per_mtok = 0.0,  success_rate_24h = 0.99, last_quality_eval = 0.90 },
+        ["gpt-5.4-mini@openai_codex"]       = { price_in_usd_per_mtok = 0.0,  price_out_usd_per_mtok = 0.0,  success_rate_24h = 0.99, last_quality_eval = 0.86 },
         ["gpt-5.3-codex-spark@openai_codex"] = { price_in_usd_per_mtok = 0.0,  price_out_usd_per_mtok = 0.0,  success_rate_24h = 0.99, last_quality_eval = 0.90 },
 
         -- gpt-5.5

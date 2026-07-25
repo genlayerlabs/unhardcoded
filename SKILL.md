@@ -45,7 +45,14 @@ present — the policy drives the choice.
 
 Every step is a request with the **same** `Authorization: Bearer <key>` you used to fetch this guide. You never have to fly blind:
 
-1. **Author** the `policy_ir` (the grammar is below).
+1. **Start from an intent template whenever it fits.** `GET /x/policy/templates`
+   lists the blessed choices. Compile one with
+   `POST /x/policy/templates/{id}` (for example
+   `{"family":"glm-5.2","provider_strategy":"ordered"}` against
+   `cheapest-family`). Author raw `policy_ir` only when the templates cannot
+   express the intent. The published `default` template is byte-for-byte
+   equivalent after normalization to the policy used when an
+   OpenAI-compatible request sends no `policy_ir`.
 2. **Admit & identify — no spend.** `POST /x/policy/normalize` `{policy_ir}` → `{policy_ir, fingerprint, version}`. A `400` here pinpoints what's invalid (unknown op, undeclared field, …) so you fix the term before paying.
 3. **Preview the ranking — no spend.** `POST /x/rank` `{policy_ir}` → `{ranked, rejected}`: the candidates this host would admit and how it orders them, plus the ones it filtered out, each with the `reason` it failed. This is how you see *what your policy does* without a single call.
 4. **Run it for real.** `POST /v1/chat/completions` with `policy_ir` (or `flow_ir`) + `messages` (the example above). A real call — real spend.
@@ -148,6 +155,10 @@ Score on the **raw observable fields** (the same names the filter gates on; see
 - `["top_k", N, ["argmax"]]` — keep the N best as the failover cascade.
 - `["sample", <temp>]` — seeded, reproducible stochastic pick (rank-geometric;
   `temp=0` ≡ argmax, larger → more uniform). Used for greybox divergence.
+- `["prefer", <Pred>, <Selector>]` — strict stable priority: every matching
+  candidate precedes every non-match, while the inner selector still orders
+  candidates inside both groups. Nest it for lexicographic provider order; an
+  outer `prefer(not(is("breaker_open")), ...)` keeps unhealthy routes last.
 
 ## Worked examples (copy, adjust the numbers)
 
