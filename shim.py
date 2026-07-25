@@ -37,6 +37,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
+from env_coerce import env_int
 import host_store
 
 _log = logging.getLogger("unhardcoded.shim")
@@ -53,6 +54,12 @@ DEFAULT_PROFILE_FALLBACK = "default"
 # create_app(default_max_tokens=...); pass None to keep the strict
 # omit-when-absent behaviour.
 DEFAULT_MAX_TOKENS_FALLBACK = 4096
+
+# Hard ceiling for one router execution, including retries and fallbacks. This
+# deliberately stays below the production ALB's 60 s idle timeout so unary
+# requests finish with a structured router error instead of being cut off as an
+# opaque gateway 503. Override with ROUTER_REQUEST_DEADLINE_MS.
+DEFAULT_REQUEST_DEADLINE_MS = 50_000
 
 
 class ChatRequest(BaseModel):
@@ -75,6 +82,9 @@ class ChatRequest(BaseModel):
     # Optional upstream liveness guard. For OpenAI-compatible streaming-capable
     # routes, fail/fallback if no content/tool delta arrives before this budget.
     first_token_timeout_ms: int | None = None
+    # Hard timeout for each provider attempt. This is separate from the
+    # server-side request deadline, which caps the complete fallback chain.
+    timeout_ms: int | None = None
     # Σ_pol per-call policy: a TERM (plain JSON array, e.g.
     # ["policy", ["ev_zero"], ["meets_req"], ...]). Data, never code: the
     # core admits it (sorts/arity/depth/node bounds) and ∧-composes the
@@ -116,6 +126,7 @@ class ResponsesRequest(BaseModel):
     max_output_tokens: int | None = None
     temperature: float | None = None
     first_token_timeout_ms: int | None = None
+    timeout_ms: int | None = None
     policy_ir: list | None = None
     session: str | None = None
     caller: str | None = None
@@ -222,6 +233,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                streaming_call=None,
                default_max_tokens: int | None = DEFAULT_MAX_TOKENS_FALLBACK,
                codex_store=None,
+               request_deadline_ms: int | None = None,
                ) -> FastAPI:
     """Build a FastAPI app wired to a pre-initialized LLMRouterHost.
 
@@ -233,10 +245,52 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     (streaming.make_streaming_dispatcher). Without it, `stream: true`
     requests still work via the pseudo-stream path (complete result encoded
     as SSE) — which is also what mocked backends produce.
+
+    `request_deadline_ms` caps the complete router execution (all retries and
+    fallbacks). When omitted, ROUTER_REQUEST_DEADLINE_MS is read once at app
+    startup, defaulting to 50 seconds.
     """
     import asyncio
 
     import streaming as _streaming
+
+    if request_deadline_ms is None:
+        request_deadline_ms = env_int(
+            "ROUTER_REQUEST_DEADLINE_MS", DEFAULT_REQUEST_DEADLINE_MS)
+    if request_deadline_ms <= 0:
+        raise ValueError("request_deadline_ms must be greater than zero")
+    request_deadline_s = request_deadline_ms / 1000.0
+
+    async def _execute_with_deadline(awaitable):
+        """Await one complete router run and cancel it at the outer deadline.
+
+        asyncio.timeout propagates cancellation into the active provider call,
+        so an expired request does not leave an orphan fallback chain running
+        after the HTTP response has finished.
+        """
+        deadline = asyncio.timeout(request_deadline_s)
+        try:
+            async with deadline:
+                return await awaitable
+        except TimeoutError:
+            # Do not relabel a TimeoutError raised by the host itself: only the
+            # timeout context's own expiry is the outer request deadline.
+            if not deadline.expired():
+                raise
+            _log.warning(
+                "router request deadline exceeded after %d ms",
+                request_deadline_ms,
+            )
+            return {
+                "ok": False,
+                "error": "timeout",
+                "trace": {
+                    "decision_path": [],
+                    "request_deadline_exceeded": True,
+                    "request_deadline_ms": request_deadline_ms,
+                    "total_latency_ms": request_deadline_ms,
+                },
+            }
 
     app = FastAPI(title="llm-router shim", docs_url=None, redoc_url=None)
 
@@ -893,7 +947,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             "max_tokens": req.max_tokens or 512,
         }
         try:
-            res = await host.execute_async(contract)
+            res = await _execute_with_deadline(host.execute_async(contract))
         except Exception as exc:
             admission = _policy_admission_error(exc)
             if admission is not None:
@@ -989,6 +1043,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             temperature=req.temperature,
             max_tokens=req.max_output_tokens,
             first_token_timeout_ms=req.first_token_timeout_ms,
+            timeout_ms=req.timeout_ms,
             policy_ir=req.policy_ir,
             session=req.session,
         )
@@ -998,7 +1053,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
 
         if not req.stream:
             try:
-                result = await host.execute_async(contract)
+                result = await _execute_with_deadline(host.execute_async(contract))
             except Exception as exc:
                 admission = _policy_admission_error(exc)
                 if admission is None:
@@ -1011,7 +1066,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
 
     async def _handle_responses_stream(contract: dict, req: ResponsesRequest):
         import responses_api as _rapi
-        task = asyncio.create_task(host.execute_async(contract))
+        task = asyncio.create_task(
+            _execute_with_deadline(host.execute_async(contract)))
         done, _ = await asyncio.wait({task}, timeout=_EARLY_FAIL_S,
                                      return_when=asyncio.FIRST_COMPLETED)
         if task in done:
@@ -1113,7 +1169,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             # Async driver: the Lua VM is touched only between awaits, so one
             # shared LuaRuntime overlaps many concurrent requests on one loop.
             try:
-                result = await host.execute_async(contract)
+                result = await _execute_with_deadline(host.execute_async(contract))
             except Exception as exc:
                 admission = _policy_admission_error(exc)
                 if admission is None:
@@ -1144,7 +1200,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                     await queue.put(delta)
                 return await streaming_call(request, emit)
 
-        task = asyncio.create_task(host.execute_async(contract, call_override=override))
+        task = asyncio.create_task(_execute_with_deadline(
+            host.execute_async(contract, call_override=override)))
 
         # A single-model policy is fast: keep the exact prior behavior — wait for
         # the commit point or completion; a pre-delta failure is a clean JSON
@@ -1321,6 +1378,8 @@ def _request_to_contract(
         contract["max_tokens"] = max_tokens
     if req.first_token_timeout_ms is not None:
         contract["first_token_timeout_ms"] = req.first_token_timeout_ms
+    if req.timeout_ms is not None:
+        contract["timeout_ms"] = req.timeout_ms
     if req.policy_ir is not None:
         # Forwarded verbatim: the CORE is the admission boundary (check ->
         # normalize -> eval, bounded), and it ∧-applies the host envelope.
