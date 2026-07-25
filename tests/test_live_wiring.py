@@ -82,9 +82,10 @@ def test_pin_openai_routes_native_api_not_codex():
     assert body["x_router"]["provider"] == "openai"
 
 
-def test_default_profile_cascades_off_a_failing_provider():
-    # The codex backend fails; the router must cascade to an OpenAI-compatible
-    # fallback candidate under the default policy and still serve a response.
+def test_vanilla_openai_request_uses_default_and_cascades():
+    # A client keeps its ordinary OpenAI model string and sends no policy_ir.
+    # The shim deliberately maps that to the product default; when Codex fails,
+    # the default must cascade and still serve a response.
     async def default(req):
         return {"ok": True, "latency_ms": 5,
                 "response": {"text": f"served-by-{req['provider_id']}", "finish_reason": "stop"}}
@@ -94,7 +95,7 @@ def test_default_profile_cascades_off_a_failing_provider():
 
     client = _build_client(default, codex)
     r = client.post("/v1/chat/completions", json={
-        "model": "profile:default",
+        "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": "hi"}],
     })
     assert r.status_code == 200, r.text

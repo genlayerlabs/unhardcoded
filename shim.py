@@ -39,6 +39,11 @@ from pydantic import BaseModel, ConfigDict
 
 from env_coerce import env_int
 import host_store
+from policy_templates import (
+    PolicyTemplateError,
+    build_policy_template,
+    template_catalog,
+)
 
 _log = logging.getLogger("unhardcoded.shim")
 
@@ -853,6 +858,38 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             return JSONResponse(status_code=400, content={"error": {
                 "message": msg[idx + 11:] if idx != -1 else msg,
                 "type": "invalid_request_error", "code": "invalid_policy_spec"}})
+
+    @app.get("/x/policy/templates")
+    def policy_templates():
+        """List the blessed intent-level templates and their safe defaults."""
+        return {"templates": template_catalog()}
+
+    @app.post("/x/policy/templates/{template_id}")
+    def policy_template_build(
+        template_id: str,
+        body: dict[str, Any] | None = None,
+    ):
+        """Compile a product intent to normalized sigma-pol/v2 data.
+
+        This is deliberately a small, safe surface over the raw algebra.  The
+        returned term goes through the same identity and later admission path
+        as a hand-authored policy_ir; preview it with POST /x/rank.
+        """
+        try:
+            term, intent = build_policy_template(template_id, body)
+            built = host.normalize_policy(term)
+            return {**built, "intent": intent}
+        except PolicyTemplateError as exc:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": str(exc),
+                "type": "invalid_request_error",
+                "code": "invalid_policy_template",
+            }})
+        except Exception as exc:
+            admission = _policy_admission_error(exc)
+            if admission is not None:
+                return _invalid_policy_response(admission)
+            raise
 
     @app.get("/x/fields")
     def list_fields():

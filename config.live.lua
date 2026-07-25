@@ -1,7 +1,6 @@
--- config.live.lua — provider catalog used by `hosts/python_shim/live_smoke.py`.
--- Primary model is minimax-m2.7 served by OpenRouter — fast, current,
--- and inexpensive. Llama-3.3-70b is kept as a secondary candidate so
--- the cascade behaviour can still be demonstrated when needed.
+-- config.live.lua — production provider/model catalog.  Plain
+-- OpenAI-compatible requests use the identified default policy below; callers
+-- can override it with a per-call Σ_pol policy_ir.
 
 -- Tier policies live in their own files under policies/ for clarity; this dir is
 -- resolved relative to the process cwd (run from the repo root) or $LLM_POLICY_DIR.
@@ -28,6 +27,123 @@ local function mfield(name, sort, default)
                  if o ~= nil and o.traits ~= nil and o.traits[name] ~= nil then return o.traits[name] end
                  return nil
              end }
+end
+
+-- The same bounded product defaults exposed by policy_templates.py.  A parity
+-- test compares the normalized terms so the Python template and this
+-- no-policy profile cannot drift silently.
+local DEFAULT_PROVIDER_ORDER = {
+    { "openai_codex" },
+    { "antseed" },
+    { "bedrock", "bedrock_market" },
+    { "openrouter", "openrouter_market" },
+}
+local DEFAULT_EXPECTED_INPUT_SHARE = 0.8
+local DEFAULT_RELIABILITY_FLOOR = 0.8
+local DEFAULT_MAX_PRICE_IN = 5.0
+local DEFAULT_MAX_PRICE_OUT = 25.0
+local DEFAULT_QUALITY_TOP_N = 5
+local DEFAULT_COST_WEIGHT = 0.75
+local DEFAULT_INTELLIGENCE_WEIGHT = 0.25
+
+local BALANCED_RETRY = {
+    rate_limit        = { action = "next_candidate", open_breaker_ms = 30000 },
+    timeout           = { action = "next_candidate" },
+    server_error      = { action = "retry_same", attempts = 1, backoff_ms = 500,
+                          then_action = "next_candidate" },
+    auth_error        = { action = "disable_provider" },
+    bad_request       = { action = "next_candidate" },
+    content_filter    = { action = "next_candidate" },
+    bad_response      = { action = "next_candidate" },
+    model_unavailable = { action = "next_provider_same_model", mark_unavailable_ms = 300000 },
+    network_error     = { action = "retry_same", attempts = 2, backoff_ms = { 200, 600 },
+                          then_action = "next_candidate" },
+    -- A context overflow on one route says nothing about the others.
+    context_overflow  = { action = "next_candidate" },
+    -- A stream that died after content reached the client cannot fall through.
+    stream_interrupted = { action = "abort" },
+    -- Out of credits will not heal on retry; keep the breaker open for 5 min.
+    payment_required  = { action = "next_candidate", open_breaker_ms = 300000 },
+    unknown           = { action = "next_candidate" },
+}
+
+local function fail_plan(actions)
+    local keys = {}
+    for reason, _ in pairs(actions) do
+        if reason ~= "unknown" then keys[#keys + 1] = reason end
+    end
+    table.sort(keys)
+    local out = { "always", actions.unknown }
+    for _, reason in ipairs(keys) do
+        out = { "override", out, reason, actions[reason] }
+    end
+    return out
+end
+
+local function provider_pred(group)
+    if #group == 1 then return { "provider_eq", group[1] } end
+    local out = { "or" }
+    for _, provider in ipairs(group) do
+        out[#out + 1] = { "provider_eq", provider }
+    end
+    return out
+end
+
+local function default_policy_ir()
+    local provider_preds = {}
+    local allowed = { "or" }
+    for _, group in ipairs(DEFAULT_PROVIDER_ORDER) do
+        local pred = provider_pred(group)
+        provider_preds[#provider_preds + 1] = pred
+        allowed[#allowed + 1] = pred
+    end
+
+    -- Cost dominates the value score inside a provider, with intelligence as
+    -- the quality/tie-break component.  The top-five preference is soft: a
+    -- lower-ranked family remains available when requirements (or an explicit
+    -- `family:` model) leave no top-five candidate.
+    local selector = { "argmax" }
+    for i = #provider_preds, 1, -1 do
+        selector = { "prefer", provider_preds[i], selector }
+    end
+    selector = {
+        "prefer",
+        { "cmp", "bench_intelligence_rank", "le", DEFAULT_QUALITY_TOP_N },
+        selector,
+    }
+    selector = {
+        "prefer",
+        { "not", { "is", "breaker_open" } },
+        selector,
+    }
+
+    return {
+        "policy",
+        { "and",
+            { "meets_req" },
+            { "not", { "is", "disabled" } },
+            { "cmp", "success_rate", "ge", DEFAULT_RELIABILITY_FLOOR },
+            { "cmp", "price_in", "le", DEFAULT_MAX_PRICE_IN },
+            { "cmp", "price_out", "le", DEFAULT_MAX_PRICE_OUT },
+            allowed,
+        },
+        { "add",
+            { "scale", DEFAULT_COST_WEIGHT,
+                { "neg", { "normalize",
+                    { "add",
+                        { "scale", DEFAULT_EXPECTED_INPUT_SHARE, { "field", "price_in" } },
+                        { "scale", 1.0 - DEFAULT_EXPECTED_INPUT_SHARE, { "field", "price_out" } },
+                    },
+                } },
+            },
+            { "scale", DEFAULT_INTELLIGENCE_WEIGHT,
+                { "normalize", { "field", "bench_intelligence" } },
+            },
+        },
+        selector,
+        { "id" },
+        fail_plan(BALANCED_RETRY),
+    }
 end
 
 return {
@@ -370,70 +486,19 @@ return {
     },
 
     profiles = {
-        -- No tiers. Each caller sends its own policy as a Σ_pol term (policy_ir,
-        -- e.g. from the dashboard builder). `default` is only the fallback when a
-        -- caller sends no policy at all: a balanced, DECLARATIVE policy — so it
-        -- lowers to a Σ_pol term with an identity (copyable, testable in the
-        -- builder), unlike the old closure-based tier profiles.
+        -- Callers may send their own policy_ir.  Plain OpenAI-compatible
+        -- requests use this identified policy: healthy Codex -> AntSeed ->
+        -- Bedrock -> OpenRouter, with safe price/reliability rails and the best
+        -- intelligence-ranked families preferred inside each provider.
         default = {
-            -- (sigma-pol/v2) the composite scorer atoms AND quality/quality_hint
-            -- were removed; score on real fields. Balanced = benchmark (per
-            -- model, identical whoever serves it) vs price (cheaper wins — this
-            -- is where AntSeed, serving the same families, competes and often
-            -- wins) vs learned reliability. success_rate is the live EMA of
-            -- observed success per (provider, family) — the only signal that is
-            -- genuinely per-provider for the same model (OpenRouter's benchmark
-            -- can't tell you a peer's reliability). Its cold-start default is 1,
-            -- so it's neutral until real traffic differentiates: a peer that
-            -- starts failing has its EMA fall and is PROGRESSIVELY demoted as the
-            -- failures accumulate. Weighted 0.30 (was 0.10): at 0.10 the demotion
-            -- was too weak to overcome a failing peer's price edge, so dead peers
-            -- (e.g. a marketplace seller timing out every request) kept being
-            -- re-chosen. At 0.30 a peer whose EMA collapses falls below a reliable
-            -- alternative — self-healing, and it climbs back if it recovers.
-            -- (Raw latency_ms is deliberately NOT scored here: its cold-start
-            -- default is +inf, which would freeze out every never-tried peer.)
-            scorer       = { "add",
-                { "scale", 0.35, { "field", "bench_intelligence" } },
-                { "scale", 0.35, { "neg", { "normalize", { "field", "price_in" } } } },
-                { "scale", 0.30, { "field", "success_rate" } },
-            },
-            filter       = { "requirements", "not_disabled" },
+            policy_ir    = default_policy_ir(),
             selector     = "argmax",
             retry_policy = "balanced",
         },
     },
 
     retry_policies = {
-        balanced = {
-            rate_limit        = { action = "next_candidate", open_breaker_ms = 30000 },
-            timeout           = { action = "next_candidate" },
-            server_error      = { action = "retry_same", attempts = 1, backoff_ms = 500,
-                                  then_action = "next_candidate" },
-            auth_error        = { action = "disable_provider" },
-            bad_request       = { action = "next_candidate" },
-            content_filter    = { action = "next_candidate" },
-            bad_response      = { action = "next_candidate" },
-            model_unavailable = { action = "next_provider_same_model", mark_unavailable_ms = 300000 },
-            network_error     = { action = "retry_same", attempts = 2, backoff_ms = { 200, 600 },
-                                  then_action = "next_candidate" },
-            -- A context overflow on ONE route says nothing about the others:
-            -- a provider-neutral family (e.g. family:gpt-5.4) spans candidates
-            -- with heterogeneous context windows, so the next one may well fit.
-            -- retry_same would be futile (same model, same window) but
-            -- next_candidate is not — fall through. If every candidate overflows
-            -- the request still ends cleanly in `exhausted: context_overflow`.
-            context_overflow  = { action = "next_candidate" },
-            -- A stream that died AFTER content reached the client cannot
-            -- fall through (the next candidate would append a second answer
-            -- to a half-delivered one): abort, the shim reports in-stream.
-            stream_interrupted = { action = "abort" },
-            -- Out of credits (OpenRouter 402, AntSeed insufficient_deposits).
-            -- Won't heal on retry: fall through, and keep the breaker open
-            -- long (5 min) so dead-broke providers stop eating latency.
-            payment_required  = { action = "next_candidate", open_breaker_ms = 300000 },
-            unknown           = { action = "next_candidate" },
-        },
+        balanced = BALANCED_RETRY,
     },
 
     -- Model-level observation fields (registered traits from OpenRouter, read

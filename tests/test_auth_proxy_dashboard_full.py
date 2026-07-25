@@ -1192,6 +1192,20 @@ def test_dashboard_html_has_provider_health_ui():
     assert "healthDot" in html              # dot renderer
 
 
+def test_dashboard_builder_exposes_and_wires_safe_policy_templates():
+    html = auth_proxy._dashboard_html()
+    for marker in (
+        "bTemplateBar",
+        "cheapest-family",
+        "smart-value",
+        "Default for vanilla clients",
+        "/dashboard/api/policy/templates/",
+        "$('bLoadTemplate').onclick=bCreateTemplate",
+        "bTemplateChanged();",
+    ):
+        assert marker in html
+
+
 def test_policy_snapshot_prefers_live_ranks():
     live = {"default": [
         {"provider": "openai", "model_family": "gpt-5.5-codex",

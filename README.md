@@ -120,6 +120,41 @@ benchmarks/modalities/capabilities (`bench_intelligence`, `in_image`,
 `cap_tools`, …). See the core's `core/docs/SIGMA-POL.md` for the algebra;
 `config.live.lua` declares the host fields and the `default` policy.
 
+### Blessed policy templates
+
+Most callers should not write raw weights. `GET /x/policy/templates` lists the
+supported intent-level templates; `POST /x/policy/templates/{id}` compiles one
+to an identified `policy_ir` that can be previewed with `POST /x/rank`.
+
+```bash
+curl -s http://127.0.0.1:8080/x/policy/templates/cheapest-family \
+  -H "Authorization: Bearer <key>" -H "Content-Type: application/json" \
+  -d '{
+    "family": "glm-5.2",
+    "provider_strategy": "ordered"
+  }'
+```
+
+The three templates are:
+
+- `cheapest-family` — stay in one exact family and minimize expected token
+  cost; `provider_strategy: "ordered"` instead enforces Codex → AntSeed →
+  Bedrock → OpenRouter, skipping unavailable providers and retaining
+  breaker-open routes only as final fallbacks.
+- `smart-value` — minimize cost among the current top five intelligence models
+  (the shortlist size and price/reliability rails are configurable).
+- `default` — the actual policy used by OpenAI-compatible callers that send no
+  policy: prefer a top-five intelligence model, then enforce Codex → AntSeed →
+  Bedrock → OpenRouter and use a 75% cost / 25% intelligence value score inside
+  each provider. Lower-ranked models remain available when request requirements
+  or an explicit `family:` model leave no top-five candidate.
+
+The ordered strategy compiles to nested `prefer(pred, inner)` selectors, not
+large score weights. Cost still orders candidates inside each provider group.
+All templates reject unknown prices and default to explicit $5 input / $25
+output per-million-token ceilings plus a `0.8` reliability floor; callers can
+tighten or deliberately raise those rails on the configurable templates.
+
 ## Dashboard
 
 `auth_proxy` serves an operator console at `/dashboard`:
