@@ -298,6 +298,19 @@ def _optional_int(value: Any, *, min_value: int = 0, max_value: int | None = 1_0
     return max(min_value, ivalue)
 
 
+def _optional_float(value: Any, *, min_value: float = 0.0,
+                    max_value: float = 1_000_000.0) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (min_value <= number <= max_value):
+        return None
+    return round(number, 6)
+
+
 def _normalize_key_record(record: Any) -> dict[str, Any] | None:
     if not isinstance(record, dict):
         return None
@@ -356,6 +369,9 @@ def _normalize_consumer_record(consumer: str, record: Any) -> dict[str, Any]:
         "allowed_routes": _clean_route_list(record.get("allowed_routes")),
         "rate_per_min": rate_per_min,
         "burst": burst,
+        "batch": str(record.get("batch") or "").strip()[:80] or None,
+        "member_id": str(record.get("member_id") or "").strip()[:16] or None,
+        "budget_usd": _optional_float(record.get("budget_usd"), min_value=0.01),
         "keys": keys,
         "updated_at": _optional_int(record.get("updated_at")) or now,
     }
@@ -418,6 +434,9 @@ def _consumer_key_rows(by_caller_stats: dict[str, dict[str, Any]] | None = None)
             "allowed_routes": meta.get("allowed_routes") or [],
             "rate_per_min": meta.get("rate_per_min"),
             "burst": meta.get("burst"),
+            "batch": meta.get("batch"),
+            "member_id": meta.get("member_id"),
+            "budget_usd": meta.get("budget_usd"),
             "effective_rate_per_min": meta.get("rate_per_min") or RATE_PER_MIN,
             "effective_burst": meta.get("burst") or BURST,
             "issued_metadata": name in records,
@@ -3343,6 +3362,9 @@ async def dashboard_list_keys(request: Request) -> Response:
         "allowed_routes": meta.get("allowed_routes") or [],
         "rate_per_min": meta.get("rate_per_min"),
         "burst": meta.get("burst"),
+        "batch": meta.get("batch"),
+        "member_id": meta.get("member_id"),
+        "budget_usd": meta.get("budget_usd"),
         "keys": keys,
     })
 
@@ -3402,6 +3424,84 @@ async def dashboard_create_key(request: Request) -> Response:
         return JSONResponse(status_code=500, content={"ok": False, "error": "failed to persist the issued key"})
     _log({"event": "dashboard_key_created", "consumer": consumer, "viewer": caller, "rotate": rotate, "rotated_prefix": rotate_prefix or None})
     return JSONResponse(content={"ok": True, "consumer": consumer, "api_key": token, "sha256_prefix": token_hash[:12], "rotate": rotate, "grace_period_s": None if not rotate else (DEFAULT_ROTATION_GRACE_S if grace_period_s is None else grace_period_s), "warning": "Copy now. The raw key is shown once and only hashed key metadata is persisted."})
+
+
+@app.post("/dashboard/api/keys/batch")
+async def dashboard_create_key_batch(request: Request) -> Response:
+    ctx, error = _require_admin_dashboard_auth(request)
+    if error:
+        return error
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        batch = _safe_consumer_name(str(data.get("batch", "")))
+        try:
+            count = int(data.get("count"))
+        except (TypeError, ValueError):
+            count = 0
+        budget_usd = _optional_float(data.get("budget_usd"), min_value=0.01)
+        rate_per_min = _optional_int(data.get("rate_per_min"), min_value=1)
+        burst = _optional_int(data.get("burst"), min_value=1)
+        allowed_routes = _clean_route_list(data.get("allowed_routes"))
+        if not 1 <= count <= 50:
+            raise ValueError("count must be between 1 and 50")
+        if budget_usd is None:
+            raise ValueError("budget_usd must be a positive number")
+        members = [(f"{idx:03d}", _safe_consumer_name(f"{batch}-{idx:03d}"))
+                   for idx in range(1, count + 1)]
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": str(exc), "type": "invalid_request_error",
+            "code": "invalid_key_batch"}})
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "invalid JSON body", "type": "invalid_request_error",
+            "code": "invalid_json"}})
+
+    records = _issued_consumer_records()
+    collisions = [consumer for _, consumer in members if consumer in records]
+    if collisions:
+        return JSONResponse(status_code=409, content={"error": {
+            "message": "batch consumers already exist", "type": "conflict",
+            "code": "consumer_batch_exists", "consumers": collisions[:10]}})
+
+    now = int(time.time())
+    viewer = str(ctx.get("viewer"))
+    old_hashes = dict(CALLER_KEY_HASHES)
+    new_hashes = dict(old_hashes)
+    issued = []
+    for member_id, consumer in members:
+        token = f"{DASHBOARD_KEY_PREFIX}_{secrets.token_urlsafe(32)}"
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        new_hashes[digest] = consumer
+        meta = _normalize_consumer_record(consumer, {
+            "status": "active", "batch": batch, "member_id": member_id,
+            "budget_usd": budget_usd, "rate_per_min": rate_per_min,
+            "burst": burst, "allowed_routes": allowed_routes,
+            "keys": [{"sha256_prefix": digest[:12], "status": "active",
+                      "created_at": now, "viewer": viewer}],
+            "updated_at": now})
+        records[consumer] = meta
+        issued.append({"batch": batch, "member_id": member_id,
+                       "consumer": consumer, "api_key": token,
+                       "sha256_prefix": digest[:12], "budget_usd": budget_usd})
+
+    _upsert_env_json(Path(DASHBOARD_KEY_ENV_PATH), "CALLER_KEYS_SHA256_JSON", new_hashes)
+    CALLER_KEY_HASHES.clear()
+    CALLER_KEY_HASHES.update(new_hashes)
+    if not _write_issued_consumer_records(records):
+        _upsert_env_json(Path(DASHBOARD_KEY_ENV_PATH), "CALLER_KEYS_SHA256_JSON", old_hashes)
+        CALLER_KEY_HASHES.clear()
+        CALLER_KEY_HASHES.update(old_hashes)
+        return JSONResponse(status_code=500, content={"error": {
+            "message": "failed to persist key batch", "type": "server_error",
+            "code": "key_batch_persistence"}})
+    _log({"event": "dashboard_key_batch_created", "batch": batch,
+          "count": count, "budget_usd": budget_usd, "viewer": viewer})
+    return JSONResponse(content={"ok": True, "batch": batch, "count": count,
+                                 "keys": issued,
+                                 "warning": "Copy or download now. Raw keys are shown only once."})
 
 
 
@@ -3545,6 +3645,21 @@ async def proxy(path: str, request: Request) -> Response:
         _record_probe(caller=caller, method=request.method, path="/" + path, status=200, latency_ms=latency_ms, requested_model=requested_model, route="metadata_probe", key_sha256_prefix=str(auth.get("digest") or "")[:12] or None)
         _log({"event": "metadata_probe", "caller": caller, "method": request.method, "path": "/" + path, "status": 200, "latency_ms": latency_ms, "requested_model": requested_model})
         return JSONResponse(content=_ollama_show_response(requested_model))
+
+    budget_usd = _optional_float((auth.get("meta") or {}).get("budget_usd"), min_value=0.01)
+    if budget_usd is not None:
+        spent_usd, spend_ok = await asyncio.to_thread(host_store.consumer_spend_usd, caller)
+        if not spend_ok:
+            return JSONResponse(status_code=503, content={"error": {
+                "message": "consumer budget state is temporarily unavailable",
+                "type": "server_error", "code": "consumer_budget_unavailable"}})
+        if spent_usd >= budget_usd:
+            _record_reject(reason="budget_exhausted", path="/" + path,
+                           caller=caller, status=402, route=requested_route)
+            return JSONResponse(status_code=402, content={"error": {
+                "message": "consumer budget exhausted", "type": "budget_error",
+                "code": "consumer_budget_exhausted",
+                "budget_usd": budget_usd, "spent_usd": spent_usd}})
 
     assert _client is not None
     upstream_url = f"{UPSTREAM}/{path}"
@@ -4741,7 +4856,7 @@ def _dashboard_html() -> str:
 
     <section class='grid hidden page' id='consumersPage'>
       <div class='card span12'>
-        <div class='toolbar'><div class='toolbarLeft'><div class='label'>Consumers</div><input id='consumerSearch' class='input search' placeholder='Search consumers…' /><div class='seg' id='consumerStatusSeg'><button data-status='' class='active'>All</button><button data-status='active'>Active</button><button data-status='inactive'>Inactive</button></div></div><div class='toolbarRight'><button class='btn primary' id='newConsumerKey'>Generate key</button></div></div>
+        <div class='toolbar'><div class='toolbarLeft'><div class='label'>Consumers</div><input id='consumerSearch' class='input search' placeholder='Search consumers…' /><div class='seg' id='consumerStatusSeg'><button data-status='' class='active'>All</button><button data-status='active'>Active</button><button data-status='inactive'>Inactive</button></div></div><div class='toolbarRight'><button class='btn' id='newKeyBatch'>Generate batch</button><button class='btn primary' id='newConsumerKey'>Generate key</button></div></div>
         <div id='keys'></div>
       </div>
       <div class='card span12'><div id='consumerDetail'></div></div>
@@ -4837,6 +4952,11 @@ def _dashboard_html() -> str:
   <div id='newKeyStep1'><div class='formGrid'><label>Who is this key for?<input id='newKeyConsumer' placeholder='acme-support' autocomplete='off' /></label><div class='muted small'>A name for the app or person calling the router. Letters, numbers, and . _ : -</div><button class='btn primary' id='createKey'>Create and generate key</button></div></div>
   <div id='newKeyStep2' style='display:none'><div class='sub' id='newKeyStep2Title'>Key ready</div><div class='keyWarn'>Shown once — copy it now</div><textarea id='newKeyValue' class='mono' readonly></textarea><div class='drawerActions'><button class='btn' id='copyKey'>Copy key</button><button class='btn primary' id='copyKeyHandoff'>Copy setup blurb</button></div><textarea id='newKeyHandoffValue' readonly style='display:none'></textarea><div class='drawerActions' style='margin-top:12px'><button class='btn' id='newKeyDone'>Done</button></div></div>
 </div></div><div id='toast' class='toast'></div>
+
+<div id='batchKeyShade' class='drawerShade'><div class='dialog' role='dialog' aria-modal='true' aria-labelledby='batchKeyTitle'><div class='drawerHead'><div><div class='label'>Key batch</div><h2 id='batchKeyTitle'>Generate consumer keys</h2></div><button class='btn iconBtn ghost' id='closeKeyBatch'>×</button></div>
+  <div id='batchKeyForm' class='formGrid'><label>Batch name<input id='batchKeyName' placeholder='validators-mainnet' /></label><label>Number of validators<input id='batchKeyCount' type='number' min='1' max='50' value='50' /></label><label>Budget per validator (USD)<input id='batchKeyBudget' type='number' min='0.01' step='0.01' placeholder='25' /></label><label>Allowed routes (optional)<input id='batchKeyRoutes' placeholder='profile:default' /></label><label>Requests per minute (optional)<input id='batchKeyRate' type='number' min='1' placeholder='default' /></label><label>Burst (optional)<input id='batchKeyBurst' type='number' min='1' placeholder='default' /></label><div class='muted small'>Creates batch-001 through batch-NNN. Each consumer has an independent key and budget.</div><button class='btn primary' id='createKeyBatch'>Generate batch</button></div>
+  <div id='batchKeyResult' style='display:none'><div class='keyWarn'>Shown once — download now</div><textarea id='batchKeyCsv' class='mono' readonly style='width:100%;min-height:240px'></textarea><div class='drawerActions'><button class='btn primary' id='downloadKeyBatchCsv'>Download CSV</button><button class='btn' id='downloadKeyBatchJson'>Download JSON</button><button class='btn' id='batchKeyDone'>Done</button></div></div>
+</div></div>
 
 <script>
 const $=(id)=>document.getElementById(id);const fmt=(n)=>Number(n||0).toLocaleString();const ts=(s)=>s?new Date(s*1000).toLocaleString():'—';const esc=(s)=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -4956,6 +5076,12 @@ function showKeyReady(apiKey,consumer,title){const box=$('keyReady');box.innerHT
 function openNewKey(){$('newKeyConsumer').value='';$('newKeyStep1').style.display='';$('newKeyStep2').style.display='none';$('newKeyValue').value='';$('newKeyHandoffValue').value='';$('newKeyShade').classList.add('open');setTimeout(()=>$('newKeyConsumer').focus(),0)}
 function closeNewKey(){$('newKeyShade').classList.remove('open')}
 async function createKey(){try{const consumer=$('newKeyConsumer').value.trim();if(!consumer){showErr('Enter who this key is for');return}const r=await fetch('/dashboard/api/keys',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({consumer})});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`create ${r.status}`);const d=await r.json();const name=d.consumer||consumer;$('newKeyStep2Title').textContent='Key for '+name;$('newKeyValue').value=d.api_key||'';$('newKeyHandoffValue').value=buildKeyHandoff(d.api_key||'',name);$('newKeyStep1').style.display='none';$('newKeyStep2').style.display='';toast('Key generated — copy it now');load()}catch(e){showErr(e.message)}}
+let lastKeyBatch=null;
+function openKeyBatch(){$('batchKeyName').value='';$('batchKeyCount').value='50';$('batchKeyBudget').value='';$('batchKeyRoutes').value='profile:default';$('batchKeyRate').value='';$('batchKeyBurst').value='';$('batchKeyForm').style.display='grid';$('batchKeyResult').style.display='none';$('batchKeyShade').classList.add('open');setTimeout(()=>$('batchKeyName').focus(),0)}
+function closeKeyBatch(){$('batchKeyShade').classList.remove('open');lastKeyBatch=null;$('batchKeyCsv').value=''}
+function keyBatchCsv(keys){const q=v=>'"'+String(v??'').replaceAll('"','""')+'"';return ['batch,member_id,consumer,api_key,budget_usd'].concat((keys||[]).map(k=>[k.batch,k.member_id,k.consumer,k.api_key,k.budget_usd].map(q).join(','))).join('\\n')+'\\n'}
+function downloadKeyBatch(kind){if(!lastKeyBatch)return;const csv=keyBatchCsv(lastKeyBatch.keys);const text=kind==='json'?JSON.stringify(lastKeyBatch,null,2):csv;const blob=new Blob([text],{type:kind==='json'?'application/json':'text/csv'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=lastKeyBatch.batch+'-consumer-keys.'+kind;a.click();URL.revokeObjectURL(a.href)}
+async function createKeyBatch(){try{clearErr();const body={batch:$('batchKeyName').value.trim(),count:Number($('batchKeyCount').value),budget_usd:Number($('batchKeyBudget').value),allowed_routes:$('batchKeyRoutes').value.split(',').map(x=>x.trim()).filter(Boolean)};if($('batchKeyRate').value)body.rate_per_min=Number($('batchKeyRate').value);if($('batchKeyBurst').value)body.burst=Number($('batchKeyBurst').value);if(!body.batch||!body.budget_usd)throw new Error('Batch name and budget are required');$('createKeyBatch').disabled=true;const r=await fetch('/dashboard/api/keys/batch',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify(body)});const d=await r.json();if(r.status===401){showLogin();return}if(!r.ok)throw new Error(d.error?.message||`batch ${r.status}`);lastKeyBatch=d;$('batchKeyCsv').value=keyBatchCsv(d.keys);$('batchKeyForm').style.display='none';$('batchKeyResult').style.display='';toast(d.count+' keys generated — download now');load()}catch(e){showErr(e.message)}finally{$('createKeyBatch').disabled=false}}
 async function rotateKey(prefix){try{const grace=Number($('rotationGrace').value);const r=await fetch('/dashboard/api/keys',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({consumer:drawerConsumer,rotate:true,sha256_prefix:prefix,grace_period_s:grace})});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`rotate ${r.status}`);const d=await r.json();showKeyReady(d.api_key||'',drawerConsumer,'New key for '+drawerConsumer);toast('Key rotated — copy the new key now');loadDrawerKeys();load()}catch(e){showErr(e.message)}}
 async function revokeKey(prefix){try{const r=await fetch('/dashboard/api/keys/revoke',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({consumer:drawerConsumer,sha256_prefix:prefix})});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`revoke ${r.status}`);toast('Key revoked');loadDrawerKeys();load()}catch(e){showErr(e.message)}}
 async function saveConsumerSettings(){try{const c=drawerConsumer;const routes=$('settingsAllowedRoutes').value.trim();const body={status:$('settingsStatus').value};if(routes)body.allowed_routes=routes.split(',').map(s=>s.trim()).filter(Boolean);else body.allowed_routes=[];const rate=$('settingsRate').value.trim();const burst=$('settingsBurst').value.trim();if(rate)body.rate_per_min=Number(rate);if(burst)body.burst=Number(burst);const r=await fetch('/dashboard/api/consumers/'+encodeURIComponent(c),{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify(body)});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`settings ${r.status}`);toast('Settings saved');load()}catch(e){showErr(e.message)}}
@@ -5088,6 +5214,7 @@ function setBuilderKind(k){const flow=k==='flow';$('policyBuilder').style.displa
 $('builderKindSeg').addEventListener('click',e=>{const b=e.target.closest('[data-kind]');if(b)setBuilderKind(b.dataset.kind)});
 $('fAddNode').onclick=fAddNode;$('fReview').onclick=fReview;$('fDownload').onclick=fDownload;$('fTestBtn').onclick=fTest;$('fEx1').onclick=fLoadExample;$('fOutput').onchange=()=>{fOutput=$('fOutput').value};
 $('flowBuilder').addEventListener('click',e=>{const b=e.target.closest('[data-fact]');if(!b)return;fSync();const id=b.dataset.id,act=b.dataset.fact,n=fNodes.find(x=>x.id===id);if(act==='del'){fNodes=fNodes.filter(x=>x.id!==id);if(fOutput===id)fOutput=fNodes.length?fNodes[fNodes.length-1].id:null;fRender()}else if(act==='usepol'){if(n){try{n.policy=bCurrentTerm();n.custom=true;toast('Captured the Policy-builder term into '+id)}catch(err){fFail(err.message)}fRender()}}else if(act==='editpol'){const ta=$('flowBuilder').querySelector('.fN-pol[data-id="'+id+'"]');if(ta)ta.style.display=ta.style.display==='none'?'':'none'}});
+$('newKeyBatch').onclick=openKeyBatch;$('closeKeyBatch').onclick=closeKeyBatch;$('batchKeyDone').onclick=closeKeyBatch;$('createKeyBatch').onclick=createKeyBatch;$('downloadKeyBatchCsv').onclick=()=>downloadKeyBatch('csv');$('downloadKeyBatchJson').onclick=()=>downloadKeyBatch('json');$('batchKeyShade').addEventListener('click',e=>{if(e.target===$('batchKeyShade'))closeKeyBatch()});
 </script>
 </body></html>"""
     return html.replace("__PUBLIC_BASE_URL__", _public_base_url())
