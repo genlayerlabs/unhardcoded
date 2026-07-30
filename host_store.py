@@ -105,6 +105,7 @@ _SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_calls_route    ON calls(route_key, ts)",
     "CREATE INDEX IF NOT EXISTS idx_calls_session  ON calls(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_calls_consumer ON calls(consumer_sha, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_calls_caller   ON calls(caller, ts)",
     # Evolve the existing `calls` fact table in place — CREATE TABLE IF NOT EXISTS
     # never alters a table that already exists. Idempotent both ways: a no-op on a
     # fresh DB (the CREATE above already has these columns), the actual migration
@@ -147,6 +148,10 @@ _SCHEMA_STATEMENTS = [
     )""",
     """CREATE TABLE IF NOT EXISTS consumer_keys (
         consumer TEXT PRIMARY KEY, record TEXT NOT NULL, updated_at BIGINT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS consumer_budget_usage (
+        consumer TEXT PRIMARY KEY, spent_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+        updated_at BIGINT NOT NULL
     )""",
     # The antseed marketplace book. One RAW row per (peer, advertised service) —
     # the seller's announced prices/caps/reputation, stored as columns, not
@@ -303,6 +308,16 @@ def insert_call(row: dict[str, Any]) -> None:
                 " tokens_out, tokens_total, tokens_cached, cost_usd, served_by,"
                 " cost_basis)"
                 " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", values)
+            caller = row.get("caller")
+            cost = row.get("cost_usd")
+            if caller and isinstance(cost, (int, float)) and float(cost) > 0:
+                conn.execute(
+                    "INSERT INTO consumer_budget_usage(consumer,spent_usd,updated_at)"
+                    " VALUES (%s,%s,%s)"
+                    " ON CONFLICT(consumer) DO UPDATE SET"
+                    " spent_usd=consumer_budget_usage.spent_usd+EXCLUDED.spent_usd,"
+                    " updated_at=EXCLUDED.updated_at",
+                    [str(caller), float(cost), int(time.time())])
         with _prune_lock:
             _inserts_since_prune += 1
             due = _inserts_since_prune >= _PRUNE_EVERY
@@ -1034,6 +1049,20 @@ def policy_backtest_groups(since_ts: "int | None" = None,
         }
 
 
+def consumer_spend_usd(caller: str) -> tuple[float, bool]:
+    """Authoritative persisted spend for budget admission. Fail closed."""
+    try:
+        with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
+            row = conn.execute(
+                "SELECT spent_usd FROM consumer_budget_usage WHERE consumer = %s",
+                [caller]).fetchone()
+            return round(float(row[0] if row else 0.0), 6), True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store consumer_spend_usd failed: %s", exc)
+        return 0.0, False
+
+
 def usage_count(since_ts: "int | None" = None) -> int:
     """Row count in the window (the dashboard's history_events_all). Fail-soft -> 0."""
     try:
@@ -1325,5 +1354,5 @@ def truncate_all_for_tests() -> None:
     """Test helper: wipe every table for isolation against a shared Postgres."""
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
-                     " consumer_keys, peer_offers, buyer_status, route_observations,"
+                     " consumer_keys, consumer_budget_usage, peer_offers, buyer_status, route_observations,"
                      " login_history, provider_prices")

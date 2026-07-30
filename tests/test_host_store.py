@@ -45,6 +45,13 @@ def test_insert_and_recent_roundtrip(store):
     assert r["session_id"] == "sess-A"
 
 
+def test_consumer_spend_usd_sums_only_that_consumer(store):
+    store.insert_call(_row(usage_event_id="budget-1", caller="validator-001", cost_usd=1.25))
+    store.insert_call(_row(usage_event_id="budget-2", caller="validator-001", cost_usd=0.75))
+    store.insert_call(_row(usage_event_id="other", caller="validator-002", cost_usd=99))
+    assert store.consumer_spend_usd("validator-001") == (2.0, True)
+
+
 def test_usage_rows_since_ts_filters_in_query(store):
     # The timeframe window lives in SQL now (idx_calls_ts), not Python: a windowed
     # dashboard view reads only its window, never the whole retention table to then

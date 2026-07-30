@@ -239,6 +239,9 @@ def test_dashboard_key_generation_ui_has_copy_key_and_handoff_blurb(monkeypatch,
     assert "copyKeyHandoff" in html
     assert "Copy setup blurb" in html
     assert "buildKeyHandoff" in html
+    assert "Generate batch" in html
+    assert "batchKeyBudget" in html
+    assert "downloadKeyBatchCsv" in html
     # Two-step new-consumer-key dialog and the scoped keys drawer.
     assert "newKeyConsumer" in html
     assert "Create and generate key" in html
@@ -875,6 +878,7 @@ def test_dashboard_admin_endpoints_reject_unauthenticated_and_consumer_bearer(mo
             ("GET", "/dashboard/api/keys/reveal?consumer=crm", None),
             ("POST", "/dashboard/api/key-usage", {"api_key": token}),
             ("POST", "/dashboard/api/keys", {"consumer": "crm"}),
+            ("POST", "/dashboard/api/keys/batch", {"batch": "validators", "count": 2, "budget_usd": 5}),
             ("POST", "/dashboard/api/keys/revoke", {"consumer": "crm", "sha256_prefix": "01234567"}),
             ("POST", "/dashboard/api/consumers/crm", {"status": "inactive"}),
         ]
@@ -885,6 +889,53 @@ def test_dashboard_admin_endpoints_reject_unauthenticated_and_consumer_bearer(mo
             assert consumer_auth.status_code == 401, path
     finally:
         _restore_auth_maps(original_plaintext, original_hashes)
+
+
+def test_dashboard_generates_bounded_key_batch_with_independent_budgets(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    env_path = tmp_path / ".env.secrets"
+    monkeypatch.setattr(auth_proxy, "DASHBOARD_KEY_ENV_PATH", str(env_path))
+    original = dict(auth_proxy.CALLER_KEY_HASHES)
+    try:
+        client = _dashboard_client(monkeypatch)
+        resp = client.post("/dashboard/api/keys/batch", json={
+            "batch": "validators-mainnet", "count": 3, "budget_usd": 25,
+            "allowed_routes": ["profile:default"], "rate_per_min": 10, "burst": 2})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert [row["consumer"] for row in body["keys"]] == [
+            "validators-mainnet-001", "validators-mainnet-002", "validators-mainnet-003"]
+        assert len({row["api_key"] for row in body["keys"]}) == 3
+        records = _issued_data()
+        for idx in range(1, 4):
+            meta = records[f"validators-mainnet-{idx:03d}"]
+            assert meta["batch"] == "validators-mainnet"
+            assert meta["member_id"] == f"{idx:03d}"
+            assert meta["budget_usd"] == 25
+            assert meta["allowed_routes"] == ["profile:default"]
+        collision = client.post("/dashboard/api/keys/batch", json={
+            "batch": "validators-mainnet", "count": 3, "budget_usd": 25})
+        assert collision.status_code == 409
+        too_many = client.post("/dashboard/api/keys/batch", json={
+            "batch": "other", "count": 51, "budget_usd": 25})
+        assert too_many.status_code == 400
+    finally:
+        auth_proxy.CALLER_KEY_HASHES.clear()
+        auth_proxy.CALLER_KEY_HASHES.update(original)
+
+
+def test_consumer_budget_rejects_before_upstream(monkeypatch):
+    monkeypatch.setattr(auth_proxy, "_caller_auth", lambda token: {
+        "ok": True, "caller": "validators-001", "digest": "a" * 64,
+        "meta": {"status": "active", "budget_usd": 5.0}})
+    monkeypatch.setattr(auth_proxy, "_route_allowed", lambda caller, route: True)
+    monkeypatch.setattr(auth_proxy, "_rate_ok", lambda caller: True)
+    monkeypatch.setattr(host_store, "consumer_spend_usd", lambda caller: (5.0, True))
+    resp = TestClient(auth_proxy.app).post(
+        "/v1/chat/completions", headers={"Authorization": "Bearer test"},
+        json={"model": "profile:default", "messages": []})
+    assert resp.status_code == 402
+    assert resp.json()["error"]["code"] == "consumer_budget_exhausted"
 
 
 def test_malformed_issued_key_metadata_fails_closed(monkeypatch, tmp_path):
