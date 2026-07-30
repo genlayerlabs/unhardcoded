@@ -1044,7 +1044,7 @@ def test_dashboard_stats_defaults_to_latest_events_and_consumer_rows(monkeypatch
         assert resp.status_code == 200
         body = resp.json()
         assert body["timeframe"]["selected"] == "recent"
-        assert body["timeframe"]["source"] == "persistent_history"
+        assert body["timeframe"]["source"] == "recent_events"
         assert body["totals"]["requests"] == 3
         assert body["by_caller"]["crm"]["requests"] == 2
         assert body["by_caller"]["wingston"]["requests"] == 1
@@ -1075,6 +1075,21 @@ def test_dashboard_stats_defaults_to_latest_events_and_consumer_rows(monkeypatch
     finally:
         _restore_auth_maps(original_plaintext, original_hashes)
         auth_proxy._reset_stats_for_tests()
+
+
+def test_historical_dashboard_reads_rollups_not_raw_aggregation(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    _install_test_state(monkeypatch)
+    monkeypatch.setattr(host_store, "usage_aggregate", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("historical dashboard must not aggregate raw calls")))
+    client = _dashboard_client(monkeypatch)
+    response = client.get("/dashboard/api/stats?timeframe=7d")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["timeframe"]["selected"] == "7d"
+    assert body["timeframe"]["source"] == "analytics_hourly"
+    assert body["timeframe"]["analytics"]["available"] is True
+    assert body["totals"]["requests"] == 0
 
 
 def test_dashboard_api_key_login_filters_same_dashboard_to_exact_key(monkeypatch, tmp_path):
@@ -1152,6 +1167,10 @@ def test_openapi_and_dashboard_document_key_usage_controls():
     assert "cost_estimate" in html
     assert "recentOffset" in html
     assert "Latest 100 events" in html
+    assert "Last 24 hours" in html
+    assert "Last 7 days" in html
+    assert "Last 30 days" in html
+    assert "analyticsFreshness" in html
     assert "value='all' selected" not in html
     assert "dashboardLoading" in html
     assert "AbortController" in html

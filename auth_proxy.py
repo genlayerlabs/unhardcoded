@@ -4583,6 +4583,30 @@ def _stats_history_bundle(*, since: int | None, selected: str | None,
     }
 
 
+def _analytics_history_bundle(*, since: int, selected: str | None,
+                              provider: str | None, model: str | None,
+                              key_filter: str | None = None) -> dict[str, Any]:
+    sql_agg, state, ok = host_store.analytics_aggregate(
+        since_ts=since, caller=selected, provider=provider, model_family=model,
+        consumer_sha=key_filter)
+    recent = host_store.usage_rows_page(caller=selected, provider=provider,
+                                        model_family=model,
+                                        consumer_sha=key_filter,
+                                        limit=DASHBOARD_STATS_RECENT_LIMIT)
+    agg = _agg_from_sql(sql_agg, recent, selected=selected)
+    return {
+        "agg": agg,
+        "keys_by_caller": {k: _counter_snapshot(_counter_from_sql(v))
+                           for k, v in sorted(sql_agg["by_caller"].items())},
+        "filter_options": {"providers": sorted(sql_agg["by_provider"]),
+                           "models": sorted(sql_agg["by_model_family"])},
+        "daily_totals": _daily_totals_from_sql(sql_agg["by_day"]),
+        "history_events": int(sql_agg["totals"]["requests"]),
+        "history_events_all": int(sql_agg["totals"]["requests"]),
+        "analytics": {"available": ok, **state},
+    }
+
+
 def _unlanded_recent_requests(since: int | None) -> list[dict[str, Any]]:
     """Runtime `recent` request rows whose async ledger write has NOT landed yet.
     The old code merged the whole history read with the runtime deque and
@@ -4672,9 +4696,15 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
         # re-scanning the window per request.
         since = _dashboard_timeframe_options(timeframe).get("since")
         cache_key = ("stats", timeframe, selected, key_filter, provider, model)
-        bundle = _snapshot_cached_compute(cache_key, lambda: _stats_history_bundle(
-            since=since, selected=selected, key_filter=key_filter,
-            provider=provider, model=model, recent_only=timeframe == "recent"))
+        if timeframe == "recent":
+            compute = lambda: _stats_history_bundle(
+                since=since, selected=selected, key_filter=key_filter,
+                provider=provider, model=model, recent_only=True)
+        else:
+            compute = lambda: _analytics_history_bundle(
+                since=int(since or 0), selected=selected,
+                provider=provider, model=model, key_filter=key_filter)
+        bundle = _snapshot_cached_compute(cache_key, compute)
         agg = bundle["agg"]
         # Surface live in-memory events (dashboard test calls, probes, just-served
         # requests) that are not persisted to billing history, so Activity always
@@ -4697,7 +4727,7 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
             "viewer_role": viewer_role,
             "selected_consumer": selected,
             "selected_key_sha256_prefix": key_filter[:12] if key_filter else None,
-            "timeframe": {"selected": timeframe, "source": "persistent_history", "history_path_configured": True, "history_events": bundle["history_events"], "history_events_all": bundle["history_events_all"]},
+            "timeframe": {"selected": timeframe, "source": "recent_events" if timeframe == "recent" else "analytics_hourly", "history_path_configured": True, "history_events": bundle["history_events"], "history_events_all": bundle["history_events_all"], "analytics": bundle.get("analytics")},
             "rate_limit": {"rate_per_min": RATE_PER_MIN, "burst": BURST, "effective_per_min": max(RATE_PER_MIN, BURST)},
             "upstream": {"status": upstream_status, "health": upstream_health},
             "consumers": [{"name": name, "configured": True} for name in _consumers()],
@@ -4714,8 +4744,8 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
             "daily_totals": bundle["daily_totals"],
             "route_health": route_health,
             "health_summary": health_summary,
-            "logins": _login_connections_snapshot(timeframe=timeframe, consumer=selected, viewer_role=viewer_role),
-            "provider_keys": _provider_credentials_snapshot(timeframe=timeframe, viewer_role=viewer_role),
+            "logins": _login_connections_snapshot(timeframe="recent" if timeframe != "recent" else timeframe, consumer=selected, viewer_role=viewer_role),
+            "provider_keys": _provider_credentials_snapshot(timeframe="recent" if timeframe != "recent" else timeframe, viewer_role=viewer_role),
         }
     with _stats_lock:
         by_caller_all = {k: _counter_snapshot(v) for k, v in sorted(_stats["by_caller"].items())}
@@ -4839,14 +4869,14 @@ def _dashboard_html() -> str:
   <main class='content'>
     <div class='topbar'>
       <div class='pageTitle'><h1 id='pageTitle'>Analytics</h1><div class='sub' id='pageSub'>Spend, traffic and errors — filter by timeframe, consumer, provider and model.</div></div>
-      <div class='topActions'><select class='select' id='consumer'><option value=''>All consumers</option></select><select class='select' id='timeframe' title='Usage scope'><option value='recent' selected>Latest 100 events</option></select><button class='btn' id='refresh'>Refresh</button><button class='btn' id='logout'>Log out</button></div>
+      <div class='topActions'><select class='select' id='consumer'><option value=''>All consumers</option></select><select class='select' id='timeframe' title='Usage scope'><option value='recent' selected>Latest 100 events</option><option value='24h'>Last 24 hours</option><option value='7d'>Last 7 days</option><option value='30d'>Last 30 days</option></select><button class='btn' id='refresh'>Refresh</button><button class='btn' id='logout'>Log out</button></div>
     </div>
     <div id='err' class='errorbox'></div>
     <div id='dashboardLoading' class='card cardPad' style='display:flex;align-items:center;gap:12px;margin-bottom:14px'><span aria-hidden='true' style='font-size:24px'>◌</span><div><b>Loading recent activity…</b><div class='muted small'>Applying the selected filters.</div></div></div>
     <section id='login' class='card login hidden'><div class='label'>Dashboard login</div><h2>Welcome back</h2><p class='muted'>Admins can use the dashboard password. Consumers can paste their router API key to see only their own usage.</p><div class='formGrid' style='margin-top:14px'><label>Admin password<input id='password' type='password' placeholder='Dashboard password' autocomplete='current-password' /></label><button class='btn primary' id='loginBtn'>Admin log in</button><label>Consumer API key<input id='apiKeyLogin' type='password' placeholder='Router API key' autocomplete='off' /></label><button class='btn' id='apiKeyLoginBtn'>View my usage</button></div></section>
 
     <section class='grid hidden page' id='app'>
-      <div class='card cardPad span12'><div class='toolbar'><div class='label'>Filters</div><div style='margin-left:auto;display:flex;gap:8px;align-items:center'><span class='muted small'>timeframe &amp; consumer: top right</span><select id='anProvider'><option value=''>All providers</option></select><select id='anModel'><option value=''>All models</option></select></div></div></div>
+      <div class='card cardPad span12'><div class='toolbar'><div class='label'>Filters</div><span id='analyticsFreshness' class='muted small'></span><div style='margin-left:auto;display:flex;gap:8px;align-items:center'><span class='muted small'>timeframe &amp; consumer: top right</span><select id='anProvider'><option value=''>All providers</option></select><select id='anModel'><option value=''>All models</option></select></div></div></div>
       <div class='card cardPad span3'><div class='label'>Requests</div><div id='anRequests' class='metric'>0</div><div id='anReqSub' class='statSub'>—</div></div>
       <div class='card cardPad span3'><div class='label'>Spend</div><div id='anSpend' class='metric'>$0</div><div id='anSpendSub' class='statSub'>—</div></div>
       <div class='card cardPad span3'><div class='label'>Tokens</div><div id='anTokens' class='metric'>0</div><div id='anTokSub' class='statSub'>—</div></div>
@@ -5003,7 +5033,7 @@ function renderSeries(days){if(!days||!days.length){$('anSeries').innerHTML='<di
 function renderAnalytics(d){const t=d.totals||{};const req=Number(t.requests||0),err=Number(t.errors||0);$('anRequests').textContent=fmt(req);$('anReqSub').textContent=`${fmt(err)} errors · ${fmt(t.rejects||0)} rejects`;$('anSpend').textContent='$'+Number(t.cost_usd||0).toFixed(4);$('anSpendSub').textContent=`over ${fmt(req)} requests`;$('anTokens').textContent=fmt(t.tokens_total);$('anTokSub').textContent=`in ${fmt(t.tokens_in)} · out ${fmt(t.tokens_out)}`;const sr=req?(req-err)/req:null;$('anSuccess').textContent=sr==null?'—':Math.round(sr*100)+'%';$('anSuccess').className='metric '+(sr==null?'':sr>=0.95?'ok':sr>=0.8?'warn':'bad');$('anSuccessSub').textContent=`${fmt(req-err)} ok / ${fmt(req)}`;$('anByProvider').innerHTML=table(counterRows(d.by_provider),anCols());$('anByModel').innerHTML=table(counterRows(d.by_model_family),anCols());$('anByConsumer').innerHTML=table(counterRows(d.by_caller),anCols());$('anByStatus').innerHTML=table(Object.entries(d.by_status||{}).map(([name,count])=>({name,requests:count})),[{label:'Status',f:r=>`<span class="pill">${esc(r.name)}</span>`},{label:'Count',cls:'right',f:r=>fmt(r.requests)}]);renderSeries(d.daily_totals||[]);const fo=d.filter_options||{};fillFilter('anProvider',fo.providers,'All providers');fillFilter('anModel',fo.models,'All models')}
 function renderCostAccuracy(rows){const el=$('anCostAccuracy');if(!el)return;if(!rows||!rows.length){el.innerHTML='<div class="empty">No priced traffic in the window yet.</div>';return}const drift=r=>{const pct=Math.round((r.deviation-1)*100);const cls=r.warn?(pct>0?'bad':'warn'):'muted';const sign=pct>0?'+':'';return `<span class="${cls}">${sign}${pct}%</span>${r.warn?' <span class="pill warn">drift</span>':''}`};const sig=r=>r.signal==='reported'?'<span class="pill" title="provider reports its own cost — drift is real signal">reported</span>':'<span class="muted small" title="cost derived from the list price — drift is reprice noise, not a discount">derived</span>';el.innerHTML=table(rows,[{label:'Provider',f:r=>`<b>${esc(r.provider)}</b> ${sig(r)}`},{label:'Effective $/Mtok',cls:'right',f:r=>'$'+Number(r.measured_usd_per_mtok).toFixed(3)},{label:'List $/Mtok',cls:'right',f:r=>'$'+Number(r.expected_usd_per_mtok).toFixed(3)},{label:'Drift',cls:'right',f:drift},{label:'Calls',cls:'right',f:r=>fmt(r.calls)}])}
 async function loadCostAccuracy(){try{const r=await fetch('/dashboard/api/cost-accuracy',{credentials:'same-origin'});if(!r.ok)return;const d=await r.json();renderCostAccuracy(d.rows||[])}catch(e){}}
-function render(d){$('login').classList.add('hidden');applyViewerMode(d);document.querySelectorAll('.page').forEach(el=>el.classList.add('hidden'));$(({overview:'app',consumers:'consumersPage',providerKeys:'providerKeysPage',keyUsage:'keyUsagePage',market:'marketPage',builder:'builderPage',activity:'activityPage',config:'configPage'})[activeTab]||'app').classList.remove('hidden');syncConsumers(d.consumers||[],d.selected_consumer||'');renderAnalytics(d);renderConsumers(d.keys||[]);renderConsumerDetail(d);renderProviderKeys(d);let recent=(d.recent||[]);if(activityKind)recent=recent.filter(r=>r.event===activityKind);renderActivity(recent.slice(0,60))}
+function render(d){$('login').classList.add('hidden');applyViewerMode(d);document.querySelectorAll('.page').forEach(el=>el.classList.add('hidden'));$(({overview:'app',consumers:'consumersPage',providerKeys:'providerKeysPage',keyUsage:'keyUsagePage',market:'marketPage',builder:'builderPage',activity:'activityPage',config:'configPage'})[activeTab]||'app').classList.remove('hidden');syncConsumers(d.consumers||[],d.selected_consumer||'');const am=(d.timeframe||{}).analytics||null;$('analyticsFreshness').textContent=am?(am.available?'Hourly analytics · updated '+ts(am.updated_at):'Hourly analytics unavailable'):'Live recent events';renderAnalytics(d);renderConsumers(d.keys||[]);renderConsumerDetail(d);renderProviderKeys(d);let recent=(d.recent||[]);if(activityKind)recent=recent.filter(r=>r.event===activityKind);renderActivity(recent.slice(0,60))}
 async function login(){try{clearErr();const r=await fetch('/dashboard/login',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({password:$('password').value})});if(!r.ok)throw new Error('login failed');$('password').value='';toast('Logged in');load()}catch(e){showErr(e.message)}}async function apiKeyLogin(){try{clearErr();const r=await fetch('/dashboard/login',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({api_key:$('apiKeyLogin').value})});if(!r.ok)throw new Error('API key login failed');$('apiKeyLogin').value='';activeTab='consumers';toast('Logged in');load()}catch(e){showErr(e.message)}}async function logout(){await fetch('/dashboard/logout',{method:'POST',credentials:'same-origin'});showLogin()}async function revealKey(prefix){try{const r=await fetch('/dashboard/api/keys/reveal?consumer='+encodeURIComponent(drawerConsumer),{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`reveal ${r.status}`);const d=await r.json();const match=(d.keys||[]).find(k=>String(k.sha256_prefix||'').startsWith(String(prefix))||String(prefix).startsWith(String(k.sha256_prefix||'')))||(d.keys||[])[0];if(!match||!match.api_key){toast(d.message||'No recoverable raw key for this key');return}showKeyReady(match.api_key,drawerConsumer,'Recovered key for '+drawerConsumer)}catch(e){showErr(e.message)}}
 function buildKeyHandoff(apiKey,consumer){
   const key=String(apiKey||'').trim();

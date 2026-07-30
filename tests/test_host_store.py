@@ -52,6 +52,33 @@ def test_consumer_spend_usd_sums_only_that_consumer(store):
     assert store.consumer_spend_usd("validator-001") == (2.0, True)
 
 
+def test_hourly_analytics_rollup_is_idempotent_and_filterable(store):
+    base = 1_800_000_000
+    store.insert_call(_row(ts=base + 10, usage_event_id="a1", caller="a",
+                           provider="p1", model_family="m1", status=200,
+                           tokens_in=10, tokens_out=5, tokens_total=15, cost_usd=1.0))
+    store.insert_call(_row(ts=base + 20, usage_event_id="a2", caller="a",
+                           provider="p2", model_family="m2", status=500,
+                           tokens_in=20, tokens_out=10, tokens_total=30, cost_usd=2.0))
+    store.insert_call(_row(ts=base + 30, usage_event_id="b1", caller="b",
+                           provider="p1", model_family="m1", status=200,
+                           tokens_in=30, tokens_out=15, tokens_total=45, cost_usd=3.0))
+    first = store.rollup_analytics(base, base + 3600)
+    assert first["rows"] == 3
+    agg, state, ok = store.analytics_aggregate(base, caller="a")
+    assert ok is True
+    assert agg["totals"]["requests"] == 2
+    assert agg["totals"]["errors"] == 1
+    assert agg["totals"]["cost_usd"] == 3.0
+    assert set(agg["by_provider"]) == {"p1", "p2"}
+    assert state["covered_until"] >= base + 3600
+    # Replacing the same buckets must not double count.
+    store.rollup_analytics(base, base + 3600)
+    agg2, _, _ = store.analytics_aggregate(base)
+    assert agg2["totals"]["requests"] == 3
+    assert agg2["totals"]["cost_usd"] == 6.0
+
+
 def test_usage_rows_since_ts_filters_in_query(store):
     # The timeframe window lives in SQL now (idx_calls_ts), not Python: a windowed
     # dashboard view reads only its window, never the whole retention table to then
