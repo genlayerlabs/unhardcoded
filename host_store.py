@@ -153,6 +153,25 @@ _SCHEMA_STATEMENTS = [
         consumer TEXT PRIMARY KEY, spent_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
         updated_at BIGINT NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS analytics_hourly (
+        bucket_start BIGINT NOT NULL,
+        caller TEXT NOT NULL, key_prefix TEXT NOT NULL, provider_id TEXT NOT NULL,
+        model_family TEXT NOT NULL, requested_model TEXT NOT NULL,
+        served_model_id TEXT NOT NULL, status INTEGER NOT NULL,
+        requests BIGINT NOT NULL, errors BIGINT NOT NULL,
+        tokens_in BIGINT NOT NULL, tokens_out BIGINT NOT NULL,
+        tokens_total BIGINT NOT NULL, cost_usd DOUBLE PRECISION NOT NULL,
+        priced BIGINT NOT NULL, last_seen BIGINT,
+        PRIMARY KEY(bucket_start, caller, key_prefix, provider_id, model_family,
+                    requested_model, served_model_id, status)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_analytics_hourly_caller ON analytics_hourly(caller,bucket_start)",
+    "CREATE INDEX IF NOT EXISTS idx_analytics_hourly_provider ON analytics_hourly(provider_id,bucket_start)",
+    "CREATE INDEX IF NOT EXISTS idx_analytics_hourly_model ON analytics_hourly(model_family,bucket_start)",
+    """CREATE TABLE IF NOT EXISTS analytics_rollup_state (
+        name TEXT PRIMARY KEY, covered_from BIGINT, covered_until BIGINT,
+        updated_at BIGINT NOT NULL
+    )""",
     # The antseed marketplace book. One RAW row per (peer, advertised service) —
     # the seller's announced prices/caps/reputation, stored as columns, not
     # interpreted: ranking/admission stays in sources/antseed.offers_sync (host)
@@ -1049,6 +1068,120 @@ def policy_backtest_groups(since_ts: "int | None" = None,
         }
 
 
+_ANALYTICS_LOCK_KEY = 0x616E616C_79746963
+
+
+def rollup_analytics(start_ts: int, end_ts: int) -> dict[str, Any]:
+    """Idempotently replace hourly aggregates for [start_ts, end_ts)."""
+    start = (int(start_ts) // 3600) * 3600
+    end = ((int(end_ts) + 3599) // 3600) * 3600
+    if end <= start:
+        raise ValueError("analytics rollup end must be after start")
+    with _get_pool().connection() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", [_ANALYTICS_LOCK_KEY])
+        conn.execute("SELECT set_config('statement_timeout', %s, true)",
+                     [os.getenv("ANALYTICS_ROLLUP_TIMEOUT_MS", "120000")])
+        conn.execute("DELETE FROM analytics_hourly WHERE bucket_start >= %s AND bucket_start < %s",
+                     [start, end])
+        cur = conn.execute(
+            "INSERT INTO analytics_hourly("
+            " bucket_start,caller,key_prefix,provider_id,model_family,requested_model,served_model_id,status,"
+            " requests,errors,tokens_in,tokens_out,tokens_total,cost_usd,priced,last_seen)"
+            " SELECT (ts/3600)*3600,"
+            " COALESCE(NULLIF(caller,''),'unknown'),"
+            " COALESCE(NULLIF(substr(consumer_sha,1,12),''),'unknown'),"
+            " COALESCE(NULLIF(provider_id,''),'unknown'),"
+            " COALESCE(NULLIF(model_family,''),NULLIF(requested_model,''),'unknown'),"
+            " COALESCE(NULLIF(requested_model,''),'unknown'),"
+            " COALESCE(NULLIF(served_model_id,''),'unknown'), COALESCE(status,0),"
+            " count(*), count(*) FILTER(WHERE COALESCE(status,0)>=400),"
+            " COALESCE(sum(COALESCE(tokens_in,0)),0),"
+            " COALESCE(sum(COALESCE(tokens_out,0)),0),"
+            " COALESCE(sum(CASE WHEN COALESCE(tokens_total,0)<>0 THEN tokens_total"
+            " ELSE COALESCE(tokens_in,0)+COALESCE(tokens_out,0) END),0),"
+            " COALESCE(sum(GREATEST(cost_usd,0)),0)::float8, count(cost_usd), max(ts)"
+            " FROM calls WHERE ts >= %s AND ts < %s"
+            " GROUP BY 1,2,3,4,5,6,7,8",
+            [start, end])
+        rows = cur.rowcount
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO analytics_rollup_state(name,covered_from,covered_until,updated_at)"
+            " VALUES('hourly',%s,%s,%s) ON CONFLICT(name) DO UPDATE SET"
+            " covered_from=LEAST(analytics_rollup_state.covered_from,EXCLUDED.covered_from),"
+            " covered_until=GREATEST(analytics_rollup_state.covered_until,EXCLUDED.covered_until),"
+            " updated_at=EXCLUDED.updated_at", [start, end, now])
+    return {"start": start, "end": end, "rows": int(rows or 0), "updated_at": now}
+
+
+def analytics_rollup_state() -> dict[str, Any]:
+    try:
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT covered_from,covered_until,updated_at FROM analytics_rollup_state"
+                " WHERE name='hourly'").fetchone()
+        return {"covered_from": row[0], "covered_until": row[1],
+                "updated_at": row[2]} if row else {}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store analytics_rollup_state failed: %s", exc)
+        return {}
+
+
+def analytics_aggregate(since_ts: int, caller: str | None = None,
+                        provider: str | None = None,
+                        model_family: str | None = None,
+                        consumer_sha: str | None = None) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    """Dashboard-shaped counters from hourly rollups, never from raw calls."""
+    out = _empty_usage_aggregate()
+    try:
+        clauses = ["bucket_start >= %s"]
+        params: list[Any] = [(int(since_ts) // 3600) * 3600]
+        for column, value in (("caller", caller), ("provider_id", provider),
+                              ("model_family", model_family)):
+            if value:
+                clauses.append(f"{column} = %s")
+                params.append(value)
+        if consumer_sha:
+            clauses.append("key_prefix = %s")
+            params.append(str(consumer_sha)[:12])
+        where = " WHERE " + " AND ".join(clauses)
+        measures = (" COALESCE(sum(requests),0), COALESCE(sum(errors),0),"
+                    " COALESCE(sum(tokens_in),0), COALESCE(sum(tokens_out),0),"
+                    " COALESCE(sum(tokens_total),0),"
+                    " round(COALESCE(sum(cost_usd),0)::numeric,6)::float8,"
+                    " COALESCE(sum(priced),0), max(last_seen)")
+        with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
+            total = conn.execute("SELECT" + measures + " FROM analytics_hourly" + where,
+                                 params).fetchone()
+            out["totals"] = _agg_counter(total)
+            for bucket, column in (("by_caller", "caller"), ("by_provider", "provider_id"),
+                                   ("by_model_family", "model_family"),
+                                   ("by_route", "requested_model"),
+                                   ("by_served_model", "served_model_id")):
+                for row in conn.execute("SELECT " + column + "," + measures +
+                                        " FROM analytics_hourly" + where + " GROUP BY " + column,
+                                        params):
+                    out[bucket][str(row[0])] = _agg_counter(row[1:])
+            for status, count in conn.execute(
+                    "SELECT status,sum(requests) FROM analytics_hourly" + where +
+                    " GROUP BY status", params):
+                out["by_status"][str(status)] = int(count)
+            for day, *counter in conn.execute(
+                    "SELECT to_char(to_timestamp(bucket_start) AT TIME ZONE 'UTC','YYYY-MM-DD')," +
+                    measures + " FROM analytics_hourly" + where + " GROUP BY 1", params):
+                out["by_day"][str(day)] = _agg_counter(tuple(counter))
+            state_row = conn.execute(
+                "SELECT covered_from,covered_until,updated_at FROM analytics_rollup_state"
+                " WHERE name='hourly'").fetchone()
+        state = {"covered_from": state_row[0], "covered_until": state_row[1],
+                 "updated_at": state_row[2]} if state_row else {}
+        return out, state, True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store analytics_aggregate failed: %s", exc)
+        return out, {}, False
+
+
 def consumer_spend_usd(caller: str) -> tuple[float, bool]:
     """Authoritative persisted spend for budget admission. Fail closed."""
     try:
@@ -1354,5 +1487,5 @@ def truncate_all_for_tests() -> None:
     """Test helper: wipe every table for isolation against a shared Postgres."""
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
-                     " consumer_keys, consumer_budget_usage, peer_offers, buyer_status, route_observations,"
+                     " consumer_keys, consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
                      " login_history, provider_prices")
