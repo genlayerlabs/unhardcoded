@@ -541,6 +541,11 @@ def _requested_route_from(path: str, body: bytes | None) -> str | None:
     parts = [p for p in path.strip("/").split("/") if p]
     if len(parts) >= 3 and parts[1:] == ["v1", "chat", "completions"] and parts[0] != "v1":
         route = route or f"profile:{parts[0]}"
+    # The router already treats a missing/empty OpenAI model as its current
+    # default policy. Normalize admission to that same identity so a consumer
+    # restricted to profile:default is not rejected before reaching the router.
+    if not route and parts in (["v1", "chat", "completions"], ["v1", "responses"]):
+        route = "profile:default"
     return str(route).strip() if route else None
 
 

@@ -653,6 +653,26 @@ def test_restricted_consumer_fails_closed_when_route_is_missing(monkeypatch, tmp
         _restore_auth_maps(original_plaintext, original_hashes)
 
 
+def test_missing_or_empty_openai_model_maps_to_default_profile(monkeypatch):
+    assert auth_proxy._requested_route_from(
+        "v1/chat/completions", b'{"messages":[]}') == "profile:default"
+    assert auth_proxy._requested_route_from(
+        "/v1/chat/completions", b'{"model":"","messages":[]}') == "profile:default"
+    assert auth_proxy._requested_route_from(
+        "v1/responses", b'{"input":"hello"}') == "profile:default"
+    assert auth_proxy._requested_route_from(
+        "v1/chat/completions", b'{"model":"profile:edge"}') == "profile:edge"
+    monkeypatch.setattr(auth_proxy, "_consumer_meta", lambda caller: {
+        "allowed_routes": ["profile:default"]})
+    assert auth_proxy._route_allowed("validator-001", auth_proxy._requested_route_from(
+        "v1/chat/completions", b'{"messages":[]}'))
+    assert auth_proxy._route_allowed("validator-001", auth_proxy._requested_route_from(
+        "v1/chat/completions", b'{"model":""}'))
+    # Unknown paths remain unidentified and therefore fail closed for a
+    # route-restricted consumer.
+    assert auth_proxy._requested_route_from("v1/embeddings", b'{"input":"x"}') is None
+
+
 def test_dashboard_rotation_with_zero_grace_expires_old_key_not_new_key(monkeypatch, tmp_path):
     digest = hashlib.sha256("crm-token".encode()).hexdigest()
     token, digest, original_plaintext, original_hashes = _with_consumer_auth(
