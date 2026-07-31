@@ -160,11 +160,13 @@ _SCHEMA_STATEMENTS = [
         served_model_id TEXT NOT NULL, status INTEGER NOT NULL,
         requests BIGINT NOT NULL, errors BIGINT NOT NULL,
         tokens_in BIGINT NOT NULL, tokens_out BIGINT NOT NULL,
-        tokens_total BIGINT NOT NULL, cost_usd DOUBLE PRECISION NOT NULL,
+        tokens_total BIGINT NOT NULL, tokens_cached BIGINT NOT NULL DEFAULT 0,
+        cost_usd DOUBLE PRECISION NOT NULL,
         priced BIGINT NOT NULL, last_seen BIGINT,
         PRIMARY KEY(bucket_start, caller, key_prefix, provider_id, model_family,
                     requested_model, served_model_id, status)
     )""",
+    "ALTER TABLE analytics_hourly ADD COLUMN IF NOT EXISTS tokens_cached BIGINT NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS idx_analytics_hourly_caller ON analytics_hourly(caller,bucket_start)",
     "CREATE INDEX IF NOT EXISTS idx_analytics_hourly_provider ON analytics_hourly(provider_id,bucket_start)",
     "CREATE INDEX IF NOT EXISTS idx_analytics_hourly_model ON analytics_hourly(model_family,bucket_start)",
@@ -872,7 +874,7 @@ def usage_rows_page(since_ts: "int | None" = None, caller: "str | None" = None,
 #   * rejects are never persisted to `calls`, so they don't appear here.
 
 _AGG_INNER = (
-    "SELECT id, ts, status, tokens_in, tokens_out, tokens_total, cost_usd,"
+    "SELECT id, ts, status, tokens_in, tokens_out, tokens_total, tokens_cached, cost_usd,"
     " requested_model, model_family, provider_id,"
     " COALESCE(NULLIF(caller,''),'unknown') AS caller_k,"
     " COALESCE(NULLIF(provider_id,''),'unknown') AS provider_k,"
@@ -896,6 +898,7 @@ _AGG_MEASURES = (
     " COALESCE(sum(COALESCE(tokens_out,0)),0) AS tokens_out,"
     " COALESCE(sum(CASE WHEN COALESCE(tokens_total,0) <> 0 THEN tokens_total"
     " ELSE COALESCE(tokens_in,0)+COALESCE(tokens_out,0) END),0) AS tokens_total,"
+    " COALESCE(sum(COALESCE(tokens_cached,0)),0) AS tokens_cached,"
     " round(COALESCE(sum(GREATEST(cost_usd,0)),0)::numeric,6)::float8 AS cost_usd,"
     " count(cost_usd) AS priced,"
     " max(ts) AS last_seen"
@@ -903,17 +906,24 @@ _AGG_MEASURES = (
 
 
 def _agg_counter(row: tuple) -> dict[str, Any]:
-    requests, errors, tin, tout, ttotal, cost, priced, last_seen = row
-    return {"requests": int(requests), "errors": int(errors),
+    requests, errors, tin, tout, ttotal, cached, cost, priced, last_seen = row
+    requests, tin, ttotal, cached = int(requests), int(tin), int(ttotal), int(cached)
+    cost = float(cost)
+    return {"requests": requests, "errors": int(errors),
             "tokens_in": int(tin), "tokens_out": int(tout),
-            "tokens_total": int(ttotal), "cost_usd": float(cost),
+            "tokens_total": ttotal, "tokens_cached": cached, "cost_usd": cost,
+            "cost_per_mtok": round(cost * 1_000_000 / ttotal, 4) if ttotal else None,
+            "cost_per_request": round(cost / requests, 6) if requests else None,
+            "cache_hit_rate": round(cached / tin, 4) if tin else None,
             "priced": int(priced),
             "last_seen": int(last_seen) if last_seen is not None else None}
 
 
 def _empty_usage_aggregate() -> dict[str, Any]:
     return {"totals": {"requests": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0,
-                       "tokens_total": 0, "cost_usd": 0.0, "priced": 0,
+                       "tokens_total": 0, "tokens_cached": 0, "cost_usd": 0.0,
+                       "cost_per_mtok": None, "cost_per_request": None,
+                       "cache_hit_rate": None, "priced": 0,
                        "last_seen": None},
             "by_caller": {}, "by_provider": {}, "by_model_family": {},
             "by_route": {}, "by_served_model": {}, "by_status": {}, "by_day": {}}
@@ -1069,6 +1079,7 @@ def policy_backtest_groups(since_ts: "int | None" = None,
 
 
 _ANALYTICS_LOCK_KEY = 0x616E616C_79746963
+_ANALYTICS_STATE_NAME = "hourly-v2-cache"
 
 
 def rollup_analytics(start_ts: int, end_ts: int) -> dict[str, Any]:
@@ -1086,7 +1097,7 @@ def rollup_analytics(start_ts: int, end_ts: int) -> dict[str, Any]:
         cur = conn.execute(
             "INSERT INTO analytics_hourly("
             " bucket_start,caller,key_prefix,provider_id,model_family,requested_model,served_model_id,status,"
-            " requests,errors,tokens_in,tokens_out,tokens_total,cost_usd,priced,last_seen)"
+            " requests,errors,tokens_in,tokens_out,tokens_total,tokens_cached,cost_usd,priced,last_seen)"
             " SELECT (ts/3600)*3600,"
             " COALESCE(NULLIF(caller,''),'unknown'),"
             " COALESCE(NULLIF(substr(consumer_sha,1,12),''),'unknown'),"
@@ -1099,6 +1110,7 @@ def rollup_analytics(start_ts: int, end_ts: int) -> dict[str, Any]:
             " COALESCE(sum(COALESCE(tokens_out,0)),0),"
             " COALESCE(sum(CASE WHEN COALESCE(tokens_total,0)<>0 THEN tokens_total"
             " ELSE COALESCE(tokens_in,0)+COALESCE(tokens_out,0) END),0),"
+            " COALESCE(sum(COALESCE(tokens_cached,0)),0),"
             " COALESCE(sum(GREATEST(cost_usd,0)),0)::float8, count(cost_usd), max(ts)"
             " FROM calls WHERE ts >= %s AND ts < %s"
             " GROUP BY 1,2,3,4,5,6,7,8",
@@ -1107,10 +1119,10 @@ def rollup_analytics(start_ts: int, end_ts: int) -> dict[str, Any]:
         now = int(time.time())
         conn.execute(
             "INSERT INTO analytics_rollup_state(name,covered_from,covered_until,updated_at)"
-            " VALUES('hourly',%s,%s,%s) ON CONFLICT(name) DO UPDATE SET"
+            " VALUES(%s,%s,%s,%s) ON CONFLICT(name) DO UPDATE SET"
             " covered_from=LEAST(analytics_rollup_state.covered_from,EXCLUDED.covered_from),"
             " covered_until=GREATEST(analytics_rollup_state.covered_until,EXCLUDED.covered_until),"
-            " updated_at=EXCLUDED.updated_at", [start, end, now])
+            " updated_at=EXCLUDED.updated_at", [_ANALYTICS_STATE_NAME, start, end, now])
     return {"start": start, "end": end, "rows": int(rows or 0), "updated_at": now}
 
 
@@ -1119,7 +1131,7 @@ def analytics_rollup_state() -> dict[str, Any]:
         with _get_pool().connection() as conn:
             row = conn.execute(
                 "SELECT covered_from,covered_until,updated_at FROM analytics_rollup_state"
-                " WHERE name='hourly'").fetchone()
+                " WHERE name=%s", [_ANALYTICS_STATE_NAME]).fetchone()
         return {"covered_from": row[0], "covered_until": row[1],
                 "updated_at": row[2]} if row else {}
     except Exception as exc:  # noqa: BLE001
@@ -1147,7 +1159,7 @@ def analytics_aggregate(since_ts: int, caller: str | None = None,
         where = " WHERE " + " AND ".join(clauses)
         measures = (" COALESCE(sum(requests),0), COALESCE(sum(errors),0),"
                     " COALESCE(sum(tokens_in),0), COALESCE(sum(tokens_out),0),"
-                    " COALESCE(sum(tokens_total),0),"
+                    " COALESCE(sum(tokens_total),0), COALESCE(sum(tokens_cached),0),"
                     " round(COALESCE(sum(cost_usd),0)::numeric,6)::float8,"
                     " COALESCE(sum(priced),0), max(last_seen)")
         with _get_pool().connection() as conn:
@@ -1173,7 +1185,7 @@ def analytics_aggregate(since_ts: int, caller: str | None = None,
                 out["by_day"][str(day)] = _agg_counter(tuple(counter))
             state_row = conn.execute(
                 "SELECT covered_from,covered_until,updated_at FROM analytics_rollup_state"
-                " WHERE name='hourly'").fetchone()
+                " WHERE name=%s", [_ANALYTICS_STATE_NAME]).fetchone()
         state = {"covered_from": state_row[0], "covered_until": state_row[1],
                  "updated_at": state_row[2]} if state_row else {}
         return out, state, True
@@ -1231,7 +1243,7 @@ def usage_provider_stats(since_ts: "int | None" = None) -> dict[str, dict[str, A
                 f" FROM ({_AGG_INNER}{where}) c"
                 " ORDER BY provider_k, ts DESC, id DESC", params)
             for provider_k, ts, status, route, family in cur.fetchall():
-                item = out.setdefault(str(provider_k), _agg_counter((0,) * 7 + (None,)))
+                item = out.setdefault(str(provider_k), _agg_counter((0,) * 8 + (None,)))
                 item.update({"last_ts": ts, "last_status": status,
                              "last_route": route, "last_model_family": family})
         return out

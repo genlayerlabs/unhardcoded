@@ -183,8 +183,9 @@ def test_sql_stats_bundle_empty_db_matches_python_empty_shapes(host_store_clean)
                                            key_filter=None, provider=None, model=None)
     _assert_bundle_equal(got, exp)
     assert got["agg"]["totals"] == {"requests": 0, "rejects": 0, "errors": 0,
-                                    "tokens_in": 0, "tokens_out": 0,
-                                    "tokens_total": 0, "cost_usd": 0.0}
+                                        "tokens_in": 0, "tokens_out": 0,
+                                        "tokens_total": 0, "tokens_cached": 0,
+                                        "cost_usd": 0.0}
     assert got["daily_totals"] == []
     assert got["agg"]["recent"] == []
 

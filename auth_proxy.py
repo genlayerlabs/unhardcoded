@@ -99,6 +99,7 @@ def _counter() -> dict[str, Any]:
         "tokens_in": 0,
         "tokens_out": 0,
         "tokens_total": 0,
+        "tokens_cached": 0,
         "latency_ms_total": 0.0,
         "latency_ms_max": 0.0,
         "last_seen": None,
@@ -4123,6 +4124,13 @@ def _counter_snapshot(d: dict[str, Any]) -> dict[str, Any]:
     out["latency_ms_avg"] = round(float(out.pop("latency_ms_total", 0.0)) / req, 1) if req else 0.0
     out["latency_ms_max"] = round(float(out.get("latency_ms_max") or 0), 1)
     out["error_rate"] = round((int(out.get("errors") or 0) / req), 4) if req else 0.0
+    tokens = int(out.get("tokens_total") or 0)
+    tokens_in = int(out.get("tokens_in") or 0)
+    cached = int(out.get("tokens_cached") or 0)
+    cost = float(out.get("cost_usd") or 0.0)
+    out["cost_per_mtok"] = round(cost * 1_000_000 / tokens, 4) if tokens else None
+    out["cost_per_request"] = round(cost / req, 6) if req else None
+    out["cache_hit_rate"] = round(cached / tokens_in, 4) if tokens_in else None
     return out
 
 
@@ -4271,6 +4279,7 @@ def _add_counter(counter: dict[str, Any], row: dict[str, Any], cost: float | Non
     tokens_in = int(row.get("tokens_in") or 0)
     tokens_out = int(row.get("tokens_out") or 0)
     tokens_total = int(row.get("tokens_total") or (tokens_in + tokens_out))
+    tokens_cached = int(row.get("tokens_cached") or 0)
     latency_ms = float(row.get("latency_ms") or 0)
     ts = int(row.get("ts") or 0)
     counter["requests"] += 1
@@ -4279,6 +4288,7 @@ def _add_counter(counter: dict[str, Any], row: dict[str, Any], cost: float | Non
     counter["tokens_in"] += tokens_in
     counter["tokens_out"] += tokens_out
     counter["tokens_total"] += tokens_total
+    counter["tokens_cached"] += tokens_cached
     counter["latency_ms_total"] += latency_ms
     counter["latency_ms_max"] = max(float(counter.get("latency_ms_max") or 0), latency_ms)
     counter["last_seen"] = max(int(counter.get("last_seen") or 0), ts) or None
@@ -4473,6 +4483,7 @@ def _counter_from_sql(c: dict[str, Any]) -> dict[str, Any]:
     out = {"requests": int(c.get("requests") or 0), "errors": int(c.get("errors") or 0),
            "tokens_in": int(c.get("tokens_in") or 0), "tokens_out": int(c.get("tokens_out") or 0),
            "tokens_total": int(c.get("tokens_total") or 0),
+           "tokens_cached": int(c.get("tokens_cached") or 0),
            "latency_ms_total": 0.0, "latency_ms_max": 0.0,
            "last_seen": c.get("last_seen") or None}
     if int(c.get("priced") or 0):
@@ -4491,6 +4502,7 @@ def _agg_from_sql(sql_agg: dict[str, Any], recent_rows: list[dict[str, Any]], *,
     totals = {"requests": int(t["requests"]), "rejects": 0, "errors": int(t["errors"]),
               "tokens_in": int(t["tokens_in"]), "tokens_out": int(t["tokens_out"]),
               "tokens_total": int(t["tokens_total"]),
+              "tokens_cached": int(t.get("tokens_cached") or 0),
               "cost_usd": round(float(t["cost_usd"] or 0.0), 6)}
 
     def snap(bucket: dict[str, Any]) -> dict[str, Any]:
@@ -4631,7 +4643,9 @@ def _aggregate_usage_rows(rows: list[dict[str, Any]], *, selected: str | None = 
     # same shape in SQL (_stats_history_bundle / host_store.usage_aggregate) —
     # tests/test_dashboard_stats_sql.py asserts the two stay identical. Keep the
     # semantics here and there in lockstep.
-    totals = {"requests": 0, "rejects": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0, "tokens_total": 0, "cost_usd": 0.0}
+    totals = {"requests": 0, "rejects": 0, "errors": 0, "tokens_in": 0,
+              "tokens_out": 0, "tokens_total": 0, "tokens_cached": 0,
+              "cost_usd": 0.0}
     prices = _price_table()
     by_caller: dict[str, dict[str, Any]] = defaultdict(_counter)
     by_provider: dict[str, dict[str, Any]] = defaultdict(_counter)
@@ -4655,6 +4669,7 @@ def _aggregate_usage_rows(rows: list[dict[str, Any]], *, selected: str | None = 
         totals["tokens_in"] += int(row.get("tokens_in") or 0)
         totals["tokens_out"] += int(row.get("tokens_out") or 0)
         totals["tokens_total"] += int(row.get("tokens_total") or (int(row.get("tokens_in") or 0) + int(row.get("tokens_out") or 0)))
+        totals["tokens_cached"] += int(row.get("tokens_cached") or 0)
         if cost is not None:
             totals["cost_usd"] = round(totals["cost_usd"] + cost, 6)
         by_status[str(status)] += 1
@@ -4869,7 +4884,7 @@ def _dashboard_html() -> str:
   <main class='content'>
     <div class='topbar'>
       <div class='pageTitle'><h1 id='pageTitle'>Analytics</h1><div class='sub' id='pageSub'>Spend, traffic and errors — filter by timeframe, consumer, provider and model.</div></div>
-      <div class='topActions'><select class='select' id='consumer'><option value=''>All consumers</option></select><select class='select' id='timeframe' title='Usage scope'><option value='recent' selected>Latest 100 events</option><option value='24h'>Last 24 hours</option><option value='7d'>Last 7 days</option><option value='30d'>Last 30 days</option></select><button class='btn' id='refresh'>Refresh</button><button class='btn' id='logout'>Log out</button></div>
+      <div class='topActions'><select class='select' id='consumer'><option value=''>All consumers</option></select><select class='select' id='timeframe' title='Usage scope'><option value='recent'>Latest 100 events</option><option value='24h'>Last 24 hours</option><option value='7d'>Last 7 days</option><option value='30d' selected>Last 30 days</option></select><button class='btn' id='refresh'>Refresh</button><button class='btn' id='logout'>Log out</button></div>
     </div>
     <div id='err' class='errorbox'></div>
     <div id='dashboardLoading' class='card cardPad' style='display:flex;align-items:center;gap:12px;margin-bottom:14px'><span aria-hidden='true' style='font-size:24px'>◌</span><div><b>Loading recent activity…</b><div class='muted small'>Applying the selected filters.</div></div></div>
@@ -4881,11 +4896,16 @@ def _dashboard_html() -> str:
       <div class='card cardPad span3'><div class='label'>Spend</div><div id='anSpend' class='metric'>$0</div><div id='anSpendSub' class='statSub'>—</div></div>
       <div class='card cardPad span3'><div class='label'>Tokens</div><div id='anTokens' class='metric'>0</div><div id='anTokSub' class='statSub'>—</div></div>
       <div class='card cardPad span3'><div class='label'>Success rate</div><div id='anSuccess' class='metric'>—</div><div id='anSuccessSub' class='statSub'>—</div></div>
+      <div class='card cardPad span4'><div class='label'>Blended $ / Mtok</div><div id='anCostPerMtok' class='metric'>—</div><div class='statSub'>effective cost efficiency</div></div>
+      <div class='card cardPad span4'><div class='label'>Cache hit rate</div><div id='anCacheRate' class='metric'>—</div><div id='anCacheSub' class='statSub'>cached input tokens</div></div>
+      <div class='card cardPad span4'><div class='label'>$ / request</div><div id='anCostPerRequest' class='metric'>—</div><div class='statSub'>blended average</div></div>
       <div class='card span12'><div class='toolbar'><div class='label'>Requests &amp; spend over time</div></div><div id='anSeries' class='cardPad'></div></div>
-      <div class='card span6'><div class='toolbar'><div class='label'>By provider</div></div><div id='anByProvider'></div></div>
-      <div class='card span6'><div class='toolbar'><div class='label'>By model family</div></div><div id='anByModel'></div></div>
+      <div class='card span6'><div class='toolbar'><div class='label'>By provider</div><span class='muted small' style='margin-left:auto'>actual traffic efficiency</span></div><div id='anByProvider'></div></div>
+      <div class='card span6'><div class='toolbar'><div class='label'>By model family</div><span class='muted small' style='margin-left:auto'>actual destination family</span></div><div id='anByModel'></div></div>
+      <div class='card span12'><div class='toolbar'><div class='label'>Destination model</div><span class='muted small' style='margin-left:auto'>where policies sent traffic</span></div><div id='anByDestination'></div></div>
       <div class='card span6'><div class='toolbar'><div class='label'>By consumer</div></div><div id='anByConsumer'></div></div>
-      <div class='card span6'><div class='toolbar'><div class='label'>By status</div></div><div id='anByStatus'></div></div>
+      <div class='card span6'><div class='toolbar'><div class='label'>Cost by policy / route</div></div><div id='anByRoute'></div></div>
+      <div class='card span12'><div class='toolbar'><div class='label'>By status</div></div><div id='anByStatus'></div></div>
       <div class='card span12'><div class='toolbar'><div class='label'>Cost accuracy</div><span class='muted small' style='margin-left:auto'>measured spend vs advertised list · drift flags only where the provider reports its own cost (≥ 20 calls)</span></div><div id='anCostAccuracy'></div></div>
     </section>
 
@@ -5027,10 +5047,10 @@ function actFlowCard(n){const itr=n.decision_trace||{};const raw=(Array.isArray(
 function actFlowDag(nodes){const byId={};nodes.forEach(n=>{byId[n.node]=n});const lvl={};const level=n=>{if(lvl[n.node]!=null)return lvl[n.node];lvl[n.node]=1;let m=1;(n.inputs||[]).forEach(p=>{if(byId[p])m=Math.max(m,level(byId[p])+1)});return lvl[n.node]=m};nodes.forEach(level);const maxL=Math.max(1,...nodes.map(n=>lvl[n.node]));let rows='';for(let L=1;L<=maxL;L++){const at=nodes.filter(n=>lvl[n.node]===L);if(!at.length)continue;rows+=`<div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">${at.map(actFlowCard).join('')}</div>`;if(L<maxL)rows+=`<div style="text-align:center;color:var(--muted);margin:1px 0">↓</div>`}return `<div style="display:flex;flex-direction:column;gap:2px">${rows}</div>`}
 function actDetail(r){const tr=r.decision_trace||{};const rawPath=Array.isArray(tr.decision_path)?tr.decision_path:(Array.isArray(tr.attempts)?tr.attempts:[]);const path=rawPath.filter(e=>e&&(e.provider_id||e.provider));const steps=path.length?path.map((e,i)=>actStep(e,i+1)).join(''):'<div class="muted small">No fallback trace recorded for this event.</div>';const fnodes=Array.isArray(tr.flow_nodes)?tr.flow_nodes:null;const fp=tr.flow_fingerprint?('flow '+tr.flow_fingerprint):(tr.policy_fingerprint||r.policy_fingerprint||r.requested_model);const cost=r.cost_usd==null?'—':'$'+Number(r.cost_usd).toFixed(6);const termStr=tr.policy_term?JSON.stringify(tr.policy_term):null;const policyBlock=termStr?`<div class="label small" style="margin-top:10px;display:flex;align-items:center;gap:8px">Policy term<button class="btn" data-copyterm="${esc(termStr)}" style="height:22px;padding:0 8px;font-size:11px">Copy</button></div><pre class="mono small" style="white-space:pre-wrap;max-height:160px;overflow:auto;background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:8px;padding:8px;margin-top:4px">${esc(termStr)}</pre>`:`<div class="muted small" style="margin-top:10px">No Σ_pol term — legacy closure profile (no copyable policy object).</div>`;return `<div class="actDetailBox"><div class="actMeta"><span class="pill">policy ${fp?esc(fp):'—'}</span><span class="pill">cost ${cost}</span><span class="pill">tokens ${fmt(r.tokens_total)} · in ${fmt(r.tokens_in)} · out ${fmt(r.tokens_out)}</span><span class="pill">${fmt(Math.round(r.latency_ms||0))} ms</span>${r.served_model_id?`<span class="pill">served <code>${esc(r.served_model_id)}</code></span>`:''}</div>${fnodes?('<div class="label small" style="margin-bottom:4px">Σ_flow — node DAG ('+fnodes.length+' node'+(fnodes.length===1?'':'s')+')</div>'+(fnodes.some(n=>Array.isArray(n.inputs))?actFlowDag(fnodes):fnodes.map(actFlowNode).join(''))):('<div class="label small" style="margin-bottom:4px">Attempts — fallback order</div>'+steps)}${policyBlock}</div>`}
 function renderActivity(rows){if(!rows.length){$('recent').innerHTML='<div class="empty">No activity yet.</div>';return}const head=`<tr><th></th><th>Time</th><th>Event</th><th>Caller</th><th class="right">Status</th><th>Route</th><th>Provider</th><th class="right">Cost</th><th>Error</th></tr>`;const body=rows.map((r,i)=>{const errK=r.error_kind||r.error_code||r.error_type||'';const st=Number(r.status||0);const sCls=(st>=200&&st<300)?'ok':(st>=400||errK)?'bad':'warn';const summary=`<tr class="actRow" data-i="${i}"><td class="actToggle" data-t="${i}">▸</td><td>${ts(r.ts)}</td><td><span class="pill">${esc(r.event)}</span></td><td>${esc(r.caller||'—')}</td><td class="right"><span class="${sCls}">${esc(r.status||'—')}</span></td><td>${esc(r.requested_model||r.route||'—')}</td><td>${esc(r.provider||'—')}</td><td class="right">${r.cost_usd==null?'—':'$'+Number(r.cost_usd).toFixed(6)}</td><td>${errK?`<span class="bad">${esc(errK)}</span>`:'—'}</td></tr>`;const detail=`<tr class="actDetail hidden" data-d="${i}"><td></td><td colspan="8">${actDetail(r)}</td></tr>`;return summary+detail}).join('');$('recent').innerHTML=`<table class="dataTable">${head}${body}</table>`}
-function anCols(){return [{label:'Name',f:r=>`<span class="pill">${esc(r.name)}</span>`},{label:'Requests',cls:'right',f:r=>fmt(r.requests)},{label:'Errors',cls:'right',f:r=>fmt(r.errors)},{label:'Tokens',cls:'right',f:r=>fmt(r.tokens_total)},{label:'Spend',cls:'right',f:r=>r.cost_usd==null?'—':'$'+Number(r.cost_usd).toFixed(4)}]}
+function anCols(){return [{label:'Name',f:r=>`<span class="pill">${esc(r.name)}</span>`},{label:'Requests',cls:'right',f:r=>fmt(r.requests)},{label:'Errors',cls:'right',f:r=>fmt(r.errors)},{label:'Tokens',cls:'right',f:r=>fmt(r.tokens_total)},{label:'Spend',cls:'right',f:r=>r.cost_usd==null?'—':'$'+Number(r.cost_usd).toFixed(4)},{label:'$/Mtok',cls:'right',f:r=>r.cost_per_mtok==null?'—':'$'+Number(r.cost_per_mtok).toFixed(2)},{label:'Cache',cls:'right',f:r=>r.cache_hit_rate==null?'—':Math.round(Number(r.cache_hit_rate)*100)+'%'}]}
 function fillFilter(id,opts,allLabel){const sel=$(id);if(!sel)return;const cur=sel.value;sel.innerHTML=`<option value="">${esc(allLabel)}</option>`+(opts||[]).map(o=>`<option value="${esc(o)}"${o===cur?' selected':''}>${esc(o)}</option>`).join('');if([...sel.options].some(o=>o.value===cur))sel.value=cur}
-function renderSeries(days){if(!days||!days.length){$('anSeries').innerHTML='<div class="muted small">No data in this window.</div>';return}const rows=days.slice(0,30);const max=Math.max(1,...rows.map(d=>Number(d.requests||0)));$('anSeries').innerHTML=rows.map(d=>{const r=Number(d.requests||0),w=Math.round(r/max*100);return `<div style="display:flex;align-items:center;gap:10px;margin:3px 0;font-size:12px"><span class="muted" style="width:88px;flex:none">${esc(d.date||d.month||'—')}</span><div style="flex:1;background:rgba(255,255,255,.04);border-radius:4px;height:14px;overflow:hidden"><div style="width:${w}%;height:100%;background:linear-gradient(90deg,#7170ff,#5e6ad2)"></div></div><span style="width:54px;text-align:right;flex:none">${fmt(r)}</span><span class="muted" style="width:78px;text-align:right;flex:none">$${Number(d.cost_usd||0).toFixed(4)}</span></div>`}).join('')}
-function renderAnalytics(d){const t=d.totals||{};const req=Number(t.requests||0),err=Number(t.errors||0);$('anRequests').textContent=fmt(req);$('anReqSub').textContent=`${fmt(err)} errors · ${fmt(t.rejects||0)} rejects`;$('anSpend').textContent='$'+Number(t.cost_usd||0).toFixed(4);$('anSpendSub').textContent=`over ${fmt(req)} requests`;$('anTokens').textContent=fmt(t.tokens_total);$('anTokSub').textContent=`in ${fmt(t.tokens_in)} · out ${fmt(t.tokens_out)}`;const sr=req?(req-err)/req:null;$('anSuccess').textContent=sr==null?'—':Math.round(sr*100)+'%';$('anSuccess').className='metric '+(sr==null?'':sr>=0.95?'ok':sr>=0.8?'warn':'bad');$('anSuccessSub').textContent=`${fmt(req-err)} ok / ${fmt(req)}`;$('anByProvider').innerHTML=table(counterRows(d.by_provider),anCols());$('anByModel').innerHTML=table(counterRows(d.by_model_family),anCols());$('anByConsumer').innerHTML=table(counterRows(d.by_caller),anCols());$('anByStatus').innerHTML=table(Object.entries(d.by_status||{}).map(([name,count])=>({name,requests:count})),[{label:'Status',f:r=>`<span class="pill">${esc(r.name)}</span>`},{label:'Count',cls:'right',f:r=>fmt(r.requests)}]);renderSeries(d.daily_totals||[]);const fo=d.filter_options||{};fillFilter('anProvider',fo.providers,'All providers');fillFilter('anModel',fo.models,'All models')}
+function renderSeries(days){if(!days||!days.length){$('anSeries').innerHTML='<div class="muted small">No data in this window.</div>';return}const rows=days.slice(0,30).reverse();const max=Math.max(1,...rows.map(d=>Number(d.requests||0)));$('anSeries').innerHTML=`<div style="display:flex;align-items:flex-end;gap:8px;height:220px;overflow-x:auto;padding:12px 4px 0">${rows.map(d=>{const r=Number(d.requests||0),h=Math.max(3,Math.round(r/max*150)),label=String(d.date||d.month||'—'),short=label.slice(5),mt=d.cost_per_mtok==null?'—':'$'+Number(d.cost_per_mtok).toFixed(2),cache=d.cache_hit_rate==null?'—':Math.round(Number(d.cache_hit_rate)*100)+'%';return `<div title="${esc(label)} · ${fmt(r)} requests · $${Number(d.cost_usd||0).toFixed(4)} · ${mt}/Mtok · cache ${cache}" style="height:190px;min-width:34px;flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:5px"><span class="muted small">${fmt(r)}</span><div style="width:min(28px,80%);height:${h}px;border-radius:5px 5px 2px 2px;background:linear-gradient(180deg,#8584ff,#5e6ad2)"></div><span class="muted small" style="font-size:10px;white-space:nowrap">${esc(short)}</span></div>`}).join('')}</div>`}
+function renderAnalytics(d){const t=d.totals||{};const req=Number(t.requests||0),err=Number(t.errors||0),tok=Number(t.tokens_total||0),tin=Number(t.tokens_in||0),cached=Number(t.tokens_cached||0),cost=Number(t.cost_usd||0);$('anRequests').textContent=fmt(req);$('anReqSub').textContent=`${fmt(err)} errors · ${fmt(t.rejects||0)} rejects`;$('anSpend').textContent='$'+cost.toFixed(4);$('anSpendSub').textContent=`over ${fmt(req)} requests`;$('anTokens').textContent=fmt(tok);$('anTokSub').textContent=`in ${fmt(tin)} · out ${fmt(t.tokens_out)}`;const sr=req?(req-err)/req:null;$('anSuccess').textContent=sr==null?'—':Math.round(sr*100)+'%';$('anSuccess').className='metric '+(sr==null?'':sr>=0.95?'ok':sr>=0.8?'warn':'bad');$('anSuccessSub').textContent=`${fmt(req-err)} ok / ${fmt(req)}`;$('anCostPerMtok').textContent=tok?'$'+(cost*1e6/tok).toFixed(2):'—';$('anCacheRate').textContent=tin?Math.round(cached/tin*100)+'%':'—';$('anCacheSub').textContent=tin?`${fmt(cached)} / ${fmt(tin)} input tokens`:'no input tokens';$('anCostPerRequest').textContent=req?'$'+(cost/req).toFixed(4):'—';$('anByProvider').innerHTML=table(counterRows(d.by_provider),anCols());$('anByModel').innerHTML=table(counterRows(d.by_model_family),anCols());$('anByDestination').innerHTML=table(counterRows(d.by_served_model),anCols());$('anByConsumer').innerHTML=table(counterRows(d.by_caller),anCols());$('anByRoute').innerHTML=table(counterRows(d.by_route),anCols());$('anByStatus').innerHTML=table(Object.entries(d.by_status||{}).map(([name,count])=>({name,requests:count})),[{label:'Status',f:r=>`<span class="pill">${esc(r.name)}</span>`},{label:'Count',cls:'right',f:r=>fmt(r.requests)}]);renderSeries(d.daily_totals||[]);const fo=d.filter_options||{};fillFilter('anProvider',fo.providers,'All providers');fillFilter('anModel',fo.models,'All models')}
 function renderCostAccuracy(rows){const el=$('anCostAccuracy');if(!el)return;if(!rows||!rows.length){el.innerHTML='<div class="empty">No priced traffic in the window yet.</div>';return}const drift=r=>{const pct=Math.round((r.deviation-1)*100);const cls=r.warn?(pct>0?'bad':'warn'):'muted';const sign=pct>0?'+':'';return `<span class="${cls}">${sign}${pct}%</span>${r.warn?' <span class="pill warn">drift</span>':''}`};const sig=r=>r.signal==='reported'?'<span class="pill" title="provider reports its own cost — drift is real signal">reported</span>':'<span class="muted small" title="cost derived from the list price — drift is reprice noise, not a discount">derived</span>';el.innerHTML=table(rows,[{label:'Provider',f:r=>`<b>${esc(r.provider)}</b> ${sig(r)}`},{label:'Effective $/Mtok',cls:'right',f:r=>'$'+Number(r.measured_usd_per_mtok).toFixed(3)},{label:'List $/Mtok',cls:'right',f:r=>'$'+Number(r.expected_usd_per_mtok).toFixed(3)},{label:'Drift',cls:'right',f:drift},{label:'Calls',cls:'right',f:r=>fmt(r.calls)}])}
 async function loadCostAccuracy(){try{const r=await fetch('/dashboard/api/cost-accuracy',{credentials:'same-origin'});if(!r.ok)return;const d=await r.json();renderCostAccuracy(d.rows||[])}catch(e){}}
 function render(d){$('login').classList.add('hidden');applyViewerMode(d);document.querySelectorAll('.page').forEach(el=>el.classList.add('hidden'));$(({overview:'app',consumers:'consumersPage',providerKeys:'providerKeysPage',keyUsage:'keyUsagePage',market:'marketPage',builder:'builderPage',activity:'activityPage',config:'configPage'})[activeTab]||'app').classList.remove('hidden');syncConsumers(d.consumers||[],d.selected_consumer||'');const am=(d.timeframe||{}).analytics||null;$('analyticsFreshness').textContent=am?(am.available?'Hourly analytics · updated '+ts(am.updated_at):'Hourly analytics unavailable'):'Live recent events';renderAnalytics(d);renderConsumers(d.keys||[]);renderConsumerDetail(d);renderProviderKeys(d);let recent=(d.recent||[]);if(activityKind)recent=recent.filter(r=>r.event===activityKind);renderActivity(recent.slice(0,60))}
