@@ -1161,6 +1161,11 @@ def test_dashboard_key_usage_accepts_window_and_pagination_controls(monkeypatch,
 
 def test_openapi_and_dashboard_document_key_usage_controls():
     html = auth_proxy._dashboard_html()
+    assert "anCostPerMtok" in html
+    assert "anCacheRate" in html
+    assert "anCostPerRequest" in html
+    assert "anByRoute" in html
+    assert "align-items:flex-end" in html
     assert "tabKeyUsage" in html
     assert "keyUsageApiKey" in html
     assert "loadKeyUsage" in html

@@ -56,13 +56,16 @@ def test_hourly_analytics_rollup_is_idempotent_and_filterable(store):
     base = 1_800_000_000
     store.insert_call(_row(ts=base + 10, usage_event_id="a1", caller="a",
                            provider="p1", model_family="m1", status=200,
-                           tokens_in=10, tokens_out=5, tokens_total=15, cost_usd=1.0))
+                           tokens_in=10, tokens_out=5, tokens_total=15,
+                           tokens_cached=5, cost_usd=1.0))
     store.insert_call(_row(ts=base + 20, usage_event_id="a2", caller="a",
                            provider="p2", model_family="m2", status=500,
-                           tokens_in=20, tokens_out=10, tokens_total=30, cost_usd=2.0))
+                           tokens_in=20, tokens_out=10, tokens_total=30,
+                           tokens_cached=10, cost_usd=2.0))
     store.insert_call(_row(ts=base + 30, usage_event_id="b1", caller="b",
                            provider="p1", model_family="m1", status=200,
-                           tokens_in=30, tokens_out=15, tokens_total=45, cost_usd=3.0))
+                           tokens_in=30, tokens_out=15, tokens_total=45,
+                           tokens_cached=0, cost_usd=3.0))
     first = store.rollup_analytics(base, base + 3600)
     assert first["rows"] == 3
     agg, state, ok = store.analytics_aggregate(base, caller="a")
@@ -70,6 +73,9 @@ def test_hourly_analytics_rollup_is_idempotent_and_filterable(store):
     assert agg["totals"]["requests"] == 2
     assert agg["totals"]["errors"] == 1
     assert agg["totals"]["cost_usd"] == 3.0
+    assert agg["totals"]["tokens_cached"] == 15
+    assert agg["totals"]["cache_hit_rate"] == 0.5
+    assert agg["totals"]["cost_per_request"] == 1.5
     assert set(agg["by_provider"]) == {"p1", "p2"}
     assert state["covered_until"] >= base + 3600
     # Replacing the same buckets must not double count.
