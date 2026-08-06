@@ -8,6 +8,7 @@ never catch it because the failing format never appears in dev. db.test.js
 exercises BOTH formats; running it from pytest means it executes wherever the
 suite runs, not just by hand.
 """
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -58,3 +59,42 @@ def test_antseed_reclaim_channel_selection():
     reclaim.mjs itself deep-imports @antseed/cli internals that exist only in the
     sidecar image, so the selection logic lives here where it can be tested."""
     _run_node_test("antseed/ids.test.js")
+
+
+_LOCAL_IMPORT = re.compile(
+    r"""(?:require\(\s*|from\s+)['"](\./[^'"]+)['"]""")
+
+
+def test_every_local_import_is_shipped_in_the_sidecar_image():
+    """Every `require('./x.js')` in a shipped sidecar module resolves to another
+    shipped file.
+
+    The node tests above run against the REPO, so they pass whether or not a file
+    reaches the image. That gap shipped a control.js requiring ./ids.js into an
+    image built from an explicit COPY list that named neither ids.js nor queue.js:
+    the control server died at import (`Cannot find module './ids.js'`), :8379
+    never bound, and every wallet endpoint 502'd — with the only symptom a
+    Cloudflare error page on the deposit button. Nothing else noticed, because the
+    market/status writers do not import it and the buyer proxy is a separate
+    process.
+    """
+    antseed = _REPO_ROOT / "antseed"
+    shipped = {p.name for p in antseed.iterdir()
+               if p.suffix in (".js", ".mjs") and not p.name.endswith(".test.js")}
+    assert "control.js" in shipped and "ids.js" in shipped, shipped
+
+    missing = []
+    for name in sorted(shipped):
+        for spec in _LOCAL_IMPORT.findall((antseed / name).read_text()):
+            target = spec[2:]  # drop the leading "./"
+            if target not in shipped:
+                missing.append(f"{name} imports {spec!r}, which is not shipped")
+    assert not missing, "\n".join(missing)
+
+    # The COPY must be pattern-based; an explicit list is what drifted.
+    copy_lines = [ln for ln in (_REPO_ROOT / "Dockerfile.antseed").read_text().splitlines()
+                  if ln.startswith("COPY ") and "/usr/local/lib/antseed/" in ln]
+    assert copy_lines, "Dockerfile.antseed has no COPY into /usr/local/lib/antseed/"
+    assert any("antseed/*.js" in ln for ln in copy_lines), (
+        "COPY must glob antseed/*.js — naming files individually is how ids.js "
+        f"and queue.js were left out of the image: {copy_lines}")
