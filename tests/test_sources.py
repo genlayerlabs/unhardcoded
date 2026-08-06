@@ -819,7 +819,8 @@ ANTSEED_CATALOG = {
 }
 
 
-def _antseed_source(tmp_path, market_body=None, pins=None, observed_at=None):
+def _antseed_source(tmp_path, market_body=None, pins=None, observed_at=None,
+                    available="25.0"):
     import json as _json
     from conftest import require_host_store, seed_peer_offers, seed_buyer_status
     from sources.antseed import AntSeedSource
@@ -835,7 +836,12 @@ def _antseed_source(tmp_path, market_body=None, pins=None, observed_at=None):
     default_pins = {"antseed_free": "1d90f467689d499dc435e5744b4613c3203eb0aa",
                     "antseed_cheap": "1d90f467689d499dc435e5744b4613c3203eb0aa"}
     for pid, peer in (pins if pins is not None else default_pins).items():
-        seed_buyer_status(pid, pinned_peer_id=peer, deposits_available="0.0",
+        # FUNDED by default: offers_sync now suppresses a buyer whose escrow
+        # cannot cover one channel reserve (antseed.min_available_usdc), and
+        # these tests are about offer admission, not funding. The funding gate
+        # has its own tests below.
+        seed_buyer_status(pid, pinned_peer_id=peer,
+                          deposits_available=available,
                           deposits_reserved="0.0", wallet_address="0x0")
     return AntSeedSource(ANTSEED_CATALOG)
 
@@ -1065,6 +1071,196 @@ def test_antseed_stale_market_returns_no_offers(tmp_path):
     s = _antseed_source(tmp_path, observed_at=old)
     assert s.offers_sync("antseed_free") == []
     assert s.snapshot_stats()["stale"] is True
+
+
+# ---- the funds tourniquet (offers_sync) --------------------------------------
+
+def test_offers_suppressed_when_escrow_cannot_cover_one_channel_reserve(tmp_path):
+    """Opening a payment channel RESERVES ~1 USDC, so below one reserve every
+    routed call 402s `insufficient_deposits` — prod burned 5,432 attempts in 24h
+    that way. Offering a route that provably cannot pay spends the caller's
+    request on a certain failure AND poisons the peer's reliability score, so the
+    provider is suppressed instead."""
+    import settings
+    s = _antseed_source(tmp_path, available="0.231")   # the live prod reading
+    assert float(settings.get("antseed.min_available_usdc")) == 1.1
+    assert s.offers_sync("antseed_cheap") == []
+    stats = s.snapshot_stats()
+    assert stats["suppressed_no_funds"] == 1
+    assert stats["deposits_available"] == 0.231
+    assert stats["offers"] == 0
+
+
+def test_offers_still_served_just_above_the_tourniquet(tmp_path):
+    # 1.1 is the floor: at/above it the provider keeps trading.
+    s = _antseed_source(tmp_path, available="1.1")
+    assert s.offers_sync("antseed_cheap")
+    assert s.snapshot_stats()["suppressed_no_funds"] == 0
+
+
+def test_funds_gate_fails_OPEN_when_the_status_is_missing(tmp_path):
+    # No buyer_status row at all (cold start, sidecar lag). That is a READ error,
+    # not evidence of an empty escrow — suppressing on it would black out routing
+    # every time the DB hiccups. The keeper's twin decision fails CLOSED.
+    s = _antseed_source(tmp_path, pins={})
+    assert s.offers_sync("antseed_cheap")
+    assert s.snapshot_stats()["suppressed_no_funds"] == 0
+
+
+def test_funds_gate_fails_OPEN_when_the_status_is_unparseable(tmp_path):
+    from conftest import seed_buyer_status
+    _antseed_source(tmp_path)
+    seed_buyer_status("antseed_cheap", pinned_peer_id=None,
+                      deposits_available="not-a-number", deposits_reserved="0")
+    from sources.antseed import AntSeedSource
+    s = AntSeedSource(ANTSEED_CATALOG)
+    assert s.offers_sync("antseed_cheap")
+    assert s.snapshot_stats()["suppressed_no_funds"] == 0
+
+
+def test_funds_gate_fails_OPEN_when_the_store_is_unreadable(tmp_path, monkeypatch):
+    import host_store
+    s = _antseed_source(tmp_path)
+    monkeypatch.setattr(host_store, "buyer_status", lambda pid: None)
+    assert s.offers_sync("antseed_cheap"), "a store error must not kill routing"
+
+
+def test_dropped_unmapped_stat_is_gone(tmp_path):
+    # It was assigned a literal 0 and never incremented: uncurated services are
+    # exposed under their raw wire name, not dropped, so the counter described a
+    # behaviour that does not exist. `uncurated` is the real one.
+    s = _antseed_source(tmp_path)
+    s.offers_sync("antseed_cheap")
+    stats = s.snapshot_stats()
+    assert "dropped_unmapped" not in stats
+    assert "uncurated" in stats
+
+
+# ---- wedge detection + stats surfacing ---------------------------------------
+
+def test_wallet_health_flags_a_wedged_provider(tmp_path, caplog):
+    """Offers were ranked, yet every routed attempt failed. The funds gate cannot
+    see that (the escrow is healthy), so it gets its own flag: a dead proxy, a
+    wedged peer or a stale pin looks exactly like this."""
+    from sources.antseed import WEDGE_CONSECUTIVE_FAILURES
+    from conftest import seed_route_obs
+    s = _antseed_source(tmp_path)
+    s.offers_sync("antseed_cheap")
+    seed_route_obs("antseed", "qwen3-235b-a22b", "peerA", ok=False,
+                   n=WEDGE_CONSECUTIVE_FAILURES)
+    with caplog.at_level("WARNING"):
+        assert s._refresh_wallet_health() == "wedged"
+    assert "antseed wedged" in caplog.text
+    assert s.snapshot_stats()["wallet_health"] == "wedged"
+
+
+def test_wallet_health_is_ok_when_some_attempts_succeed(tmp_path):
+    from conftest import seed_route_obs
+    s = _antseed_source(tmp_path)
+    s.offers_sync("antseed_cheap")
+    seed_route_obs("antseed", "qwen3-235b-a22b", "peerA", ok=False, n=9)
+    seed_route_obs("antseed", "qwen3-235b-a22b", "peerA", ok=True, n=1)
+    assert s._refresh_wallet_health() == "ok"
+
+
+def test_wallet_health_does_not_blame_a_suppressed_provider(tmp_path):
+    # Suppressed by the funds gate -> no offers went out -> failures cannot be
+    # blamed on us handing out unpayable routes.
+    from sources.antseed import WEDGE_CONSECUTIVE_FAILURES
+    from conftest import seed_route_obs
+    s = _antseed_source(tmp_path, available="0.1")
+    s.offers_sync("antseed_cheap")
+    seed_route_obs("antseed", "qwen3-235b-a22b", "peerA", ok=False,
+                   n=WEDGE_CONSECUTIVE_FAILURES)
+    assert s._refresh_wallet_health() == "suppressed"
+
+
+def test_refresh_once_surfaces_source_stats(tmp_path):
+    """snapshot_stats() had no non-test caller. It rides the same refresh tick as
+    `balances`, which is what puts it on /x/runtime."""
+    import sources as src
+    src.SOURCE_STATE.clear()
+    s = _antseed_source(tmp_path)
+    asyncio.run(src.refresh_once(FakeHost(), ANTSEED_CATALOG, s))
+    stats = src.SOURCE_STATE["antseed"]["stats"]
+    assert stats["offers"] > 0 and stats["stale"] is False
+    assert stats["wallet_health"] in ("ok", "idle", "unknown", "wedged")
+    src.SOURCE_STATE.clear()
+
+
+# ---- credits push ------------------------------------------------------------
+
+class _CreditHost:
+    """Records update_metrics writes — the boundary sources.push_credits uses."""
+
+    def __init__(self):
+        self.metrics: dict[tuple[str, str], dict] = {}
+
+    def update_metrics(self, provider, model, delta):
+        self.metrics.setdefault((provider, model), {}).update(delta)
+
+
+def test_push_credits_publishes_escrow_into_the_engine_credits_slot():
+    import sources as src
+    h = _CreditHost()
+    n = src.push_credits(h, {"antseed": {
+        "kind": "deposits_usdc", "value": 12.5, "detail": {}, "fetched_at": 1}})
+    assert n == 1
+    assert h.metrics[("__credits", "antseed")] == {
+        "free_credits_remaining_usd": 12.5}
+
+
+def test_push_credits_ignores_quota_windows_and_missing_values():
+    # A subscription's used-FRACTION is not a dollar balance; publishing it as
+    # credits would compare a ratio against a USD floor.
+    import sources as src
+    h = _CreditHost()
+    assert src.push_credits(h, {
+        "openai_codex": {"kind": "quota_window", "value": 0.8, "detail": {}},
+        "openrouter": {"kind": "credits_usd", "value": None, "detail": {}},
+        "x": {"kind": "credits_usd", "value": True, "detail": {}},
+    }) == 0
+    assert h.metrics == {}
+
+
+def test_refresh_once_pushes_credits_every_tick(tmp_path):
+    import sources as src
+    from conftest import seed_buyer_status
+    src.SOURCE_STATE.clear()
+    s = _antseed_source(tmp_path)
+    seed_buyer_status("antseed_free", pinned_peer_id=None,
+                      deposits_available="3.25", deposits_reserved="0.0",
+                      wallet_address="0x0")
+    h = _CreditHost()
+    h.catalog = lambda: ANTSEED_CATALOG
+    asyncio.run(src.refresh_once(h, ANTSEED_CATALOG, s))
+    assert h.metrics[("__credits", "antseed_free")]["free_credits_remaining_usd"] \
+        == 3.25
+    assert src.SOURCE_STATE["antseed"]["credits_pushed"] >= 1
+    src.SOURCE_STATE.clear()
+
+
+def test_seed_credits_reads_only_durable_state(tmp_path):
+    # Cold start must not depend on the network: credits_seed() reads the
+    # buyer_status row the sidecar already wrote, nothing else.
+    import sources as src
+    s = _antseed_source(tmp_path)
+    h = _CreditHost()
+    assert src.seed_credits(h, [s]) == 2         # both pinned buyer proxies
+    assert h.metrics[("__credits", "antseed_free")]["free_credits_remaining_usd"] \
+        == 25.0
+
+
+def test_seed_credits_never_raises_on_a_broken_source():
+    import sources as src
+
+    class _Broken:
+        name = "broken"
+
+        def credits_seed(self):
+            raise RuntimeError("db down")
+
+    assert src.seed_credits(_CreditHost(), [_Broken()]) == 0
 
 
 def test_antseed_balances_from_status_files(tmp_path):

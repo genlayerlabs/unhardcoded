@@ -20,13 +20,24 @@ pytestmark = pytest.mark.skipif(
     shutil.which("node") is None, reason="node not on PATH (antseed sidecar tests)")
 
 
-def test_antseed_node_unit_tests():
-    """The sidecar's DATABASE_URL parser (db.js) handles
-    both the compose `postgres://` URL and the prod libpq kv conninfo."""
+def _run_node_test(rel_path: str) -> None:
     proc = subprocess.run(
         # Pin the actual test file. Node 26 stopped resolving a directory passed
         # to `--test` even though older releases discovered db.test.js there.
-        ["node", "--test", "antseed/db.test.js"],
+        ["node", "--test", rel_path],
         cwd=_REPO_ROOT, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, (
-        f"antseed node tests failed:\n{proc.stdout}\n{proc.stderr}")
+        f"antseed node tests failed ({rel_path}):\n{proc.stdout}\n{proc.stderr}")
+
+
+def test_antseed_node_unit_tests():
+    """The sidecar's DATABASE_URL parser (db.js) handles
+    both the compose `postgres://` URL and the prod libpq kv conninfo."""
+    _run_node_test("antseed/db.test.js")
+
+
+def test_antseed_control_amount_cap():
+    """The control server's deposit-amount guard (antseed/amount.js). /deposit is
+    now called autonomously by the router's wallet keeper, so the per-deposit
+    ceiling has to hold server-side, not only in the caller."""
+    _run_node_test("antseed/amount.test.js")

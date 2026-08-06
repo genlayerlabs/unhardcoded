@@ -218,6 +218,7 @@ def attach_sources(app, host, catalog=None, registry=None) -> None:
 
     import providers
     import sources as sources_mod
+    import wallet_keeper
 
     catalog = catalog if catalog is not None else host.catalog()
     registry = (registry if registry is not None
@@ -229,7 +230,21 @@ def attach_sources(app, host, catalog=None, registry=None) -> None:
     @contextlib.asynccontextmanager
     async def lifespan(app_):
         async with inner(app_):
+            # COLD START, before the first request: publish last-known credits so
+            # the host envelope's antseed funding clause — which fails CLOSED on
+            # the engine's `credits` default of 0 — does not reject every antseed
+            # candidate until the first balances tick. Reads durable state only.
+            seeded = sources_mod.seed_credits(host, registry)
+            if seeded:
+                print(f"credits seeded for {seeded} provider(s)")
             tasks = sources_mod.start_refresh_tasks(host, catalog, registry)
+            # The autonomous AntSeed funding loop lives HERE, in the router: the
+            # buyer identity + sqlite are on an RWO PVC bound to this pod and the
+            # sidecar control server is pod-local. Ships dark — it re-reads
+            # `antseed.keeper_enabled` (default 0) every cycle.
+            keeper = wallet_keeper.start(catalog)
+            if keeper is not None:
+                tasks.append(keeper)
             try:
                 yield
             finally:

@@ -290,3 +290,109 @@ def test_route_stats_window_excludes_old_observations(store):
     seed_route_obs("p", "m", "stale", ok=True, ts=now - 20 * 60 * 1000)  # 20 min ago
     assert set(store.route_stats(window_ms=15 * 60 * 1000)) == {"p|m|fresh"}
     assert set(store.route_stats(window_ms=30 * 60 * 1000)) == {"p|m|fresh", "p|m|stale"}
+
+
+# ---- wallet_ops: the keeper's audit trail + rate-cap ledger -------------------
+# Not best-effort telemetry like `calls`: these rows gate real USDC movement, so
+# the writers report failure and every read fails in the SAFE direction.
+
+def test_wallet_op_begin_writes_the_intent_before_the_transaction(store):
+    op_id = store.wallet_op_begin("antseed", "topup", amount_usdc=5.0,
+                                  reason="below trigger", pre_available=0.5)
+    assert op_id is not None
+    (row,) = store.wallet_ops_recent("antseed")
+    assert row["op"] == "topup" and row["outcome"] == "pending"
+    assert row["amount_usdc"] == 5.0 and row["pre_available"] == 0.5
+    assert row["reason"] == "below trigger" and row["post_available"] is None
+    # `pending` means "in flight": open for reconciliation, already counted spent.
+    assert [r["id"] for r in store.wallet_ops_open("antseed", "topup")] == [op_id]
+    assert store.wallet_op_spend_since("antseed", "topup", 0)["spent_usdc"] == 5.0
+
+
+def test_wallet_op_finish_records_the_measured_outcome(store):
+    op_id = store.wallet_op_begin("antseed", "topup", amount_usdc=5.0,
+                                  pre_available=0.5)
+    assert store.wallet_op_finish(op_id, "effective", post_available=5.4,
+                                  detail="landed") is True
+    (row,) = store.wallet_ops_settled("antseed", "topup")
+    assert row["outcome"] == "effective" and row["post_available"] == 5.4
+    assert store.wallet_ops_open("antseed", "topup") == []
+
+
+def test_failed_ops_do_not_consume_the_daily_cap(store):
+    ok_id = store.wallet_op_begin("antseed", "topup", amount_usdc=5.0)
+    store.wallet_op_finish(ok_id, "fired")
+    bad_id = store.wallet_op_begin("antseed", "topup", amount_usdc=5.0)
+    store.wallet_op_finish(bad_id, "failed")
+    spend = store.wallet_op_spend_since("antseed", "topup", 0)
+    assert spend["spent_usdc"] == 5.0 and spend["count"] == 1
+
+
+def test_spend_ledger_is_scoped_per_provider_and_per_op(store):
+    store.wallet_op_begin("antseed_a", "topup", amount_usdc=5.0)
+    store.wallet_op_begin("antseed_b", "topup", amount_usdc=7.0)
+    store.wallet_op_begin("antseed_a", "reclaim_withdraw")
+    assert store.wallet_op_spend_since("antseed_a", "topup", 0)["spent_usdc"] == 5.0
+    assert store.wallet_op_spend_since("antseed_b", "topup", 0)["spent_usdc"] == 7.0
+
+
+def test_spend_ledger_window_excludes_older_ops(store):
+    op_id = store.wallet_op_begin("antseed", "topup", amount_usdc=5.0)
+    store.wallet_op_finish(op_id, "fired")
+    old = int(time.time()) - 90_000                       # ~25h ago
+    with store._get_pool().connection() as conn:
+        conn.execute("UPDATE wallet_ops SET ts=%s WHERE id=%s", (old, op_id))
+    since = int(time.time()) - 86_400
+    assert store.wallet_op_spend_since("antseed", "topup", since)["spent_usdc"] == 0.0
+    assert store.wallet_op_spend_since("antseed", "topup", 0)["spent_usdc"] == 5.0
+
+
+def test_halt_is_durable_scoped_and_operator_cleared(store):
+    assert store.wallet_halted("antseed", "topup") is False
+    assert store.wallet_halt("antseed", "topup", "two ineffective deposits") is True
+    assert store.wallet_halted("antseed", "topup") is True
+    assert store.wallet_halted("antseed", "reclaim") is False   # per-class
+    assert store.wallet_halted("antseed_other", "topup") is False  # per-provider
+    store.wallet_halt("antseed", "topup", "again")              # idempotent
+    assert len([r for r in store.wallet_ops_recent("antseed")
+                if r["outcome"] == "halted"]) == 1
+    assert store.wallet_clear_halt("antseed", "topup") is True
+    assert store.wallet_halted("antseed", "topup") is False
+
+
+def test_wallet_reads_fail_in_the_safe_direction(store, monkeypatch):
+    def _boom(*a, **kw):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(hs, "_get_pool", _boom)
+    # An unreadable ledger must look like "already halted, cap consumed,
+    # cooldown just started" — never like "free to spend".
+    assert hs.wallet_halted("antseed", "topup") is True
+    spend = hs.wallet_op_spend_since("antseed", "topup", 0)
+    assert spend["spent_usdc"] == float("inf") and spend["unreadable"] is True
+    # ...and the intent write reports failure so the caller aborts.
+    assert hs.wallet_op_begin("antseed", "topup", amount_usdc=5.0) is None
+
+
+def test_provider_attempt_counts_distinguishes_wedged_from_idle(store):
+    from conftest import seed_route_obs
+    assert store.provider_attempt_counts("antseed") == {
+        "ok": 0, "failed": 0, "total": 0}, "idle: no attempts at all"
+    seed_route_obs("antseed", "m", "peerA", ok=False, n=5)
+    assert store.provider_attempt_counts("antseed") == {
+        "ok": 0, "failed": 5, "total": 5}, "wedged: attempts, zero successes"
+    seed_route_obs("antseed", "m", "peerA", ok=True, n=1)
+    assert store.provider_attempt_counts("antseed")["ok"] == 1
+    # scoped per provider, and windowed
+    assert store.provider_attempt_counts("openrouter")["total"] == 0
+    old = int(time.time() * 1000) - 7200 * 1000
+    seed_route_obs("stale_p", "m", "peerA", ok=False, n=3, ts=old)
+    assert store.provider_attempt_counts("stale_p", window_ms=3_600_000)["total"] == 0
+
+
+def test_provider_recent_ok_returns_newest_first(store):
+    from conftest import seed_route_obs
+    now = int(time.time() * 1000)
+    seed_route_obs("antseed", "m", "peerA", ok=True, n=1, ts=now - 3000)
+    seed_route_obs("antseed", "m", "peerA", ok=False, n=2, ts=now - 1000)
+    assert store.provider_recent_ok("antseed", limit=3) == [False, False, True]
+    assert store.provider_recent_ok("antseed", limit=1) == [False]

@@ -547,5 +547,25 @@ return {
     -- so callers can only NARROW what this host allows, never widen it.
     -- Floor: the contract's requirements must hold, and auth-disabled
     -- providers stay out no matter what the caller's term says.
-    policy_envelope = { "and", { "meets_req" }, { "not", { "is", "disabled" } } },
+    --
+    -- Third clause — ANTSEED FUNDING ADMISSION. AntSeed pays every call out of an
+    -- on-chain USDC escrow, and opening a payment channel reserves ~1 USDC; below
+    -- that, every routed call 402s `insufficient_deposits`. `credits` carries the
+    -- buyer's live `deposits_available` (pushed by sources.push_credits on each
+    -- balances refresh), so this keeps an unfundable buyer out of ranking.
+    --
+    -- Deliberately SCOPED to antseed by the `or`: every other provider bills
+    -- against its own quota/credit mechanics with no on-chain escrow, and the
+    -- engine's `credits` field defaults to 0 — an unscoped clause would reject
+    -- the entire catalog. The scoped form needs no core change precisely because
+    -- the `not provider_eq` branch is true for them.
+    --
+    -- This fails CLOSED (default 0 < 1.0 => rejected) where the offer-side
+    -- tourniquet in sources/antseed.py fails OPEN. That asymmetry is intended —
+    -- envelope = belt, offers_sync = braces — and the cold-start hole it opens is
+    -- closed by sources.seed_credits, which publishes the last known escrow from
+    -- the durable buyer_status row before the app serves its first request.
+    policy_envelope = { "and", { "meets_req" }, { "not", { "is", "disabled" } },
+        { "or", { "not", { "provider_eq", "antseed" } },
+                { "cmp", "credits", "ge", 1.0 } } },
 }

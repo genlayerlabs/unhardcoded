@@ -184,6 +184,63 @@ PROVIDERS: "list[Provider]" = [
                 "type": "float", "default": env_float("RUNWAY_DEPOSITS_EMPTY_USDC", 0.01),
                 "min": 0, "max": 100000, "label": "Wallet runway: empty (USDC)",
                 "help": "Deposits at/below this read as 'empty'."},
+            # ---- funding autonomy (the wallet keeper, `wallet_keeper.py`) ------
+            # These knobs govern code that moves REAL USDC on Base mainnet. The
+            # keeper cross-validates them on every load (see
+            # wallet_keeper._load_knobs) and refuses to act on an inconsistent
+            # set — settings.SCHEMA validates each knob in isolation, so the
+            # RELATIONS between them (trigger above the tourniquet, one top-up
+            # within the daily cap) have to be checked where they are read.
+            "keeper_enabled": {
+                "type": "int", "default": env_int("ANTSEED_KEEPER_ENABLED", 0),
+                "min": 0, "max": 1, "label": "Wallet keeper: enabled",
+                "help": "Global kill switch for the autonomous funding loop "
+                        "(reclaim + top-up). 0 = OFF (default: the loop ships "
+                        "dark and is armed deliberately), 1 = ON. Off means the "
+                        "keeper reads nothing and fires nothing."},
+            "min_available_usdc": {
+                "type": "float", "default": env_float("ANTSEED_MIN_AVAILABLE_USDC", 1.1),
+                "min": 0, "max": 100000, "label": "Offer tourniquet: min available (USDC)",
+                "help": "Stop offering AntSeed routes at all when escrow "
+                        "deposits_available falls below this. Opening a payment "
+                        "channel RESERVES ~1 USDC, so below one reserve every "
+                        "call 402s insufficient_deposits. Default 1.1 = just "
+                        "above one reserve."},
+            "topup_trigger_usdc": {
+                "type": "float", "default": env_float("ANTSEED_TOPUP_TRIGGER_USDC", 2.0),
+                "min": 0, "max": 100000, "label": "Top-up trigger (USDC)",
+                "help": "Deposit when escrow deposits_available falls below "
+                        "this. Must be ABOVE the offer tourniquet so funding "
+                        "reacts before routing is suppressed."},
+            "topup_amount_usdc": {
+                "type": "float", "default": env_float("ANTSEED_TOPUP_AMOUNT_USDC", 5),
+                "min": 0.01, "max": 50, "label": "Top-up amount (USDC)",
+                "help": "USDC moved wallet->escrow per top-up. Hard-capped at 50 "
+                        "here AND server-side in antseed/control.js."},
+            "topup_wallet_floor_usdc": {
+                "type": "float", "default": env_float("ANTSEED_TOPUP_WALLET_FLOOR_USDC", 1),
+                "min": 0, "max": 100000, "label": "Top-up: hot-wallet floor (USDC)",
+                "help": "Never deposit if it would leave the hot wallet below "
+                        "this. VETO-ONLY: the wallet balance comes from an "
+                        "untrusted public RPC, so a low read blocks a top-up but "
+                        "a high read never authorizes one."},
+            "topup_daily_cap_usdc": {
+                "type": "float", "default": env_float("ANTSEED_TOPUP_DAILY_CAP_USDC", 10),
+                "min": 0, "max": 100000, "label": "Top-up: daily cap (USDC)",
+                "help": "Maximum USDC the keeper may deposit in any rolling 24h, "
+                        "derived from the durable wallet_ops ledger (a pod "
+                        "restart does not reset it)."},
+            "topup_cooldown_s": {
+                "type": "int", "default": env_int("ANTSEED_TOPUP_COOLDOWN_S", 900),
+                "min": 0, "max": 86400, "label": "Top-up: cooldown (s)",
+                "help": "Minimum seconds between top-ups, also derived from the "
+                        "durable ledger."},
+            "reclaim_min_usdc": {
+                "type": "float", "default": env_float("ANTSEED_RECLAIM_MIN_USDC", 3),
+                "min": 0, "max": 100000, "label": "Reclaim: min reserved (USDC)",
+                "help": "Only force-close idle payment channels when escrow "
+                        "deposits_reserved exceeds this AND the provider has "
+                        "served zero successful calls for an hour."},
         },
     ),
     Provider(

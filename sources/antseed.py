@@ -11,6 +11,7 @@ antseed containers (only the proxy ports are shared with the router's netns).
 """
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any
@@ -20,7 +21,15 @@ import route_reliability as _route_reliability
 import settings
 from sources import Balance, Price
 
+_log = logging.getLogger("unhardcoded.sources.antseed")
+
 STALE_AFTER_S = 900
+
+# Wedge detector: this many consecutive FAILED attempts, while offers were
+# actually being ranked, reads as "the provider is offering routes it cannot
+# serve" — the exact 24h/5,432-attempts/zero-successes shape the funding gate
+# exists to prevent. Surfaced as `wallet_health` on the source stats.
+WEDGE_CONSECUTIVE_FAILURES = 10
 
 # Vendor prefixes stripped (as a whole leading token) when canonicalizing a
 # marketplace service name to match curated families. `claude-` is included so a
@@ -50,6 +59,19 @@ def _canon_service(name: str) -> str:
 _BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 _USDC_DECIMALS = 6
 _DEFAULT_BASE_RPC = "https://mainnet.base.org"
+
+
+def as_float(value: Any) -> "float | None":
+    """The buyer reports its escrow as STRINGS; coerce one to a float, or None
+    when it is absent/unparseable. None means UNKNOWN — never zero: a funding
+    decision must be able to tell "no money" apart from "no reading"."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
 
 
 def _wallet_rpc_url() -> str | None:
@@ -111,7 +133,8 @@ class AntSeedSource:
             and str(p.get("discovery_id", "")).startswith("antseed")
         }
         self.provider_ids = list(self._providers)
-        self._stats: dict[str, Any] = {"stale": False, "dropped_unmapped": 0}
+        self._stats: dict[str, Any] = {"stale": False, "suppressed_no_funds": 0,
+                                       "wallet_health": "unknown"}
 
     # ---- market parsing -------------------------------------------------
 
@@ -180,7 +203,30 @@ class AntSeedSource:
         cap = cfg.get("market_price_cap") or {}
         cap_in = float(cap.get("input", float("inf")))
         cap_out = float(cap.get("output", float("inf")))
-        pinned = self._pinned_peer(provider_id)
+        # ONE buyer_status read serves both the session pin and the funds gate.
+        status = host_store.buyer_status(provider_id) or {}
+        pinned = status.get("pinned_peer_id") or None
+        available = as_float(status.get("deposits_available"))
+        self._stats["deposits_available"] = available
+        # FUNDS TOURNIQUET. Opening a payment channel RESERVES ~1 USDC of escrow,
+        # so once deposits_available drops below one reserve EVERY routed call
+        # 402s `insufficient_deposits` — prod burned 5,432 attempts in 24h for
+        # zero successes that way. Offering routes that provably cannot pay is
+        # worse than offering none: the caller's request is spent on a certain
+        # failure and the peer's reliability score is poisoned. Suppress instead.
+        #
+        # FAILS OPEN, deliberately: `available is None` means the status row is
+        # absent or unreadable (cold start, DB blip, sidecar lag) — a READ error,
+        # not evidence of an empty escrow — so the provider stays offered. The
+        # host envelope's `credits` clause is the belt to this braces and fails
+        # CLOSED on the same signal; the asymmetry is the point (see
+        # config.live.lua policy_envelope + sources.seed_credits).
+        if available is not None and available < float(
+                settings.get("antseed.min_available_usdc")):
+            self._stats["suppressed_no_funds"] = \
+                int(self._stats.get("suppressed_no_funds") or 0) + 1
+            self._stats["offers"] = 0
+            return []
         rep_min = float(settings.get("antseed.reputation_min"))
         allowlist = set(settings.get("antseed.peer_allowlist") or [])
         denylist = set(settings.get("antseed.peer_denylist") or [])
@@ -245,7 +291,6 @@ class AntSeedSource:
                 kept_rows.append(r)
                 if len(seen_peers) >= top_n:
                     break
-        self._stats["dropped_unmapped"] = 0
         self._stats["uncurated"] = uncurated
         self._stats["rejected_by_buyer"] = rejected_by_buyer
         self._stats["rejected_by_reputation"] = rejected_by_reputation
@@ -309,6 +354,40 @@ class AntSeedSource:
 
     def snapshot_stats(self) -> dict:
         return dict(self._stats)
+
+    def _refresh_wallet_health(self) -> str:
+        """Classify the buyer's serving health from the last few per-attempt
+        observations, and warn once per transition when the provider is WEDGED:
+        offers were ranked (the router did hand out antseed routes) yet the last
+        WEDGE_CONSECUTIVE_FAILURES attempts all failed. That is the signature of
+        the 402 loop the funds tourniquet suppresses — if it shows up anyway the
+        cause is something the balance gate cannot see (a dead proxy, a wedged
+        peer, a stale pin), so it deserves an operator-visible flag rather than a
+        silent zero-success day.
+
+        Runs off the request path (from `balances()`, once per refresh tick), not
+        inside offers_sync — the rank hot path takes no extra query for it."""
+        if not self._stats.get("offers"):
+            # Nothing was offered (suppressed, stale market, or genuinely idle):
+            # failures cannot be blamed on us handing out unpayable routes.
+            health = "suppressed" if self._stats.get("suppressed_no_funds") else "idle"
+        else:
+            recent = host_store.provider_recent_ok(
+                self.name, limit=WEDGE_CONSECUTIVE_FAILURES)
+            if len(recent) >= WEDGE_CONSECUTIVE_FAILURES and not any(recent):
+                health = "wedged"
+            elif not recent:
+                health = "unknown"
+            else:
+                health = "ok"
+        if health == "wedged" and self._stats.get("wallet_health") != "wedged":
+            _log.warning(
+                "antseed wedged: last %d routed attempts all failed while offers "
+                "were ranked (deposits_available=%s) — check escrow, the buyer "
+                "proxy and the session pin",
+                WEDGE_CONSECUTIVE_FAILURES, self._stats.get("deposits_available"))
+        self._stats["wallet_health"] = health
+        return health
 
     # ---- full-market book (dashboard only) --------------------------------
 
@@ -387,8 +466,29 @@ class AntSeedSource:
                 })
         return prices
 
+    def credits_seed(self) -> dict[str, float]:
+        """{provider_id -> last-known spendable escrow}, straight from the durable
+        buyer_status row — no network, no refresh tick.
+
+        Published into the engine's `__credits|<pid>` slot at STARTUP, before the
+        app serves traffic. The host envelope gates antseed on `credits >= 1.0`
+        and the engine's `credits` field defaults to 0, so that clause fails
+        CLOSED: a fresh pod that has not yet completed a balances refresh would
+        reject every antseed candidate until the first tick (up to 300s). Seeding
+        from the last known status closes that hole without weakening the gate."""
+        out: dict[str, float] = {}
+        for pid in self.provider_ids:
+            available = as_float((host_store.buyer_status(pid) or {})
+                                 .get("deposits_available"))
+            if available is not None:
+                out[pid] = available
+        return out
+
     async def balances(self) -> dict[str, Balance]:
         out: dict[str, Balance] = {}
+        # Off the request path and after this tick's pricing()/offers_sync, so the
+        # offer counts it reads are current.
+        self._refresh_wallet_health()
         for pid in self.provider_ids:
             data = host_store.buyer_status(pid)
             if not data:

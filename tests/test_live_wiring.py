@@ -434,3 +434,137 @@ def test_discovered_alias_family_is_policy_addressable():
     assert candidate["provider_id"] == "openrouter_market"
     assert candidate["model_family"] == "gpt-5-mini"
     assert candidate["offer"]["wire_model_id"] == "openai/gpt-5-mini"
+
+
+# ---- AntSeed funding admission (the host envelope's third clause) -------------
+
+def _antseed_host(env=None):
+    """The live catalog with ONE AntSeed offer available from the discover hook.
+    AntSeed needs no key (`auth = none`), so nothing else gates it — the funding
+    clause in policy_envelope is the only thing that can keep it out."""
+    host = LLMRouterHost(
+        router_path=ROOT / "core" / "router.lua",
+        config_path=ROOT / "config.live.lua",
+        metrics_path=ROOT / "metrics.live.lua",
+        env=(env if env is not None else LIVE_TEST_ENV.copy()),
+        now_ms=lambda: 1,
+    )
+    host.set_discover_hook(lambda did: {
+        "ok": True, "fetched_at_ms": 1,
+        "offers": [
+            {"model_family": "gpt-5-mini", "wire_model_id": "gpt-5-mini",
+             "seller_endpoint": "http://antseed:8378/v1",
+             "price_in_usd_per_mtok": 0.01, "price_out_usd_per_mtok": 0.02,
+             "peer_id": "peerA",
+             "capabilities": {"context": 400000, "supports_tools": True,
+                              "supports_json_mode": True}},
+        ],
+    } if did == "antseed" else {"ok": False, "error": "x"})
+    host.init()
+    return host
+
+
+_ANY_GPT5_MINI = ["policy",
+                  ["and", ["meets_req"], ["family_eq", "gpt-5-mini"]],
+                  ["neg", ["normalize", ["field", "price_in"]]],
+                  ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
+
+
+def _providers_for(host):
+    ranked, _ = host.rank({"policy_ir": _ANY_GPT5_MINI,
+                           "requirements": {"context": 8000}})
+    return [r["candidate"]["provider_id"] for r in ranked]
+
+
+def test_antseed_is_rejected_until_its_escrow_can_pay():
+    """The envelope keeps an unfundable AntSeed buyer out of ranking. This
+    FAILS CLOSED on purpose: the engine's `credits` field defaults to 0, so a
+    router that has never published a balance rejects AntSeed rather than
+    routing calls into a certain 402."""
+    host = _antseed_host()
+    # The offer exists and is the ONLY candidate for this family — so an empty
+    # ranking here is the gate rejecting it, not the family being unserved.
+    assert _providers_for(host) == [], \
+        "credits default 0 -> below the 1.0 floor -> not routable"
+
+    # A funded escrow admits it (this is what sources.push_credits publishes).
+    host.update_metrics("__credits", "antseed", {"free_credits_remaining_usd": 5.0})
+    assert "antseed" in _providers_for(host)
+
+    # Draining back below one channel reserve takes it out again.
+    host.update_metrics("__credits", "antseed", {"free_credits_remaining_usd": 0.4})
+    assert "antseed" not in _providers_for(host)
+
+
+_ANY_CANDIDATE = ["policy", ["and", ["meets_req"]],
+                  ["neg", ["normalize", ["field", "price_in"]]],
+                  ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
+
+
+def test_the_funding_clause_is_scoped_to_antseed_only():
+    """Every other provider bills against its own quota/credit mechanics and has
+    no on-chain escrow, so an unscoped `credits >= 1` clause would reject the
+    WHOLE catalog — the engine's `credits` field defaults to 0 for all of them.
+    With no credits published anywhere, everyone except antseed must still rank."""
+    host = _antseed_host()
+    ranked, _ = host.rank({"policy_ir": _ANY_CANDIDATE,
+                           "requirements": {"context": 8000}})
+    providers = {r["candidate"]["provider_id"] for r in ranked}
+    assert providers - {"antseed"}, "the clause must not empty the catalog"
+    assert "antseed" not in providers
+
+
+def test_operator_profiles_bypass_the_envelope_so_offers_sync_is_the_cover():
+    """A deliberate property of the CORE, pinned here because the funding design
+    depends on knowing it: `config.policy_envelope` is ∧-ed onto CALLER-supplied
+    `policy_ir` only — an operator profile is the operator's own term and is
+    ranked as written (core/llm_policy.lua, "operator's own; no envelope").
+
+    So the envelope covers caller terms, and the offer-side tourniquet in
+    sources/antseed.offers_sync — which suppresses the offers themselves, before
+    any policy sees them — is what covers profile traffic. Belt and braces, but
+    each one covers a different half."""
+    host = _antseed_host()
+    ranked, _ = host.rank({"profile": "default", "requirements": {"context": 8000}})
+    providers = {r["candidate"]["provider_id"] for r in ranked}
+    assert "antseed" in providers, (
+        "if this ever fails the core started applying the envelope to profiles "
+        "too — good news, but the comment above is then stale")
+
+
+def test_cold_start_seed_makes_antseed_routable_before_the_first_refresh(
+        host_store_clean, monkeypatch):
+    """The cold-start hole the fail-closed envelope opens, and its fix: a fresh
+    pod has published no credits yet, so AntSeed would stay rejected for up to a
+    full poll interval. `sources.seed_credits` publishes the last known escrow
+    from the durable buyer_status row during startup, before serving."""
+    import sources as sources_mod
+    from conftest import seed_buyer_status
+    from sources.antseed import AntSeedSource
+
+    catalog = {"providers": {"antseed": {
+        "discovery": "marketplace", "discovery_id": "antseed",
+        "base_url": "http://antseed:8378/v1"}}, "models": {}}
+    seed_buyer_status("antseed", deposits_available="12.5",
+                      deposits_reserved="1.0", wallet_address="0x0")
+
+    host = _antseed_host()
+    assert "antseed" not in _providers_for(host)          # cold: rejected
+    assert sources_mod.seed_credits(host, [AntSeedSource(catalog)]) == 1
+    assert "antseed" in _providers_for(host)              # seeded: routable
+
+
+def test_cold_start_seed_leaves_the_gate_closed_when_the_escrow_is_empty(
+        host_store_clean):
+    import sources as sources_mod
+    from conftest import seed_buyer_status
+    from sources.antseed import AntSeedSource
+
+    catalog = {"providers": {"antseed": {
+        "discovery": "marketplace", "discovery_id": "antseed"}}, "models": {}}
+    seed_buyer_status("antseed", deposits_available="0.23",
+                      deposits_reserved="15.6", wallet_address="0x0")
+    host = _antseed_host()
+    assert sources_mod.seed_credits(host, [AntSeedSource(catalog)]) == 1
+    assert "antseed" not in _providers_for(host), \
+        "seeding publishes the truth, it does not open the gate"

@@ -15,6 +15,9 @@ const { execFile } = require('child_process');
 const { Pool } = require('pg');
 const { pgConfig } = require('./db.js');
 const { UPSERT_BUYER_STATUS, buyerStatusRow } = require('./store.js');
+// Amount validation (incl. the hard per-deposit ceiling) lives in its own
+// dependency-free module so it can be unit-tested outside the sidecar image.
+const { validAmount, MAX_AMOUNT_USDC } = require('./amount.js');
 
 const path = require('path');
 
@@ -37,12 +40,6 @@ const pool = new Pool(pgConfig(process.env.DATABASE_URL));
 if (!TOKEN) {
   console.error('[control] ANTSEED_CONTROL_TOKEN unset — control server disabled');
   return;
-}
-
-// USDC amount: human units, up to 6 decimals, strictly positive.
-const AMOUNT_RE = /^\d+(\.\d{1,6})?$/;
-function validAmount(s) {
-  return typeof s === 'string' && AMOUNT_RE.test(s) && parseFloat(s) > 0;
 }
 
 function run(args, timeout) {
@@ -124,7 +121,7 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     const amount = body && body.amount != null ? String(body.amount) : '';
     if (!validAmount(amount)) {
-      return send(res, 400, { ok: false, error: 'amount must be a positive USDC value (<=6 decimals)' });
+      return send(res, 400, { ok: false, error: 'amount must be a positive USDC value (<=6 decimals, <=' + MAX_AMOUNT_USDC + ')' });
     }
     return serialize(async () => {
       const r = await run(['buyer', verb, amount], DEPOSIT_TIMEOUT_MS);

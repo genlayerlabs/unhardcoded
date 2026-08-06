@@ -98,6 +98,31 @@ docker compose --profile antseed up -d --build antseed
 - **Per replica:** if you scale the shim horizontally, each replica needs a
   reachable AntSeed node — a sidecar per replica (own funded identity) or one
   shared instance. Decide this when you add replicas.
+- **Funding autonomy (`wallet_keeper.py`) — off by default.** Escrow *ratchets*:
+  every channel open reserves ~1 USDC, and a channel that never settles never
+  gives it back, so a buyer whose `depositsAvailable` falls below one reserve
+  answers 402 `insufficient_deposits` to *every* call until a human deposits or
+  reclaims. Two things now cover that:
+  - a **tourniquet** in `sources/antseed.py`: below
+    `antseed.min_available_usdc` (1.1) the source stops offering AntSeed routes
+    at all, rather than spending callers' requests on certain failures. It fails
+    OPEN — an unreadable buyer status is a read error, not an empty escrow.
+  - the **wallet keeper**, a loop in the router (the buyer identity + sqlite are
+    on an RWO PVC bound to this pod, and the control server is pod-local) that
+    reclaims stuck channels and then tops the escrow up. It **reclaims before it
+    tops up** — refilling a ratchet you have not unwound just feeds the leak —
+    and only force-closes channels when the provider is provably wedged (traffic,
+    zero successes for an hour), never when it is merely idle.
+
+  It **ships dark**: `antseed.keeper_enabled` defaults to `0`, and arming it is a
+  deliberate operator act (Config tab or `ANTSEED_KEEPER_ENABLED=1`). Its limits
+  are the `antseed.topup_*` / `antseed.reclaim_min_usdc` knobs, cross-validated
+  on load. It will **never** run `buyer withdraw` (escrow → wallet): that is the
+  exfiltration path if `ANTSEED_CONTROL_TOKEN` leaks and stays human-only. Every
+  action is written to `wallet_ops` as an INTENT *before* it fires — that table
+  is the audit trail, the daily-cap ledger and the `/x/runtime` feed at once —
+  and two deposits in a row that fail to raise `depositsAvailable` hard-halt
+  top-ups until an operator clears the flag.
 
 The `model` field we send is the offer's wire id (the peer's service name),
 forwarded verbatim; AntSeed translates protocols and serves it.

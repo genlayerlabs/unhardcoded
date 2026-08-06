@@ -211,6 +211,29 @@ _SCHEMA_STATEMENTS = [
         connection_state   TEXT,
         fetched_at         BIGINT
     )""",
+    # The wallet keeper's operation ledger — the audit trail, the rate-cap ledger
+    # and the dashboard feed in ONE table. Every row is an INTENT written BEFORE
+    # the transaction fires and updated with its outcome after, so a crash between
+    # the two leaves a `pending` row to reconcile instead of an invisible spend on
+    # Base mainnet. The cooldown and the daily cap are DERIVED from these rows
+    # (not from process memory) so a pod restart cannot reset either. Deliberately
+    # NOT pruned by the retention sweep: it is a money audit trail, and it grows a
+    # handful of rows per day. ts / updated_at in SECONDS.
+    """CREATE TABLE IF NOT EXISTS wallet_ops (
+        id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        ts             BIGINT NOT NULL,
+        pid            TEXT NOT NULL,
+        op             TEXT NOT NULL,
+        amount_usdc    DOUBLE PRECISION,
+        reason         TEXT,
+        pre_available  DOUBLE PRECISION,
+        post_available DOUBLE PRECISION,
+        outcome        TEXT NOT NULL,
+        detail         TEXT,
+        updated_at     BIGINT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_ops_pid_ts ON wallet_ops(pid, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_ops_open ON wallet_ops(pid, op, outcome)",
     # Dashboard login audit (#5) — replaces dashboard-logins.jsonl. A small record
     # read whole by the dashboard, so it follows the consumer_keys pattern: the
     # row as a JSON record in TEXT (not analysed by column). ts in SECONDS.
@@ -614,6 +637,44 @@ def route_stats(window_ms: int = 900_000) -> dict[str, dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001 — measurement read is best-effort
         _log.warning("host_store route_stats failed: %s", exc)
         return {}
+
+
+def provider_attempt_counts(provider_id: str, window_ms: int = 3_600_000) -> dict[str, int]:
+    """{ok, failed, total} attempts for one provider over the last `window_ms`,
+    across every family and peer. The wallet keeper's "is this provider fully
+    wedged?" evidence: `ok == 0` with a non-zero `total` means every routed call
+    failed, which is what distinguishes a stuck escrow from an idle provider (a
+    quiet provider has total == 0 and must NOT trigger a reclaim).
+
+    Fail-soft in the SAFE direction: a store error reports ok=-1, which the keeper
+    reads as "cannot prove wedged" and declines to force-close channels."""
+    try:
+        cutoff = int(time.time() * 1000) - max(0, window_ms)
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT coalesce(sum(CASE WHEN ok THEN 1 ELSE 0 END),0), count(*)"
+                " FROM route_observations WHERE provider_id=%s AND ts >= %s",
+                (provider_id, cutoff)).fetchone()
+        ok, total = int(row[0] or 0), int(row[1] or 0)
+        return {"ok": ok, "failed": total - ok, "total": total}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store provider_attempt_counts failed: %s", exc)
+        return {"ok": -1, "failed": -1, "total": -1}
+
+
+def provider_recent_ok(provider_id: str, limit: int = 10) -> list[bool]:
+    """The last `limit` per-attempt ok flags for a provider, NEWEST FIRST — the
+    wedge detector's raw. Fail-soft -> [] (no evidence, no warning)."""
+    try:
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT ok FROM route_observations WHERE provider_id=%s"
+                " ORDER BY ts DESC, id DESC LIMIT %s",
+                (provider_id, max(1, min(int(limit), 1000))))
+            return [bool(r[0]) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store provider_recent_ok failed: %s", exc)
+        return []
 
 
 def tool_incapable_routes(window_ms: int = 1_800_000, min_samples: int = 20) -> "set[str]":
@@ -1430,6 +1491,195 @@ def buyer_status(pid: str) -> "dict[str, Any] | None":
         return None
 
 
+# ---- wallet_ops (the wallet keeper's audit trail + rate-cap ledger; DURABLE) ---
+# Unlike the ledger these writes are NOT best-effort: the keeper moves real USDC,
+# so a write failure must STOP it (`wallet_op_begin` returning None means "do not
+# fire"). Reads are fail-soft in the SAFE direction — a read failure looks like
+# "already spent / already halted", never like "free to spend".
+
+# Outcomes that count as money having left the wallet for cap + cooldown purposes.
+# `pending` and `unknown` count too: a keeper that died mid-deposit must ASSUME the
+# transaction landed rather than re-fire on top of it.
+WALLET_OP_SPENT_OUTCOMES = ("pending", "fired", "effective", "ineffective", "unknown")
+# Outcomes of a deposit whose effect on `deposits_available` has been measured.
+WALLET_OP_SETTLED_OUTCOMES = ("effective", "ineffective")
+
+_WALLET_OP_FIELDS = ("id", "ts", "pid", "op", "amount_usdc", "reason",
+                     "pre_available", "post_available", "outcome", "detail",
+                     "updated_at")
+
+
+def wallet_op_begin(pid: str, op: str, amount_usdc: "float | None" = None,
+                    reason: "str | None" = None,
+                    pre_available: "float | None" = None) -> "int | None":
+    """Record the INTENT to run a wallet op and return its row id. Call this
+    BEFORE firing the transaction. Returns None when the row could NOT be
+    persisted — the caller must then abort: an unlogged on-chain spend is worse
+    than a missed top-up (no audit trail, no cap accounting, no reconciliation)."""
+    try:
+        now = int(time.time())
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "INSERT INTO wallet_ops (ts, pid, op, amount_usdc, reason,"
+                " pre_available, outcome, updated_at)"
+                " VALUES (%s,%s,%s,%s,%s,%s,'pending',%s) RETURNING id",
+                (now, pid, op,
+                 float(amount_usdc) if amount_usdc is not None else None,
+                 reason,
+                 float(pre_available) if pre_available is not None else None,
+                 now)).fetchone()
+            return int(row[0]) if row else None
+    except Exception as exc:  # noqa: BLE001 — surfaced to the caller as "do not fire"
+        _log.warning("host_store wallet_op_begin failed: %s", exc)
+        return None
+
+
+def wallet_op_finish(op_id: int, outcome: str,
+                     post_available: "float | None" = None,
+                     detail: "str | None" = None) -> bool:
+    """Close out an intent row with its observed outcome. False on a persistence
+    failure so the caller can log it; the row then stays `pending` and startup
+    reconciliation treats it conservatively (as spent)."""
+    try:
+        with _get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE wallet_ops SET outcome=%s, post_available=%s,"
+                " detail=%s, updated_at=%s WHERE id=%s",
+                (outcome,
+                 float(post_available) if post_available is not None else None,
+                 str(detail)[:2000] if detail is not None else None,
+                 int(time.time()), int(op_id)))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_op_finish failed: %s", exc)
+        return False
+
+
+def wallet_ops_recent(pid: "str | None" = None, limit: int = 50) -> list[dict[str, Any]]:
+    """The newest wallet ops (audit feed for the dashboard). Fail-soft -> []."""
+    try:
+        cols = ", ".join(_WALLET_OP_FIELDS)
+        with _get_pool().connection() as conn:
+            if pid is None:
+                cur = conn.execute(
+                    f"SELECT {cols} FROM wallet_ops ORDER BY id DESC LIMIT %s",
+                    (max(1, min(int(limit), 1000)),))
+            else:
+                cur = conn.execute(
+                    f"SELECT {cols} FROM wallet_ops WHERE pid=%s"
+                    " ORDER BY id DESC LIMIT %s",
+                    (pid, max(1, min(int(limit), 1000))))
+            return [dict(zip(_WALLET_OP_FIELDS, r)) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_ops_recent failed: %s", exc)
+        return []
+
+
+def wallet_ops_open(pid: str, op: "str | None" = None) -> list[dict[str, Any]]:
+    """Ops still awaiting an outcome (`pending`, or `fired` awaiting the effect
+    check). The startup reconciliation and the money-pump breaker both read this.
+    Fail-soft -> []."""
+    try:
+        cols = ", ".join(_WALLET_OP_FIELDS)
+        sql = (f"SELECT {cols} FROM wallet_ops WHERE pid=%s"
+               " AND outcome IN ('pending','fired')")
+        params: list[Any] = [pid]
+        if op is not None:
+            sql += " AND op=%s"
+            params.append(op)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(sql + " ORDER BY id", params)
+            return [dict(zip(_WALLET_OP_FIELDS, r)) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_ops_open failed: %s", exc)
+        return []
+
+
+def wallet_op_spend_since(pid: str, op: str, since_ts: int) -> dict[str, Any]:
+    """{spent_usdc, last_ts, count} over the ops of this kind since `since_ts`
+    that COUNT as spent — the daily-cap and cooldown ledger. Fail-soft in the SAFE
+    direction: a store error reports the cap as fully consumed and the cooldown as
+    just started, so a broken read can never authorize a spend."""
+    now = int(time.time())
+    try:
+        placeholders = ",".join(["%s"] * len(WALLET_OP_SPENT_OUTCOMES))
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT coalesce(sum(amount_usdc),0), max(ts), count(*)"
+                " FROM wallet_ops WHERE pid=%s AND op=%s AND ts >= %s"
+                f" AND outcome IN ({placeholders})",
+                (pid, op, int(since_ts), *WALLET_OP_SPENT_OUTCOMES)).fetchone()
+        return {"spent_usdc": float(row[0] or 0.0),
+                "last_ts": int(row[1]) if row[1] is not None else None,
+                "count": int(row[2] or 0)}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_op_spend_since failed: %s", exc)
+        return {"spent_usdc": float("inf"), "last_ts": now, "count": -1,
+                "unreadable": True}
+
+
+def wallet_ops_settled(pid: str, op: str, limit: int = 2) -> list[dict[str, Any]]:
+    """The newest ops of this kind whose EFFECT has been measured, newest first —
+    the money-pump breaker's input. Fail-soft -> []."""
+    try:
+        cols = ", ".join(_WALLET_OP_FIELDS)
+        placeholders = ",".join(["%s"] * len(WALLET_OP_SETTLED_OUTCOMES))
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                f"SELECT {cols} FROM wallet_ops WHERE pid=%s AND op=%s"
+                f" AND outcome IN ({placeholders}) ORDER BY id DESC LIMIT %s",
+                (pid, op, *WALLET_OP_SETTLED_OUTCOMES, max(1, min(int(limit), 100))))
+            return [dict(zip(_WALLET_OP_FIELDS, r)) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_ops_settled failed: %s", exc)
+        return []
+
+
+def wallet_halt(pid: str, kind: str, reason: str) -> bool:
+    """Persist a HARD halt for one class of keeper action (e.g. `topup`). Durable
+    and deliberately sticky: only an operator clears it (`wallet_clear_halt`)."""
+    if wallet_halted(pid, kind):
+        return True
+    try:
+        now = int(time.time())
+        with _get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO wallet_ops (ts, pid, op, reason, outcome, updated_at)"
+                " VALUES (%s,%s,%s,%s,'halted',%s)",
+                (now, pid, f"halt:{kind}", str(reason)[:2000], now))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_halt failed: %s", exc)
+        return False
+
+
+def wallet_halted(pid: str, kind: str) -> bool:
+    """Is this class of keeper action hard-halted? Fail-soft to TRUE — an
+    unreadable store must stop the keeper, never silently un-halt it."""
+    try:
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM wallet_ops WHERE pid=%s AND op=%s"
+                " AND outcome='halted' LIMIT 1", (pid, f"halt:{kind}")).fetchone()
+        return row is not None
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_halted failed (treating as halted): %s", exc)
+        return True
+
+
+def wallet_clear_halt(pid: str, kind: str) -> bool:
+    """Operator reset of a hard halt (also the test hook). Not called by the
+    keeper — a breaker that re-arms itself is not a breaker."""
+    try:
+        with _get_pool().connection() as conn:
+            conn.execute("DELETE FROM wallet_ops WHERE pid=%s AND op=%s"
+                         " AND outcome='halted'", (pid, f"halt:{kind}"))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_clear_halt failed: %s", exc)
+        return False
+
+
 # ---- provider_prices (direct-provider list prices; written by sources/official_pricing) ----
 
 _PROVIDER_PRICE_FIELDS = ("provider_id", "model_family", "price_in",
@@ -1500,4 +1750,4 @@ def truncate_all_for_tests() -> None:
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
                      " consumer_keys, consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
-                     " login_history, provider_prices")
+                     " login_history, provider_prices, wallet_ops")

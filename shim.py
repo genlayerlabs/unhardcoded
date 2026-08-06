@@ -548,12 +548,16 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         disabled providers, EMA metrics (incl. live prices), source freshness
         and balances. Internal — the ingress proxy hides /x/* from consumer
         callers and fetches this server-side."""
+        import host_store as _host_store
         import sources as _sources
+        import wallet_keeper as _wallet_keeper
         state = host.dump_state() or {}
         balances: dict = {}
         sources_view: dict = {}
         for name, s in _sources.SOURCE_STATE.items():
             balances.update(s.get("balances") or {})
+            # `stats` rides along here (offers kept/suppressed, wallet_health);
+            # only the bulky per-row views are stripped.
             sources_view[name] = {k: v for k, v in s.items()
                                   if k not in ("balances", "book")}
         return {
@@ -563,6 +567,11 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             "ema_metrics": state.get("ema_metrics") or {},
             "balances": balances,
             "sources": sources_view,
+            # The autonomous funding loop's last decision per buyer proxy, plus
+            # its recent wallet ops — the audit trail for money the router moved
+            # on its own. Read-only.
+            "keeper": dict(_wallet_keeper.KEEPER_STATE),
+            "wallet_ops": _host_store.wallet_ops_recent(limit=20),
         }
 
     @app.get("/x/market")
