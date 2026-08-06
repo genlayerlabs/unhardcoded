@@ -1,0 +1,93 @@
+name: ci
+
+# Pre-merge gate. Until this existed the repo had NO pre-merge checks at all —
+# notify-ci.yml fires on push to main (i.e. after the merge button) and only
+# dispatches to the private CI repo. The consequence was not theoretical:
+# tests/test_antseed_node.py sat red for a month across #63/#68/#69/#70/#71,
+# each PR body noting "1 pre-existing failure", and every one merged.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: test
+          # UTF8 explicitly: a SQL_ASCII cluster makes psycopg return TEXT as
+          # bytes, settings.reload() then silently drops every override and ~26
+          # store-backed tests fail for a reason that looks like application code.
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+          POSTGRES_DB: hoststore_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:test@localhost:5432/hoststore_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The Lua policy core is a submodule; without it the engine-backed
+          # tests import nothing and the suite is quietly meaningless.
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"      # matches Dockerfile's python:3.12-slim
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"          # tests/test_antseed_node.py shells out to `node --test`
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: python -m pytest tests -q
+
+  core-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - run: sudo apt-get update && sudo apt-get install -y lua5.4
+      - name: Policy core unit + golden conformance
+        working-directory: core
+        run: lua tests/run_lua.lua
+
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+
+      - run: docker build -f Dockerfile -t unhardcoded:ci .
+      - run: docker build -f Dockerfile.antseed -t unhardcoded-antseed:ci .
+
+      # The check that would have caught #95. A passing test suite proves the
+      # REPO is consistent; it says nothing about what the COPY actually put in
+      # the image. control.js gained require('./ids.js') while the Dockerfile
+      # still named files individually — build succeeded, tests stayed green,
+      # and the sidecar's control server died at import in prod with every
+      # wallet endpoint 502ing. Importing each shipped module inside the built
+      # image is the only place that divergence is observable.
+      - name: Every shipped sidecar module resolves its imports inside the image
+        run: |
+          docker run --rm \
+            -v "$PWD/scripts/check_sidecar_modules.js:/tmp/check.js:ro" \
+            --entrypoint node unhardcoded-antseed:ci /tmp/check.js
+
+      - name: Router image starts and serves /healthz
+        run: |
+          docker run -d --name router-ci -p 18080:18080 --entrypoint sh unhardcoded:ci -c \
+            "python serve.py --config config.live.lua --metrics metrics.live.lua \
+             --default-profile default --host 0.0.0.0 --port 18080" || true
+          for i in $(seq 1 30); do
+            if curl -fsS localhost:18080/healthz >/dev/null 2>&1; then echo "router up"; exit 0; fi
+            sleep 2
+          done
+          echo "router did not become healthy"; docker logs router-ci | tail -40; exit 1
