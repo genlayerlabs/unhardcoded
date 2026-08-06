@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -31,25 +32,100 @@ STALE_AFTER_S = 900
 # exists to prevent. Surfaced as `wallet_health` on the source stats.
 WEDGE_CONSECUTIVE_FAILURES = 10
 
-# Vendor prefixes stripped (as a whole leading token) when canonicalizing a
-# marketplace service name to match curated families. `claude-` is included so a
-# curated `claude-opus-4-8` and a peer's bare `opus-4.8` reduce to the same form.
-_VENDOR_PREFIXES = ("anthropic-", "claude-", "openai-", "google-", "gemini-",
-                    "meta-", "qwen-", "x-ai-", "deepseek-")
+# How many unbound wire names snapshot_stats() ranks. The point of the list is a
+# curation QUEUE an operator works top-down, not an inventory.
+UNBOUND_TOP_N = 20
+
+# Leading vendor token -> the ONE vendor it names. `claude`/`anthropic` and
+# `gemini`/`google` are the same vendor spelled two ways, so an `anthropic-`
+# prefixed wire name still reaches a `claude-` prefixed curated family — while a
+# peer that names a DIFFERENT vendor than the family's own can never reach it.
+# Only brand tokens belong here: a token that is also the head of a real model
+# name (`gemma`, `mistral`) would leave a residue like `large` that is far too
+# generic to be a safe route target.
+_VENDOR_PREFIXES: dict[str, str] = {
+    "anthropic": "anthropic", "claude": "anthropic",
+    "google": "google", "gemini": "google",
+    "openai": "openai",
+    "meta": "meta", "meta-llama": "meta",
+    "qwen": "qwen",
+    "x-ai": "x-ai", "xai": "x-ai",
+    "deepseek": "deepseek",
+    "moonshot": "moonshot", "moonshotai": "moonshot",
+    "z-ai": "z-ai",
+    "minimax": "minimax",
+    "mistralai": "mistral",
+}
+# longest first, so `meta-llama-…` is not read as `meta-` + `llama-…`
+_VENDOR_TOKENS = tuple(sorted(_VENDOR_PREFIXES, key=len, reverse=True))
+
+# Serving-MODE markers: the same weights behind a different serving switch. Each
+# gets its OWN family (`glm-5.1:web` -> `glm-5.1@web`) and is never folded into the
+# base — folding would silently land an existing `family_eq("glm-5.1")` policy on
+# the web-search product. Checked once, longest-first where they overlap
+# (`-non-thinking` before `-thinking`).
+#
+# NEVER listed here, deliberately: `-uncensored` and `-it` are different WEIGHTS,
+# not a serving mode (and prod policies name `gemma-4-31b-it` *with* the suffix),
+# and a bare `-p` has no known meaning — a one-letter rule would eat real name
+# segments. Those stay separate families; see the tests that pin them.
+_VARIANT_SUFFIXES = (
+    (":web", "web"), ("@web", "web"),
+    ("-non-thinking", "non-thinking"),
+    ("-thinking", "thinking"),
+    ("-fast", "fast"),
+)
+_VARIANT_PREFIXES = (("e2ee-", "e2ee"),)
 
 
 def _canon_service(name: str) -> str:
-    """Canonical form for matching a peer's wire model name to a curated family:
-    lowercase, dots->dashes, and strip ONE leading known vendor prefix. Kept
-    deliberately conservative — it bridges `opus-4.8` / `anthropic-claude-opus-4.8`
-    to `claude-opus-4-8`, but does NOT merge digit-run differences (`gpt-55` vs
-    `gpt-5.5`) or model variants (`...-fast`), so it cannot collapse two distinct
-    models into one route."""
-    s = (name or "").strip().lower().replace(".", "-")
-    for vp in _VENDOR_PREFIXES:
-        if s.startswith(vp):
-            return s[len(vp):]
-    return s
+    """Canonical key for a model name: lowercase, with every run of non-alphanumerics
+    folded to a single `-`. The same shape as sources/bedrock.py's `_norm`, so
+    `Anthropic/Claude-Opus-4.8`, `anthropic:claude_opus_4.8` and
+    `anthropic-claude-opus-4-8` are one key.
+
+    Separators are FOLDED, never REMOVED: `gpt55` and `gpt-5.5` canonicalize to
+    `gpt55` and `gpt-5-5`, two different models, and stay that way. It also does
+    NOT bridge a letter/digit boundary (`gemma4-31b` vs `gemma-4-31b`) — that is an
+    operator `service_aliases` decision, not something to guess.
+
+    Note what this no longer does: it does not strip vendor prefixes. Stripping on
+    BOTH sides is what used to file `deepseek-v4-pro` under the vendor-free residue
+    `v4-pro`, where a peer's `x-ai-v4-pro` matched it — silent cross-vendor routing.
+    Vendor handling now lives in `_split_vendor` + the two-layer family index."""
+    return re.sub(r"[^a-z0-9]+", "-", str(name or "").lower()).strip("-")
+
+
+def _squash(name: str) -> str:
+    """Every separator REMOVED (`gemma4-31b` and `gemma-4-31b` -> `gemma431b`).
+    Strictly an advisory key for the `near_miss` curation hint — never for binding,
+    because it also collapses `gpt55` onto `gpt-5.5`, which is the merge
+    `_canon_service` exists to prevent."""
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+
+
+def _split_vendor(canon: str) -> tuple[str | None, str]:
+    """(vendor, remainder) for a canonical name carrying a leading vendor token,
+    else (None, canon) — the peer made no vendor claim we could contradict."""
+    for token in _VENDOR_TOKENS:
+        if canon.startswith(token + "-"):
+            return _VENDOR_PREFIXES[token], canon[len(token) + 1:]
+    return None, canon
+
+
+def _split_variant(name: str) -> tuple[str, str | None]:
+    """(base, variant) for a wire name carrying a serving-mode marker, else
+    (name, None). Runs on the RAW lowercased name so `:web` is still visible —
+    `_canon_service` would have folded the colon into a dash. At most ONE marker is
+    taken off; a peer stacking two (`e2ee-glm-5.1:web`) keeps the outer one."""
+    s = (name or "").strip().lower()
+    for suffix, variant in _VARIANT_SUFFIXES:
+        if s.endswith(suffix) and len(s) > len(suffix):
+            return s[: -len(suffix)], variant
+    for prefix, variant in _VARIANT_PREFIXES:
+        if s.startswith(prefix) and len(s) > len(prefix):
+            return s[len(prefix):], variant
+    return s, None
 
 # Buyer hot-wallet on-chain reads. The marketplace spends from ESCROW
 # (depositsAvailable); the raw wallet balance — USDC sitting in the wallet, plus
@@ -135,6 +211,22 @@ class AntSeedSource:
         self.provider_ids = list(self._providers)
         self._stats: dict[str, Any] = {"stale": False, "suppressed_no_funds": 0,
                                        "wallet_health": "unknown"}
+        # optional live model-metadata oracle for UNCURATED names (bind_trait_source)
+        self._trait_source: Any = None
+
+    def bind_trait_source(self, source: Any) -> None:
+        """Hand this source a live model-metadata oracle: any source exposing
+        `live_offers()` rows with `model_family` / `wire_model_id` /
+        `capabilities.context` / `traits` — in practice sources/openrouter, whose
+        live /models snapshot covers most of what AntSeed peers resell.
+
+        AntSeed rows carry NO model metadata of their own, so without this an
+        uncurated peer service has no `context` and the core rejects it for any
+        `min_context` request (core/llm_policy/filter.lua). Wired at the
+        composition root (providers.build_source_registry), never imported across
+        sources — `sources/*` stay leaves."""
+        self._trait_source = source
+        self._trait_index_cache = None
 
     # ---- market parsing -------------------------------------------------
 
@@ -158,45 +250,220 @@ class AntSeedSource:
         data = host_store.buyer_status(provider_id)
         return (data or {}).get("pinned_peer_id") or None
 
-    def _canon_models(self) -> dict[str, str]:
-        """Lazy {canonical_name -> curated family} index over self._models, so a
-        peer that names a curated model with a different vendor prefix / separator
-        (e.g. `opus-4.8`, `anthropic-claude-sonnet-4.6`) still folds into the
-        curated family instead of being exposed under its raw wire name. A
-        canonical form shared by TWO curated families is AMBIGUOUS and dropped —
-        never risk routing to the wrong model; the offer falls through to raw."""
+    def _canon_models(self) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
+        """Lazy (exact, bare) family index over self._models, built once.
+
+        `exact` files every curated family under its OWN canonical name
+        (`claude-opus-4-8` -> `claude-opus-4-8`). Nothing is stripped here: a
+        vendor-stripped INDEX is what created the cross-vendor mis-binds, because
+        it exposed `v4-pro` / `fable-5` / `sonnet-4-6` as vendor-free keys any
+        prefixed wire name could reach after its own prefix came off.
+
+        `bare` files the vendor-carrying families a SECOND time under their
+        vendor-stripped residue, together with that vendor
+        (`claude-opus-4-8` -> ("claude-opus-4-8", "anthropic")). It is consulted
+        only for a wire name that claims no vendor, or the same one — so a peer's
+        bare `opus-4.8` still reaches `claude-opus-4-8`, while `meta-opus-4-8`
+        never does. A residue starting with a digit (`gemini-3.1-pro-preview` ->
+        `3-1-pro-preview`) is skipped: a bare version number names no model.
+
+        A canonical form shared by TWO curated families is AMBIGUOUS and dropped
+        from that layer — never risk routing to the wrong model; the offer falls
+        through to its raw wire name. The drop is LOUD (WARN + `_stats`
+        `ambiguous`): catalog growth silently unbinding a family that worked
+        yesterday is exactly the failure this index exists to prevent."""
         cached = getattr(self, "_canon_models_cache", None)
-        if cached is None:
-            index: dict[str, str] = {}
-            ambiguous: set[str] = set()
-            for fam in self._models:
-                c = _canon_service(fam)
-                if c in index and index[c] != fam:
-                    ambiguous.add(c)
-                index[c] = fam
-            for c in ambiguous:
-                index.pop(c, None)
-            cached = self._canon_models_cache = index
+        if cached is not None:
+            return cached
+
+        # key -> the families claiming it, collected per layer so an ambiguous
+        # residue never costs a family its own unambiguous exact key.
+        exact_claims: dict[str, set[str]] = {}
+        bare_claims: dict[str, set[str]] = {}
+        bare_vendor: dict[str, str] = {}
+        for fam in sorted(self._models):
+            canon = _canon_service(fam)
+            exact_claims.setdefault(canon, set()).add(fam)
+            vendor, residue = _split_vendor(canon)
+            if vendor and residue and not residue[0].isdigit():
+                bare_claims.setdefault(residue, set()).add(fam)
+                bare_vendor[residue] = vendor
+
+        ambiguous: set[str] = set()
+
+        def resolve(layer: str, claims: dict[str, set[str]]) -> dict[str, str]:
+            out: dict[str, str] = {}
+            for key, families in claims.items():
+                if len(families) == 1:
+                    out[key] = next(iter(families))
+                    continue
+                ambiguous.add(key)
+                _log.warning(
+                    "antseed: catalog families %s share the %s index key %r — "
+                    "dropped, so peers advertising that name stay UNBOUND. Rename "
+                    "one family or add a service_aliases entry.",
+                    sorted(families), layer, key)
+            return out
+
+        exact = resolve("exact", exact_claims)
+        bare = {key: (fam, bare_vendor[key])
+                for key, fam in resolve("bare", bare_claims).items()}
+        self._stats["ambiguous"] = sorted(ambiguous)
+
+        cached = self._canon_models_cache = (exact, bare)
         return cached
 
-    def _family_for(self, provider_cfg: dict, service: str) -> str | None:
-        # Exact wire name and the operator's static aliases are authoritative.
-        aliases = provider_cfg.get("service_aliases") or {}
-        family = aliases.get(service, service)
-        if family in self._models:
+    def _match_curated(self, aliases: dict, name: str) -> str | None:
+        """The curated family a wire name denotes, or None. Ordered strongest
+        evidence first: the operator's alias, the exact catalog key, the canonical
+        form, and only then a vendor-aware match."""
+        alias = aliases.get(name)
+        if alias is not None and alias in self._models:
+            return alias
+        if name in self._models:
+            return name
+        exact, bare = self._canon_models()
+        canon = _canon_service(name)
+        family = exact.get(canon)
+        if family is not None:
             return family
-        # Conservative canonical match (vendor-prefix + separator/case only): a
-        # peer's `opus-4.8` reaches the curated `claude-opus-4-8`. None on no/
-        # ambiguous match, so the caller keeps exposing the service raw.
-        return self._canon_models().get(_canon_service(service))
+        vendor, residue = _split_vendor(canon)
+        if vendor is None:
+            # No vendor claimed -> the vendor-free residue index may answer:
+            # `opus-4.8` reaches `claude-opus-4-8`, unambiguously by construction.
+            hit = bare.get(canon)
+            return hit[0] if hit is not None else None
+        # A vendor WAS claimed. The remainder may spell the family in full
+        # (`anthropic-` + `claude-opus-4-8`, the double-prefix form), or name the
+        # residue of a family belonging to the SAME vendor. A family whose own
+        # name carries no vendor token makes no claim to contradict, so it stays
+        # reachable (`google-gemma-3-27b` -> `gemma-3-27b`); one that does must
+        # agree, which is what keeps `x-ai-v4-pro` off `deepseek-v4-pro`.
+        family = exact.get(residue)
+        if family is not None:
+            fam_vendor, _ = _split_vendor(_canon_service(family))
+            if fam_vendor is None or fam_vendor == vendor:
+                return family
+            return None
+        hit = bare.get(residue)
+        if hit is not None and hit[1] == vendor:
+            return hit[0]
+        return None
+
+    def _bind(self, provider_cfg: dict, service: str) -> dict | None:
+        """Resolve a peer's wire model name to a routable family:
+        {family, base_family, variant}, or None when nothing curated matches (the
+        caller then exposes the service under its raw wire name).
+
+        A serving-mode variant of a curated family gets its own `<base>@<variant>`
+        family rather than being merged into the base. `family_eq` is an exact
+        string compare (core/llm_policy/filter.lua), so this leaves every existing
+        policy semantically untouched while unifying all spellings of a variant
+        (`glm-5.1:web`, `glm-5.1@web`) into ONE reachable family — and it needs no
+        core change, since a family name is free text to the engine."""
+        aliases = provider_cfg.get("service_aliases") or {}
+        family = self._match_curated(aliases, service)
+        if family is not None:
+            return {"family": family, "base_family": family, "variant": None}
+        base, variant = _split_variant(service)
+        if variant is None:
+            return None
+        # Only a CURATED base earns an `@variant` family: that keeps every variant
+        # anchored to a real family whose capabilities it can inherit, and leaves
+        # uncurated names exposed under their raw wire name as before.
+        family = self._match_curated(aliases, base)
+        if family is None:
+            return None
+        return {"family": f"{family}@{variant}", "base_family": family,
+                "variant": variant}
+
+    def _family_for(self, provider_cfg: dict, service: str) -> str | None:
+        """The policy-facing family for a wire name (see `_bind`), or None."""
+        bound = self._bind(provider_cfg, service)
+        return bound["family"] if bound is not None else None
+
+    # ---- model metadata ---------------------------------------------------
+
+    def _trait_index(self) -> dict[str, dict]:
+        """{canonical model name -> {"context", "traits"}} over the bound trait
+        oracle's live catalog, keyed by BOTH the oracle's policy family and its
+        wire id so either spelling a peer uses lands. Rebuilt only when the oracle
+        publishes a new snapshot list (it replaces the list per refresh), so the
+        join stays off the per-rank path. First entry wins: a later duplicate is
+        the same model under another vendor scope."""
+        if self._trait_source is None:
+            return {}
+        offers = self._trait_source.live_offers()
+        cached = getattr(self, "_trait_index_cache", None)
+        if cached is not None and cached[0] is offers:
+            return cached[1]
+        index: dict[str, dict] = {}
+        for offer in offers:
+            ctx = (offer.get("capabilities") or {}).get("context")
+            meta = {"context": ctx, "traits": offer.get("traits") or {}}
+            for name in (offer.get("model_family"), offer.get("wire_model_id")):
+                key = _canon_service(name) if name else ""
+                if key and key not in index:
+                    index[key] = meta
+        self._trait_index_cache = (offers, index)
+        return index
+
+    def _model_meta(self, row: dict) -> dict:
+        """{capabilities, quality_hint, traits} for one market row.
+
+        A curated family — or the curated BASE of an `@variant` — hands over its
+        capabilities and quality hint. A variant inherits BOTH because the markers
+        `_split_variant` recognises are serving-mode switches on the same weights
+        (that is exactly why `-uncensored` and `-it` are excluded from them):
+        context and tool/json support are architecture, and withholding the
+        quality hint would silently fail every `min_quality` request
+        (core/llm_policy/filter.lua) — the same class of bug as a missing context.
+
+        A genuinely uncurated name gets what the live trait oracle can prove and
+        nothing more. An absent context stays ABSENT: inventing one to clear a
+        `min_context` gate would route a prompt to a model that silently truncates
+        it."""
+        base = row.get("base_family")
+        model = self._models.get(base) if base else None
+        if model:
+            return {"capabilities": dict(model.get("capabilities") or {}),
+                    "quality_hint": model.get("static_quality_hint"),
+                    "traits": None}
+        meta = self._trait_index().get(_canon_service(row["service"]))
+        if meta is None:
+            return {"capabilities": {}, "quality_hint": None, "traits": None}
+        caps = {"context": int(meta["context"])} if meta["context"] else {}
+        return {"capabilities": caps, "quality_hint": None,
+                "traits": meta["traits"] or None}
+
+    def _unbound_top(self, sellers: dict[str, set[str]]) -> list[dict]:
+        """The unbound wire names ranked by DISTINCT sellers — "161 unbound" turned
+        into a curation queue an operator works top-down. `near_miss` names the
+        curated family the wire name would reach if someone added one alias: the
+        family it matches once every separator is removed (`gemma4-31b` vs
+        `gemma-4-31b`). Deliberately looser than the binding rule, which never
+        removes separators — so it also flags `gpt55` against `gpt-5.5`. That is
+        the point: a near miss is a question for an operator, never a route."""
+        squashed = getattr(self, "_squashed_models_cache", None)
+        if squashed is None:
+            squashed = self._squashed_models_cache = {}
+            for fam in sorted(self._models):
+                squashed.setdefault(_squash(fam), fam)
+        ranked = sorted(sellers.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        out = []
+        for service, peers in ranked[:UNBOUND_TOP_N]:
+            base, _variant = _split_variant(service)
+            out.append({"service": service, "sellers": len(peers),
+                        "near_miss": squashed.get(_squash(base))})
+        return out
 
     def offers_sync(self, provider_id: str) -> list[dict]:
         """One offer per advertised service for this buyer proxy — the WHOLE
-        market, not just curated families. A service that maps to a curated
-        family carries that family's benchmark/capabilities; every other
-        service is exposed under its raw wire name (no benchmark → it scores on
-        price + learned latency, never dropped). Sync: called from the core's
-        discover hook inside rank."""
+        market, not just curated families. A service that maps to a curated family
+        (directly, or as `<family>@<variant>`) carries that family's
+        benchmark/capabilities; every other service is exposed under its raw wire
+        name, carrying whatever the live trait oracle can prove about it and never
+        dropped. Sync: called from the core's discover hook inside rank."""
         cfg = self._providers.get(provider_id)
         if cfg is None:
             return []
@@ -234,6 +501,8 @@ class AntSeedSource:
         rejected_by_buyer = 0
         rejected_by_reputation = 0
         denied = 0
+        # unbound wire name -> the distinct peers selling it (the curation queue)
+        unbound: dict[str, set[str]] = {}
         # family -> rows, one per advertising peer
         by_family: dict[str, list[dict]] = {}
         for row in self._load_market():
@@ -270,12 +539,14 @@ class AntSeedSource:
                 # family, killing it). Drop it to mirror the buyer's admission.
                 rejected_by_buyer += 1
                 continue
-            family = self._family_for(cfg, row["service"])
-            if family is None:
+            bound = self._bind(cfg, row["service"])
+            if bound is None:
                 # expose every advertised service, not only curated ones.
-                family = row["service"]
+                bound = {"family": row["service"], "base_family": None,
+                         "variant": None}
                 uncurated += 1
-            by_family.setdefault(family, []).append({**row, "family": family})
+                unbound.setdefault(row["service"], set()).add(row["peer_id"])
+            by_family.setdefault(bound["family"], []).append({**row, **bound})
         # Surface the OFFERS_TOP_N cheapest *distinct peers* per family as separate
         # routable offers (not just the single cheapest), so the router can rotate
         # to another seller via next_candidate when the cheapest is broken.
@@ -296,6 +567,8 @@ class AntSeedSource:
         self._stats["rejected_by_reputation"] = rejected_by_reputation
         self._stats["denied"] = denied
         self._stats["offers"] = len(kept_rows)
+        # WHICH names are unbound, ranked — a count alone can't be curated against.
+        self._stats["unbound_top"] = self._unbound_top(unbound)
         # #4a/#4c: reliability + latency + learned tool-incapability are derived on
         # the fly from route_observations (one query each per offers_sync, not per
         # candidate), keyed by route identity.
@@ -304,7 +577,10 @@ class AntSeedSource:
         offers = []
         for row in kept_rows:
             family = row["family"]
-            model = self._models.get(family) or {}
+            # Curated family, curated BASE of an `@variant`, or — for a genuinely
+            # uncurated name — whatever the live trait oracle can prove. Never a
+            # guess: an unknown context stays unset (see _model_meta).
+            meta = self._model_meta(row)
             rkey = _route_reliability.route_key(provider_id, family, row["peer_id"])
             rstat = stats.get(rkey) or {}
             # AntSeed rows carry no capability data, so supports_tools defaults to
@@ -317,14 +593,23 @@ class AntSeedSource:
             # still serves non-tool requests. The learned-incapable verdict overrides
             # even a curated claim (the peer is the ground truth); everything else
             # (json_mode, curated caps) is unchanged.
-            caps = {"supports_json_mode": True, **(model.get("capabilities") or {})}
+            caps = {"supports_json_mode": True, **meta["capabilities"]}
             if rkey not in incapable:
                 caps.setdefault("supports_tools", True)
             else:
                 caps.pop("supports_tools", None)
             offers.append({
                 "model_family": family,
-                "quality_hint": model.get("static_quality_hint"),
+                # the curated family this offer resolved to — `model_family`
+                # itself for a plain match, the base for a `<base>@<variant>`, and
+                # None when nothing curated matched. Stamped so a policy can opt
+                # into variants later without re-deriving the mapping.
+                "base_family": row.get("base_family"),
+                "quality_hint": meta["quality_hint"],
+                # live model traits for an uncurated family, read pointwise by the
+                # algebra's mfield fallback (config.live.lua). None when nothing
+                # authoritative was found — never a placeholder.
+                "traits": meta["traits"],
                 "wire_model_id": row["service"],
                 "seller_endpoint": cfg.get("base_url"),
                 "price_in_usd_per_mtok": row["price_in"],
@@ -353,6 +638,10 @@ class AntSeedSource:
         return offers
 
     def snapshot_stats(self) -> dict:
+        # Build the family index if no poll has yet, so the ambiguity audit (a
+        # family silently unbound by a catalog name collision) is always reported,
+        # not only once the market has been read.
+        self._canon_models()
         return dict(self._stats)
 
     def _refresh_wallet_health(self) -> str:

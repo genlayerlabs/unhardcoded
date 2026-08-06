@@ -131,6 +131,24 @@ def test_build_source_registry_adds_bedrock_source():
     assert [s.name for s in reg] == ["bedrock"]
 
 
+def test_build_source_registry_hands_antseed_the_openrouter_trait_oracle():
+    # AntSeed rows carry no model metadata, so an uncurated peer service would have
+    # no context and the core would reject it for any min_context request. The
+    # composition root is where the two sources meet — `sources/*` never import
+    # one another.
+    cat = {"providers": {
+        "openrouter": {},
+        "antseed": {"discovery": "marketplace", "discovery_id": "antseed"},
+    }, "models": {}}
+    by_name = {s.name: s for s in providers.build_source_registry(cat)}
+    assert by_name["antseed"]._trait_source is by_name["openrouter"]
+    # ...and AntSeed alone stays wired to nothing rather than half-wired
+    antseed_only = providers.build_source_registry({"providers": {
+        "antseed": {"discovery": "marketplace", "discovery_id": "antseed"}},
+        "models": {}})
+    assert antseed_only[0]._trait_source is None
+
+
 # ---- openrouter source ----------------------------------------------------
 
 OR_MODELS_BODY = {
@@ -894,16 +912,57 @@ def test_antseed_pricing_rows_match_offers(tmp_path):
     assert ("antseed_cheap", "claude-sonnet-4-6") in rows
 
 
-def test_canon_service_is_conservative():
+def test_canon_service_folds_separators_but_never_removes_them():
     from sources.antseed import _canon_service
-    assert _canon_service("opus-4.8") == "opus-4-8"            # dots -> dashes
-    assert _canon_service("claude-opus-4-8") == "opus-4-8"     # strip vendor prefix
-    assert _canon_service("OpenAI-GPT-OSS-120B") == "gpt-oss-120b"  # case + prefix
-    assert _canon_service("gpt-5.5") == "gpt-5-5"              # no vendor prefix
-    # does NOT bridge digit-run differences -> stays distinct from gpt-5-5
-    assert _canon_service("gpt-55") == "gpt-55"
-    # strips only ONE leading prefix (real peers use a single form)
-    assert _canon_service("anthropic-claude-sonnet-4.6") == "claude-sonnet-4-6"
+    # every run of non-alphanumerics -> a single dash; case folded
+    assert _canon_service("opus-4.8") == "opus-4-8"
+    assert _canon_service("Anthropic/Claude_Opus-4.8") == "anthropic-claude-opus-4-8"
+    assert _canon_service("OpenAI-GPT-OSS-120B") == "openai-gpt-oss-120b"
+    # separators are FOLDED, not REMOVED: a digit-run difference survives, so
+    # `gpt55` can never become `gpt-5.5`
+    assert _canon_service("gpt-5.5") == "gpt-5-5"
+    assert _canon_service("gpt55") == "gpt55"
+    # and it no longer strips vendors — that is what used to file a curated
+    # family under a vendor-free residue any other vendor could reach
+    assert _canon_service("claude-opus-4-8") == "claude-opus-4-8"
+    assert _canon_service("deepseek-v4-pro") == "deepseek-v4-pro"
+
+
+# The four cross-vendor mis-binds observed against the live catalog: each wire
+# name reached a curated family belonging to a DIFFERENT vendor, because the
+# family was indexed under its vendor-stripped residue. Silent wrong-model
+# routing — the peer's own vendor token must veto the match.
+CROSS_VENDOR_MISBINDS = [
+    ("x-ai-v4-pro", "deepseek-v4-pro"),
+    ("openai-fable-5", "claude-fable-5"),
+    ("google-sonnet-4-6", "claude-sonnet-4-6"),
+    ("meta-opus-4-8", "claude-opus-4-8"),
+]
+
+
+@pytest.mark.parametrize("wire,used_to_bind", CROSS_VENDOR_MISBINDS)
+def test_family_for_refuses_cross_vendor_wire_name(wire, used_to_bind):
+    from sources.antseed import AntSeedSource
+    cat = {
+        "providers": {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}},
+        "models": {fam: {"served_by": [], "capabilities": {}}
+                   for _w, fam in CROSS_VENDOR_MISBINDS},
+    }
+    s = AntSeedSource(cat)
+    assert used_to_bind in cat["models"], "the family it wrongly reached is curated"
+    assert s._family_for(cat["providers"]["antseed"], wire) is None
+
+
+def test_family_for_binds_double_prefixed_wire_name():
+    # The form the old docstring CLAIMED to bridge and did not: stripping one
+    # vendor off the wire name left `claude-opus-4-8`, but the index key was the
+    # doubly-stripped `opus-4-8`. Now the index keeps the family's own name, so a
+    # single strip lands exactly.
+    from sources.antseed import AntSeedSource
+    s = AntSeedSource(ANTSEED_CATALOG)
+    cfg = ANTSEED_CATALOG["providers"]["antseed_cheap"]
+    assert s._family_for(cfg, "anthropic-claude-sonnet-4.6") == "claude-sonnet-4-6"
+    assert s._family_for(cfg, "anthropic/claude-sonnet-4.6") == "claude-sonnet-4-6"
 
 
 def test_family_for_canonicalizes_vendor_prefix_and_separators():
@@ -914,26 +973,134 @@ def test_family_for_canonicalizes_vendor_prefix_and_separators():
     cfg = ANTSEED_CATALOG["providers"]["antseed_cheap"]
     assert s._family_for(cfg, "sonnet-4.6") == "claude-sonnet-4-6"        # bare + dotted
     assert s._family_for(cfg, "claude-sonnet-4-6") == "claude-sonnet-4-6"  # exact
+    assert s._family_for(cfg, "Claude_Sonnet-4.6") == "claude-sonnet-4-6"  # any separator
+    assert s._family_for(cfg, "anthropic-sonnet-4-6") == "claude-sonnet-4-6"  # same vendor
     assert s._family_for(cfg, "qwen3-235b-instruct") == "qwen3-235b-a22b"  # static alias wins
-    # never collapse a variant or an unknown into a curated family
-    assert s._family_for(cfg, "sonnet-4.6-fast") is None
     assert s._family_for(cfg, "some-unknown-model") is None
 
 
-def test_family_for_drops_ambiguous_canonical():
-    # Two curated families sharing a canonical form must NOT auto-match (it would
-    # risk routing to the wrong model); only an exact wire name still resolves.
+def test_family_for_drops_ambiguous_residue():
+    # Two curated families whose vendor-stripped residues collide must NOT
+    # auto-match a bare wire name (it would risk routing to the wrong model);
+    # each family's own full name still resolves exactly.
     from sources.antseed import AntSeedSource
     cat = {
         "providers": {"antseed_cheap": {"discovery": "marketplace",
                                         "discovery_id": "antseed_cheap"}},
         "models": {"claude-opus-4-8": {"served_by": []},
-                   "opus-4-8": {"served_by": []}},   # both canonicalize to "opus-4-8"
+                   "anthropic-opus-4-8": {"served_by": []}},  # both -> "opus-4-8"
     }
     s = AntSeedSource(cat)
     cfg = cat["providers"]["antseed_cheap"]
     assert s._family_for(cfg, "opus-4.8") is None                      # ambiguous -> raw
     assert s._family_for(cfg, "claude-opus-4-8") == "claude-opus-4-8"  # exact still ok
+    # and the drop is LOUD: a catalog that silently unbinds a working family is
+    # exactly what this has to surface
+    assert s.snapshot_stats()["ambiguous"] == ["opus-4-8"]
+
+
+def test_ambiguous_family_index_is_logged(caplog):
+    from sources.antseed import AntSeedSource
+    cat = {
+        "providers": {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}},
+        "models": {"claude-opus-4-8": {"served_by": []},
+                   "anthropic-opus-4-8": {"served_by": []}},
+    }
+    with caplog.at_level("WARNING", logger="sources.antseed"):
+        AntSeedSource(cat).snapshot_stats()
+    assert any("opus-4-8" in r.getMessage() and "UNBOUND" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_gpt55_never_merges_with_gpt_5_5():
+    # A removed separator would make these one model. They are two.
+    from sources.antseed import AntSeedSource
+    cat = {
+        "providers": {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}},
+        "models": {"gpt-5.5": {"served_by": [], "capabilities": {}}},
+    }
+    s = AntSeedSource(cat)
+    cfg = cat["providers"]["antseed"]
+    assert s._family_for(cfg, "gpt-5.5") == "gpt-5.5"
+    assert s._family_for(cfg, "gpt_5_5") == "gpt-5.5"
+    assert s._family_for(cfg, "gpt55") is None
+    assert s._family_for(cfg, "gpt-55") is None
+
+
+# Serving-MODE markers: same weights, different serving switch. Each earns its own
+# `<family>@<variant>` family — merging into the base would silently land an
+# existing family_eq("glm-5.1") policy on a different product.
+VARIANT_CASES = [
+    ("glm-5.1:web", "glm-5.1@web", "web"),
+    ("glm-5.1@web", "glm-5.1@web", "web"),
+    ("e2ee-glm-5.1", "glm-5.1@e2ee", "e2ee"),
+    ("glm-5.1-thinking", "glm-5.1@thinking", "thinking"),
+    ("glm-5.1-non-thinking", "glm-5.1@non-thinking", "non-thinking"),
+    ("claude-opus-4-8-fast", "claude-opus-4-8@fast", "fast"),
+    # a variant of a spelling that itself needs canonicalizing still lands
+    ("opus-4.8-fast", "claude-opus-4-8@fast", "fast"),
+    ("e2ee-anthropic/claude-opus-4.8", "claude-opus-4-8@e2ee", "e2ee"),
+]
+
+
+@pytest.fixture
+def variant_source():
+    from sources.antseed import AntSeedSource
+    cat = {
+        "providers": {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}},
+        "models": {
+            "glm-5.1": {"served_by": [], "capabilities": {"context": 200000},
+                        "static_quality_hint": 0.84},
+            "claude-opus-4-8": {"served_by": [], "capabilities": {"context": 200000},
+                                "static_quality_hint": 0.93},
+            "gemma-3-27b": {"served_by": [], "capabilities": {"context": 96000}},
+        },
+    }
+    return AntSeedSource(cat), cat["providers"]["antseed"]
+
+
+@pytest.mark.parametrize("wire,family,variant", VARIANT_CASES)
+def test_variant_gets_its_own_family_anchored_to_the_base(variant_source, wire,
+                                                          family, variant):
+    s, cfg = variant_source
+    assert s._bind(cfg, wire) == {"family": family,
+                                  "base_family": family.split("@")[0],
+                                  "variant": variant}
+
+
+# NEVER variant-stripped: `-uncensored` and `-it` are different WEIGHTS (a fold
+# would be a correctness AND a safety bug, and prod policies name `...-it` with the
+# suffix); `-p` has no known meaning and a one-letter rule would eat real segments.
+@pytest.mark.parametrize("wire", ["glm-5.1-uncensored", "gemma-3-27b-it",
+                                  "glm-5.1-p", "glm-5.1-instruct"])
+def test_never_folded_suffix_stays_its_own_family(variant_source, wire):
+    s, cfg = variant_source
+    assert s._bind(cfg, wire) is None, "must stay exposed under its raw wire name"
+
+
+def test_variant_of_an_uncurated_base_stays_raw(variant_source):
+    # `@variant` families are anchored to a CURATED base (that is what they inherit
+    # capabilities from). A variant of something uncurated is left raw, as before.
+    s, cfg = variant_source
+    assert s._bind(cfg, "e2ee-some-unknown-model") is None
+
+
+def test_letter_digit_boundary_is_left_to_an_alias(variant_source):
+    # `gemma4-31b` vs `gemma-4-31b` is a letter/digit boundary the canonicalizer
+    # deliberately does not bridge — guessing there is how `gpt55` would become
+    # `gpt-5.5`. The operator's service_aliases is the sanctioned bridge.
+    from sources.antseed import AntSeedSource
+    cat = {
+        "providers": {"antseed": {"discovery": "marketplace", "discovery_id": "antseed",
+                                  "service_aliases": {"gemma4-31b-it": "gemma-4-31b-it"}}},
+        "models": {"gemma-4-31b-it": {"served_by": [], "capabilities": {}}},
+    }
+    s = AntSeedSource(cat)
+    cfg = cat["providers"]["antseed"]
+    assert s._family_for(cfg, "gemma4-31b-it") == "gemma-4-31b-it"     # alias bridges it
+    assert s._family_for(cfg, "gemma4-31b") is None                    # nothing guesses
+    # and the alias reaches through a variant marker too
+    assert s._family_for(cfg, "gemma4-31b-it-fast") == "gemma-4-31b-it@fast"
 
 
 def test_antseed_drops_offer_when_cached_input_exceeds_input(tmp_path):
