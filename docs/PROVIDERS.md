@@ -106,9 +106,11 @@ docker compose --profile antseed up -d --build antseed
   - a **tourniquet** in `sources/antseed.py`: below
     `antseed.min_available_usdc` (1.1) the source stops offering AntSeed routes
     at all, rather than spending callers' requests on certain failures. It fails
-    OPEN — an unreadable buyer status is a read error, not an empty escrow — but
-    a status row older than 15 minutes is treated as no reading at all, since
-    the sidecar rewrites it every 60s.
+    OPEN — an unreadable buyer status is a read error, not an empty escrow — and
+    it does *not* bound the row's age, deliberately: the belt that does is the
+    envelope. A status row older than 15 minutes (the sidecar rewrites it every
+    60s) makes `balances()` publish **0** credits, which closes the envelope's
+    `credits >= 1.0` clause and takes AntSeed out of ranking anyway.
   - the **wallet keeper**, a loop in the router (the buyer identity + sqlite are
     on an RWO PVC bound to this pod, and the control server is pod-local) that
     reclaims stuck channels and then tops the escrow up. It **reclaims before it
@@ -133,18 +135,34 @@ docker compose --profile antseed up -d --build antseed
   - two deposits in a row that fail to raise the **escrow** (`depositsAvailable`
     *plus* `depositsReserved` — a deposit immediately reserved by an opening
     channel did arrive, it just moved one column right); and
-  - three in a row whose outcome could not be established at all. A deposit
-    whose HTTP call timed out, reset, or came back `502`/`504` is recorded
-    `unknown`, **counts against the daily cap and the cooldown**, and backs the
-    retry interval off exponentially. Only a response that proves the buyer CLI
-    never ran — a `400` from the amount validator, a `429` from the sidecar's
-    queue gate — is recorded `failed` and costs nothing.
+  - three in a row that could not be *completed*. A deposit whose HTTP call
+    timed out, reset, or came back `502`/`504` is recorded `unknown` and
+    **counts against the daily cap and the cooldown** — it may have put a
+    transaction on Base mainnet. A response that proves the buyer CLI never ran
+    (a `400` from the amount validator, a `401` after a token rotation, a `429`
+    from the sidecar's queue gate) is recorded `failed`: it consumes no cap and
+    no cooldown, but it is **not free** — it still counts toward this breaker
+    and still backs the retry interval off exponentially, or a misconfigured
+    endpoint would be retried every 60s forever.
+
+  Both halts are cleared by an operator via `POST /x/wallet/clear-halt`
+  (`{"kind": "topup"}` or `{"kind": "reclaim"}`); `GET /x/wallet/halts` shows
+  what is set and why. Nothing self-clears — a breaker that re-arms itself is
+  not a breaker — but a breaker with no reset is a trap, so there is a way back.
 
   Reclaim has its own cooldown (one challenge window) and its own breaker, and
   names the exact channels the sidecar may act on, so the per-cycle transaction
-  cap and the dust filter bind on-chain rather than only in the log line. A
+  cap and the dust filter bind on-chain rather than only in the log line. The
+  sidecar echoes back what it acted on and the keeper **verifies** it: router
+  and sidecar are separate images, and one that predates the channel-id list
+  would silently act on every eligible channel, so a mismatch halts reclaim. A
   top-up halt does **not** stop reclaim: it means "stop putting money in", and
   reclaim moves money the other way.
+
+  Dashboard-initiated deposits and withdrawals are ledgered too, under
+  `topup_manual` / `withdraw_manual` — same wallet, same CLI, same need for an
+  audit trail — but they do not consume the keeper's daily cap: two actors, two
+  budgets, one wallet.
 
   > **`ANTSEED_WALLET_RPC_URL=off` disables top-ups.** The hot-wallet floor is
   > checked against a public Base RPC read, and an *absent* read vetoes just as a

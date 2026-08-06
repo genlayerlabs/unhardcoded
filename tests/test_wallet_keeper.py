@@ -97,11 +97,27 @@ class _FakeControl(wk.WalletKeeper):
 
     async def _control_post(self, op, body, timeout):
         self.calls.append((op, body))
-        return self.responses.get(op, {"ok": True})
+        resp = dict(self.responses.get(op, {"ok": True}))
+        # A CURRENT sidecar echoes back the channels it acted on, and the keeper
+        # verifies that echo — router and sidecar are separate images, so one
+        # that predates the id list would ignore the selection and fire a
+        # transaction per eligible channel. `_LegacyControl` below is that one.
+        if body and body.get("ids") and "selected" not in resp:
+            resp["selected"] = list(body["ids"])
+        return resp
 
     @property
     def ops(self):
         return [op for op, _ in self.calls]
+
+
+class _LegacyControl(_FakeControl):
+    """A sidecar image that predates the channel-id list: it accepts the request
+    and acts on EVERY eligible channel, echoing nothing."""
+
+    async def _control_post(self, op, body, timeout):
+        self.calls.append((op, body))
+        return dict(self.responses.get(op, {"ok": True}))
 
 
 def _run(coro):
@@ -218,6 +234,22 @@ def test_a_STALE_buyer_status_stands_the_keeper_down(caplog):
     assert out["decision"] == "status_stale"
     assert k.calls == [], "no money moves on a row nobody is writing"
     assert "is the sidecar alive?" in caplog.text
+
+
+def test_a_FUTURE_dated_status_row_is_not_fresh_forever():
+    """`fetched_at` is the SIDECAR's clock. Clamping any future stamp to "age 0"
+    made such a row pass `age <= bound` forever — a never-expiring signal, which
+    is the exact thing the bound exists to remove. A little skew between two
+    containers is still tolerated."""
+    seed_buyer_status(PID, deposits_available="0.5", deposits_reserved="20.0")
+    _age_status(PID, -wk.CLOCK_SKEW_ALLOWANCE_S + 30)          # mild skew: fine
+    k = _FakeControl()
+    assert _run(k.cycle_provider(PID, _knobs()))["decision"] == "acted"
+
+    before = len(k.calls)
+    _age_status(PID, -(wk.CLOCK_SKEW_ALLOWANCE_S + 3600))      # an hour ahead
+    assert _run(k.cycle_provider(PID, _knobs()))["decision"] == "status_stale"
+    assert len(k.calls) == before, "nothing further reached the control plane"
 
 
 def test_a_status_row_with_no_write_stamp_is_treated_as_stale():
@@ -606,6 +638,39 @@ def test_a_success_is_attempted_even_if_the_sidecar_omits_the_field(monkeypatch)
     assert resp["ok"] is True and resp["attempted"] is True
 
 
+def test_a_200_with_an_UNREADABLE_body_is_not_a_success(monkeypatch):
+    # The sidecar always answers JSON, so a 200 carrying something else is
+    # something else answering — a proxy error page, a truncated response. It
+    # used to default to ok:True and be recorded `fired`: a deposit marked
+    # successful on no evidence whatsoever.
+    k = wk.WalletKeeper([PID])
+    _post_returning(monkeypatch, _Resp(200, None, text="<html>gateway</html>"))
+    resp = _run(k._control_post("deposit", None, 1.0))
+    assert resp["ok"] is False and resp["attempted"] is True
+    assert k._outcome_for(resp) == "unknown"
+
+
+def test_the_keeper_and_the_sidecar_agree_on_what_a_channel_id_looks_like():
+    """M-7: the keeper built its id list with a bare `str()` while ids.js applies
+    a narrow charset. A scan row the sidecar rejects comes back 400 -> `failed`
+    -> feeds the reclaim breaker, so an unusual id would eventually halt reclaim
+    for no good reason. Both sides now use the same shape."""
+    ids_js = (ROOT / "antseed" / "ids.js").read_text()
+    m = re.search(r"const CHANNEL_ID_RE = /\^(.+)\$/;", ids_js)
+    assert m, "CHANNEL_ID_RE not found in antseed/ids.js"
+    assert wk.CHANNEL_ID_RE.pattern == f"^{m.group(1)}$", \
+        "wallet_keeper and antseed/ids.js disagree on the channel-id shape"
+
+
+def test_a_channel_id_the_sidecar_would_reject_declines_the_batch():
+    _wedge()
+    scan = {**_SCAN_OK, "channels": [
+        {"id": "c 1", "reclaimable": "4.0", "closeRequested": False}]}
+    k = _FakeControl(responses={"reclaim/scan": scan})
+    assert _run(k._maybe_reclaim(PID, _knobs(), 0.5, 20.0)) == "scan_malformed"
+    assert k.ops == ["reclaim/scan"], "no doomed request went out"
+
+
 def test_the_intent_row_never_dangles_when_the_deposit_call_raises(monkeypatch):
     """M-9: `import httpx` sat outside the try and the except caught only
     `httpx.HTTPError`, so an ImportError/InvalidURL propagated AFTER the intent
@@ -646,8 +711,26 @@ def test_repeated_unresolvable_deposits_back_off_instead_of_re_firing():
     # despite the operator's cooldown being 0.
     assert wk.TOPUP_BACKOFF_BASE_S > wk.CYCLE_S
     assert k._topup_cooldown_s(PID, knobs) == wk.TOPUP_BACKOFF_BASE_S
-    assert _run(k._maybe_topup(PID, knobs, 0.5)) == "cooldown"
+    assert _run(k._maybe_topup(PID, knobs, 0.5)) == "backoff"
     assert len(k.calls) == 1, "the backoff must stop the immediate retry"
+
+
+def test_the_backoff_throttles_a_FAILED_deposit_too():
+    """`failed` spends nothing, so it never sets the cooldown's clock (which is
+    keyed on the outcomes that count as spent) — yet it DOES feed the hard-halt
+    breaker. Without its own clock, a 401 after a token rotation, a 404 from a
+    misrouted URL or a 429 from a busy queue retried at the full 60s cycle rate
+    and sticky-halted the keeper in three minutes."""
+    knobs = _knobs(topup_cooldown_s=0)
+    k = _FakeControl(responses={"deposit": {
+        "ok": False, "attempted": False, "error": "unauthorized"}})
+    seed_buyer_status(PID, deposits_available="0.5", deposits_reserved="0.0")
+    assert _run(k._maybe_topup(PID, knobs, 0.5)) == "topup_failed"
+    spend = host_store.wallet_op_spend_since(PID, "topup", 0)
+    assert spend["spent_usdc"] == 0.0 and spend["last_ts"] is None, \
+        "a failed deposit still spends nothing — it just may not hammer"
+    assert _run(k._maybe_topup(PID, knobs, 0.5)) == "backoff"
+    assert len(k.calls) == 1
 
 
 def test_the_backoff_doubles_per_strike_and_is_capped():
@@ -1054,6 +1137,37 @@ def test_reclaim_caps_the_batch_instead_of_declining_it_entirely():
     assert len(body["ids"]) == wk.MAX_TX_PER_CYCLE, "the cap BINDS the sidecar"
     # richest first: c10 (11.0) down to c3 (4.0)
     assert body["ids"][0] == f"c{wk.MAX_TX_PER_CYCLE + 2}"
+
+
+def test_a_sidecar_that_ignores_the_selection_halts_reclaim(caplog):
+    """The cap is only real if the sidecar honours it, and the router and the
+    sidecar are SEPARATE IMAGES — a rollout can leave one that predates the id
+    list, accepts the request, and fires one transaction per eligible channel
+    while this side logs "1 of 2 channels". reclaim.mjs echoes what it acted on
+    precisely so the caller need not assume; the keeper now checks. One
+    unbounded batch has already happened by the time we notice — halting is what
+    stops the second."""
+    _wedge()
+    k = _LegacyControl(responses={"reclaim/scan": _SCAN_OK})
+    with caplog.at_level("ERROR"):
+        out = _run(k._maybe_reclaim(PID, _knobs(), 0.5, 20.0))
+    assert out == "reclaim_request_close_unbounded"
+    assert "did NOT honour the channel selection" in caplog.text
+    assert host_store.wallet_halted(PID, "reclaim") is True
+    # ...and it does not get a second chance.
+    assert _run(k._maybe_reclaim(PID, _knobs(), 0.5, 20.0)) == "halted"
+
+
+def test_a_selection_echoed_back_WRONG_also_halts():
+    # Not just a missing echo: a sidecar that acted on a different set than it
+    # was told is no more trustworthy than one that ignored the list.
+    _wedge()
+    k = _FakeControl(responses={"reclaim/scan": _SCAN_OK,
+                                "reclaim/request-close": {
+                                    "ok": True, "selected": ["c1", "c2", "c99"]}})
+    assert _run(k._maybe_reclaim(PID, _knobs(), 0.5, 20.0)) == \
+        "reclaim_request_close_unbounded"
+    assert host_store.wallet_halted(PID, "reclaim") is True
 
 
 def test_an_empty_channel_selection_never_reaches_the_wire():

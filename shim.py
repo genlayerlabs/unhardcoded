@@ -411,7 +411,24 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             pass
         return _antseed_wallet_view()
 
+    def _antseed_pid() -> str:
+        """The buyer proxy these dashboard ops act on — the ledger key. Matches
+        the sidecar's ANTSEED_BUYER_PID default when the catalog has none."""
+        import wallet_keeper as _wk
+        pids = _wk.antseed_provider_ids(host.catalog())
+        return pids[0] if pids else "antseed"
+
     async def _wallet_mutate(op: str, body: dict):
+        """A HUMAN-initiated deposit/withdraw from the dashboard.
+
+        Ledgered, for the same reason the keeper's are: this endpoint reaches the
+        same buyer CLI and the same hot wallet, and a dashboard deposit whose
+        HTTP call timed out while the CLI was still executing used to leave NO
+        record anywhere — real USDC moved, `wallet_ops` said nothing, and the
+        operator saw only "wallet control unreachable". Recorded under
+        `topup_manual`/`withdraw_manual` rather than the keeper's own `topup`, so
+        the audit trail is complete without a human top-up silently consuming the
+        keeper's daily cap (two actors, two budgets, one wallet)."""
         url, token = _wallet_control()
         if not url:
             return JSONResponse(status_code=503, content={"error": {
@@ -422,22 +439,56 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             return JSONResponse(status_code=400, content={"error": {
                 "message": "amount must be a positive USDC value (<=6 decimals)",
                 "type": "invalid_request", "code": "wallet_amount"}})
+        import wallet_keeper as _wk
+        pid = _antseed_pid()
+        op_id = host_store.wallet_op_begin(
+            pid, f"{op}_manual", amount_usdc=float(amount),
+            reason=f"dashboard-initiated {op}")
         import httpx
         try:
             async with httpx.AsyncClient() as c:
+                # The client budget must strictly EXCEED the sidecar's own worst
+                # case for this endpoint, or the timeout is a lie: the control
+                # server goes on executing a request this side has written off.
                 r = await c.post(f"{url}/{op}", json={"amount": amount},
-                                 headers={"x-antseed-control-token": token}, timeout=130.0)
-        except httpx.HTTPError as e:
+                                 headers={"x-antseed-control-token": token},
+                                 timeout=_wk.DEPOSIT_TIMEOUT_S)
+        except (httpx.InvalidURL, httpx.UnsupportedProtocol) as e:
+            if op_id is not None:
+                host_store.wallet_op_finish(op_id, "failed", detail=str(e)[:2000])
             return JSONResponse(status_code=502, content={"error": {
-                "message": f"wallet control unreachable: {e}",
+                "message": f"wallet control misconfigured: {e}",
+                "type": "wallet_error", "code": "wallet_control_unreachable"}})
+        except Exception as e:  # noqa: BLE001 — timeout, reset, DNS, TLS, ...
+            # The request reached the wire, so the CLI may have broadcast a Base
+            # mainnet transaction. `unknown`, never `failed`.
+            if op_id is not None:
+                host_store.wallet_op_finish(
+                    op_id, "unknown",
+                    detail=f"{type(e).__name__}: {e} (the transaction may have landed)")
+            return JSONResponse(status_code=502, content={"error": {
+                "message": f"wallet control unreachable: {e} — the {op} may still "
+                           "have executed; check the wallet ops ledger before retrying",
                 "type": "wallet_error", "code": "wallet_control_unreachable"}})
         if r.status_code != 200:
             try:
-                detail = (r.json() or {}).get("error")
+                payload = r.json() or {}
             except Exception:  # noqa: BLE001
-                detail = (r.text or "")[:300]
+                payload = {}
+            detail = payload.get("error") or (r.text or "")[:300]
+            attempted = payload.get("attempted")
+            if not isinstance(attempted, bool):
+                attempted = r.status_code not in _wk.NOT_ATTEMPTED_STATUSES
+            if op_id is not None:
+                host_store.wallet_op_finish(
+                    op_id, "unknown" if attempted else "failed",
+                    detail=str(detail)[:2000])
             return JSONResponse(status_code=502, content={"error": {
                 "message": str(detail), "type": "wallet_error", "code": "wallet_op_failed"}})
+        if op_id is not None:
+            host_store.wallet_op_finish(op_id, "ok", detail=str(
+                (r.json() or {}).get("stdout") if r.headers.get("content-type", "")
+                .startswith("application/json") else "")[:2000])
         return {"ok": True, "action": op, "amount": amount,
                 "wallet": await _refresh_antseed_wallet()}
 
@@ -502,23 +553,68 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             payload["wallet"] = await _refresh_antseed_wallet()
         return payload
 
+    # Budgets are the keeper's, which are derived from the sidecar's OWN
+    # published worst case (antseed/control.js /budgets). A shorter one here
+    # would be a lie in the same way the keeper's used to be: the control server
+    # keeps working on a request this side has already given up on.
     @app.post("/x/wallet/reclaim/scan")
     async def wallet_reclaim_scan():
-        return await _wallet_reclaim("scan", 95.0, with_wallet=False)
+        import wallet_keeper as _wk
+        return await _wallet_reclaim("scan", _wk.RECLAIM_SCAN_TIMEOUT_S,
+                                     with_wallet=False)
 
     @app.post("/x/wallet/reclaim/set-operator")
     async def wallet_reclaim_set_operator():
         # One-time: assign the buyer wallet as its own deposits operator so
         # requestClose/withdraw stop reverting NotAuthorized(). Moves no funds.
-        return await _wallet_reclaim("set-operator", 250.0, with_wallet=False)
+        import wallet_keeper as _wk
+        return await _wallet_reclaim("set-operator", _wk.RECLAIM_TX_TIMEOUT_S,
+                                     with_wallet=False)
 
     @app.post("/x/wallet/reclaim/request-close")
     async def wallet_reclaim_request_close():
-        return await _wallet_reclaim("request-close", 250.0, with_wallet=False)
+        import wallet_keeper as _wk
+        return await _wallet_reclaim("request-close", _wk.RECLAIM_TX_TIMEOUT_S,
+                                     with_wallet=False)
 
     @app.post("/x/wallet/reclaim/withdraw")
     async def wallet_reclaim_withdraw():
-        return await _wallet_reclaim("withdraw", 250.0, with_wallet=True)
+        import wallet_keeper as _wk
+        return await _wallet_reclaim("withdraw", _wk.RECLAIM_TX_TIMEOUT_S,
+                                     with_wallet=True)
+
+    # ---- keeper hard halts: the operator's way back ----------------------
+    # Both breakers are sticky and deliberately not self-clearing, and the docs
+    # say "until an operator clears the flag" — but nothing outside the tests
+    # ever called `wallet_clear_halt`, so the only recovery was psql. A breaker
+    # with no reset is not a breaker, it is a trap.
+
+    @app.get("/x/wallet/halts")
+    async def wallet_halts():
+        pid = _antseed_pid()
+        return {"ok": True, "provider": pid, "halts": {
+            kind: {
+                "halted": host_store.wallet_halted(pid, kind),
+                "rows": [r for r in host_store.wallet_ops_recent(pid, limit=100)
+                         if r["op"] == f"halt:{kind}"],
+            } for kind in ("topup", "reclaim")}}
+
+    @app.post("/x/wallet/clear-halt")
+    async def wallet_clear_halt(body: dict):
+        kind = str((body or {}).get("kind", "")).strip()
+        if kind not in ("topup", "reclaim"):
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "kind must be 'topup' or 'reclaim'",
+                "type": "invalid_request", "code": "wallet_halt_kind"}})
+        pid = _antseed_pid()
+        if not host_store.wallet_clear_halt(pid, kind):
+            return JSONResponse(status_code=502, content={"error": {
+                "message": "could not clear the halt (store unavailable)",
+                "type": "wallet_error", "code": "wallet_halt_clear_failed"}})
+        _log.warning("wallet keeper: %s halt CLEARED for %s by an operator",
+                     kind, pid)
+        return {"ok": True, "provider": pid, "kind": kind,
+                "halted": host_store.wallet_halted(pid, kind)}
 
     @app.get("/healthz")
     def healthz():

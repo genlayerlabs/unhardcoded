@@ -61,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -87,6 +88,11 @@ SETTLE_AFTER_S = 90
 # with the market book's window (sources.antseed.STALE_AFTER_S) because both
 # answer the same question: is the sidecar still telling us things?
 STATUS_MAX_AGE_S = STALE_AFTER_S
+
+# `fetched_at` comes from the SIDECAR's clock, so a little future is ordinary
+# container skew. More than this is not a timestamp worth reasoning about, and
+# must not be clamped to "age 0" — that would make the row fresh forever.
+CLOCK_SKEW_ALLOWANCE_S = 120
 
 # How old the untrusted chain reading may be and still veto. `AntSeedSource`
 # polls every 300s, so this is three missed polls. Beyond it the reading is not
@@ -167,6 +173,12 @@ RECLAIM_TX_TIMEOUT_S = (CONTROL_QUEUE_WAIT_S + CONTROL_RECLAIM_TX_S
 # control.js states this per-branch via `attempted`; the status list is the
 # fallback for a response that predates it or comes from something in between.
 NOT_ATTEMPTED_STATUSES = frozenset({400, 401, 404, 405, 429})
+
+# The channel-id shape the sidecar accepts — kept in step with CHANNEL_ID_RE in
+# antseed/ids.js (tests/test_wallet_keeper.py asserts the two agree). Checked
+# here as well so a scan row the sidecar would reject never becomes a request:
+# its 400 comes back as `failed`, which feeds the reclaim breaker.
+CHANNEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
 # The sidecar control verbs the keeper may call. EXACT-MATCH allowlist.
 ALLOWED_CONTROL_OPS = frozenset({
@@ -303,9 +315,11 @@ class WalletKeeper:
                                  headers={"x-antseed-control-token": token},
                                  timeout=timeout)
         except (httpx.InvalidURL, httpx.UnsupportedProtocol) as exc:
-            # Raised while BUILDING the request — and not subclasses of
-            # HTTPError, so they used to escape this function entirely and leave
-            # the caller's intent row dangling as `pending`.
+            # Raised while BUILDING the request, so nothing was sent. Listed
+            # explicitly because they must be `attempted=False` while every other
+            # transport error is True — and because `InvalidURL` is not an
+            # HTTPError subclass at all, so it used to escape this function
+            # entirely and leave the caller's intent row dangling as `pending`.
             return {"ok": False, "attempted": False,
                     "error": f"control endpoint misconfigured: {exc}"}
         except Exception as exc:  # noqa: BLE001 — timeout, reset, DNS, TLS, ...
@@ -313,15 +327,26 @@ class WalletKeeper:
                     "error": f"control unreachable ({type(exc).__name__}): {exc}"}
         try:
             payload = r.json() or {}
+            parsed = isinstance(payload, dict)
         except Exception:  # noqa: BLE001 — a non-JSON body is still a failure
-            payload = {}
+            payload, parsed = {}, False
         if r.status_code != 200:
-            attempted = payload.get("attempted")
+            attempted = payload.get("attempted") if parsed else None
             if not isinstance(attempted, bool):
                 attempted = r.status_code not in NOT_ATTEMPTED_STATUSES
             return {"ok": False, "attempted": attempted,
                     "status": r.status_code,
-                    "error": str(payload.get("error") or (r.text or "")[:300])}
+                    "error": str((parsed and payload.get("error"))
+                                 or (r.text or "")[:300])}
+        if not parsed:
+            # A 200 whose body we cannot read is NOT a success. The sidecar
+            # always answers JSON, so this is something else answering — a proxy
+            # error page, a truncated response — and the buyer CLI's fate is
+            # unknown. Defaulting it to ok would record a deposit as `fired` on
+            # no evidence at all.
+            return {"ok": False, "attempted": True,
+                    "error": f"control returned 200 with an unreadable body: "
+                             f"{(r.text or '')[:300]}"}
         payload.setdefault("ok", True)
         payload.setdefault("attempted", True)
         return payload
@@ -497,11 +522,20 @@ class WalletKeeper:
                 f"{PUMP_STRIKES_TO_HALT} consecutive deposits failed to lift the "
                 f"escrow by {PUMP_EFFECTIVE_FRACTION:.0%} of the amount")
 
-        strikes = self._error_strikes(pid, "topup", TOPUP_ERROR_STRIKES_TO_HALT)
+        rows = host_store.wallet_ops_terminal(pid, "topup",
+                                              limit=TOPUP_ERROR_STRIKES_TO_HALT)
+        strikes = self._consecutive(rows, host_store.WALLET_OP_ERROR_OUTCOMES)
         if strikes >= TOPUP_ERROR_STRIKES_TO_HALT:
+            # Say which KIND of failure, because the two mean different things to
+            # whoever reads this: `unknown` may have put a transaction on Base
+            # mainnet, `failed` provably did not and points at configuration (a
+            # rotated token, a misrouted URL) rather than at the chain.
+            unresolved = sum(1 for r in rows[:strikes] if r["outcome"] == "unknown")
+            detail = (f", {unresolved} of which may have moved USDC" if unresolved
+                      else " — none of them reached the buyer CLI, so this is a "
+                           "configuration fault, not a chain one")
             return self._halt_topups(pid, "error_halt",
-                f"{strikes} consecutive deposits could not be completed or "
-                "confirmed (failed/unknown) — each one may have moved USDC")
+                f"{strikes} consecutive deposits could not be completed{detail}")
         return None
 
     @staticmethod
@@ -627,7 +661,12 @@ class WalletKeeper:
             return (as_float(c.get("reclaimable")) or 0.0) >= MIN_CHANNEL_RECLAIMABLE
 
         def _ids(batch: list[dict]) -> list[str]:
-            return [str(c["id"]) for c in batch if c.get("id")]
+            # Same shape antseed/ids.js accepts. Mirrored here so a scan row the
+            # sidecar would reject is caught BEFORE the request goes out: a 400
+            # comes back as `failed`, which feeds the reclaim breaker, so an
+            # unusual id would eventually halt reclaim for no good reason.
+            return [str(c["id"]) for c in batch
+                    if c.get("id") and CHANNEL_ID_RE.match(str(c["id"]))]
 
         withdrawable = [c for c in channels if c.get("closeRequested") and _worth_it(c)]
         closable = [c for c in channels
@@ -725,6 +764,25 @@ class WalletKeeper:
         host_store.wallet_op_finish(
             op_id, "ok" if outcome == "fired" else outcome,
             detail=str(resp if outcome == "fired" else resp.get("error"))[:2000])
+        if outcome == "fired" and ids is not None:
+            # VERIFY the cap actually bound. The router and the sidecar are
+            # separate images, so a rollout can leave a sidecar that predates
+            # the id list — and that one ignores `ids` and fires one transaction
+            # per eligible channel while this side logs "1 of 100 channels". The
+            # phase echoes back what it acted on precisely so the caller need
+            # not assume. One unbounded batch has already happened by the time
+            # we notice; halting is what stops a second.
+            echoed = resp.get("selected")
+            if not isinstance(echoed, list) or set(map(str, echoed)) != set(ids):
+                reason = (f"{op} did NOT honour the channel selection (sent "
+                          f"{len(ids)}, echoed {echoed!r}) — the sidecar may have "
+                          "acted on every eligible channel; reclaim halted "
+                          "pending operator review")
+                host_store.wallet_halt(pid, "reclaim", reason)
+                _log.error("wallet keeper: HARD HALT on %s reclaim — %s. Check "
+                           "that the antseed sidecar image matches the router.",
+                           pid, reason)
+                return f"{op}_unbounded"
         if outcome != "fired":
             _log.warning("wallet keeper: %s %s on %s: %s",
                          op, outcome, pid, resp.get("error"))
@@ -746,7 +804,7 @@ class WalletKeeper:
     # ---- top-up ----------------------------------------------------------
 
     def _topup_cooldown_s(self, pid: str, knobs: Knobs) -> int:
-        """The cooldown to enforce right now: the operator's knob, doubled per
+        """The wait to enforce right now: the operator's knob, doubled per
         consecutive unmeasurable failure.
 
         Without this a deposit that fails every time re-fires on the plain
@@ -757,6 +815,31 @@ class WalletKeeper:
             return knobs.topup_cooldown_s
         base = max(knobs.topup_cooldown_s, TOPUP_BACKOFF_BASE_S)
         return int(min(base * (2 ** (strikes - 1)), TOPUP_BACKOFF_CAP_S))
+
+    def _retry_gate(self, pid: str, knobs: Knobs, spend: dict) -> "str | None":
+        """Why a top-up must wait, or None to proceed.
+
+        TWO clocks, because they are keyed off different rows. The cooldown runs
+        from the last op that SPENT (`wallet_op_spend_since`, which by design
+        excludes `failed`). The backoff runs from the last op that ERRORED —
+        which must include `failed`, or the throttle misses exactly the case it
+        exists for: a 401 after a token rotation, a 404 from a misrouted URL, a
+        429 from a busy queue. Those spend nothing, so they never set the
+        cooldown's clock, and before this they re-fired at the full 60s cycle
+        rate and sticky-halted the keeper in three minutes."""
+        now = int(time.time())
+        last_spent = spend.get("last_ts")
+        if last_spent is not None and now - int(last_spent) < knobs.topup_cooldown_s:
+            return "cooldown"
+        rows = host_store.wallet_ops_terminal(pid, "topup",
+                                              limit=TOPUP_ERROR_STRIKES_TO_HALT)
+        strikes = self._consecutive(rows, host_store.WALLET_OP_ERROR_OUTCOMES)
+        if not strikes:
+            return None
+        base = max(knobs.topup_cooldown_s, TOPUP_BACKOFF_BASE_S)
+        backoff = int(min(base * (2 ** (strikes - 1)), TOPUP_BACKOFF_CAP_S))
+        last_error = int(rows[0]["updated_at"] or rows[0]["ts"])
+        return "backoff" if now - last_error < backoff else None
 
     async def _maybe_topup(self, pid: str, knobs: Knobs, available: float,
                            reserved: "float | None" = None) -> str:
@@ -772,9 +855,9 @@ class WalletKeeper:
 
         now = int(time.time())
         spend = host_store.wallet_op_spend_since(pid, "topup", now - 86400)
-        last_ts = spend.get("last_ts")
-        if last_ts is not None and now - int(last_ts) < self._topup_cooldown_s(pid, knobs):
-            return "cooldown"
+        waiting = self._retry_gate(pid, knobs, spend)
+        if waiting:
+            return waiting
         # Full-amount-or-nothing: a partial deposit that squeezes under the
         # remaining cap is usually below one channel reserve, i.e. dust that only
         # burns gas. Wait for the 24h window to roll instead.
@@ -894,12 +977,22 @@ class WalletKeeper:
     @staticmethod
     def _status_age_s(status: "dict | None") -> "float | None":
         """Seconds since the sidecar wrote this row, or None when it carries no
-        usable stamp (`fetched_at` is epoch MILLISECONDS). A row from the future
-        is treated as age 0 — clock skew is not evidence of staleness."""
+        USABLE stamp (`fetched_at` is epoch MILLISECONDS, from the SIDECAR's
+        clock).
+
+        A modest amount of future is ordinary clock skew between two containers
+        and is treated as age 0. Beyond that the stamp is not a timestamp we can
+        reason about — and since the freshness test is `age <= bound`, silently
+        clamping an arbitrarily future stamp to 0 would make that row fresh
+        FOREVER, which is precisely the never-expiring signal this bound exists
+        to remove."""
         raw = (status or {}).get("fetched_at")
         if not isinstance(raw, (int, float)) or isinstance(raw, bool):
             return None
-        return max(0.0, time.time() - float(raw) / 1000.0)
+        age = time.time() - float(raw) / 1000.0
+        if age < -CLOCK_SKEW_ALLOWANCE_S:
+            return None
+        return max(0.0, age)
 
     async def cycle(self) -> dict:
         """One full pass. Never raises: a keeper that crashes the app is worse

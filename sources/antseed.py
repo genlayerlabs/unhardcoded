@@ -909,15 +909,23 @@ class AntSeedSource:
                 })
         return prices
 
-    @staticmethod
-    def _status_age_s(status: "dict | None") -> "float | None":
+    # `fetched_at` is the SIDECAR's clock, so a little future is ordinary
+    # container skew. More than this must NOT be clamped to "age 0": the
+    # freshness test is `age <= bound`, so that would make the row fresh forever
+    # — exactly the never-expiring signal the bound exists to remove.
+    CLOCK_SKEW_ALLOWANCE_S = 120
+
+    @classmethod
+    def _status_age_s(cls, status: "dict | None") -> "float | None":
         """Seconds since the sidecar wrote this buyer_status row, or None when it
-        carries no usable stamp (`fetched_at` is epoch MILLISECONDS). A row from
-        the future is age 0 — clock skew is not evidence of staleness."""
+        carries no USABLE stamp (`fetched_at` is epoch MILLISECONDS)."""
         raw = (status or {}).get("fetched_at")
         if not isinstance(raw, (int, float)) or isinstance(raw, bool):
             return None
-        return max(0.0, time.time() - float(raw) / 1000.0)
+        age = time.time() - float(raw) / 1000.0
+        if age < -cls.CLOCK_SKEW_ALLOWANCE_S:
+            return None
+        return max(0.0, age)
 
     @classmethod
     def _status_is_fresh(cls, status: "dict | None") -> bool:

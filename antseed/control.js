@@ -137,6 +137,10 @@ function send(res, status, obj) {
   res.end(body);
 }
 
+// Resolves the parsed body, or NULL when the body was malformed or the request
+// died mid-flight. Callers MUST distinguish those: a null body is not an empty
+// one, and treating it as `{}` is how a truncated POST turns "act on these two
+// channels" into "act on every channel you can find" (see the reclaim handler).
 function readBody(req) {
   return new Promise((resolve) => {
     let b = '';
@@ -219,11 +223,18 @@ const server = http.createServer(async (req, res) => {
     const phase = url === '/reclaim/set-operator' ? 'set-operator'
       : url === '/reclaim/request-close' ? 'request-close' : 'withdraw';
     const body = await readBody(req);
+    if (body === null) {
+      // A malformed or truncated body. It must NOT fall through to "no ids
+      // supplied", because that means "act on every eligible channel" — a
+      // connection reset mid-POST would silently widen a two-channel batch to
+      // the whole store. Refusing costs a retry; widening costs transactions.
+      return refuse(res, 400, 'malformed request body');
+    }
     // Optional channel-id list. It is what makes the caller's per-cycle
     // transaction cap real — without it reclaim.mjs acts on EVERY eligible
     // channel and the caller's own filter is decorative. Omitted = act on all
     // (the human-by-hand path); malformed = refuse, never silently widen.
-    const sel = encodeIds(body && body.ids != null ? body.ids : undefined);
+    const sel = encodeIds(body.ids != null ? body.ids : undefined);
     if (!sel.ok) return refuse(res, 400, sel.error);
     return serialize(async () => {
       const r = await runReclaim(phase, RECLAIM_TX_TIMEOUT_MS, sel.value);
