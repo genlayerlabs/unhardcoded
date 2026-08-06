@@ -953,6 +953,154 @@ def test_family_for_refuses_cross_vendor_wire_name(wire, used_to_bind):
     assert s._family_for(cat["providers"]["antseed"], wire) is None
 
 
+# ---- the SHIPPED catalog, probed name by name --------------------------------
+#
+# The four cases above were refused only because the family they reached happens
+# to be named with a vendor token. Most curated families are not: `glm-5.1`,
+# `qwen3-coder`, `gemma-3-27b`. For those the vendor check had nothing to compare
+# and waved the claim through, so the cross-vendor hole stayed open one layer
+# down. It is now closed by the RULE (an unknown family vendor refuses every
+# vendor claim) plus the `vendor` annotations that re-open the true spellings —
+# and an annotation quietly deleted is exactly how this regresses, so these run
+# against config.live.lua itself, not a hand-built stand-in.
+LIVE_CROSS_VENDOR_MISBINDS = [
+    ("x-ai-glm-5.1", "glm-5.1"),                  # GLM is z-ai's, not x-ai's
+    ("claude-glm-5.1", "glm-5.1"),
+    ("deepseek-llama-3.3-70b", "llama-3.3-70b"),  # the naming shape of a REAL
+                                                  # distill: different weights
+    ("openai-qwen3-coder", "qwen3-coder"),
+    ("meta-mistral-large", "mistral-large"),
+    ("openai-gemma-3-27b", "gemma-3-27b"),
+]
+
+# What the annotations exist to KEEP reachable: a peer naming the family's TRUE
+# vendor still binds. These mirror the OpenRouter slugs in each family's own
+# `served_by`, i.e. the spellings peers actually resell under.
+LIVE_SAME_VENDOR_BINDS = [
+    ("z-ai-glm-5.1", "glm-5.1"),
+    ("google-gemma-3-27b", "gemma-3-27b"),
+    ("openai-gpt-5.5", "gpt-5.5"),
+    ("openai-gpt-oss-120b", "gpt-oss-120b"),
+    ("qwen-qwen3-coder", "qwen3-coder"),
+    ("mistralai-mistral-large", "mistral-large"),
+    ("moonshot-kimi-k2.6", "kimi-k2.6"),
+    # vendor read off the family's OWN name — no annotation needed
+    ("minimax-minimax-m2.7", "minimax-m2.7"),
+    ("deepseek-deepseek-v4-pro", "deepseek-v4-pro"),
+    # the two forms that must never break: same vendor spelled two ways, and a
+    # wire name making no vendor claim at all
+    ("anthropic-claude-sonnet-4.6", "claude-sonnet-4-6"),
+    ("opus-4.8", "claude-opus-4-8"),
+]
+
+
+@pytest.fixture(scope="module")
+def live_catalog_antseed():
+    """An AntSeedSource over the catalog the router actually ships."""
+    from llm_router_host import LLMRouterHost
+    from sources.antseed import AntSeedSource
+    host = LLMRouterHost(router_path=ROOT / "core" / "router.lua",
+                         config_path=ROOT / "config.live.lua",
+                         metrics_path=ROOT / "metrics.live.lua", now_ms=lambda: 1)
+    cat = host.catalog()
+    cfg = {"discovery": "marketplace", "discovery_id": "antseed_probe"}
+    cat["providers"]["antseed_probe"] = cfg
+    return AntSeedSource(cat), cfg
+
+
+@pytest.mark.parametrize("wire,used_to_bind", LIVE_CROSS_VENDOR_MISBINDS)
+def test_live_catalog_refuses_a_foreign_vendor_claim(live_catalog_antseed, wire,
+                                                     used_to_bind):
+    s, cfg = live_catalog_antseed
+    assert used_to_bind in s._models, "the family it wrongly reached is curated"
+    assert s._family_for(cfg, wire) is None
+
+
+@pytest.mark.parametrize("wire,family", LIVE_SAME_VENDOR_BINDS)
+def test_live_catalog_keeps_the_true_vendor_spelling(live_catalog_antseed, wire,
+                                                     family):
+    s, cfg = live_catalog_antseed
+    assert s._family_for(cfg, wire) == family
+
+
+# M-2: `sources/antseed.py` special-cased a DIGIT-leading residue with the
+# rationale "a bare version number names no model" — which is equally true of the
+# `v`/`m`-leading ones it let through. `v4-pro` is the identical residue from the
+# production incident, reachable again the moment the wire name claims no vendor
+# (nothing then contradicts it). Generalized to the rule the comment states.
+@pytest.mark.parametrize("wire", ["v4-pro", "v3.2", "m2.7", "v4-flash",
+                                  "3-1-pro-preview"])
+def test_bare_version_residue_never_binds(live_catalog_antseed, wire):
+    s, cfg = live_catalog_antseed
+    assert s._family_for(cfg, wire) is None
+
+
+# The other half of the same rule: a residue leading with a real NAME word is
+# still a name, and still binds. Losing these would trade one silent mis-route
+# for a silent loss of every bare Anthropic spelling peers sell.
+@pytest.mark.parametrize("wire,family", [
+    ("opus-4.8", "claude-opus-4-8"), ("opus-4.7", "claude-opus-4-7"),
+    ("sonnet-4.6", "claude-sonnet-4-6"), ("haiku-4.5", "claude-haiku-4-5"),
+    ("fable-5", "claude-fable-5"),
+])
+def test_named_residue_still_binds(live_catalog_antseed, wire, family):
+    s, cfg = live_catalog_antseed
+    assert s._family_for(cfg, wire) == family
+
+
+def test_vendor_annotation_is_what_reopens_a_vendor_prefixed_spelling():
+    """The hybrid rule, both halves. Unannotated, `glm-5.1`'s vendor is UNKNOWN
+    and every vendor claim is refused — safe by default, and the offer stays
+    routable under its raw wire name. Annotated, the ONE true vendor binds and
+    every other is still refused."""
+    from sources.antseed import AntSeedSource
+    providers = {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}}
+    cfg = providers["antseed"]
+
+    bare = AntSeedSource({"providers": providers,
+                          "models": {"glm-5.1": {"served_by": []}}})
+    assert bare._family_for(cfg, "glm-5.1") == "glm-5.1"      # no claim, no problem
+    assert bare._family_for(cfg, "z-ai-glm-5.1") is None      # unknown -> refuse
+    assert bare._family_for(cfg, "x-ai-glm-5.1") is None
+
+    annotated = AntSeedSource({"providers": providers,
+                               "models": {"glm-5.1": {"served_by": [],
+                                                      "vendor": "z-ai"}}})
+    assert annotated._family_for(cfg, "z-ai-glm-5.1") == "glm-5.1"
+    assert annotated._family_for(cfg, "x-ai-glm-5.1") is None
+    assert annotated._family_for(cfg, "claude-glm-5.1") is None
+
+
+def test_vendor_annotation_accepts_a_wire_token_or_its_canonical_id():
+    # `mistralai` (what a peer spells) and `mistral` (the id it resolves to) name
+    # one vendor; an operator should not have to know which is which.
+    from sources.antseed import AntSeedSource
+    providers = {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}}
+    cfg = providers["antseed"]
+    for spelling in ("mistralai", "mistral"):
+        s = AntSeedSource({"providers": providers,
+                           "models": {"mistral-large": {"served_by": [],
+                                                        "vendor": spelling}}})
+        assert s._family_for(cfg, "mistralai-mistral-large") == "mistral-large"
+        assert s._family_for(cfg, "meta-mistral-large") is None
+
+
+def test_unrecognised_vendor_annotation_is_loud_and_inert(caplog):
+    # A peer can only ever claim one of the tokens this module knows, so an
+    # annotation outside that set can never match — it is a typo that silently
+    # leaves the family refusing every vendor-prefixed name. Fails SAFE, but an
+    # operator has to be able to see it.
+    from sources.antseed import AntSeedSource
+    cat = {
+        "providers": {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}},
+        "models": {"glm-5.1": {"served_by": [], "vendor": "zed-ai"}},
+    }
+    with caplog.at_level("WARNING", logger="unhardcoded.sources.antseed"):
+        stats = AntSeedSource(cat).snapshot_stats()
+    assert stats["vendor_unknown"] == ["glm-5.1=zed-ai"]
+    assert "NO effect" in caplog.text
+
+
 def test_family_for_binds_double_prefixed_wire_name():
     # The form the old docstring CLAIMED to bridge and did not: stripping one
     # vendor off the wire name left `claude-opus-4-8`, but the index key was the
@@ -1006,10 +1154,15 @@ def test_ambiguous_family_index_is_logged(caplog):
         "models": {"claude-opus-4-8": {"served_by": []},
                    "anthropic-opus-4-8": {"served_by": []}},
     }
-    with caplog.at_level("WARNING", logger="sources.antseed"):
+    with caplog.at_level("WARNING", logger="unhardcoded.sources.antseed"):
         AntSeedSource(cat).snapshot_stats()
-    assert any("opus-4-8" in r.getMessage() and "UNBOUND" in r.getMessage()
-               for r in caplog.records)
+    warned = [r for r in caplog.records
+              if "opus-4-8" in r.getMessage() and "UNBOUND" in r.getMessage()]
+    assert warned
+    # and it is THAT logger's record. Naming a logger that does not exist still
+    # passes by propagation to root, so the level filter this test thinks it is
+    # applying would silently not be the one under test.
+    assert warned[0].name == "unhardcoded.sources.antseed"
 
 
 def test_gpt55_never_merges_with_gpt_5_5():
@@ -1076,6 +1229,33 @@ def test_variant_gets_its_own_family_anchored_to_the_base(variant_source, wire,
 def test_never_folded_suffix_stays_its_own_family(variant_source, wire):
     s, cfg = variant_source
     assert s._bind(cfg, wire) is None, "must stay exposed under its raw wire name"
+
+
+def test_stacked_variant_markers_stay_raw(variant_source):
+    """L-7: at most ONE marker comes off, suffix first — so the base of
+    `e2ee-glm-5.1:web` is `e2ee-glm-5.1`, which is not curated, and the offer
+    keeps its raw wire name. The docstring used to say it "keeps the outer one",
+    which reads as a bind that does not happen."""
+    from sources.antseed import _split_variant
+    s, cfg = variant_source
+    assert _split_variant("e2ee-glm-5.1:web") == ("e2ee-glm-5.1", "web")
+    assert s._bind(cfg, "e2ee-glm-5.1:web") is None
+
+
+def test_variant_inherits_capabilities_but_never_the_quality_hint(variant_source):
+    """M-1: `-fast` is asserted to be a serving-mode switch on the same weights;
+    in marketplace practice it routinely means quantized or distilled. Context is
+    architecture and is inherited (withholding it would drop the variant from
+    every min_context request for no gain); the quality hint is a claim about
+    WEIGHTS and is not, or any peer could clear min_quality by spelling a suffix."""
+    s, cfg = variant_source
+    variant = s._bind(cfg, "glm-5.1-fast")
+    meta = s._model_meta({**variant, "service": "glm-5.1-fast"})
+    assert meta["capabilities"]["context"] == 200000
+    assert meta["quality_hint"] is None
+    # the base family itself is untouched — it earned its number
+    plain = s._bind(cfg, "glm-5.1")
+    assert s._model_meta({**plain, "service": "glm-5.1"})["quality_hint"] == 0.84
 
 
 def test_variant_of_an_uncurated_base_stays_raw(variant_source):

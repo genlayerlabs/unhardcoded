@@ -139,10 +139,15 @@ def test_offers_sync_dedups_same_peer(tmp_path):
 
 
 def test_variant_offer_inherits_the_base_family_capabilities(tmp_path):
-    # A serving-mode variant is the same weights behind a different switch, so it
-    # inherits the base's context (else min_context rejects it) AND the base's
-    # quality hint (else min_quality rejects it — core/llm_policy/filter.lua). It
-    # keeps its own family name so no existing family_eq policy moves.
+    # A serving-mode variant inherits the base's CAPABILITIES — context is
+    # architecture, no serving switch shrinks it, and withholding it would drop
+    # the variant from every min_context request for no gain. It keeps its own
+    # family name so no existing family_eq policy moves.
+    #
+    # It does NOT inherit the quality hint. "Same marker, same weights" is a
+    # premise this module asserts and cannot check, and the hint is what
+    # min_quality gates on (core/llm_policy/filter.lua) — see
+    # test_peer_minted_variant_does_not_inherit_the_quality_hint.
     rr.reset()
     _seed_market([_peer("peerA", 0.5, service=FAMILY + ":web")])
     offer = AntSeedSource(CATALOG).offers_sync("antseed")[0]
@@ -150,7 +155,7 @@ def test_variant_offer_inherits_the_base_family_capabilities(tmp_path):
     assert offer["base_family"] == FAMILY
     assert offer["wire_model_id"] == FAMILY + ":web"   # wire name preserved
     assert offer["capabilities"]["context"] == 32000
-    assert offer["quality_hint"] == 0.90
+    assert offer["quality_hint"] is None
 
 
 def test_uncurated_offer_with_no_trait_source_is_left_unstamped(tmp_path):
@@ -221,3 +226,51 @@ def test_offers_sync_excludes_peer_outside_window(tmp_path):
     _seed_market([_peer("peerNew", 1.0)])
     offers = AntSeedSource(CATALOG).offers_sync("antseed")
     assert [o["peer_id"] for o in offers] == ["peerNew"]
+
+
+def test_peer_minted_variant_does_not_inherit_the_quality_hint(tmp_path):
+    """M-1: a peer mints `<family>-fast` by spelling a suffix. `-fast` routinely
+    means quantized or distilled in marketplace practice — DIFFERENT weights — so
+    the variant must not arrive carrying the base's benchmark, which is exactly
+    what `min_quality` gates on (core/llm_policy/filter.lua). Capabilities are
+    architecture and still come across, so the variant stays routable."""
+    rr.reset()
+    _seed_market([_peer("peerA", 0.5, service=FAMILY),
+                  _peer("peerB", 0.5, service=FAMILY + "-fast")])
+    offers = {o["model_family"]: o for o in AntSeedSource(CATALOG).offers_sync("antseed")}
+
+    base = offers[FAMILY]
+    assert base["quality_hint"] == 0.90            # curated, earned, unchanged
+
+    variant = offers[f"{FAMILY}@fast"]
+    assert variant["base_family"] == FAMILY        # still anchored to the family
+    assert variant["capabilities"]["context"] == 32000
+    assert variant["quality_hint"] is None
+
+
+def test_suppressed_tick_clears_last_ticks_curation_queue(tmp_path):
+    """L-8: the funds tourniquet returns before reading the market, and used to
+    leave the PREVIOUS tick's `uncurated` / `unbound_top` standing next to
+    `offers = 0`. An operator reads a stale queue as "nothing left to curate" —
+    and a suppressed provider is precisely when those numbers stop refreshing."""
+    from conftest import seed_buyer_status
+    rr.reset()
+    _seed_market([_peer("peerA", 0.5, service="something-uncurated-7b")])
+    src = AntSeedSource(CATALOG)
+
+    # funded tick (no buyer_status row -> the gate fails open): a real queue
+    src.offers_sync("antseed")
+    seeded = src.snapshot_stats()
+    assert seeded["uncurated"] == 1
+    assert [r["service"] for r in seeded["unbound_top"]] == ["something-uncurated-7b"]
+    assert seeded["stale"] is False
+
+    # escrow drops below one channel reserve -> suppressed, nothing read
+    seed_buyer_status("antseed", deposits_available="0.1", deposits_reserved="0")
+    assert src.offers_sync("antseed") == []
+    stats = src.snapshot_stats()
+    assert stats["offers"] == 0 and stats["suppressed_no_funds"] == 1
+    assert stats["uncurated"] == 0 and stats["unbound_top"] == []
+    # UNKNOWN, not False: `stale` answers "did the last market read find fresh
+    # rows", and this tick performed no read at all.
+    assert stats["stale"] is None

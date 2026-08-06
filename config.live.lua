@@ -315,8 +315,24 @@ return {
         },
     },
 
+    -- `vendor` (optional): who actually makes the weights. Only the AntSeed
+    -- marketplace canonicalizer reads it (sources/antseed.py `_family_vendor`).
+    --
+    -- A peer's wire name may claim a vendor (`z-ai-glm-5.1`), and that claim is
+    -- refused unless this family's vendor is KNOWN and agrees — so `x-ai-glm-5.1`
+    -- and `deepseek-llama-3.3-70b` (the naming shape of a real distill with
+    -- DIFFERENT weights) never reach these families. Unknown vendor + a vendor
+    -- claim = refused, and the offer stays routable under its raw wire name.
+    --
+    -- So annotate ONLY a family whose own name does not already carry its vendor
+    -- token: `claude-*`, `gemini-*`, `deepseek-*` and `minimax-*` are read off
+    -- the name and need no line. Annotating is what re-opens the legitimate
+    -- `<vendor>-<family>` spellings peers really advertise (they mirror the
+    -- OpenRouter slugs in `served_by` below) — and only those. Write the vendor
+    -- as the wire token (`mistralai`) or its canonical id (`mistral`); anything
+    -- else is dead config and warns.
     models = {
-        ["minimax-m2.7"] = {
+        ["minimax-m2.7"] = {  -- vendor read off the name: `minimax-`
             served_by = {
                 { provider = "openrouter", provider_model_id = "minimax/minimax-m2.7" },
             },
@@ -328,6 +344,7 @@ return {
             static_quality_hint = 0.80,
         },
         ["llama-3.3-70b"] = {
+            vendor = "meta",
             served_by = {
                 { provider = "heurist",    provider_model_id = "meta-llama/llama-3.3-70b-instruct" },
                 { provider = "io_net",     provider_model_id = "meta-llama/Llama-3.3-70B-Instruct" },
@@ -351,6 +368,7 @@ return {
         -- over before the 429 wall. Claude/Gemini have no codex path, so they
         -- cascade through their other configured providers.
         ["gpt-5.5"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.5" },
                 { provider = "openai",       provider_model_id = "gpt-5.5" },
@@ -360,6 +378,7 @@ return {
             static_quality_hint = 0.95,
         },
         ["gpt-5.4"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.4" },
                 { provider = "openai",       provider_model_id = "gpt-5.4" },
@@ -369,6 +388,7 @@ return {
             static_quality_hint = 0.90,
         },
         ["gpt-5.4-mini"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.4-mini" },
                 { provider = "openai",       provider_model_id = "gpt-5.4-mini" },
@@ -444,6 +464,7 @@ return {
         -- expensive frontier models were rejected by OpenRouter credit ceilings,
         -- while this Qwen route returned valid content/tool-call responses.
         ["qwen3-235b-a22b"] = {
+            vendor = "qwen",
             served_by = {
                 { provider = "bedrock", provider_model_id = "qwen.qwen3-vl-235b-a22b" },
                 { provider = "openrouter", provider_model_id = "qwen/qwen3-235b-a22b-2507" },
@@ -455,6 +476,7 @@ return {
         -- Free codex safety net for `edge`: spark (subscription, ~0 marginal)
         -- ranks just below gpt-5.5-codex and above every paid candidate.
         ["gpt-5.3-codex-spark"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.3-codex-spark" },
             },
@@ -517,6 +539,7 @@ return {
             static_quality_hint = 0.82,
         },
         ["glm-5.1"] = {
+            vendor = "z-ai",
             served_by = {
                 { provider = "openrouter",    provider_model_id = "z-ai/glm-5.1" },
             },
@@ -524,6 +547,7 @@ return {
             static_quality_hint = 0.84,
         },
         ["kimi-k2.6"] = {
+            vendor = "moonshot",
             served_by = {
                 { provider = "openrouter",    provider_model_id = "moonshotai/kimi-k2.6" },
             },
@@ -531,6 +555,7 @@ return {
             static_quality_hint = 0.83,
         },
         ["qwen3-coder"] = {
+            vendor = "qwen",
             served_by = {
                 { provider = "openrouter",    provider_model_id = "qwen/qwen3-coder" },
             },
@@ -538,6 +563,7 @@ return {
             static_quality_hint = 0.82,
         },
         ["mistral-large"] = {
+            vendor = "mistral",
             served_by = {
                 { provider = "openrouter",    provider_model_id = "mistralai/mistral-large" },
             },
@@ -554,6 +580,7 @@ return {
             static_quality_hint = 0.76,
         },
         ["gpt-oss-120b"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "bedrock",       provider_model_id = "openai.gpt-oss-120b-1:0" },
                 { provider = "openrouter",    provider_model_id = "openai/gpt-oss-120b" },
@@ -562,6 +589,7 @@ return {
             static_quality_hint = 0.70,
         },
         ["gemma-3-27b"] = {
+            vendor = "google",
             served_by = {
                 { provider = "bedrock",       provider_model_id = "google.gemma-3-27b-it" },
                 { provider = "openrouter",    provider_model_id = "google/gemma-3-27b-it" },
