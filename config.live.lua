@@ -684,11 +684,31 @@ return {
     -- the entire catalog. The scoped form needs no core change precisely because
     -- the `not provider_eq` branch is true for them.
     --
+    -- SCOPING IS BY EXACT PROVIDER ID, and `provider_eq` is the only identity
+    -- predicate the algebra has — there is no prefix match. Every OTHER antseed
+    -- predicate in the host (sources/antseed.py, providers.py, wallet_keeper.py)
+    -- selects on `discovery_id` STARTSWITH "antseed", so a second buyer proxy
+    -- would be an antseed buyer everywhere except here — and because of the
+    -- `or` shape it would escape this clause by failing the `provider_eq`, i.e.
+    -- fail OPEN, the one direction this gate must never fail. Adding a proxy
+    -- therefore means or-composing its id into the `not` below. That is not left
+    -- to memory: tests/test_live_wiring.py asserts every marketplace antseed
+    -- provider in this file is named here, and fails the build if one is not.
+    --
+    -- The 1.0 floor is ONE CHANNEL RESERVE, the same quantity the offer
+    -- tourniquet uses. It is a literal because the envelope is static Lua and
+    -- cannot read an operator knob, so the knob is constrained instead:
+    -- `antseed.min_available_usdc` has a schema minimum of 1.0 (providers.py).
+    -- Without that, lowering the knob below 1.0 was a SILENT no-op — offers
+    -- would rank and the envelope would reject every one of them, with nothing
+    -- anywhere explaining why.
+    --
     -- This fails CLOSED (default 0 < 1.0 => rejected) where the offer-side
     -- tourniquet in sources/antseed.py fails OPEN. That asymmetry is intended —
     -- envelope = belt, offers_sync = braces — and the cold-start hole it opens is
     -- closed by sources.seed_credits, which publishes the last known escrow from
-    -- the durable buyer_status row before the app serves its first request.
+    -- the durable buyer_status row before the app serves its first request
+    -- (skipping any row too stale to prove anything).
     policy_envelope = { "and", { "meets_req" }, { "not", { "is", "disabled" } },
         { "or", { "not", { "provider_eq", "antseed" } },
                 { "cmp", "credits", "ge", 1.0 } } },

@@ -1488,12 +1488,18 @@ def test_dropped_unmapped_stat_is_gone(tmp_path):
 def test_wallet_health_flags_a_wedged_provider(tmp_path, caplog):
     """Offers were ranked, yet every routed attempt failed. The funds gate cannot
     see that (the escrow is healthy), so it gets its own flag: a dead proxy, a
-    wedged peer or a stale pin looks exactly like this."""
+    wedged peer or a stale pin looks exactly like this.
+
+    The observations are seeded under the PROVIDER ID that was ranked. They used
+    to be seeded under `antseed` — the SOURCE name — while the source ranks
+    `antseed_cheap`, and the assertion passed anyway because the lookup also used
+    the source name. Two wrongs: the test demonstrated the bug instead of
+    catching it, and a second buyer proxy's attempts were invisible."""
     from sources.antseed import WEDGE_CONSECUTIVE_FAILURES
     from conftest import seed_route_obs
     s = _antseed_source(tmp_path)
     s.offers_sync("antseed_cheap")
-    seed_route_obs("antseed", "qwen3-235b-a22b", "peerA", ok=False,
+    seed_route_obs("antseed_cheap", "qwen3-235b-a22b", "peerA", ok=False,
                    n=WEDGE_CONSECUTIVE_FAILURES)
     with caplog.at_level("WARNING"):
         assert s._refresh_wallet_health() == "wedged"
@@ -1501,12 +1507,27 @@ def test_wallet_health_flags_a_wedged_provider(tmp_path, caplog):
     assert s.snapshot_stats()["wallet_health"] == "wedged"
 
 
+def test_wallet_health_reads_every_buyer_proxy_not_just_the_source_name(tmp_path):
+    """A second proxy's attempts must count. `route_observations` is keyed by
+    provider id, so looking up `self.name` found rows only for the proxy that
+    happens to share the source's name — `antseed_free` could fail every call
+    forever and the source would report `unknown`."""
+    from sources.antseed import WEDGE_CONSECUTIVE_FAILURES
+    from conftest import seed_route_obs
+    s = _antseed_source(tmp_path)
+    s.offers_sync("antseed_cheap")
+    # Nothing under `antseed` (the source name); everything under a real proxy.
+    seed_route_obs("antseed_free", "qwen3-235b-a22b", "peerA", ok=False,
+                   n=WEDGE_CONSECUTIVE_FAILURES)
+    assert s._refresh_wallet_health() == "wedged"
+
+
 def test_wallet_health_is_ok_when_some_attempts_succeed(tmp_path):
     from conftest import seed_route_obs
     s = _antseed_source(tmp_path)
     s.offers_sync("antseed_cheap")
-    seed_route_obs("antseed", "qwen3-235b-a22b", "peerA", ok=False, n=9)
-    seed_route_obs("antseed", "qwen3-235b-a22b", "peerA", ok=True, n=1)
+    seed_route_obs("antseed_cheap", "qwen3-235b-a22b", "peerA", ok=False, n=9)
+    seed_route_obs("antseed_cheap", "qwen3-235b-a22b", "peerA", ok=True, n=1)
     assert s._refresh_wallet_health() == "ok"
 
 
@@ -1517,9 +1538,33 @@ def test_wallet_health_does_not_blame_a_suppressed_provider(tmp_path):
     from conftest import seed_route_obs
     s = _antseed_source(tmp_path, available="0.1")
     s.offers_sync("antseed_cheap")
-    seed_route_obs("antseed", "qwen3-235b-a22b", "peerA", ok=False,
+    seed_route_obs("antseed_cheap", "qwen3-235b-a22b", "peerA", ok=False,
                    n=WEDGE_CONSECUTIVE_FAILURES)
     assert s._refresh_wallet_health() == "suppressed"
+
+
+def test_suppression_is_a_current_state_not_a_lifetime_counter(tmp_path):
+    """`suppressed_no_funds` only ever grows, so reading it as a flag made every
+    later diagnosis inherit it: once the escrow had dipped for a single tick, a
+    sidecar that died hours afterwards still reported `suppressed` — a FUNDS
+    problem — when the real cause was staleness or an idle hour. The counter is
+    still there (it counts), but the classification reads the flag."""
+    from conftest import seed_buyer_status
+    s = _antseed_source(tmp_path, available="0.1")
+    s.offers_sync("antseed_cheap")
+    assert s.snapshot_stats()["suppressed_no_funds"] == 1
+    assert s._refresh_wallet_health() == "suppressed"
+
+    # The escrow recovers and the provider goes quiet. The lifetime counter is
+    # unchanged, so the old code kept saying "suppressed" forever.
+    seed_buyer_status("antseed_cheap", pinned_peer_id="peerA",
+                      deposits_available="25.0", deposits_reserved="0.0")
+    seed_buyer_status("antseed_free", pinned_peer_id="peerA",
+                      deposits_available="25.0", deposits_reserved="0.0")
+    s.offers_sync("antseed_cheap")
+    s._stats["offers"] = 0                       # ranked nothing this tick
+    assert s.snapshot_stats()["suppressed_no_funds"] == 1, "the counter still counts"
+    assert s._refresh_wallet_health() == "idle", "but the diagnosis is current"
 
 
 def test_refresh_once_surfaces_source_stats(tmp_path):
@@ -1619,8 +1664,69 @@ def test_antseed_balances_from_status_files(tmp_path):
     b = balances["antseed_free"]
     assert b["kind"] == "deposits_usdc" and b["value"] == 1.5
     assert b["detail"]["wallet"] == "0x7C39"
-    s_nostatus = _antseed_source(tmp_path, pins={})
-    assert asyncio.run(s_nostatus.balances()) == {}   # no buyer_status -> absent
+
+
+def test_a_missing_or_stale_status_publishes_zero_credits_rather_than_nothing(host_store_clean):
+    """The engine's `__credits|<pid>` slot has NO TTL: `push_credits` only ever
+    overwrites, so a pid this function skips keeps its last published value
+    forever. Skipping on a missing/stale row therefore left the host envelope
+    gating on a balance that could be hours old and long since spent — belt and
+    braces failing open together, which is how the 402 storm comes back.
+
+    Publishing 0 is the TTL. `credits` means money we can PROVE is spendable,
+    and a row nobody is writing proves nothing."""
+    import time as _time
+
+    import host_store
+    from conftest import require_host_store, seed_buyer_status
+    from sources.antseed import AntSeedSource, STALE_AFTER_S
+    require_host_store()
+    catalog = {"providers": {"antseed": {
+        "discovery": "marketplace", "discovery_id": "antseed"}}, "models": {}}
+    s = AntSeedSource(catalog)
+
+    # No row at all.
+    out = asyncio.run(s.balances())
+    assert out["antseed"]["value"] == 0.0
+    assert out["antseed"]["detail"]["unproven"] is True
+
+    # A row the sidecar stopped updating, still reporting a healthy escrow.
+    seed_buyer_status("antseed", deposits_available="42.0", deposits_reserved="0.0")
+    with host_store._get_pool().connection() as conn:
+        conn.execute("UPDATE buyer_status SET fetched_at=%s WHERE pid=%s",
+                     (int((_time.time() - STALE_AFTER_S - 60) * 1000), "antseed"))
+    out = asyncio.run(s.balances())
+    assert out["antseed"]["value"] == 0.0, \
+        "a stale row must not publish the escrow it happens to remember"
+    assert out["antseed"]["detail"]["reason"] == "stale buyer_status"
+
+    # ...and a fresh row publishes the truth again.
+    seed_buyer_status("antseed", deposits_available="42.0", deposits_reserved="0.0")
+    assert asyncio.run(s.balances())["antseed"]["value"] == 42.0
+
+
+def test_credits_seed_skips_a_stale_row_so_the_cold_start_gate_stays_closed(host_store_clean):
+    """`credits_seed` exists specifically to defeat the envelope's fail-closed
+    cold start, which makes it the one place a dead sidecar can re-open the gate
+    on a pod that has observed nothing at all. Leaving the gate closed is the
+    safe direction — the first healthy refresh tick opens it minutes later."""
+    import time as _time
+
+    import host_store
+    from conftest import require_host_store, seed_buyer_status
+    from sources.antseed import AntSeedSource, STALE_AFTER_S
+    require_host_store()
+    catalog = {"providers": {"antseed": {
+        "discovery": "marketplace", "discovery_id": "antseed"}}, "models": {}}
+    s = AntSeedSource(catalog)
+
+    seed_buyer_status("antseed", deposits_available="12.5", deposits_reserved="1.0")
+    assert s.credits_seed() == {"antseed": 12.5}
+
+    with host_store._get_pool().connection() as conn:
+        conn.execute("UPDATE buyer_status SET fetched_at=%s WHERE pid=%s",
+                     (int((_time.time() - STALE_AFTER_S - 1) * 1000), "antseed"))
+    assert s.credits_seed() == {}, "a stale row must not seed the gate open"
 
 
 def test_wallet_rpc_url_default_and_disable(monkeypatch):

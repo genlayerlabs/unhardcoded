@@ -14,14 +14,22 @@
 // the buyer wallet as its own operator (set-operator phase) — the one-time setup
 // the normal deposit/reserve flow never needs.
 //
-// Usage:  node reclaim.mjs <phase>
+// Usage:  node reclaim.mjs <phase> [id,id,...]
 //   list           read-only: enumerate channels + on-chain reclaimable + operator (default)
 //   set-operator   one-time: assign the buyer wallet as its own deposits operator
 //   request-close  fire requestClose on channels that still hold buyer funds
 //   withdraw       withdraw channels whose challenge window has elapsed
 //
+// The optional id list NARROWS a tx phase to the named channels. It exists
+// because the router's wallet keeper filters channels (skipping dust) and caps
+// the batch at MAX_TX_PER_CYCLE, and neither bound used to reach here: the
+// keeper could decide "1 channel is worth closing" and this script would still
+// fire one transaction per eligible channel. Omitting it keeps the original
+// act-on-everything behaviour, which is what a human running this by hand gets.
+//
 // Emits ONE JSON object on stdout (control.js parses it). Never throws to the
 // shell without a JSON envelope.
+import { createRequire } from 'node:module';
 import { loadConfig } from '@antseed/cli/dist/config/loader.js';
 import {
   loadCryptoContext,
@@ -38,7 +46,15 @@ const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
 const DEPOSITS_DOMAIN_NAME = 'AntseedDeposits';
 const SET_OPERATOR_TYPES = { SetOperator: [{ name: 'operator', type: 'address' }, { name: 'nonce', type: 'uint256' }] };
 
+// ids.js is CommonJS and dependency-free (so it can be unit-tested outside the
+// sidecar image); this file is ESM because @antseed/cli's dist is.
+const { parseIds } = createRequire(import.meta.url)('./ids.js');
+
 const PHASE = process.argv[2] || 'list';
+// null = no selection (act on every eligible channel). A non-null EMPTY set is
+// still a selection and correctly acts on nothing — the caller filtered its
+// batch down to zero, which must never be read as "act on everything".
+const SELECTED = parseIds(process.argv[3]);
 const DATA_DIR = process.env.ANTSEED_DATA_DIR || '/data';
 // Same defaults the vendored CLI uses for deposit/withdraw: a missing config
 // file makes loadConfig fall back to createDefaultConfig() (Base mainnet chain
@@ -133,6 +149,16 @@ async function main() {
     rec.onchainStatus = status;
     reclaimableTotal += remaining;
 
+    // The caller named its batch: every other channel is reported but untouched.
+    // This is the ONLY thing that makes the keeper's per-cycle transaction cap
+    // real, so it is checked before either tx phase's own eligibility rules.
+    if (SELECTED !== null && !SELECTED.has(id) && PHASE !== 'list') {
+      rec.action = 'skip';
+      rec.reason = 'not selected by the caller';
+      channels.push(rec);
+      continue;
+    }
+
     if (PHASE === 'request-close') {
       if (closeRequestedAt > 0n) {
         rec.action = 'skip';
@@ -178,6 +204,10 @@ async function main() {
     reclaimableTotal: formatUsdc(reclaimableTotal),
     count: channels.length,
     skipped, // settled/timeout channels: already returned funds, not reclaimable
+    // What the caller asked to act on, echoed back so it can verify its own cap
+    // was honoured rather than assuming it (null = no selection).
+    selected: SELECTED === null ? null : [...SELECTED],
+    acted: channels.filter((c) => c.tx !== undefined).length,
     channels,
   });
 }

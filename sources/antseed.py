@@ -623,6 +623,12 @@ class AntSeedSource:
                 settings.get("antseed.min_available_usdc")):
             self._stats["suppressed_no_funds"] = \
                 int(self._stats.get("suppressed_no_funds") or 0) + 1
+            # ...and the CURRENT-STATE twin of that counter. `suppressed_no_funds`
+            # only ever grows, so reading it as a flag meant every later
+            # diagnosis inherited it: a sidecar that died hours after one
+            # suppressed tick still reported "suppressed" — a FUNDS problem —
+            # when the truth was stale or idle. See _refresh_wallet_health.
+            self._stats["suppressed"] = True
             # This tick read no market, so every per-tick market number must go
             # with it. Leaving last tick's `uncurated`/`unbound_top` standing
             # beside `offers = 0` made the curation queue underreport silently —
@@ -630,6 +636,7 @@ class AntSeedSource:
             # suppressed provider is exactly when the numbers stop being refreshed.
             self._reset_market_stats()
             return []
+        self._stats["suppressed"] = False
         rep_min = float(settings.get("antseed.reputation_min"))
         allowlist = set(settings.get("antseed.peer_allowlist") or [])
         denylist = set(settings.get("antseed.peer_denylist") or [])
@@ -795,16 +802,27 @@ class AntSeedSource:
         if not self._stats.get("offers"):
             # Nothing was offered (suppressed, stale market, or genuinely idle):
             # failures cannot be blamed on us handing out unpayable routes.
-            health = "suppressed" if self._stats.get("suppressed_no_funds") else "idle"
+            # Reads the CURRENT-state flag, not `suppressed_no_funds`: that
+            # counter is monotonic, so once it had ticked even once every later
+            # tick reported "suppressed" — attributing a dead sidecar or an idle
+            # hour to a funds problem the escrow may not have.
+            health = "suppressed" if self._stats.get("suppressed") else "idle"
         else:
-            recent = host_store.provider_recent_ok(
-                self.name, limit=WEDGE_CONSECUTIVE_FAILURES)
-            if len(recent) >= WEDGE_CONSECUTIVE_FAILURES and not any(recent):
-                health = "wedged"
-            elif not recent:
-                health = "unknown"
-            else:
-                health = "ok"
+            # Per PROVIDER id, not `self.name`. They coincide for the default
+            # single-proxy catalog, which is the only reason this ever worked:
+            # `route_observations` is keyed by provider id, so a second buyer
+            # proxy (`antseed_cheap`) wrote rows this lookup could never see.
+            recent: list[bool] = []
+            health = None
+            for pid in self.provider_ids:
+                rows = host_store.provider_recent_ok(
+                    pid, limit=WEDGE_CONSECUTIVE_FAILURES)
+                if len(rows) >= WEDGE_CONSECUTIVE_FAILURES and not any(rows):
+                    health = "wedged"      # any wedged proxy wedges the source
+                    break
+                recent.extend(rows)
+            if health is None:
+                health = "ok" if recent else "unknown"
         if health == "wedged" and self._stats.get("wallet_health") != "wedged":
             _log.warning(
                 "antseed wedged: last %d routed attempts all failed while offers "
@@ -891,6 +909,25 @@ class AntSeedSource:
                 })
         return prices
 
+    @staticmethod
+    def _status_age_s(status: "dict | None") -> "float | None":
+        """Seconds since the sidecar wrote this buyer_status row, or None when it
+        carries no usable stamp (`fetched_at` is epoch MILLISECONDS). A row from
+        the future is age 0 — clock skew is not evidence of staleness."""
+        raw = (status or {}).get("fetched_at")
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+            return None
+        return max(0.0, time.time() - float(raw) / 1000.0)
+
+    @classmethod
+    def _status_is_fresh(cls, status: "dict | None") -> bool:
+        """The sidecar rewrites buyer_status every 60s. STALE_AFTER_S of silence
+        means it has stopped, and a row nobody is updating is not a balance — the
+        escrow it reports keeps being spent against by traffic nobody is
+        recording. Same bound the market book already applies to peer_offers."""
+        age = cls._status_age_s(status)
+        return age is not None and age <= STALE_AFTER_S
+
     def credits_seed(self) -> dict[str, float]:
         """{provider_id -> last-known spendable escrow}, straight from the durable
         buyer_status row — no network, no refresh tick.
@@ -900,27 +937,66 @@ class AntSeedSource:
         and the engine's `credits` field defaults to 0, so that clause fails
         CLOSED: a fresh pod that has not yet completed a balances refresh would
         reject every antseed candidate until the first tick (up to 300s). Seeding
-        from the last known status closes that hole without weakening the gate."""
+        from the last known status closes that hole without weakening the gate.
+
+        A STALE row is skipped rather than seeded. This function exists to defeat
+        the envelope's fail-closed cold start, so an unbounded-age row here is
+        the one place a dead sidecar could re-open the gate on a pod that has
+        observed nothing at all — leaving the gate closed is the safe direction,
+        and the first healthy refresh tick opens it a few minutes later."""
         out: dict[str, float] = {}
         for pid in self.provider_ids:
-            available = as_float((host_store.buyer_status(pid) or {})
-                                 .get("deposits_available"))
+            status = host_store.buyer_status(pid)
+            if not self._status_is_fresh(status):
+                if status:
+                    _log.warning("antseed: not seeding credits for %s — its "
+                                 "buyer_status is stale (>%ds); the funding gate "
+                                 "stays closed until a fresh status arrives",
+                                 pid, STALE_AFTER_S)
+                continue
+            available = as_float((status or {}).get("deposits_available"))
             if available is not None:
                 out[pid] = available
         return out
 
     async def balances(self) -> dict[str, Balance]:
+        """Per-proxy escrow, and — via `sources.push_credits` — the value the host
+        envelope's `credits >= 1.0` clause gates on.
+
+        A missing or STALE status publishes 0, it does not skip. Skipping looks
+        harmless and is not: `push_credits` only ever overwrites, so a pid left
+        out keeps whatever was last published in `__credits|<pid>` FOREVER. A
+        dead sidecar plus an escrow drained by settlements is a realistic pair,
+        and it left the engine holding the last healthy number with no TTL —
+        belt and braces both failing open together, which is how the 402 storm
+        this whole path exists to prevent comes back. `credits` means "money we
+        can PROVE is spendable", and a row nobody is writing proves nothing."""
         out: dict[str, Balance] = {}
         # Off the request path and after this tick's pricing()/offers_sync, so the
         # offer counts it reads are current.
         self._refresh_wallet_health()
         for pid in self.provider_ids:
             data = host_store.buyer_status(pid)
-            if not data:
-                continue
-            try:
-                available = float(data.get("deposits_available"))
-            except (TypeError, ValueError):
+            fresh = self._status_is_fresh(data)
+            available: "float | None" = None
+            if fresh:
+                available = as_float((data or {}).get("deposits_available"))
+            if available is None:
+                if data and not fresh:
+                    _log.warning("antseed: %s buyer_status is stale (>%ds) — "
+                                 "publishing 0 credits so the funding gate closes; "
+                                 "is the sidecar alive?", pid, STALE_AFTER_S)
+                out[pid] = {
+                    "kind": "deposits_usdc",
+                    "value": 0.0,
+                    # `unproven` distinguishes this from a genuinely empty escrow
+                    # for anything reading the detail (the dashboard, /x/market).
+                    "detail": {"unproven": True,
+                               "reason": "stale buyer_status" if data else
+                                         "no buyer_status row",
+                               "status_age_s": self._status_age_s(data)},
+                    "fetched_at": int(time.time()),
+                }
                 continue
             detail = {"reserved": data.get("deposits_reserved"),
                       "wallet": data.get("wallet_address"),

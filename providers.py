@@ -198,14 +198,24 @@ PROVIDERS: "list[Provider]" = [
                         "(reclaim + top-up). 0 = OFF (default: the loop ships "
                         "dark and is armed deliberately), 1 = ON. Off means the "
                         "keeper reads nothing and fires nothing."},
+            # The minimum is NOT cosmetic: config.live.lua's policy_envelope
+            # hardcodes the same floor as `credits >= 1.0` and cannot read a
+            # knob (it is static Lua evaluated by the core). Allowing this below
+            # 1.0 made the knob a silent no-op — offers would rank and the
+            # envelope would then reject every one of them, with nothing
+            # anywhere explaining the empty ranking. Two definitions of "the
+            # minimum spendable escrow" is one too many; this is the tie.
             "min_available_usdc": {
                 "type": "float", "default": env_float("ANTSEED_MIN_AVAILABLE_USDC", 1.1),
-                "min": 0, "max": 100000, "label": "Offer tourniquet: min available (USDC)",
+                "min": 1.0, "max": 100000, "label": "Offer tourniquet: min available (USDC)",
                 "help": "Stop offering AntSeed routes at all when escrow "
                         "deposits_available falls below this. Opening a payment "
                         "channel RESERVES ~1 USDC, so below one reserve every "
                         "call 402s insufficient_deposits. Default 1.1 = just "
-                        "above one reserve."},
+                        "above one reserve. Cannot go below 1.0: the host "
+                        "policy envelope rejects AntSeed below that regardless, "
+                        "so a lower value here would suppress nothing and "
+                        "explain nothing."},
             "topup_trigger_usdc": {
                 "type": "float", "default": env_float("ANTSEED_TOPUP_TRIGGER_USDC", 2.0),
                 "min": 0, "max": 100000, "label": "Top-up trigger (USDC)",
@@ -223,7 +233,14 @@ PROVIDERS: "list[Provider]" = [
                 "help": "Never deposit if it would leave the hot wallet below "
                         "this. VETO-ONLY: the wallet balance comes from an "
                         "untrusted public RPC, so a low read blocks a top-up but "
-                        "a high read never authorizes one."},
+                        "a high read never authorizes one. An ABSENT or stale "
+                        "read blocks too — a floor that is skipped whenever the "
+                        "RPC declines to answer is not a floor — so setting "
+                        "ANTSEED_WALLET_RPC_URL=off disables top-ups entirely "
+                        "(reported as `wallet_unreadable` on /x/runtime). "
+                        "Reclaim is deliberately unaffected: failing closed on "
+                        "the one action that recovers money would let an RPC "
+                        "outage strand the escrow."},
             "topup_daily_cap_usdc": {
                 "type": "float", "default": env_float("ANTSEED_TOPUP_DAILY_CAP_USDC", 10),
                 "min": 0, "max": 100000, "label": "Top-up: daily cap (USDC)",

@@ -106,13 +106,19 @@ docker compose --profile antseed up -d --build antseed
   - a **tourniquet** in `sources/antseed.py`: below
     `antseed.min_available_usdc` (1.1) the source stops offering AntSeed routes
     at all, rather than spending callers' requests on certain failures. It fails
-    OPEN — an unreadable buyer status is a read error, not an empty escrow.
+    OPEN — an unreadable buyer status is a read error, not an empty escrow — but
+    a status row older than 15 minutes is treated as no reading at all, since
+    the sidecar rewrites it every 60s.
   - the **wallet keeper**, a loop in the router (the buyer identity + sqlite are
     on an RWO PVC bound to this pod, and the control server is pod-local) that
     reclaims stuck channels and then tops the escrow up. It **reclaims before it
     tops up** — refilling a ratchet you have not unwound just feeds the leak —
-    and only force-closes channels when the provider is provably wedged (traffic,
-    zero successes for an hour), never when it is merely idle.
+    and only force-closes channels when the provider is provably not using them:
+    either the offer tourniquet is suppressing every route right now (so there
+    *cannot* be traffic), or there was traffic and none of it succeeded for an
+    hour. Never when it is merely idle. Reclaim also fires when the escrow has
+    been topped up but the reserve dwarfs it, so a deposit cannot lock the
+    recovery path out permanently.
 
   It **ships dark**: `antseed.keeper_enabled` defaults to `0`, and arming it is a
   deliberate operator act (Config tab or `ANTSEED_KEEPER_ENABLED=1`). Its limits
@@ -120,9 +126,31 @@ docker compose --profile antseed up -d --build antseed
   on load. It will **never** run `buyer withdraw` (escrow → wallet): that is the
   exfiltration path if `ANTSEED_CONTROL_TOKEN` leaks and stays human-only. Every
   action is written to `wallet_ops` as an INTENT *before* it fires — that table
-  is the audit trail, the daily-cap ledger and the `/x/runtime` feed at once —
-  and two deposits in a row that fail to raise `depositsAvailable` hard-halt
-  top-ups until an operator clears the flag.
+  is the audit trail, the daily-cap ledger and the `/x/runtime` feed at once.
+
+  Two breakers hard-halt top-ups until an operator clears the flag:
+
+  - two deposits in a row that fail to raise the **escrow** (`depositsAvailable`
+    *plus* `depositsReserved` — a deposit immediately reserved by an opening
+    channel did arrive, it just moved one column right); and
+  - three in a row whose outcome could not be established at all. A deposit
+    whose HTTP call timed out, reset, or came back `502`/`504` is recorded
+    `unknown`, **counts against the daily cap and the cooldown**, and backs the
+    retry interval off exponentially. Only a response that proves the buyer CLI
+    never ran — a `400` from the amount validator, a `429` from the sidecar's
+    queue gate — is recorded `failed` and costs nothing.
+
+  Reclaim has its own cooldown (one challenge window) and its own breaker, and
+  names the exact channels the sidecar may act on, so the per-cycle transaction
+  cap and the dust filter bind on-chain rather than only in the log line. A
+  top-up halt does **not** stop reclaim: it means "stop putting money in", and
+  reclaim moves money the other way.
+
+  > **`ANTSEED_WALLET_RPC_URL=off` disables top-ups.** The hot-wallet floor is
+  > checked against a public Base RPC read, and an *absent* read vetoes just as a
+  > low one does — otherwise taking the endpoint down removes the floor. With the
+  > read off there is no floor to check, so every top-up is declined and reported
+  > as `wallet_unreadable` on `/x/runtime`. Reclaim is unaffected.
 
 The `model` field we send is the offer's wire id (the peer's service name),
 forwarded verbatim; AntSeed translates protocols and serves it.

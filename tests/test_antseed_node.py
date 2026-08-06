@@ -41,3 +41,20 @@ def test_antseed_control_amount_cap():
     now called autonomously by the router's wallet keeper, so the per-deposit
     ceiling has to hold server-side, not only in the caller."""
     _run_node_test("antseed/amount.test.js")
+
+
+def test_antseed_control_queue_admission():
+    """The control server's mutation queue (antseed/queue.js). Its time bound is
+    what makes the sidecar's worst case FINITE — the precondition for the wallet
+    keeper picking a client timeout that strictly exceeds it. Unbounded, a
+    deposit queued behind a long reclaim phase timed out on the caller while
+    still executing here: real USDC moved and the ledger recorded nothing."""
+    _run_node_test("antseed/queue.test.js")
+
+
+def test_antseed_reclaim_channel_selection():
+    """The reclaim channel-id selector (antseed/ids.js) — what makes the keeper's
+    per-cycle transaction cap and its dust filter binding rather than decorative.
+    reclaim.mjs itself deep-imports @antseed/cli internals that exist only in the
+    sidecar image, so the selection logic lives here where it can be tested."""
+    _run_node_test("antseed/ids.test.js")

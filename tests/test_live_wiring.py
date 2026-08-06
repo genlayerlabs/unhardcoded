@@ -501,6 +501,80 @@ _ANY_CANDIDATE = ["policy", ["and", ["meets_req"]],
                   ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
 
 
+def _envelope_credits_clause(catalog):
+    """The policy_envelope's antseed funding clause, as (named pids, floor)."""
+    def walk(term):
+        if not isinstance(term, list):
+            return None
+        if term and term[0] == "or":
+            pids, floor = set(), None
+            for sub in term[1:]:
+                if (isinstance(sub, list) and sub[:1] == ["cmp"]
+                        and sub[1] == "credits"):
+                    floor = sub[3]
+                elif isinstance(sub, list) and sub[:1] == ["not"]:
+                    for eq in _flatten_eq(sub[1]):
+                        pids.add(eq)
+            if floor is not None:
+                return pids, floor
+        for sub in term:
+            got = walk(sub)
+            if got:
+                return got
+        return None
+    return walk(catalog["policy_envelope"])
+
+
+def _flatten_eq(term):
+    """Every provider id named by a provider_eq, through nested or-composition."""
+    if not isinstance(term, list):
+        return []
+    if term[:1] == ["provider_eq"]:
+        return [term[1]]
+    out = []
+    for sub in term[1:] if term and term[0] in ("or", "and") else []:
+        out.extend(_flatten_eq(sub))
+    return out
+
+
+def test_the_funding_clause_names_every_antseed_buyer_proxy():
+    """M-6. The envelope scopes by EXACT provider id (`provider_eq` is the only
+    identity predicate the algebra has), while every other antseed predicate in
+    the host selects on `discovery_id` STARTSWITH "antseed". A second buyer proxy
+    would therefore be an antseed buyer everywhere except in the one clause that
+    gates its funding — and because of the `or` shape it escapes by FAILING the
+    provider_eq, i.e. fails OPEN.
+
+    This is the gate that stops that from being a silent regression: adding a
+    proxy to config.live.lua without naming it in the envelope fails here."""
+    catalog = _antseed_host().catalog()
+    declared = {pid for pid, p in (catalog.get("providers") or {}).items()
+                if isinstance(p, dict) and p.get("discovery") == "marketplace"
+                and str(p.get("discovery_id", "")).startswith("antseed")}
+    assert declared, "no antseed proxies in the live catalog — did the shape change?"
+    named, _floor = _envelope_credits_clause(catalog)
+    assert declared <= named, (
+        f"antseed buyer proxies {sorted(declared - named)} are not named in the "
+        "policy_envelope's credits clause, so they escape the funding gate "
+        "(and the `or` shape makes that fail OPEN). Or-compose their "
+        "provider_eq into the clause in config.live.lua.")
+
+
+def test_the_envelope_floor_and_the_tourniquet_knob_cannot_disagree():
+    """M-5. Two definitions of "the minimum spendable escrow": the envelope
+    hardcodes 1.0 (static Lua — it cannot read a knob) and the offer tourniquet
+    uses `antseed.min_available_usdc`. The knob used to allow 0, which made
+    lowering it a SILENT no-op: offers rank, the envelope rejects every one of
+    them, and nothing anywhere explains the empty ranking. The knob's floor is
+    now the envelope's constant, and this is what keeps them tied."""
+    import settings
+    _named, floor = _envelope_credits_clause(_antseed_host().catalog())
+    assert settings.SCHEMA["antseed.min_available_usdc"]["min"] == floor
+    # ...and the schema actually enforces it.
+    assert settings._coerce("antseed.min_available_usdc", floor - 0.1) is None
+    assert settings._coerce("antseed.min_available_usdc", floor) == floor
+
+
 def test_the_funding_clause_is_scoped_to_antseed_only():
     """Every other provider bills against its own quota/credit mechanics and has
     no on-chain escrow, so an unscoped `credits >= 1` clause would reject the

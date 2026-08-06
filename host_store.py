@@ -228,12 +228,21 @@ _SCHEMA_STATEMENTS = [
         reason         TEXT,
         pre_available  DOUBLE PRECISION,
         post_available DOUBLE PRECISION,
+        pre_reserved   DOUBLE PRECISION,
+        post_reserved  DOUBLE PRECISION,
         outcome        TEXT NOT NULL,
         detail         TEXT,
         updated_at     BIGINT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_wallet_ops_pid_ts ON wallet_ops(pid, ts)",
     "CREATE INDEX IF NOT EXISTS idx_wallet_ops_open ON wallet_ops(pid, op, outcome)",
+    # The escrow RATCHET moves USDC from deposits_available to deposits_reserved,
+    # so `available` alone cannot tell a deposit that never landed from a deposit
+    # that landed and was immediately reserved by an opening channel. Both sides
+    # are recorded so the money-pump breaker can score the SUM (see
+    # wallet_keeper._settle_topups). Added after the table shipped, hence ALTER.
+    "ALTER TABLE wallet_ops ADD COLUMN IF NOT EXISTS pre_reserved DOUBLE PRECISION",
+    "ALTER TABLE wallet_ops ADD COLUMN IF NOT EXISTS post_reserved DOUBLE PRECISION",
     # Dashboard login audit (#5) — replaces dashboard-logins.jsonl. A small record
     # read whole by the dashboard, so it follows the consumer_keys pattern: the
     # row as a JSON record in TEXT (not analysed by column). ts in SECONDS.
@@ -1471,14 +1480,26 @@ def peer_offers(window_ms: int = 900_000) -> list[dict[str, Any]]:
 
 # ---- buyer_status (antseed buyer escrow/pin/wallet; written by the sidecar) ----
 
+# `fetched_at` (epoch MS, the sidecar's write stamp) is surfaced deliberately:
+# every funding gate downstream — the offer tourniquet, the envelope's `credits`
+# clause and the wallet keeper — decides from this row, and a row with no
+# readable age cannot be distinguished from a current one. A dead sidecar plus a
+# drained escrow is exactly the state where a stale row reads "funded" and every
+# gate fails OPEN together. Consumers bound the age themselves (the keeper fails
+# closed on it; see sources/antseed.STALE_AFTER_S for the shared bound).
 _BUYER_STATUS_FIELDS = ("pid", "pinned_peer_id", "deposits_available",
-                        "deposits_reserved", "wallet_address", "connection_state")
+                        "deposits_reserved", "wallet_address", "connection_state",
+                        "fetched_at")
 
 
 def buyer_status(pid: str) -> "dict[str, Any] | None":
     """The antseed buyer's latest status row (session pin + escrow + wallet) for
     `pid`, or None when absent / on a store error (degraded: no pin, no balance),
-    exactly as a missing status file was. Fail-soft."""
+    exactly as a missing status file was. Fail-soft.
+
+    Carries `fetched_at` (epoch MS) so callers can bound its age — the row is
+    written every 60s by the sidecar, and a row that stopped being written is not
+    evidence of anything."""
     try:
         cols = ", ".join(_BUYER_STATUS_FIELDS)
         with _get_pool().connection() as conn:
@@ -1498,35 +1519,52 @@ def buyer_status(pid: str) -> "dict[str, Any] | None":
 # "already spent / already halted", never like "free to spend".
 
 # Outcomes that count as money having left the wallet for cap + cooldown purposes.
-# `pending` and `unknown` count too: a keeper that died mid-deposit must ASSUME the
-# transaction landed rather than re-fire on top of it.
+# `pending` and `unknown` count too: a keeper that died mid-deposit — or one whose
+# HTTP call to the sidecar timed out, reset, or came back 502 from a killed CLI —
+# must ASSUME the transaction landed rather than re-fire on top of it. The one
+# outcome that is NOT here is `failed`, and it is reserved for responses that PROVE
+# nothing was attempted (no control URL, a 400 from the amount validator); anything
+# that reached the wire is `unknown`. See wallet_keeper._control_post.
 WALLET_OP_SPENT_OUTCOMES = ("pending", "fired", "effective", "ineffective", "unknown")
 # Outcomes of a deposit whose effect on `deposits_available` has been measured.
 WALLET_OP_SETTLED_OUTCOMES = ("effective", "ineffective")
+# Outcomes that will never change again — the row is closed out. `pending`/`fired`
+# are still in flight and `halted` is not an op at all (see wallet_halt).
+WALLET_OP_TERMINAL_OUTCOMES = ("effective", "ineffective", "ok", "failed", "unknown")
+# Terminal outcomes that mean the op did NOT demonstrably work. The money-pump
+# breaker scores `ineffective` (measured); the error breaker scores the other two
+# (unmeasurable), which is why they are counted separately by the keeper.
+WALLET_OP_ERROR_OUTCOMES = ("failed", "unknown")
 
 _WALLET_OP_FIELDS = ("id", "ts", "pid", "op", "amount_usdc", "reason",
-                     "pre_available", "post_available", "outcome", "detail",
-                     "updated_at")
+                     "pre_available", "post_available", "pre_reserved",
+                     "post_reserved", "outcome", "detail", "updated_at")
 
 
 def wallet_op_begin(pid: str, op: str, amount_usdc: "float | None" = None,
                     reason: "str | None" = None,
-                    pre_available: "float | None" = None) -> "int | None":
+                    pre_available: "float | None" = None,
+                    pre_reserved: "float | None" = None) -> "int | None":
     """Record the INTENT to run a wallet op and return its row id. Call this
     BEFORE firing the transaction. Returns None when the row could NOT be
     persisted — the caller must then abort: an unlogged on-chain spend is worse
-    than a missed top-up (no audit trail, no cap accounting, no reconciliation)."""
+    than a missed top-up (no audit trail, no cap accounting, no reconciliation).
+
+    `pre_reserved` is recorded alongside `pre_available` so the effect check can
+    net out the escrow ratchet (a deposit that lands and is immediately reserved
+    by an opening channel raised the escrow, just not the spendable half)."""
     try:
         now = int(time.time())
         with _get_pool().connection() as conn:
             row = conn.execute(
                 "INSERT INTO wallet_ops (ts, pid, op, amount_usdc, reason,"
-                " pre_available, outcome, updated_at)"
-                " VALUES (%s,%s,%s,%s,%s,%s,'pending',%s) RETURNING id",
+                " pre_available, pre_reserved, outcome, updated_at)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s) RETURNING id",
                 (now, pid, op,
                  float(amount_usdc) if amount_usdc is not None else None,
                  reason,
                  float(pre_available) if pre_available is not None else None,
+                 float(pre_reserved) if pre_reserved is not None else None,
                  now)).fetchone()
             return int(row[0]) if row else None
     except Exception as exc:  # noqa: BLE001 — surfaced to the caller as "do not fire"
@@ -1536,7 +1574,8 @@ def wallet_op_begin(pid: str, op: str, amount_usdc: "float | None" = None,
 
 def wallet_op_finish(op_id: int, outcome: str,
                      post_available: "float | None" = None,
-                     detail: "str | None" = None) -> bool:
+                     detail: "str | None" = None,
+                     post_reserved: "float | None" = None) -> bool:
     """Close out an intent row with its observed outcome. False on a persistence
     failure so the caller can log it; the row then stays `pending` and startup
     reconciliation treats it conservatively (as spent)."""
@@ -1544,9 +1583,10 @@ def wallet_op_finish(op_id: int, outcome: str,
         with _get_pool().connection() as conn:
             conn.execute(
                 "UPDATE wallet_ops SET outcome=%s, post_available=%s,"
-                " detail=%s, updated_at=%s WHERE id=%s",
+                " post_reserved=%s, detail=%s, updated_at=%s WHERE id=%s",
                 (outcome,
                  float(post_available) if post_available is not None else None,
+                 float(post_reserved) if post_reserved is not None else None,
                  str(detail)[:2000] if detail is not None else None,
                  int(time.time()), int(op_id)))
         return True
@@ -1635,21 +1675,79 @@ def wallet_ops_settled(pid: str, op: str, limit: int = 2) -> list[dict[str, Any]
         return []
 
 
+def wallet_ops_terminal(pid: str, op: str, limit: int = 5) -> list[dict[str, Any]]:
+    """The newest CLOSED-OUT ops of this kind, newest first — the input to the
+    keeper's consecutive-error breaker.
+
+    Wider than `wallet_ops_settled`: it includes the outcomes whose effect could
+    never be measured (`failed`, `unknown`). Those are exactly the ones that used
+    to escape every guardrail — a deposit that errors is invisible to the
+    money-pump breaker, so a permanently failing top-up re-fired every cycle
+    forever. Fail-soft -> [], which the keeper reads as "no strikes on record"
+    and pairs with the fail-closed cap/cooldown readers above."""
+    try:
+        cols = ", ".join(_WALLET_OP_FIELDS)
+        placeholders = ",".join(["%s"] * len(WALLET_OP_TERMINAL_OUTCOMES))
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                f"SELECT {cols} FROM wallet_ops WHERE pid=%s AND op=%s"
+                f" AND outcome IN ({placeholders}) ORDER BY id DESC LIMIT %s",
+                (pid, op, *WALLET_OP_TERMINAL_OUTCOMES,
+                 max(1, min(int(limit), 100))))
+            return [dict(zip(_WALLET_OP_FIELDS, r)) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_ops_terminal failed: %s", exc)
+        return []
+
+
+def wallet_ops_last_ts(pid: str, ops: "tuple[str, ...]") -> "int | None":
+    """When any of these op kinds last FIRED, or None if none ever has — the
+    reclaim cooldown's ledger (so a pod restart cannot reset it).
+
+    Separate from `wallet_op_spend_since`, which filters to the outcomes that
+    count as USDC leaving the WALLET. A reclaim moves money between the escrow
+    and its channels, settles as `ok`, and is therefore invisible to that filter
+    — it needs "did this fire at all", not "did this spend".
+
+    Fail-soft in the SAFE direction: a store error reports NOW, i.e. the cooldown
+    has only just started, so a broken read can never authorize a transaction."""
+    now = int(time.time())
+    try:
+        placeholders = ",".join(["%s"] * len(ops))
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                f"SELECT max(ts) FROM wallet_ops WHERE pid=%s AND op IN ({placeholders})"
+                " AND outcome <> 'halted'", (pid, *ops)).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_ops_last_ts failed: %s", exc)
+        return now
+
+
 def wallet_halt(pid: str, kind: str, reason: str) -> bool:
     """Persist a HARD halt for one class of keeper action (e.g. `topup`). Durable
-    and deliberately sticky: only an operator clears it (`wallet_clear_halt`)."""
-    if wallet_halted(pid, kind):
-        return True
+    and deliberately sticky: only an operator clears it (`wallet_clear_halt`).
+
+    Returns True only when the halt is PERSISTED. The de-duplication is done in
+    the same statement rather than by calling `wallet_halted` first: that reader
+    fails soft to True, so a store outage used to make this function report a
+    halt it had not written — the keeper logged "HARD HALT" and the next process
+    to read a working store found nothing there."""
     try:
         now = int(time.time())
         with _get_pool().connection() as conn:
             conn.execute(
                 "INSERT INTO wallet_ops (ts, pid, op, reason, outcome, updated_at)"
-                " VALUES (%s,%s,%s,%s,'halted',%s)",
-                (now, pid, f"halt:{kind}", str(reason)[:2000], now))
+                " SELECT %s,%s,%s,%s,'halted',%s WHERE NOT EXISTS ("
+                "  SELECT 1 FROM wallet_ops WHERE pid=%s AND op=%s"
+                "  AND outcome='halted')",
+                (now, pid, f"halt:{kind}", str(reason)[:2000], now,
+                 pid, f"halt:{kind}"))
         return True
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("host_store wallet_halt failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001 — the caller must not claim a halt it
+        # could not write; an unpersisted halt evaporates on the next restart.
+        _log.error("host_store wallet_halt FAILED to persist for %s/%s: %s",
+                   pid, kind, exc)
         return False
 
 

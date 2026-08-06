@@ -246,9 +246,15 @@ def test_buyer_status_roundtrip_and_absent(store):
             " VALUES (%s,%s,%s,%s,%s,%s,%s)",
             ("antseed", "peerX", "1.5", "0.2", "0xabc", "connected", 1))
     row = store.buyer_status("antseed")
+    # `fetched_at` (epoch MS) is part of the row on purpose. It was in the table
+    # but NOT in _BUYER_STATUS_FIELDS, so no consumer could bound the row's age —
+    # and all three funding gates (the offer tourniquet, the envelope's credits
+    # clause, the wallet keeper) decide from this one signal. A dead sidecar plus
+    # a drained escrow left every one of them reading a stale "funded".
     assert row == {"pid": "antseed", "pinned_peer_id": "peerX",
                    "deposits_available": "1.5", "deposits_reserved": "0.2",
-                   "wallet_address": "0xabc", "connection_state": "connected"}
+                   "wallet_address": "0xabc", "connection_state": "connected",
+                   "fetched_at": 1}
 
 
 def test_served_by_and_tokens_cached_recorded(store):
