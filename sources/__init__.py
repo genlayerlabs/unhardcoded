@@ -8,9 +8,12 @@ first refresh). See docs/superpowers/specs/2026-06-10-provider-sources-design.md
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import time
 from typing import Any, Literal, Protocol, TypedDict
+
+_log = logging.getLogger("unhardcoded.sources")
 
 
 class Price(TypedDict):
@@ -84,6 +87,57 @@ def push_prices(host: Any, catalog: dict, prices: list[Price]) -> int:
     return pushed
 
 
+# Balance kinds that denominate SPENDABLE MONEY, and so map onto the engine's
+# pointwise `credits` field. `quota_window` (a subscription's used-fraction) does
+# not — publishing it as credits would compare a ratio against a dollar amount.
+_CREDIT_BALANCE_KINDS = ("deposits_usdc", "credits_usd")
+
+
+def push_credits(host: Any, balances: "dict[str, Balance]") -> int:
+    """Publish each provider's spendable balance into the core's `__credits|<pid>`
+    metrics slot, which the algebra reads back pointwise as `credits`.
+
+    This is what makes a funding gate expressible in a policy term at all: without
+    it `credits` is whatever metrics.live.lua seeded (or the field default, 0) and
+    a `cmp(credits, ge, N)` clause is decorative. The host envelope uses it to keep
+    AntSeed out of ranking when its escrow cannot pay — see config.live.lua."""
+    pushed = 0
+    for pid, bal in (balances or {}).items():
+        if bal.get("kind") not in _CREDIT_BALANCE_KINDS:
+            continue
+        value = bal.get("value")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        host.update_metrics("__credits", pid,
+                            {"free_credits_remaining_usd": float(value)})
+        pushed += 1
+    return pushed
+
+
+def seed_credits(host: Any, registry: "list[ProviderSource]") -> int:
+    """COLD START: publish last-known credits before the app serves traffic.
+
+    The host envelope's AntSeed clause (`credits >= 1.0`) fails CLOSED — the
+    engine's `credits` default is 0, so a pod that has not yet completed a
+    balances refresh rejects every AntSeed candidate for up to one poll interval.
+    A source that can answer from durable state (`credits_seed()` — no network)
+    closes that window. Never raises: a seed failure just leaves the cold-start
+    gate closed until the first refresh tick, which is the safe direction."""
+    seeded = 0
+    for source in registry:
+        fn = getattr(source, "credits_seed", None)
+        if fn is None:
+            continue
+        try:
+            for pid, value in (fn() or {}).items():
+                host.update_metrics("__credits", pid,
+                                    {"free_credits_remaining_usd": float(value)})
+                seeded += 1
+        except Exception as exc:  # noqa: BLE001 — isolation is the contract
+            _log.warning("credits seed failed for %s: %s", source.name, exc)
+    return seeded
+
+
 async def refresh_once(host: Any, catalog: dict, source: ProviderSource) -> None:
     """One refresh tick. Never raises: failures land in SOURCE_STATE and the
     last-known data stays in place."""
@@ -94,8 +148,16 @@ async def refresh_once(host: Any, catalog: dict, source: ProviderSource) -> None
         prices = await source.pricing()
         state["prices_pushed"] = push_prices(host, catalog, prices)
         state["balances"] = await source.balances()
+        # Balances are also the credit signal the algebra gates on — push them
+        # every tick, not just into the dashboard view.
+        state["credits_pushed"] = push_credits(host, state["balances"])
         if hasattr(source, "market_book"):
             state["book"] = source.market_book()
+        # Per-source counters (offers kept/dropped/suppressed, wallet health).
+        # snapshot_stats had no non-test caller; surfacing it here is what puts
+        # it on /x/runtime + /x/market alongside `balances`.
+        if hasattr(source, "snapshot_stats"):
+            state["stats"] = source.snapshot_stats()
         state["last_ok"] = int(time.time())
         state["error"] = None
     except Exception as exc:  # noqa: BLE001 — isolation is the contract

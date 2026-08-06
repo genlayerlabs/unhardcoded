@@ -131,6 +131,24 @@ def test_build_source_registry_adds_bedrock_source():
     assert [s.name for s in reg] == ["bedrock"]
 
 
+def test_build_source_registry_hands_antseed_the_openrouter_trait_oracle():
+    # AntSeed rows carry no model metadata, so an uncurated peer service would have
+    # no context and the core would reject it for any min_context request. The
+    # composition root is where the two sources meet — `sources/*` never import
+    # one another.
+    cat = {"providers": {
+        "openrouter": {},
+        "antseed": {"discovery": "marketplace", "discovery_id": "antseed"},
+    }, "models": {}}
+    by_name = {s.name: s for s in providers.build_source_registry(cat)}
+    assert by_name["antseed"]._trait_source is by_name["openrouter"]
+    # ...and AntSeed alone stays wired to nothing rather than half-wired
+    antseed_only = providers.build_source_registry({"providers": {
+        "antseed": {"discovery": "marketplace", "discovery_id": "antseed"}},
+        "models": {}})
+    assert antseed_only[0]._trait_source is None
+
+
 # ---- openrouter source ----------------------------------------------------
 
 OR_MODELS_BODY = {
@@ -819,7 +837,8 @@ ANTSEED_CATALOG = {
 }
 
 
-def _antseed_source(tmp_path, market_body=None, pins=None, observed_at=None):
+def _antseed_source(tmp_path, market_body=None, pins=None, observed_at=None,
+                    available="25.0"):
     import json as _json
     from conftest import require_host_store, seed_peer_offers, seed_buyer_status
     from sources.antseed import AntSeedSource
@@ -835,7 +854,12 @@ def _antseed_source(tmp_path, market_body=None, pins=None, observed_at=None):
     default_pins = {"antseed_free": "1d90f467689d499dc435e5744b4613c3203eb0aa",
                     "antseed_cheap": "1d90f467689d499dc435e5744b4613c3203eb0aa"}
     for pid, peer in (pins if pins is not None else default_pins).items():
-        seed_buyer_status(pid, pinned_peer_id=peer, deposits_available="0.0",
+        # FUNDED by default: offers_sync now suppresses a buyer whose escrow
+        # cannot cover one channel reserve (antseed.min_available_usdc), and
+        # these tests are about offer admission, not funding. The funding gate
+        # has its own tests below.
+        seed_buyer_status(pid, pinned_peer_id=peer,
+                          deposits_available=available,
                           deposits_reserved="0.0", wallet_address="0x0")
     return AntSeedSource(ANTSEED_CATALOG)
 
@@ -888,16 +912,205 @@ def test_antseed_pricing_rows_match_offers(tmp_path):
     assert ("antseed_cheap", "claude-sonnet-4-6") in rows
 
 
-def test_canon_service_is_conservative():
+def test_canon_service_folds_separators_but_never_removes_them():
     from sources.antseed import _canon_service
-    assert _canon_service("opus-4.8") == "opus-4-8"            # dots -> dashes
-    assert _canon_service("claude-opus-4-8") == "opus-4-8"     # strip vendor prefix
-    assert _canon_service("OpenAI-GPT-OSS-120B") == "gpt-oss-120b"  # case + prefix
-    assert _canon_service("gpt-5.5") == "gpt-5-5"              # no vendor prefix
-    # does NOT bridge digit-run differences -> stays distinct from gpt-5-5
-    assert _canon_service("gpt-55") == "gpt-55"
-    # strips only ONE leading prefix (real peers use a single form)
-    assert _canon_service("anthropic-claude-sonnet-4.6") == "claude-sonnet-4-6"
+    # every run of non-alphanumerics -> a single dash; case folded
+    assert _canon_service("opus-4.8") == "opus-4-8"
+    assert _canon_service("Anthropic/Claude_Opus-4.8") == "anthropic-claude-opus-4-8"
+    assert _canon_service("OpenAI-GPT-OSS-120B") == "openai-gpt-oss-120b"
+    # separators are FOLDED, not REMOVED: a digit-run difference survives, so
+    # `gpt55` can never become `gpt-5.5`
+    assert _canon_service("gpt-5.5") == "gpt-5-5"
+    assert _canon_service("gpt55") == "gpt55"
+    # and it no longer strips vendors — that is what used to file a curated
+    # family under a vendor-free residue any other vendor could reach
+    assert _canon_service("claude-opus-4-8") == "claude-opus-4-8"
+    assert _canon_service("deepseek-v4-pro") == "deepseek-v4-pro"
+
+
+# The four cross-vendor mis-binds observed against the live catalog: each wire
+# name reached a curated family belonging to a DIFFERENT vendor, because the
+# family was indexed under its vendor-stripped residue. Silent wrong-model
+# routing — the peer's own vendor token must veto the match.
+CROSS_VENDOR_MISBINDS = [
+    ("x-ai-v4-pro", "deepseek-v4-pro"),
+    ("openai-fable-5", "claude-fable-5"),
+    ("google-sonnet-4-6", "claude-sonnet-4-6"),
+    ("meta-opus-4-8", "claude-opus-4-8"),
+]
+
+
+@pytest.mark.parametrize("wire,used_to_bind", CROSS_VENDOR_MISBINDS)
+def test_family_for_refuses_cross_vendor_wire_name(wire, used_to_bind):
+    from sources.antseed import AntSeedSource
+    cat = {
+        "providers": {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}},
+        "models": {fam: {"served_by": [], "capabilities": {}}
+                   for _w, fam in CROSS_VENDOR_MISBINDS},
+    }
+    s = AntSeedSource(cat)
+    assert used_to_bind in cat["models"], "the family it wrongly reached is curated"
+    assert s._family_for(cat["providers"]["antseed"], wire) is None
+
+
+# ---- the SHIPPED catalog, probed name by name --------------------------------
+#
+# The four cases above were refused only because the family they reached happens
+# to be named with a vendor token. Most curated families are not: `glm-5.1`,
+# `qwen3-coder`, `gemma-3-27b`. For those the vendor check had nothing to compare
+# and waved the claim through, so the cross-vendor hole stayed open one layer
+# down. It is now closed by the RULE (an unknown family vendor refuses every
+# vendor claim) plus the `vendor` annotations that re-open the true spellings —
+# and an annotation quietly deleted is exactly how this regresses, so these run
+# against config.live.lua itself, not a hand-built stand-in.
+LIVE_CROSS_VENDOR_MISBINDS = [
+    ("x-ai-glm-5.1", "glm-5.1"),                  # GLM is z-ai's, not x-ai's
+    ("claude-glm-5.1", "glm-5.1"),
+    ("deepseek-llama-3.3-70b", "llama-3.3-70b"),  # the naming shape of a REAL
+                                                  # distill: different weights
+    ("openai-qwen3-coder", "qwen3-coder"),
+    ("meta-mistral-large", "mistral-large"),
+    ("openai-gemma-3-27b", "gemma-3-27b"),
+]
+
+# What the annotations exist to KEEP reachable: a peer naming the family's TRUE
+# vendor still binds. These mirror the OpenRouter slugs in each family's own
+# `served_by`, i.e. the spellings peers actually resell under.
+LIVE_SAME_VENDOR_BINDS = [
+    ("z-ai-glm-5.1", "glm-5.1"),
+    ("google-gemma-3-27b", "gemma-3-27b"),
+    ("openai-gpt-5.5", "gpt-5.5"),
+    ("openai-gpt-oss-120b", "gpt-oss-120b"),
+    ("qwen-qwen3-coder", "qwen3-coder"),
+    ("mistralai-mistral-large", "mistral-large"),
+    ("moonshot-kimi-k2.6", "kimi-k2.6"),
+    # vendor read off the family's OWN name — no annotation needed
+    ("minimax-minimax-m2.7", "minimax-m2.7"),
+    ("deepseek-deepseek-v4-pro", "deepseek-v4-pro"),
+    # the two forms that must never break: same vendor spelled two ways, and a
+    # wire name making no vendor claim at all
+    ("anthropic-claude-sonnet-4.6", "claude-sonnet-4-6"),
+    ("opus-4.8", "claude-opus-4-8"),
+]
+
+
+@pytest.fixture(scope="module")
+def live_catalog_antseed():
+    """An AntSeedSource over the catalog the router actually ships."""
+    from llm_router_host import LLMRouterHost
+    from sources.antseed import AntSeedSource
+    host = LLMRouterHost(router_path=ROOT / "core" / "router.lua",
+                         config_path=ROOT / "config.live.lua",
+                         metrics_path=ROOT / "metrics.live.lua", now_ms=lambda: 1)
+    cat = host.catalog()
+    cfg = {"discovery": "marketplace", "discovery_id": "antseed_probe"}
+    cat["providers"]["antseed_probe"] = cfg
+    return AntSeedSource(cat), cfg
+
+
+@pytest.mark.parametrize("wire,used_to_bind", LIVE_CROSS_VENDOR_MISBINDS)
+def test_live_catalog_refuses_a_foreign_vendor_claim(live_catalog_antseed, wire,
+                                                     used_to_bind):
+    s, cfg = live_catalog_antseed
+    assert used_to_bind in s._models, "the family it wrongly reached is curated"
+    assert s._family_for(cfg, wire) is None
+
+
+@pytest.mark.parametrize("wire,family", LIVE_SAME_VENDOR_BINDS)
+def test_live_catalog_keeps_the_true_vendor_spelling(live_catalog_antseed, wire,
+                                                     family):
+    s, cfg = live_catalog_antseed
+    assert s._family_for(cfg, wire) == family
+
+
+# M-2: `sources/antseed.py` special-cased a DIGIT-leading residue with the
+# rationale "a bare version number names no model" — which is equally true of the
+# `v`/`m`-leading ones it let through. `v4-pro` is the identical residue from the
+# production incident, reachable again the moment the wire name claims no vendor
+# (nothing then contradicts it). Generalized to the rule the comment states.
+@pytest.mark.parametrize("wire", ["v4-pro", "v3.2", "m2.7", "v4-flash",
+                                  "3-1-pro-preview"])
+def test_bare_version_residue_never_binds(live_catalog_antseed, wire):
+    s, cfg = live_catalog_antseed
+    assert s._family_for(cfg, wire) is None
+
+
+# The other half of the same rule: a residue leading with a real NAME word is
+# still a name, and still binds. Losing these would trade one silent mis-route
+# for a silent loss of every bare Anthropic spelling peers sell.
+@pytest.mark.parametrize("wire,family", [
+    ("opus-4.8", "claude-opus-4-8"), ("opus-4.7", "claude-opus-4-7"),
+    ("sonnet-4.6", "claude-sonnet-4-6"), ("haiku-4.5", "claude-haiku-4-5"),
+    ("fable-5", "claude-fable-5"),
+])
+def test_named_residue_still_binds(live_catalog_antseed, wire, family):
+    s, cfg = live_catalog_antseed
+    assert s._family_for(cfg, wire) == family
+
+
+def test_vendor_annotation_is_what_reopens_a_vendor_prefixed_spelling():
+    """The hybrid rule, both halves. Unannotated, `glm-5.1`'s vendor is UNKNOWN
+    and every vendor claim is refused — safe by default, and the offer stays
+    routable under its raw wire name. Annotated, the ONE true vendor binds and
+    every other is still refused."""
+    from sources.antseed import AntSeedSource
+    providers = {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}}
+    cfg = providers["antseed"]
+
+    bare = AntSeedSource({"providers": providers,
+                          "models": {"glm-5.1": {"served_by": []}}})
+    assert bare._family_for(cfg, "glm-5.1") == "glm-5.1"      # no claim, no problem
+    assert bare._family_for(cfg, "z-ai-glm-5.1") is None      # unknown -> refuse
+    assert bare._family_for(cfg, "x-ai-glm-5.1") is None
+
+    annotated = AntSeedSource({"providers": providers,
+                               "models": {"glm-5.1": {"served_by": [],
+                                                      "vendor": "z-ai"}}})
+    assert annotated._family_for(cfg, "z-ai-glm-5.1") == "glm-5.1"
+    assert annotated._family_for(cfg, "x-ai-glm-5.1") is None
+    assert annotated._family_for(cfg, "claude-glm-5.1") is None
+
+
+def test_vendor_annotation_accepts_a_wire_token_or_its_canonical_id():
+    # `mistralai` (what a peer spells) and `mistral` (the id it resolves to) name
+    # one vendor; an operator should not have to know which is which.
+    from sources.antseed import AntSeedSource
+    providers = {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}}
+    cfg = providers["antseed"]
+    for spelling in ("mistralai", "mistral"):
+        s = AntSeedSource({"providers": providers,
+                           "models": {"mistral-large": {"served_by": [],
+                                                        "vendor": spelling}}})
+        assert s._family_for(cfg, "mistralai-mistral-large") == "mistral-large"
+        assert s._family_for(cfg, "meta-mistral-large") is None
+
+
+def test_unrecognised_vendor_annotation_is_loud_and_inert(caplog):
+    # A peer can only ever claim one of the tokens this module knows, so an
+    # annotation outside that set can never match — it is a typo that silently
+    # leaves the family refusing every vendor-prefixed name. Fails SAFE, but an
+    # operator has to be able to see it.
+    from sources.antseed import AntSeedSource
+    cat = {
+        "providers": {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}},
+        "models": {"glm-5.1": {"served_by": [], "vendor": "zed-ai"}},
+    }
+    with caplog.at_level("WARNING", logger="unhardcoded.sources.antseed"):
+        stats = AntSeedSource(cat).snapshot_stats()
+    assert stats["vendor_unknown"] == ["glm-5.1=zed-ai"]
+    assert "NO effect" in caplog.text
+
+
+def test_family_for_binds_double_prefixed_wire_name():
+    # The form the old docstring CLAIMED to bridge and did not: stripping one
+    # vendor off the wire name left `claude-opus-4-8`, but the index key was the
+    # doubly-stripped `opus-4-8`. Now the index keeps the family's own name, so a
+    # single strip lands exactly.
+    from sources.antseed import AntSeedSource
+    s = AntSeedSource(ANTSEED_CATALOG)
+    cfg = ANTSEED_CATALOG["providers"]["antseed_cheap"]
+    assert s._family_for(cfg, "anthropic-claude-sonnet-4.6") == "claude-sonnet-4-6"
+    assert s._family_for(cfg, "anthropic/claude-sonnet-4.6") == "claude-sonnet-4-6"
 
 
 def test_family_for_canonicalizes_vendor_prefix_and_separators():
@@ -908,26 +1121,166 @@ def test_family_for_canonicalizes_vendor_prefix_and_separators():
     cfg = ANTSEED_CATALOG["providers"]["antseed_cheap"]
     assert s._family_for(cfg, "sonnet-4.6") == "claude-sonnet-4-6"        # bare + dotted
     assert s._family_for(cfg, "claude-sonnet-4-6") == "claude-sonnet-4-6"  # exact
+    assert s._family_for(cfg, "Claude_Sonnet-4.6") == "claude-sonnet-4-6"  # any separator
+    assert s._family_for(cfg, "anthropic-sonnet-4-6") == "claude-sonnet-4-6"  # same vendor
     assert s._family_for(cfg, "qwen3-235b-instruct") == "qwen3-235b-a22b"  # static alias wins
-    # never collapse a variant or an unknown into a curated family
-    assert s._family_for(cfg, "sonnet-4.6-fast") is None
     assert s._family_for(cfg, "some-unknown-model") is None
 
 
-def test_family_for_drops_ambiguous_canonical():
-    # Two curated families sharing a canonical form must NOT auto-match (it would
-    # risk routing to the wrong model); only an exact wire name still resolves.
+def test_family_for_drops_ambiguous_residue():
+    # Two curated families whose vendor-stripped residues collide must NOT
+    # auto-match a bare wire name (it would risk routing to the wrong model);
+    # each family's own full name still resolves exactly.
     from sources.antseed import AntSeedSource
     cat = {
         "providers": {"antseed_cheap": {"discovery": "marketplace",
                                         "discovery_id": "antseed_cheap"}},
         "models": {"claude-opus-4-8": {"served_by": []},
-                   "opus-4-8": {"served_by": []}},   # both canonicalize to "opus-4-8"
+                   "anthropic-opus-4-8": {"served_by": []}},  # both -> "opus-4-8"
     }
     s = AntSeedSource(cat)
     cfg = cat["providers"]["antseed_cheap"]
     assert s._family_for(cfg, "opus-4.8") is None                      # ambiguous -> raw
     assert s._family_for(cfg, "claude-opus-4-8") == "claude-opus-4-8"  # exact still ok
+    # and the drop is LOUD: a catalog that silently unbinds a working family is
+    # exactly what this has to surface
+    assert s.snapshot_stats()["ambiguous"] == ["opus-4-8"]
+
+
+def test_ambiguous_family_index_is_logged(caplog):
+    from sources.antseed import AntSeedSource
+    cat = {
+        "providers": {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}},
+        "models": {"claude-opus-4-8": {"served_by": []},
+                   "anthropic-opus-4-8": {"served_by": []}},
+    }
+    with caplog.at_level("WARNING", logger="unhardcoded.sources.antseed"):
+        AntSeedSource(cat).snapshot_stats()
+    warned = [r for r in caplog.records
+              if "opus-4-8" in r.getMessage() and "UNBOUND" in r.getMessage()]
+    assert warned
+    # and it is THAT logger's record. Naming a logger that does not exist still
+    # passes by propagation to root, so the level filter this test thinks it is
+    # applying would silently not be the one under test.
+    assert warned[0].name == "unhardcoded.sources.antseed"
+
+
+def test_gpt55_never_merges_with_gpt_5_5():
+    # A removed separator would make these one model. They are two.
+    from sources.antseed import AntSeedSource
+    cat = {
+        "providers": {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}},
+        "models": {"gpt-5.5": {"served_by": [], "capabilities": {}}},
+    }
+    s = AntSeedSource(cat)
+    cfg = cat["providers"]["antseed"]
+    assert s._family_for(cfg, "gpt-5.5") == "gpt-5.5"
+    assert s._family_for(cfg, "gpt_5_5") == "gpt-5.5"
+    assert s._family_for(cfg, "gpt55") is None
+    assert s._family_for(cfg, "gpt-55") is None
+
+
+# Serving-MODE markers: same weights, different serving switch. Each earns its own
+# `<family>@<variant>` family — merging into the base would silently land an
+# existing family_eq("glm-5.1") policy on a different product.
+VARIANT_CASES = [
+    ("glm-5.1:web", "glm-5.1@web", "web"),
+    ("glm-5.1@web", "glm-5.1@web", "web"),
+    ("e2ee-glm-5.1", "glm-5.1@e2ee", "e2ee"),
+    ("glm-5.1-thinking", "glm-5.1@thinking", "thinking"),
+    ("glm-5.1-non-thinking", "glm-5.1@non-thinking", "non-thinking"),
+    ("claude-opus-4-8-fast", "claude-opus-4-8@fast", "fast"),
+    # a variant of a spelling that itself needs canonicalizing still lands
+    ("opus-4.8-fast", "claude-opus-4-8@fast", "fast"),
+    ("e2ee-anthropic/claude-opus-4.8", "claude-opus-4-8@e2ee", "e2ee"),
+]
+
+
+@pytest.fixture
+def variant_source():
+    from sources.antseed import AntSeedSource
+    cat = {
+        "providers": {"antseed": {"discovery": "marketplace", "discovery_id": "antseed"}},
+        "models": {
+            "glm-5.1": {"served_by": [], "capabilities": {"context": 200000},
+                        "static_quality_hint": 0.84},
+            "claude-opus-4-8": {"served_by": [], "capabilities": {"context": 200000},
+                                "static_quality_hint": 0.93},
+            "gemma-3-27b": {"served_by": [], "capabilities": {"context": 96000}},
+        },
+    }
+    return AntSeedSource(cat), cat["providers"]["antseed"]
+
+
+@pytest.mark.parametrize("wire,family,variant", VARIANT_CASES)
+def test_variant_gets_its_own_family_anchored_to_the_base(variant_source, wire,
+                                                          family, variant):
+    s, cfg = variant_source
+    assert s._bind(cfg, wire) == {"family": family,
+                                  "base_family": family.split("@")[0],
+                                  "variant": variant}
+
+
+# NEVER variant-stripped: `-uncensored` and `-it` are different WEIGHTS (a fold
+# would be a correctness AND a safety bug, and prod policies name `...-it` with the
+# suffix); `-p` has no known meaning and a one-letter rule would eat real segments.
+@pytest.mark.parametrize("wire", ["glm-5.1-uncensored", "gemma-3-27b-it",
+                                  "glm-5.1-p", "glm-5.1-instruct"])
+def test_never_folded_suffix_stays_its_own_family(variant_source, wire):
+    s, cfg = variant_source
+    assert s._bind(cfg, wire) is None, "must stay exposed under its raw wire name"
+
+
+def test_stacked_variant_markers_stay_raw(variant_source):
+    """L-7: at most ONE marker comes off, suffix first — so the base of
+    `e2ee-glm-5.1:web` is `e2ee-glm-5.1`, which is not curated, and the offer
+    keeps its raw wire name. The docstring used to say it "keeps the outer one",
+    which reads as a bind that does not happen."""
+    from sources.antseed import _split_variant
+    s, cfg = variant_source
+    assert _split_variant("e2ee-glm-5.1:web") == ("e2ee-glm-5.1", "web")
+    assert s._bind(cfg, "e2ee-glm-5.1:web") is None
+
+
+def test_variant_inherits_capabilities_but_never_the_quality_hint(variant_source):
+    """M-1: `-fast` is asserted to be a serving-mode switch on the same weights;
+    in marketplace practice it routinely means quantized or distilled. Context is
+    architecture and is inherited (withholding it would drop the variant from
+    every min_context request for no gain); the quality hint is a claim about
+    WEIGHTS and is not, or any peer could clear min_quality by spelling a suffix."""
+    s, cfg = variant_source
+    variant = s._bind(cfg, "glm-5.1-fast")
+    meta = s._model_meta({**variant, "service": "glm-5.1-fast"})
+    assert meta["capabilities"]["context"] == 200000
+    assert meta["quality_hint"] is None
+    # the base family itself is untouched — it earned its number
+    plain = s._bind(cfg, "glm-5.1")
+    assert s._model_meta({**plain, "service": "glm-5.1"})["quality_hint"] == 0.84
+
+
+def test_variant_of_an_uncurated_base_stays_raw(variant_source):
+    # `@variant` families are anchored to a CURATED base (that is what they inherit
+    # capabilities from). A variant of something uncurated is left raw, as before.
+    s, cfg = variant_source
+    assert s._bind(cfg, "e2ee-some-unknown-model") is None
+
+
+def test_letter_digit_boundary_is_left_to_an_alias(variant_source):
+    # `gemma4-31b` vs `gemma-4-31b` is a letter/digit boundary the canonicalizer
+    # deliberately does not bridge — guessing there is how `gpt55` would become
+    # `gpt-5.5`. The operator's service_aliases is the sanctioned bridge.
+    from sources.antseed import AntSeedSource
+    cat = {
+        "providers": {"antseed": {"discovery": "marketplace", "discovery_id": "antseed",
+                                  "service_aliases": {"gemma4-31b-it": "gemma-4-31b-it"}}},
+        "models": {"gemma-4-31b-it": {"served_by": [], "capabilities": {}}},
+    }
+    s = AntSeedSource(cat)
+    cfg = cat["providers"]["antseed"]
+    assert s._family_for(cfg, "gemma4-31b-it") == "gemma-4-31b-it"     # alias bridges it
+    assert s._family_for(cfg, "gemma4-31b") is None                    # nothing guesses
+    # and the alias reaches through a variant marker too
+    assert s._family_for(cfg, "gemma4-31b-it-fast") == "gemma-4-31b-it@fast"
 
 
 def test_antseed_drops_offer_when_cached_input_exceeds_input(tmp_path):
@@ -1067,6 +1420,241 @@ def test_antseed_stale_market_returns_no_offers(tmp_path):
     assert s.snapshot_stats()["stale"] is True
 
 
+# ---- the funds tourniquet (offers_sync) --------------------------------------
+
+def test_offers_suppressed_when_escrow_cannot_cover_one_channel_reserve(tmp_path):
+    """Opening a payment channel RESERVES ~1 USDC, so below one reserve every
+    routed call 402s `insufficient_deposits` — prod burned 5,432 attempts in 24h
+    that way. Offering a route that provably cannot pay spends the caller's
+    request on a certain failure AND poisons the peer's reliability score, so the
+    provider is suppressed instead."""
+    import settings
+    s = _antseed_source(tmp_path, available="0.231")   # the live prod reading
+    assert float(settings.get("antseed.min_available_usdc")) == 1.1
+    assert s.offers_sync("antseed_cheap") == []
+    stats = s.snapshot_stats()
+    assert stats["suppressed_no_funds"] == 1
+    assert stats["deposits_available"] == 0.231
+    assert stats["offers"] == 0
+
+
+def test_offers_still_served_just_above_the_tourniquet(tmp_path):
+    # 1.1 is the floor: at/above it the provider keeps trading.
+    s = _antseed_source(tmp_path, available="1.1")
+    assert s.offers_sync("antseed_cheap")
+    assert s.snapshot_stats()["suppressed_no_funds"] == 0
+
+
+def test_funds_gate_fails_OPEN_when_the_status_is_missing(tmp_path):
+    # No buyer_status row at all (cold start, sidecar lag). That is a READ error,
+    # not evidence of an empty escrow — suppressing on it would black out routing
+    # every time the DB hiccups. The keeper's twin decision fails CLOSED.
+    s = _antseed_source(tmp_path, pins={})
+    assert s.offers_sync("antseed_cheap")
+    assert s.snapshot_stats()["suppressed_no_funds"] == 0
+
+
+def test_funds_gate_fails_OPEN_when_the_status_is_unparseable(tmp_path):
+    from conftest import seed_buyer_status
+    _antseed_source(tmp_path)
+    seed_buyer_status("antseed_cheap", pinned_peer_id=None,
+                      deposits_available="not-a-number", deposits_reserved="0")
+    from sources.antseed import AntSeedSource
+    s = AntSeedSource(ANTSEED_CATALOG)
+    assert s.offers_sync("antseed_cheap")
+    assert s.snapshot_stats()["suppressed_no_funds"] == 0
+
+
+def test_funds_gate_fails_OPEN_when_the_store_is_unreadable(tmp_path, monkeypatch):
+    import host_store
+    s = _antseed_source(tmp_path)
+    monkeypatch.setattr(host_store, "buyer_status", lambda pid: None)
+    assert s.offers_sync("antseed_cheap"), "a store error must not kill routing"
+
+
+def test_dropped_unmapped_stat_is_gone(tmp_path):
+    # It was assigned a literal 0 and never incremented: uncurated services are
+    # exposed under their raw wire name, not dropped, so the counter described a
+    # behaviour that does not exist. `uncurated` is the real one.
+    s = _antseed_source(tmp_path)
+    s.offers_sync("antseed_cheap")
+    stats = s.snapshot_stats()
+    assert "dropped_unmapped" not in stats
+    assert "uncurated" in stats
+
+
+# ---- wedge detection + stats surfacing ---------------------------------------
+
+def test_wallet_health_flags_a_wedged_provider(tmp_path, caplog):
+    """Offers were ranked, yet every routed attempt failed. The funds gate cannot
+    see that (the escrow is healthy), so it gets its own flag: a dead proxy, a
+    wedged peer or a stale pin looks exactly like this.
+
+    The observations are seeded under the PROVIDER ID that was ranked. They used
+    to be seeded under `antseed` — the SOURCE name — while the source ranks
+    `antseed_cheap`, and the assertion passed anyway because the lookup also used
+    the source name. Two wrongs: the test demonstrated the bug instead of
+    catching it, and a second buyer proxy's attempts were invisible."""
+    from sources.antseed import WEDGE_CONSECUTIVE_FAILURES
+    from conftest import seed_route_obs
+    s = _antseed_source(tmp_path)
+    s.offers_sync("antseed_cheap")
+    seed_route_obs("antseed_cheap", "qwen3-235b-a22b", "peerA", ok=False,
+                   n=WEDGE_CONSECUTIVE_FAILURES)
+    with caplog.at_level("WARNING"):
+        assert s._refresh_wallet_health() == "wedged"
+    assert "antseed wedged" in caplog.text
+    assert s.snapshot_stats()["wallet_health"] == "wedged"
+
+
+def test_wallet_health_reads_every_buyer_proxy_not_just_the_source_name(tmp_path):
+    """A second proxy's attempts must count. `route_observations` is keyed by
+    provider id, so looking up `self.name` found rows only for the proxy that
+    happens to share the source's name — `antseed_free` could fail every call
+    forever and the source would report `unknown`."""
+    from sources.antseed import WEDGE_CONSECUTIVE_FAILURES
+    from conftest import seed_route_obs
+    s = _antseed_source(tmp_path)
+    s.offers_sync("antseed_cheap")
+    # Nothing under `antseed` (the source name); everything under a real proxy.
+    seed_route_obs("antseed_free", "qwen3-235b-a22b", "peerA", ok=False,
+                   n=WEDGE_CONSECUTIVE_FAILURES)
+    assert s._refresh_wallet_health() == "wedged"
+
+
+def test_wallet_health_is_ok_when_some_attempts_succeed(tmp_path):
+    from conftest import seed_route_obs
+    s = _antseed_source(tmp_path)
+    s.offers_sync("antseed_cheap")
+    seed_route_obs("antseed_cheap", "qwen3-235b-a22b", "peerA", ok=False, n=9)
+    seed_route_obs("antseed_cheap", "qwen3-235b-a22b", "peerA", ok=True, n=1)
+    assert s._refresh_wallet_health() == "ok"
+
+
+def test_wallet_health_does_not_blame_a_suppressed_provider(tmp_path):
+    # Suppressed by the funds gate -> no offers went out -> failures cannot be
+    # blamed on us handing out unpayable routes.
+    from sources.antseed import WEDGE_CONSECUTIVE_FAILURES
+    from conftest import seed_route_obs
+    s = _antseed_source(tmp_path, available="0.1")
+    s.offers_sync("antseed_cheap")
+    seed_route_obs("antseed_cheap", "qwen3-235b-a22b", "peerA", ok=False,
+                   n=WEDGE_CONSECUTIVE_FAILURES)
+    assert s._refresh_wallet_health() == "suppressed"
+
+
+def test_suppression_is_a_current_state_not_a_lifetime_counter(tmp_path):
+    """`suppressed_no_funds` only ever grows, so reading it as a flag made every
+    later diagnosis inherit it: once the escrow had dipped for a single tick, a
+    sidecar that died hours afterwards still reported `suppressed` — a FUNDS
+    problem — when the real cause was staleness or an idle hour. The counter is
+    still there (it counts), but the classification reads the flag."""
+    from conftest import seed_buyer_status
+    s = _antseed_source(tmp_path, available="0.1")
+    s.offers_sync("antseed_cheap")
+    assert s.snapshot_stats()["suppressed_no_funds"] == 1
+    assert s._refresh_wallet_health() == "suppressed"
+
+    # The escrow recovers and the provider goes quiet. The lifetime counter is
+    # unchanged, so the old code kept saying "suppressed" forever.
+    seed_buyer_status("antseed_cheap", pinned_peer_id="peerA",
+                      deposits_available="25.0", deposits_reserved="0.0")
+    seed_buyer_status("antseed_free", pinned_peer_id="peerA",
+                      deposits_available="25.0", deposits_reserved="0.0")
+    s.offers_sync("antseed_cheap")
+    s._stats["offers"] = 0                       # ranked nothing this tick
+    assert s.snapshot_stats()["suppressed_no_funds"] == 1, "the counter still counts"
+    assert s._refresh_wallet_health() == "idle", "but the diagnosis is current"
+
+
+def test_refresh_once_surfaces_source_stats(tmp_path):
+    """snapshot_stats() had no non-test caller. It rides the same refresh tick as
+    `balances`, which is what puts it on /x/runtime."""
+    import sources as src
+    src.SOURCE_STATE.clear()
+    s = _antseed_source(tmp_path)
+    asyncio.run(src.refresh_once(FakeHost(), ANTSEED_CATALOG, s))
+    stats = src.SOURCE_STATE["antseed"]["stats"]
+    assert stats["offers"] > 0 and stats["stale"] is False
+    assert stats["wallet_health"] in ("ok", "idle", "unknown", "wedged")
+    src.SOURCE_STATE.clear()
+
+
+# ---- credits push ------------------------------------------------------------
+
+class _CreditHost:
+    """Records update_metrics writes — the boundary sources.push_credits uses."""
+
+    def __init__(self):
+        self.metrics: dict[tuple[str, str], dict] = {}
+
+    def update_metrics(self, provider, model, delta):
+        self.metrics.setdefault((provider, model), {}).update(delta)
+
+
+def test_push_credits_publishes_escrow_into_the_engine_credits_slot():
+    import sources as src
+    h = _CreditHost()
+    n = src.push_credits(h, {"antseed": {
+        "kind": "deposits_usdc", "value": 12.5, "detail": {}, "fetched_at": 1}})
+    assert n == 1
+    assert h.metrics[("__credits", "antseed")] == {
+        "free_credits_remaining_usd": 12.5}
+
+
+def test_push_credits_ignores_quota_windows_and_missing_values():
+    # A subscription's used-FRACTION is not a dollar balance; publishing it as
+    # credits would compare a ratio against a USD floor.
+    import sources as src
+    h = _CreditHost()
+    assert src.push_credits(h, {
+        "openai_codex": {"kind": "quota_window", "value": 0.8, "detail": {}},
+        "openrouter": {"kind": "credits_usd", "value": None, "detail": {}},
+        "x": {"kind": "credits_usd", "value": True, "detail": {}},
+    }) == 0
+    assert h.metrics == {}
+
+
+def test_refresh_once_pushes_credits_every_tick(tmp_path):
+    import sources as src
+    from conftest import seed_buyer_status
+    src.SOURCE_STATE.clear()
+    s = _antseed_source(tmp_path)
+    seed_buyer_status("antseed_free", pinned_peer_id=None,
+                      deposits_available="3.25", deposits_reserved="0.0",
+                      wallet_address="0x0")
+    h = _CreditHost()
+    h.catalog = lambda: ANTSEED_CATALOG
+    asyncio.run(src.refresh_once(h, ANTSEED_CATALOG, s))
+    assert h.metrics[("__credits", "antseed_free")]["free_credits_remaining_usd"] \
+        == 3.25
+    assert src.SOURCE_STATE["antseed"]["credits_pushed"] >= 1
+    src.SOURCE_STATE.clear()
+
+
+def test_seed_credits_reads_only_durable_state(tmp_path):
+    # Cold start must not depend on the network: credits_seed() reads the
+    # buyer_status row the sidecar already wrote, nothing else.
+    import sources as src
+    s = _antseed_source(tmp_path)
+    h = _CreditHost()
+    assert src.seed_credits(h, [s]) == 2         # both pinned buyer proxies
+    assert h.metrics[("__credits", "antseed_free")]["free_credits_remaining_usd"] \
+        == 25.0
+
+
+def test_seed_credits_never_raises_on_a_broken_source():
+    import sources as src
+
+    class _Broken:
+        name = "broken"
+
+        def credits_seed(self):
+            raise RuntimeError("db down")
+
+    assert src.seed_credits(_CreditHost(), [_Broken()]) == 0
+
+
 def test_antseed_balances_from_status_files(tmp_path):
     from conftest import seed_buyer_status
     s = _antseed_source(tmp_path)
@@ -1076,8 +1664,69 @@ def test_antseed_balances_from_status_files(tmp_path):
     b = balances["antseed_free"]
     assert b["kind"] == "deposits_usdc" and b["value"] == 1.5
     assert b["detail"]["wallet"] == "0x7C39"
-    s_nostatus = _antseed_source(tmp_path, pins={})
-    assert asyncio.run(s_nostatus.balances()) == {}   # no buyer_status -> absent
+
+
+def test_a_missing_or_stale_status_publishes_zero_credits_rather_than_nothing(host_store_clean):
+    """The engine's `__credits|<pid>` slot has NO TTL: `push_credits` only ever
+    overwrites, so a pid this function skips keeps its last published value
+    forever. Skipping on a missing/stale row therefore left the host envelope
+    gating on a balance that could be hours old and long since spent — belt and
+    braces failing open together, which is how the 402 storm comes back.
+
+    Publishing 0 is the TTL. `credits` means money we can PROVE is spendable,
+    and a row nobody is writing proves nothing."""
+    import time as _time
+
+    import host_store
+    from conftest import require_host_store, seed_buyer_status
+    from sources.antseed import AntSeedSource, STALE_AFTER_S
+    require_host_store()
+    catalog = {"providers": {"antseed": {
+        "discovery": "marketplace", "discovery_id": "antseed"}}, "models": {}}
+    s = AntSeedSource(catalog)
+
+    # No row at all.
+    out = asyncio.run(s.balances())
+    assert out["antseed"]["value"] == 0.0
+    assert out["antseed"]["detail"]["unproven"] is True
+
+    # A row the sidecar stopped updating, still reporting a healthy escrow.
+    seed_buyer_status("antseed", deposits_available="42.0", deposits_reserved="0.0")
+    with host_store._get_pool().connection() as conn:
+        conn.execute("UPDATE buyer_status SET fetched_at=%s WHERE pid=%s",
+                     (int((_time.time() - STALE_AFTER_S - 60) * 1000), "antseed"))
+    out = asyncio.run(s.balances())
+    assert out["antseed"]["value"] == 0.0, \
+        "a stale row must not publish the escrow it happens to remember"
+    assert out["antseed"]["detail"]["reason"] == "stale buyer_status"
+
+    # ...and a fresh row publishes the truth again.
+    seed_buyer_status("antseed", deposits_available="42.0", deposits_reserved="0.0")
+    assert asyncio.run(s.balances())["antseed"]["value"] == 42.0
+
+
+def test_credits_seed_skips_a_stale_row_so_the_cold_start_gate_stays_closed(host_store_clean):
+    """`credits_seed` exists specifically to defeat the envelope's fail-closed
+    cold start, which makes it the one place a dead sidecar can re-open the gate
+    on a pod that has observed nothing at all. Leaving the gate closed is the
+    safe direction — the first healthy refresh tick opens it minutes later."""
+    import time as _time
+
+    import host_store
+    from conftest import require_host_store, seed_buyer_status
+    from sources.antseed import AntSeedSource, STALE_AFTER_S
+    require_host_store()
+    catalog = {"providers": {"antseed": {
+        "discovery": "marketplace", "discovery_id": "antseed"}}, "models": {}}
+    s = AntSeedSource(catalog)
+
+    seed_buyer_status("antseed", deposits_available="12.5", deposits_reserved="1.0")
+    assert s.credits_seed() == {"antseed": 12.5}
+
+    with host_store._get_pool().connection() as conn:
+        conn.execute("UPDATE buyer_status SET fetched_at=%s WHERE pid=%s",
+                     (int((_time.time() - STALE_AFTER_S - 1) * 1000), "antseed"))
+    assert s.credits_seed() == {}, "a stale row must not seed the gate open"
 
 
 def test_wallet_rpc_url_default_and_disable(monkeypatch):

@@ -34,17 +34,18 @@ CATALOG = {
             "market_price_cap": {"input": 1000, "output": 1000},
         },
     },
-    "models": {"qwen3-235b-a22b": {"capabilities": {"context": 32000}}},
+    "models": {"qwen3-235b-a22b": {"capabilities": {"context": 32000},
+                                   "static_quality_hint": 0.90}},
 }
 FAMILY = "qwen3-235b-a22b"
 
 
-def _peer(pid, price_in, maxc=5):
+def _peer(pid, price_in, maxc=5, service=FAMILY):
     return {
         "peerId": pid, "maxConcurrency": maxc, "lastSeen": 1,
         "providerPricing": {"x": {"services": {
-            FAMILY: {"inputUsdPerMillion": price_in,
-                     "outputUsdPerMillion": price_in * 2}}}},
+            service: {"inputUsdPerMillion": price_in,
+                      "outputUsdPerMillion": price_in * 2}}}},
     }
 
 
@@ -137,6 +138,84 @@ def test_offers_sync_dedups_same_peer(tmp_path):
     assert [o["peer_id"] for o in offers] == ["peerA"]
 
 
+def test_variant_offer_inherits_the_base_family_capabilities(tmp_path):
+    # A serving-mode variant inherits the base's CAPABILITIES — context is
+    # architecture, no serving switch shrinks it, and withholding it would drop
+    # the variant from every min_context request for no gain. It keeps its own
+    # family name so no existing family_eq policy moves.
+    #
+    # It does NOT inherit the quality hint. "Same marker, same weights" is a
+    # premise this module asserts and cannot check, and the hint is what
+    # min_quality gates on (core/llm_policy/filter.lua) — see
+    # test_peer_minted_variant_does_not_inherit_the_quality_hint.
+    rr.reset()
+    _seed_market([_peer("peerA", 0.5, service=FAMILY + ":web")])
+    offer = AntSeedSource(CATALOG).offers_sync("antseed")[0]
+    assert offer["model_family"] == FAMILY + "@web"
+    assert offer["base_family"] == FAMILY
+    assert offer["wire_model_id"] == FAMILY + ":web"   # wire name preserved
+    assert offer["capabilities"]["context"] == 32000
+    assert offer["quality_hint"] is None
+
+
+def test_uncurated_offer_with_no_trait_source_is_left_unstamped(tmp_path):
+    # Nothing authoritative is known about this name, so nothing is claimed. An
+    # invented context would sneak the route past a min_context gate and land the
+    # prompt on a model that silently truncates it.
+    rr.reset()
+    _seed_market([_peer("peerA", 0.5, service="totally-unknown-model")])
+    offer = AntSeedSource(CATALOG).offers_sync("antseed")[0]
+    assert offer["model_family"] == "totally-unknown-model"
+    assert offer["base_family"] is None
+    assert "context" not in offer["capabilities"]
+    assert offer["quality_hint"] is None
+    assert offer["traits"] is None
+
+
+class _FakeTraitSource:
+    """Stands in for sources/openrouter's live snapshot (see live_offers())."""
+
+    def __init__(self, offers):
+        self._offers = offers
+
+    def live_offers(self):
+        return self._offers
+
+
+def test_uncurated_offer_joins_live_traits_for_a_real_context(tmp_path):
+    rr.reset()
+    _seed_market([_peer("peerA", 0.5, service="Z-AI/GLM-4.6")])
+    src = AntSeedSource(CATALOG)
+    src.bind_trait_source(_FakeTraitSource([{
+        "model_family": "glm-4.6", "wire_model_id": "z-ai/glm-4.6",
+        "capabilities": {"context": 202752}, "traits": {"bench_coding": 0.61},
+    }]))
+    offer = src.offers_sync("antseed")[0]
+    assert offer["capabilities"]["context"] == 202752   # measured, not invented
+    assert offer["traits"] == {"bench_coding": 0.61}
+    # still its own family: the join stamps metadata, it never renames a route
+    assert offer["model_family"] == "Z-AI/GLM-4.6"
+
+
+def test_unbound_names_are_ranked_by_distinct_sellers_with_near_miss(tmp_path):
+    # "161 unbound" is not actionable; a ranked queue is. `near_miss` names the
+    # curated family one alias away — deliberately looser than binding (it also
+    # flags a digit-run difference), because it is a question for an operator.
+    rr.reset()
+    _seed_market([
+        _peer("peerA", 0.5, service="qwen3235b-a22b"),   # near miss (separators)
+        _peer("peerB", 0.6, service="qwen3235b-a22b"),
+        _peer("peerC", 0.7, service="something-else-7b"),
+        _peer("peerD", 0.8, service=FAMILY),             # binds -> not listed
+    ])
+    src = AntSeedSource(CATALOG)
+    src.offers_sync("antseed")
+    top = src.snapshot_stats()["unbound_top"]
+    assert [row["service"] for row in top] == ["qwen3235b-a22b", "something-else-7b"]
+    assert top[0]["sellers"] == 2 and top[0]["near_miss"] == FAMILY
+    assert top[1]["sellers"] == 1 and top[1]["near_miss"] is None
+
+
 def test_offers_sync_excludes_peer_outside_window(tmp_path):
     # The sliding window is now a read-time filter on observed_at: a peer last
     # seen past the window is not surfaced (degraded to "no candidate"), exactly
@@ -147,3 +226,51 @@ def test_offers_sync_excludes_peer_outside_window(tmp_path):
     _seed_market([_peer("peerNew", 1.0)])
     offers = AntSeedSource(CATALOG).offers_sync("antseed")
     assert [o["peer_id"] for o in offers] == ["peerNew"]
+
+
+def test_peer_minted_variant_does_not_inherit_the_quality_hint(tmp_path):
+    """M-1: a peer mints `<family>-fast` by spelling a suffix. `-fast` routinely
+    means quantized or distilled in marketplace practice — DIFFERENT weights — so
+    the variant must not arrive carrying the base's benchmark, which is exactly
+    what `min_quality` gates on (core/llm_policy/filter.lua). Capabilities are
+    architecture and still come across, so the variant stays routable."""
+    rr.reset()
+    _seed_market([_peer("peerA", 0.5, service=FAMILY),
+                  _peer("peerB", 0.5, service=FAMILY + "-fast")])
+    offers = {o["model_family"]: o for o in AntSeedSource(CATALOG).offers_sync("antseed")}
+
+    base = offers[FAMILY]
+    assert base["quality_hint"] == 0.90            # curated, earned, unchanged
+
+    variant = offers[f"{FAMILY}@fast"]
+    assert variant["base_family"] == FAMILY        # still anchored to the family
+    assert variant["capabilities"]["context"] == 32000
+    assert variant["quality_hint"] is None
+
+
+def test_suppressed_tick_clears_last_ticks_curation_queue(tmp_path):
+    """L-8: the funds tourniquet returns before reading the market, and used to
+    leave the PREVIOUS tick's `uncurated` / `unbound_top` standing next to
+    `offers = 0`. An operator reads a stale queue as "nothing left to curate" —
+    and a suppressed provider is precisely when those numbers stop refreshing."""
+    from conftest import seed_buyer_status
+    rr.reset()
+    _seed_market([_peer("peerA", 0.5, service="something-uncurated-7b")])
+    src = AntSeedSource(CATALOG)
+
+    # funded tick (no buyer_status row -> the gate fails open): a real queue
+    src.offers_sync("antseed")
+    seeded = src.snapshot_stats()
+    assert seeded["uncurated"] == 1
+    assert [r["service"] for r in seeded["unbound_top"]] == ["something-uncurated-7b"]
+    assert seeded["stale"] is False
+
+    # escrow drops below one channel reserve -> suppressed, nothing read
+    seed_buyer_status("antseed", deposits_available="0.1", deposits_reserved="0")
+    assert src.offers_sync("antseed") == []
+    stats = src.snapshot_stats()
+    assert stats["offers"] == 0 and stats["suppressed_no_funds"] == 1
+    assert stats["uncurated"] == 0 and stats["unbound_top"] == []
+    # UNKNOWN, not False: `stale` answers "did the last market read find fresh
+    # rows", and this tick performed no read at all.
+    assert stats["stale"] is None

@@ -280,6 +280,12 @@ return {
             -- wide outer ceiling; the real per-call price gate is the caller's
             -- Σ_pol policy. Must stay <= the buyer's ANTSEED_MAX_* spend rails.
             market_price_cap = { input = 1000, output = 1000 },
+            -- Exact wire-name -> curated family, and the ONLY way a peer's name
+            -- reaches a family the canonicalizer refuses to guess at. It folds
+            -- vendor prefixes and separators (`opus-4.8`, `anthropic/claude-opus-4.8`)
+            -- and gives serving-mode variants their own `<family>@<variant>`, but it
+            -- never bridges a letter/digit boundary (`gemma4-31b` vs `gemma-4-31b`)
+            -- and never crosses vendors — that judgement is the operator's, here.
             service_aliases  = { ["qwen3-235b-instruct"] = "qwen3-235b-a22b" },
             error_map = {
                 ["insufficient_deposits"]             = "payment_required",
@@ -309,8 +315,24 @@ return {
         },
     },
 
+    -- `vendor` (optional): who actually makes the weights. Only the AntSeed
+    -- marketplace canonicalizer reads it (sources/antseed.py `_family_vendor`).
+    --
+    -- A peer's wire name may claim a vendor (`z-ai-glm-5.1`), and that claim is
+    -- refused unless this family's vendor is KNOWN and agrees — so `x-ai-glm-5.1`
+    -- and `deepseek-llama-3.3-70b` (the naming shape of a real distill with
+    -- DIFFERENT weights) never reach these families. Unknown vendor + a vendor
+    -- claim = refused, and the offer stays routable under its raw wire name.
+    --
+    -- So annotate ONLY a family whose own name does not already carry its vendor
+    -- token: `claude-*`, `gemini-*`, `deepseek-*` and `minimax-*` are read off
+    -- the name and need no line. Annotating is what re-opens the legitimate
+    -- `<vendor>-<family>` spellings peers really advertise (they mirror the
+    -- OpenRouter slugs in `served_by` below) — and only those. Write the vendor
+    -- as the wire token (`mistralai`) or its canonical id (`mistral`); anything
+    -- else is dead config and warns.
     models = {
-        ["minimax-m2.7"] = {
+        ["minimax-m2.7"] = {  -- vendor read off the name: `minimax-`
             served_by = {
                 { provider = "openrouter", provider_model_id = "minimax/minimax-m2.7" },
             },
@@ -322,6 +344,7 @@ return {
             static_quality_hint = 0.80,
         },
         ["llama-3.3-70b"] = {
+            vendor = "meta",
             served_by = {
                 { provider = "heurist",    provider_model_id = "meta-llama/llama-3.3-70b-instruct" },
                 { provider = "io_net",     provider_model_id = "meta-llama/Llama-3.3-70B-Instruct" },
@@ -345,6 +368,7 @@ return {
         -- over before the 429 wall. Claude/Gemini have no codex path, so they
         -- cascade through their other configured providers.
         ["gpt-5.5"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.5" },
                 { provider = "openai",       provider_model_id = "gpt-5.5" },
@@ -354,6 +378,7 @@ return {
             static_quality_hint = 0.95,
         },
         ["gpt-5.4"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.4" },
                 { provider = "openai",       provider_model_id = "gpt-5.4" },
@@ -363,6 +388,7 @@ return {
             static_quality_hint = 0.90,
         },
         ["gpt-5.4-mini"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.4-mini" },
                 { provider = "openai",       provider_model_id = "gpt-5.4-mini" },
@@ -378,6 +404,27 @@ return {
             },
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.93,
+        },
+        -- The two Opus releases before 4.8. Both are sold live by several AntSeed
+        -- peers, and until they were curated every one of those peers' spellings
+        -- was its own unreachable family (`family_eq` is an exact compare). Same id
+        -- scheme as 4.8 at both providers, so the direct routes are a rename of a
+        -- route we already call — not a guess about a model that might not exist.
+        ["claude-opus-4-7"] = {
+            served_by = {
+                { provider = "anthropic",    provider_model_id = "claude-opus-4-7" },
+                { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4-7" },
+            },
+            capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.92,
+        },
+        ["claude-opus-4-6"] = {
+            served_by = {
+                { provider = "anthropic",    provider_model_id = "claude-opus-4-6" },
+                { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4-6" },
+            },
+            capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.91,
         },
         -- Curated so it has a DIRECT (non-marketplace) fallback: until now
         -- claude-fable-5 lived only as raw marketplace offers (2 thin/failing
@@ -400,11 +447,24 @@ return {
             capabilities = { context = 1000000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.92,
         },
+        -- The Flash tier of the same Gemini 3 line as the Pro preview above: same
+        -- id at the gemini API, same `google/<id>` slug at OpenRouter, and the
+        -- official-pricing scraper anchors on the family verbatim
+        -- (sources/official_pricing's gemini_html parser), so it prices itself.
+        ["gemini-3-flash-preview"] = {
+            served_by = {
+                { provider = "gemini",       provider_model_id = "gemini-3-flash-preview" },
+                { provider = "openrouter",   provider_model_id = "google/gemini-3-flash-preview" },
+            },
+            capabilities = { context = 1000000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.85,
+        },
         -- Emergency affordable edge fallback for low OpenRouter credit states.
         -- Verified 2026-06-04 with a ~20k-token Hermes/t4pebot prompt + tools:
         -- expensive frontier models were rejected by OpenRouter credit ceilings,
         -- while this Qwen route returned valid content/tool-call responses.
         ["qwen3-235b-a22b"] = {
+            vendor = "qwen",
             served_by = {
                 { provider = "bedrock", provider_model_id = "qwen.qwen3-vl-235b-a22b" },
                 { provider = "openrouter", provider_model_id = "qwen/qwen3-235b-a22b-2507" },
@@ -416,6 +476,7 @@ return {
         -- Free codex safety net for `edge`: spark (subscription, ~0 marginal)
         -- ranks just below gpt-5.5-codex and above every paid candidate.
         ["gpt-5.3-codex-spark"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.3-codex-spark" },
             },
@@ -437,6 +498,28 @@ return {
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.88,
         },
+        -- The Sonnet/Haiku releases before 4.6, curated for the same reason as the
+        -- older Opus pair: live on AntSeed under several spellings, each of which
+        -- was its own unreachable family until the curated name existed to fold
+        -- them onto. Bedrock is left off deliberately — sources/bedrock only maps
+        -- the families in its `_FAMILY_PATTERNS`, and claiming a bedrock route it
+        -- cannot price would be a route that 404s on first call.
+        ["claude-sonnet-4-5"] = {
+            served_by = {
+                { provider = "anthropic",     provider_model_id = "claude-sonnet-4-5" },
+                { provider = "openrouter",    provider_model_id = "anthropic/claude-sonnet-4-5" },
+            },
+            capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.86,
+        },
+        ["claude-haiku-4-5"] = {
+            served_by = {
+                { provider = "anthropic",     provider_model_id = "claude-haiku-4-5" },
+                { provider = "openrouter",    provider_model_id = "anthropic/claude-haiku-4-5" },
+            },
+            capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.80,
+        },
         ["deepseek-v4-pro"] = {
             served_by = {
                 { provider = "openrouter",    provider_model_id = "deepseek/deepseek-v4-pro" },
@@ -444,7 +527,19 @@ return {
             capabilities = { context = 128000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.85,
         },
+        -- Already reachable on TWO routes the repo names itself — sources/bedrock's
+        -- `_FAMILY_PATTERNS` maps AWS's ids onto this exact family, and the
+        -- OpenRouter slug is `deepseek/deepseek-v3.2`. Curating it is what lets
+        -- bedrock stamp a context on its offers (_capabilities_for reads it here).
+        ["deepseek-v3.2"] = {
+            served_by = {
+                { provider = "openrouter",    provider_model_id = "deepseek/deepseek-v3.2" },
+            },
+            capabilities = { context = 128000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.82,
+        },
         ["glm-5.1"] = {
+            vendor = "z-ai",
             served_by = {
                 { provider = "openrouter",    provider_model_id = "z-ai/glm-5.1" },
             },
@@ -452,11 +547,28 @@ return {
             static_quality_hint = 0.84,
         },
         ["kimi-k2.6"] = {
+            vendor = "moonshot",
             served_by = {
                 { provider = "openrouter",    provider_model_id = "moonshotai/kimi-k2.6" },
             },
             capabilities = { context = 256000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.83,
+        },
+        ["qwen3-coder"] = {
+            vendor = "qwen",
+            served_by = {
+                { provider = "openrouter",    provider_model_id = "qwen/qwen3-coder" },
+            },
+            capabilities = { context = 262000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.82,
+        },
+        ["mistral-large"] = {
+            vendor = "mistral",
+            served_by = {
+                { provider = "openrouter",    provider_model_id = "mistralai/mistral-large" },
+            },
+            capabilities = { context = 128000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.80,
         },
 
         -- ── `dummy` tier: quality < 0.78. Free AntSeed → cheap → OR ────────────
@@ -468,6 +580,7 @@ return {
             static_quality_hint = 0.76,
         },
         ["gpt-oss-120b"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "bedrock",       provider_model_id = "openai.gpt-oss-120b-1:0" },
                 { provider = "openrouter",    provider_model_id = "openai/gpt-oss-120b" },
@@ -476,6 +589,7 @@ return {
             static_quality_hint = 0.70,
         },
         ["gemma-3-27b"] = {
+            vendor = "google",
             served_by = {
                 { provider = "bedrock",       provider_model_id = "google.gemma-3-27b-it" },
                 { provider = "openrouter",    provider_model_id = "google/gemma-3-27b-it" },
@@ -483,6 +597,16 @@ return {
             capabilities = { context = 96000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.65,
         },
+        -- NOT curated, on purpose: `grok-4.3`, `minimax-m3`, `kimi-k2.7-code`,
+        -- `qwen3.6-27b`, `gemma-4-31b-it` and `gemma-4-26b-a4b-it` are named by
+        -- live policies, but no provider here has a route we can name for them —
+        -- each would need a `served_by` extrapolated FORWARD from a different
+        -- model's id, and `validate_model` (core/llm_policy/candidate.lua) would
+        -- happily accept the invention. They stay reachable through the AntSeed
+        -- market under their raw wire names; the AntSeed source now ranks them by
+        -- distinct-seller count in `_stats.unbound_top` (with a `near_miss` when
+        -- one alias would bind them, e.g. `gemma4-31b-it` -> `gemma-4-31b-it`), so
+        -- curating each is a one-entry job the moment a real route is confirmed.
     },
 
     profiles = {
@@ -547,5 +671,45 @@ return {
     -- so callers can only NARROW what this host allows, never widen it.
     -- Floor: the contract's requirements must hold, and auth-disabled
     -- providers stay out no matter what the caller's term says.
-    policy_envelope = { "and", { "meets_req" }, { "not", { "is", "disabled" } } },
+    --
+    -- Third clause — ANTSEED FUNDING ADMISSION. AntSeed pays every call out of an
+    -- on-chain USDC escrow, and opening a payment channel reserves ~1 USDC; below
+    -- that, every routed call 402s `insufficient_deposits`. `credits` carries the
+    -- buyer's live `deposits_available` (pushed by sources.push_credits on each
+    -- balances refresh), so this keeps an unfundable buyer out of ranking.
+    --
+    -- Deliberately SCOPED to antseed by the `or`: every other provider bills
+    -- against its own quota/credit mechanics with no on-chain escrow, and the
+    -- engine's `credits` field defaults to 0 — an unscoped clause would reject
+    -- the entire catalog. The scoped form needs no core change precisely because
+    -- the `not provider_eq` branch is true for them.
+    --
+    -- SCOPING IS BY EXACT PROVIDER ID, and `provider_eq` is the only identity
+    -- predicate the algebra has — there is no prefix match. Every OTHER antseed
+    -- predicate in the host (sources/antseed.py, providers.py, wallet_keeper.py)
+    -- selects on `discovery_id` STARTSWITH "antseed", so a second buyer proxy
+    -- would be an antseed buyer everywhere except here — and because of the
+    -- `or` shape it would escape this clause by failing the `provider_eq`, i.e.
+    -- fail OPEN, the one direction this gate must never fail. Adding a proxy
+    -- therefore means or-composing its id into the `not` below. That is not left
+    -- to memory: tests/test_live_wiring.py asserts every marketplace antseed
+    -- provider in this file is named here, and fails the build if one is not.
+    --
+    -- The 1.0 floor is ONE CHANNEL RESERVE, the same quantity the offer
+    -- tourniquet uses. It is a literal because the envelope is static Lua and
+    -- cannot read an operator knob, so the knob is constrained instead:
+    -- `antseed.min_available_usdc` has a schema minimum of 1.0 (providers.py).
+    -- Without that, lowering the knob below 1.0 was a SILENT no-op — offers
+    -- would rank and the envelope would reject every one of them, with nothing
+    -- anywhere explaining why.
+    --
+    -- This fails CLOSED (default 0 < 1.0 => rejected) where the offer-side
+    -- tourniquet in sources/antseed.py fails OPEN. That asymmetry is intended —
+    -- envelope = belt, offers_sync = braces — and the cold-start hole it opens is
+    -- closed by sources.seed_credits, which publishes the last known escrow from
+    -- the durable buyer_status row before the app serves its first request
+    -- (skipping any row too stale to prove anything).
+    policy_envelope = { "and", { "meets_req" }, { "not", { "is", "disabled" } },
+        { "or", { "not", { "provider_eq", "antseed" } },
+                { "cmp", "credits", "ge", 1.0 } } },
 }
