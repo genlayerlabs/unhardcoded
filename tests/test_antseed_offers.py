@@ -34,17 +34,18 @@ CATALOG = {
             "market_price_cap": {"input": 1000, "output": 1000},
         },
     },
-    "models": {"qwen3-235b-a22b": {"capabilities": {"context": 32000}}},
+    "models": {"qwen3-235b-a22b": {"capabilities": {"context": 32000},
+                                   "static_quality_hint": 0.90}},
 }
 FAMILY = "qwen3-235b-a22b"
 
 
-def _peer(pid, price_in, maxc=5):
+def _peer(pid, price_in, maxc=5, service=FAMILY):
     return {
         "peerId": pid, "maxConcurrency": maxc, "lastSeen": 1,
         "providerPricing": {"x": {"services": {
-            FAMILY: {"inputUsdPerMillion": price_in,
-                     "outputUsdPerMillion": price_in * 2}}}},
+            service: {"inputUsdPerMillion": price_in,
+                      "outputUsdPerMillion": price_in * 2}}}},
     }
 
 
@@ -135,6 +136,79 @@ def test_offers_sync_dedups_same_peer(tmp_path):
     _seed_market([p])
     offers = AntSeedSource(CATALOG).offers_sync("antseed")
     assert [o["peer_id"] for o in offers] == ["peerA"]
+
+
+def test_variant_offer_inherits_the_base_family_capabilities(tmp_path):
+    # A serving-mode variant is the same weights behind a different switch, so it
+    # inherits the base's context (else min_context rejects it) AND the base's
+    # quality hint (else min_quality rejects it — core/llm_policy/filter.lua). It
+    # keeps its own family name so no existing family_eq policy moves.
+    rr.reset()
+    _seed_market([_peer("peerA", 0.5, service=FAMILY + ":web")])
+    offer = AntSeedSource(CATALOG).offers_sync("antseed")[0]
+    assert offer["model_family"] == FAMILY + "@web"
+    assert offer["base_family"] == FAMILY
+    assert offer["wire_model_id"] == FAMILY + ":web"   # wire name preserved
+    assert offer["capabilities"]["context"] == 32000
+    assert offer["quality_hint"] == 0.90
+
+
+def test_uncurated_offer_with_no_trait_source_is_left_unstamped(tmp_path):
+    # Nothing authoritative is known about this name, so nothing is claimed. An
+    # invented context would sneak the route past a min_context gate and land the
+    # prompt on a model that silently truncates it.
+    rr.reset()
+    _seed_market([_peer("peerA", 0.5, service="totally-unknown-model")])
+    offer = AntSeedSource(CATALOG).offers_sync("antseed")[0]
+    assert offer["model_family"] == "totally-unknown-model"
+    assert offer["base_family"] is None
+    assert "context" not in offer["capabilities"]
+    assert offer["quality_hint"] is None
+    assert offer["traits"] is None
+
+
+class _FakeTraitSource:
+    """Stands in for sources/openrouter's live snapshot (see live_offers())."""
+
+    def __init__(self, offers):
+        self._offers = offers
+
+    def live_offers(self):
+        return self._offers
+
+
+def test_uncurated_offer_joins_live_traits_for_a_real_context(tmp_path):
+    rr.reset()
+    _seed_market([_peer("peerA", 0.5, service="Z-AI/GLM-4.6")])
+    src = AntSeedSource(CATALOG)
+    src.bind_trait_source(_FakeTraitSource([{
+        "model_family": "glm-4.6", "wire_model_id": "z-ai/glm-4.6",
+        "capabilities": {"context": 202752}, "traits": {"bench_coding": 0.61},
+    }]))
+    offer = src.offers_sync("antseed")[0]
+    assert offer["capabilities"]["context"] == 202752   # measured, not invented
+    assert offer["traits"] == {"bench_coding": 0.61}
+    # still its own family: the join stamps metadata, it never renames a route
+    assert offer["model_family"] == "Z-AI/GLM-4.6"
+
+
+def test_unbound_names_are_ranked_by_distinct_sellers_with_near_miss(tmp_path):
+    # "161 unbound" is not actionable; a ranked queue is. `near_miss` names the
+    # curated family one alias away — deliberately looser than binding (it also
+    # flags a digit-run difference), because it is a question for an operator.
+    rr.reset()
+    _seed_market([
+        _peer("peerA", 0.5, service="qwen3235b-a22b"),   # near miss (separators)
+        _peer("peerB", 0.6, service="qwen3235b-a22b"),
+        _peer("peerC", 0.7, service="something-else-7b"),
+        _peer("peerD", 0.8, service=FAMILY),             # binds -> not listed
+    ])
+    src = AntSeedSource(CATALOG)
+    src.offers_sync("antseed")
+    top = src.snapshot_stats()["unbound_top"]
+    assert [row["service"] for row in top] == ["qwen3235b-a22b", "something-else-7b"]
+    assert top[0]["sellers"] == 2 and top[0]["near_miss"] == FAMILY
+    assert top[1]["sellers"] == 1 and top[1]["near_miss"] is None
 
 
 def test_offers_sync_excludes_peer_outside_window(tmp_path):

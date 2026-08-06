@@ -280,6 +280,12 @@ return {
             -- wide outer ceiling; the real per-call price gate is the caller's
             -- Σ_pol policy. Must stay <= the buyer's ANTSEED_MAX_* spend rails.
             market_price_cap = { input = 1000, output = 1000 },
+            -- Exact wire-name -> curated family, and the ONLY way a peer's name
+            -- reaches a family the canonicalizer refuses to guess at. It folds
+            -- vendor prefixes and separators (`opus-4.8`, `anthropic/claude-opus-4.8`)
+            -- and gives serving-mode variants their own `<family>@<variant>`, but it
+            -- never bridges a letter/digit boundary (`gemma4-31b` vs `gemma-4-31b`)
+            -- and never crosses vendors — that judgement is the operator's, here.
             service_aliases  = { ["qwen3-235b-instruct"] = "qwen3-235b-a22b" },
             error_map = {
                 ["insufficient_deposits"]             = "payment_required",
@@ -379,6 +385,27 @@ return {
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.93,
         },
+        -- The two Opus releases before 4.8. Both are sold live by several AntSeed
+        -- peers, and until they were curated every one of those peers' spellings
+        -- was its own unreachable family (`family_eq` is an exact compare). Same id
+        -- scheme as 4.8 at both providers, so the direct routes are a rename of a
+        -- route we already call — not a guess about a model that might not exist.
+        ["claude-opus-4-7"] = {
+            served_by = {
+                { provider = "anthropic",    provider_model_id = "claude-opus-4-7" },
+                { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4-7" },
+            },
+            capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.92,
+        },
+        ["claude-opus-4-6"] = {
+            served_by = {
+                { provider = "anthropic",    provider_model_id = "claude-opus-4-6" },
+                { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4-6" },
+            },
+            capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.91,
+        },
         -- Curated so it has a DIRECT (non-marketplace) fallback: until now
         -- claude-fable-5 lived only as raw marketplace offers (2 thin/failing
         -- sellers), so a fable-5 request had no route home when they failed.
@@ -399,6 +426,18 @@ return {
             },
             capabilities = { context = 1000000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.92,
+        },
+        -- The Flash tier of the same Gemini 3 line as the Pro preview above: same
+        -- id at the gemini API, same `google/<id>` slug at OpenRouter, and the
+        -- official-pricing scraper anchors on the family verbatim
+        -- (sources/official_pricing's gemini_html parser), so it prices itself.
+        ["gemini-3-flash-preview"] = {
+            served_by = {
+                { provider = "gemini",       provider_model_id = "gemini-3-flash-preview" },
+                { provider = "openrouter",   provider_model_id = "google/gemini-3-flash-preview" },
+            },
+            capabilities = { context = 1000000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.85,
         },
         -- Emergency affordable edge fallback for low OpenRouter credit states.
         -- Verified 2026-06-04 with a ~20k-token Hermes/t4pebot prompt + tools:
@@ -437,12 +476,45 @@ return {
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.88,
         },
+        -- The Sonnet/Haiku releases before 4.6, curated for the same reason as the
+        -- older Opus pair: live on AntSeed under several spellings, each of which
+        -- was its own unreachable family until the curated name existed to fold
+        -- them onto. Bedrock is left off deliberately — sources/bedrock only maps
+        -- the families in its `_FAMILY_PATTERNS`, and claiming a bedrock route it
+        -- cannot price would be a route that 404s on first call.
+        ["claude-sonnet-4-5"] = {
+            served_by = {
+                { provider = "anthropic",     provider_model_id = "claude-sonnet-4-5" },
+                { provider = "openrouter",    provider_model_id = "anthropic/claude-sonnet-4-5" },
+            },
+            capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.86,
+        },
+        ["claude-haiku-4-5"] = {
+            served_by = {
+                { provider = "anthropic",     provider_model_id = "claude-haiku-4-5" },
+                { provider = "openrouter",    provider_model_id = "anthropic/claude-haiku-4-5" },
+            },
+            capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.80,
+        },
         ["deepseek-v4-pro"] = {
             served_by = {
                 { provider = "openrouter",    provider_model_id = "deepseek/deepseek-v4-pro" },
             },
             capabilities = { context = 128000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.85,
+        },
+        -- Already reachable on TWO routes the repo names itself — sources/bedrock's
+        -- `_FAMILY_PATTERNS` maps AWS's ids onto this exact family, and the
+        -- OpenRouter slug is `deepseek/deepseek-v3.2`. Curating it is what lets
+        -- bedrock stamp a context on its offers (_capabilities_for reads it here).
+        ["deepseek-v3.2"] = {
+            served_by = {
+                { provider = "openrouter",    provider_model_id = "deepseek/deepseek-v3.2" },
+            },
+            capabilities = { context = 128000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.82,
         },
         ["glm-5.1"] = {
             served_by = {
@@ -457,6 +529,20 @@ return {
             },
             capabilities = { context = 256000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.83,
+        },
+        ["qwen3-coder"] = {
+            served_by = {
+                { provider = "openrouter",    provider_model_id = "qwen/qwen3-coder" },
+            },
+            capabilities = { context = 262000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.82,
+        },
+        ["mistral-large"] = {
+            served_by = {
+                { provider = "openrouter",    provider_model_id = "mistralai/mistral-large" },
+            },
+            capabilities = { context = 128000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.80,
         },
 
         -- ── `dummy` tier: quality < 0.78. Free AntSeed → cheap → OR ────────────
@@ -483,6 +569,16 @@ return {
             capabilities = { context = 96000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.65,
         },
+        -- NOT curated, on purpose: `grok-4.3`, `minimax-m3`, `kimi-k2.7-code`,
+        -- `qwen3.6-27b`, `gemma-4-31b-it` and `gemma-4-26b-a4b-it` are named by
+        -- live policies, but no provider here has a route we can name for them —
+        -- each would need a `served_by` extrapolated FORWARD from a different
+        -- model's id, and `validate_model` (core/llm_policy/candidate.lua) would
+        -- happily accept the invention. They stay reachable through the AntSeed
+        -- market under their raw wire names; the AntSeed source now ranks them by
+        -- distinct-seller count in `_stats.unbound_top` (with a `near_miss` when
+        -- one alias would bind them, e.g. `gemma4-31b-it` -> `gemma-4-31b-it`), so
+        -- curating each is a one-entry job the moment a real route is confirmed.
     },
 
     profiles = {

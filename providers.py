@@ -262,6 +262,15 @@ def build_source_registry(catalog: dict, env_get=os.environ.get) -> list:
         s = p.source(catalog, env_get)
         if s is not None:
             out.append(s)
+    # AntSeed market rows carry no model metadata at all, so an uncurated peer
+    # service would have no context and the core would reject it for any
+    # min_context request. When both sources are live, hand the OpenRouter source
+    # over as a trait oracle. Wired HERE, at the composition root, so `sources/*`
+    # stay leaves that never import one another.
+    by_name = {getattr(s, "name", None): s for s in out}
+    antseed, openrouter = by_name.get("antseed"), by_name.get("openrouter")
+    if antseed is not None and openrouter is not None:
+        antseed.bind_trait_source(openrouter)
     return out
 
 
