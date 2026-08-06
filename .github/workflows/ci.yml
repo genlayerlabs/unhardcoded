@@ -61,6 +61,19 @@ jobs:
 
   images:
     runs-on: ubuntu-latest
+    services:
+      # The router opens a host-store pool at startup, so a boot smoke needs a
+      # database or it proves only that the process can fail to connect.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+          POSTGRES_DB: hoststore_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with: { submodules: recursive }
@@ -81,13 +94,24 @@ jobs:
             -v "$PWD/scripts/check_sidecar_modules.js:/tmp/check.js:ro" \
             --entrypoint node unhardcoded-antseed:ci /tmp/check.js
 
-      - name: Router image starts and serves /healthz
+      # --network host so the container reaches the runner's postgres service on
+      # localhost; a bridged container cannot. No `|| true` on the run: a
+      # container that fails to start must fail the job, not fall through to a
+      # curl loop that reports the same thing thirty seconds later.
+      - name: Router image boots and serves /healthz
         run: |
-          docker run -d --name router-ci -p 18080:18080 --entrypoint sh unhardcoded:ci -c \
-            "python serve.py --config config.live.lua --metrics metrics.live.lua \
-             --default-profile default --host 0.0.0.0 --port 18080" || true
-          for i in $(seq 1 30); do
-            if curl -fsS localhost:18080/healthz >/dev/null 2>&1; then echo "router up"; exit 0; fi
+          set -euo pipefail
+          docker run -d --name router-ci --network host \
+            -e DATABASE_URL='postgresql://postgres:test@localhost:5432/hoststore_ci' \
+            --entrypoint python unhardcoded:ci \
+            serve.py --config config.live.lua --metrics metrics.live.lua \
+            --default-profile default --host 0.0.0.0 --port 18080
+          for _ in $(seq 1 30); do
+            if curl -fsS localhost:18080/healthz >/dev/null 2>&1; then
+              echo "router image boots and serves /healthz"; exit 0
+            fi
             sleep 2
           done
-          echo "router did not become healthy"; docker logs router-ci | tail -40; exit 1
+          echo "::error::router image did not become healthy within 60s"
+          docker logs router-ci 2>&1 | tail -60
+          exit 1
