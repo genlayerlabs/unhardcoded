@@ -15,7 +15,13 @@ RUN apt-get update \
 RUN npm install -g @antseed/cli@0.1.128 pg@8.16.3
 ENV NODE_PATH=/usr/local/lib/node_modules
 
-COPY antseed/db.js antseed/store.js antseed/amount.js antseed/write-market.js antseed/write-status.js antseed/control.js antseed/reclaim.mjs antseed/entrypoint.sh /usr/local/lib/antseed/
+# Every non-test file under antseed/ — an explicit list silently ships a module
+# whose `require('./x.js')` has no target, and the control server then dies at
+# import time with the wallet endpoints 502ing (which is exactly what shipping
+# ids.js/queue.js without updating this line did). tests/test_antseed_node.py
+# pins that every local require resolves inside the image.
+COPY antseed/*.js antseed/*.mjs antseed/entrypoint.sh /usr/local/lib/antseed/
+RUN rm -f /usr/local/lib/antseed/*.test.js
 RUN chmod +x /usr/local/lib/antseed/entrypoint.sh
 
 ENV ANTSEED_DATA_DIR=/data
