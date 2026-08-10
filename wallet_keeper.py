@@ -50,6 +50,21 @@ below are DERIVED from `antseed/control.js`'s own published budgets rather than
 guessed, and every outcome the keeper cannot rule out is recorded as `unknown`
 and COUNTED AS SPENT.
 
+WHAT `failed` MEANS, AND WHY THE KEEPER DOES NOT DECIDE IT. `failed` is the
+outcome that consumes NEITHER the daily cap nor the cooldown, so it may only be
+reached where a broadcast is provably impossible. The sidecar decides that, not
+this module: `antseed/control.js` publishes `attempted` per branch and
+`antseed/broadcast.js` classifies a failed CLI run behind it. The keeper cannot
+do this itself — it is handed `(stderr || stdout)[:600]`, one stream and
+truncated, while the buyer CLI prints its transaction hash on the OTHER one. It
+would be classifying a lossy projection of the evidence.
+
+That classification is narrow ON PURPOSE. `@antseed/cli` discards the hash when
+a deposit fails AFTER broadcasting (a receipt poll that 403s looks exactly like
+a pre-signing 403), so the whole "the RPC refused us mid-deposit" class — the
+prod incident that motivated this — stays `unknown`. Resolving it needs evidence
+from outside the CLI's stdio. See antseed/broadcast.js for the full argument.
+
 SAFETY DIRECTION. The offer tourniquet in `sources/antseed.py` fails OPEN (a
 read blip must not kill routing); this keeper fails CLOSED (a read blip must not
 move money). Every guardrail below is written to that asymmetry.
@@ -125,6 +140,16 @@ WEDGE_MIN_ATTEMPTS = 10
 # so a permanently failing deposit re-fired every 60s forever. Weaker evidence
 # than a measured miss, hence one more strike before the same hard halt.
 TOPUP_ERROR_STRIKES_TO_HALT = 3
+# ...but three strikes are not always REACHABLE, and that was a hole. Every
+# `unknown` consumes the daily cap, so at the shipped knobs (cap 10, amount 5)
+# exactly two deposits fit in a 24h window: the third row the breaker is waiting
+# for can never be written, the cap silently absorbs the failure, and the keeper
+# goes quiet for a day with nothing logged above WARNING and no halt for anyone
+# to find. That is the prod shape — two `unknown` rows, cap exhausted, no alert.
+# So once the cap can no longer admit another attempt, a shorter run is enough:
+# at that point the keeper is not "done spending today", it is wedged, and a
+# halt costs nothing it was still able to do while making it loud and durable.
+TOPUP_ERROR_STRIKES_TO_HALT_CAPPED = 2
 # Retry backoff between error strikes. The floor exists because the cooldown knob
 # can legitimately be 0 (an operator wanting prompt refunding), and 0 × any
 # backoff is still 0 — which is the hammering this exists to stop.
@@ -166,12 +191,18 @@ RECLAIM_SCAN_TIMEOUT_S = CONTROL_RECLAIM_SCAN_S + CONTROL_SLACK_S   # 110s
 RECLAIM_TX_TIMEOUT_S = (CONTROL_QUEUE_WAIT_S + CONTROL_RECLAIM_TX_S
                         + CONTROL_STATUS_S + CONTROL_DB_S + CONTROL_SLACK_S)  # 330s
 
-# HTTP statuses from the control server that PROVE the buyer CLI never ran, so
-# the op cost nothing and may be retried freely. Everything else — a read
-# timeout, a reset, a 502 from a CLI that exited non-zero, a 504 from a CLI we
-# killed mid-broadcast — is inconclusive and must be recorded as `unknown`.
-# control.js states this per-branch via `attempted`; the status list is the
-# fallback for a response that predates it or comes from something in between.
+# HTTP statuses from the control server that PROVE nothing could have been
+# broadcast, so the op cost nothing and may be retried freely. Everything else —
+# a read timeout, a reset, a 502 from a CLI that exited non-zero, a 504 from a
+# CLI we killed mid-broadcast — is inconclusive and must be recorded as
+# `unknown`.
+#
+# This is only the FALLBACK, for a response that predates `attempted` or comes
+# from something in between (a proxy, an ingress). control.js states it
+# per-branch and that field WINS — including where the two disagree: a 502 whose
+# body says `attempted: false` is a CLI that failed before any RPC call, which
+# the status code alone cannot express. The fallback is deliberately the
+# pessimistic reading of every status it does not list.
 NOT_ATTEMPTED_STATUSES = frozenset({400, 401, 404, 405, 429})
 
 # The channel-id shape the sidecar accepts — kept in step with CHANNEL_ID_RE in
@@ -289,13 +320,15 @@ class WalletKeeper:
         seam, so a test double cannot widen the set of reachable verbs.
 
         Every return carries `attempted`, and it is the field that decides
-        whether real money may have moved. FALSE means the buyer CLI provably
-        never ran (no endpoint, a malformed URL, a 400 from the amount
-        validator, a 429 from the sidecar's queue gate) — the op cost nothing.
-        TRUE means the request reached the wire and the outcome is unknowable
-        from here: a read timeout, a reset connection, a 502 from a CLI that
-        exited non-zero, a 504 from a CLI killed mid-broadcast. Callers must
-        record the second kind as `unknown` and count it as SPENT.
+        whether real money may have moved. FALSE means no transaction could have
+        reached Base mainnet: either nothing was sent at all (no endpoint, a
+        malformed URL, a 400 from the amount validator, a 429 from the sidecar's
+        queue gate), or the sidecar ran the CLI and classified its failure as
+        provably pre-RPC (antseed/broadcast.js). Both cost nothing. TRUE means a
+        broadcast cannot be ruled out from here: a read timeout, a reset
+        connection, a 502 from a CLI that failed somewhere unclassifiable, a 504
+        from a CLI killed mid-broadcast. Callers must record the second kind as
+        `unknown` and count it as SPENT.
 
         The default on any unrecognised failure is TRUE. Being wrong in that
         direction burns a slot of the daily cap; being wrong the other way moves
@@ -369,9 +402,16 @@ class WalletKeeper:
     def _outcome_for(resp: dict) -> str:
         """`fired` / `unknown` / `failed` for a control response that is not ok.
 
-        The whole point of C1: only a response that PROVES nothing was attempted
-        is `failed`, because `failed` consumes neither the daily cap nor the
-        cooldown. Anything else is `unknown`, which does."""
+        The whole point of C1: only a response that PROVES no transaction could
+        have reached Base mainnet is `failed`, because `failed` consumes neither
+        the daily cap nor the cooldown. Anything else is `unknown`, which does.
+
+        Deliberately a one-line reading of `attempted` and nothing else. The
+        evidence for that flag — CLI streams, exit codes, kill signals — lives
+        where it is complete, in the sidecar; the keeper only ever sees a
+        truncated single-stream excerpt of it (see `_control_post`), so any
+        classification done here would be done on strictly less information than
+        the sidecar already had."""
         if resp.get("ok"):
             return "fired"
         return "failed" if resp.get("attempted") is False else "unknown"
@@ -528,12 +568,16 @@ class WalletKeeper:
         if strikes >= TOPUP_ERROR_STRIKES_TO_HALT:
             # Say which KIND of failure, because the two mean different things to
             # whoever reads this: `unknown` may have put a transaction on Base
-            # mainnet, `failed` provably did not and points at configuration (a
-            # rotated token, a misrouted URL) rather than at the chain.
+            # mainnet, `failed` provably could not have and points at
+            # configuration (a rotated token, a misrouted URL, a sidecar image
+            # missing the buyer CLI) rather than at the chain. Note `failed` no
+            # longer implies the CLI never ran — since antseed/broadcast.js it
+            # also covers a CLI that ran and died before any RPC call — so the
+            # claim made here is about BROADCAST, not about reaching the CLI.
             unresolved = sum(1 for r in rows[:strikes] if r["outcome"] == "unknown")
             detail = (f", {unresolved} of which may have moved USDC" if unresolved
-                      else " — none of them reached the buyer CLI, so this is a "
-                           "configuration fault, not a chain one")
+                      else " — none of them could have broadcast a transaction, "
+                           "so this is a configuration fault, not a chain one")
             return self._halt_topups(pid, "error_halt",
                 f"{strikes} consecutive deposits could not be completed{detail}")
         return None
@@ -862,6 +906,21 @@ class WalletKeeper:
         # remaining cap is usually below one channel reserve, i.e. dust that only
         # burns gas. Wait for the 24h window to roll instead.
         if spend["spent_usdc"] + knobs.topup_amount_usdc > knobs.topup_daily_cap_usdc:
+            # A cap reached by deposits that DEMONSTRABLY worked is the cap doing
+            # its job. A cap reached by deposits nobody could measure is a wedged
+            # keeper about to go quiet for 24h — and, because no further row can
+            # be written, one the error breaker below can never reach its third
+            # strike on. Halt on the shorter run instead: it forfeits nothing the
+            # cap was still going to allow, and it converts a silent day-long
+            # stall into a persisted, operator-cleared alarm.
+            strikes = self._error_strikes(pid, "topup",
+                                          TOPUP_ERROR_STRIKES_TO_HALT)
+            if strikes >= TOPUP_ERROR_STRIKES_TO_HALT_CAPPED:
+                return self._halt_topups(pid, "error_halt",
+                    f"{strikes} consecutive deposits could not be completed and "
+                    f"the {knobs.topup_daily_cap_usdc} USDC daily cap can no "
+                    f"longer admit another attempt ({spend['spent_usdc']:.4f} "
+                    "already consumed by deposits whose effect was never measured)")
             _log.warning("wallet keeper: %s daily cap reached (%.4f of %.4f USDC "
                          "in 24h) — no top-up", pid, spend["spent_usdc"],
                          knobs.topup_daily_cap_usdc)
@@ -937,8 +996,12 @@ class WalletKeeper:
                        "recorded as UNKNOWN and counted as spent; the transaction "
                        "may have landed", pid, resp.get("error"))
             return "topup_unknown"
-        _log.warning("wallet keeper: deposit failed on %s without reaching the "
-                     "buyer CLI: %s", pid, resp.get("error"))
+        # `failed`: the sidecar proved no transaction could have reached Base
+        # mainnet — either nothing was sent at all, or the buyer CLI ran and died
+        # before its first RPC call. Costs neither cap nor cooldown; the error
+        # backoff and the breaker are what stop it repeating.
+        _log.warning("wallet keeper: deposit on %s failed before it could "
+                     "broadcast: %s", pid, resp.get("error"))
         return "topup_failed"
 
     # ---- one cycle -------------------------------------------------------

@@ -20,6 +20,11 @@ const { UPSERT_BUYER_STATUS, buyerStatusRow } = require('./store.js');
 const { validAmount, MAX_AMOUNT_USDC } = require('./amount.js');
 const { encodeIds } = require('./ids.js');
 const { createQueue } = require('./queue.js');
+// Whether a FAILED CLI run could have broadcast a transaction. Its own
+// dependency-free module for the same reason as the two above, and because the
+// reasoning about what is and is not provable from CLI stdio is long enough to
+// deserve a file. See antseed/broadcast.js.
+const { classifyCliFailure } = require('./broadcast.js');
 
 const path = require('path');
 
@@ -150,16 +155,25 @@ function readBody(req) {
   });
 }
 
-// `attempted` tells the CALLER whether the buyer CLI ran. It is the difference
-// between "nothing happened, retry freely" and "a transaction may be on Base
-// mainnet right now" — the router's keeper records the first as `failed` (costs
-// nothing) and the second as `unknown` (counts as spent). Getting it wrong in
-// the optimistic direction moves real USDC with the ledger recording nothing, so
-// every branch below states it explicitly rather than defaulting.
-function refuse(res, status, error) {          // provably nothing was attempted
+// `attempted` tells the CALLER whether a transaction could have reached Base
+// mainnet. It is the difference between "nothing happened, retry freely" and "a
+// transaction may be on Base mainnet right now" — the router's keeper records
+// the first as `failed` (costs nothing) and the second as `unknown` (counts as
+// spent). Getting it wrong in the optimistic direction moves real USDC with the
+// ledger recording nothing, so every branch below states it explicitly rather
+// than defaulting.
+//
+// NOTE the wording: NOT "did the CLI run". A CLI that ran and exited non-zero
+// can still be `attempted: false`, but only where the failure is PROVABLY before
+// any RPC call — a process that never spawned, a module graph that would not
+// load. That judgement lives in broadcast.js, which also documents at length the
+// much larger class it refuses to narrow: once the CLI's on-chain step has
+// started, its output cannot rule a broadcast out, because @antseed/cli discards
+// the transaction hash on the post-broadcast failure path.
+function refuse(res, status, error) {          // provably nothing could have broadcast
   return send(res, status, { ok: false, error, attempted: false });
 }
-function inconclusive(res, status, error) {    // the CLI ran; outcome unknowable
+function inconclusive(res, status, error) {    // a broadcast cannot be ruled out
   return send(res, status, { ok: false, error, attempted: true });
 }
 
@@ -187,12 +201,23 @@ const server = http.createServer(async (req, res) => {
       if (r.code !== 0) {
         const why = (r.stderr || r.stdout || 'cli failed').slice(0, 600);
         // A CLI we KILLED on the timeout may already have broadcast the
-        // transaction; only a CLI that exited on its own proves it did not.
-        return r.killed
-          ? inconclusive(res, 504, 'buyer ' + verb + ' timed out after ' +
+        // transaction; only a CLI that exited on its own can ever prove it did not.
+        if (r.killed) {
+          return inconclusive(res, 504, 'buyer ' + verb + ' timed out after ' +
               DEPOSIT_TIMEOUT_MS + 'ms and was killed — the transaction may have ' +
-              'been broadcast: ' + why)
-          : inconclusive(res, 502, why);
+              'been broadcast: ' + why);
+        }
+        // ...and "can prove" is not "does prove". classifyCliFailure sees BOTH
+        // streams untruncated, which the caller does not, and answers
+        // `attempted: false` only for a recognised pre-RPC failure shape. The
+        // status stays 502 either way: the CLI really did fail, and an older
+        // keeper that falls back to the status code reads 502 as attempted —
+        // the safe direction. It is the FIELD that carries the money claim.
+        const verdict = classifyCliFailure(r);
+        return verdict.attempted
+          ? inconclusive(res, 502, why)
+          : refuse(res, 502, 'buyer ' + verb + ' failed before it could broadcast (' +
+              verdict.why + '): ' + why);
       }
       const status = await refreshStatus();
       return send(res, 200, { ok: true, attempted: true, action: verb, amount, stdout: r.stdout.slice(0, 600), status });

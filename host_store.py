@@ -1523,8 +1523,13 @@ def buyer_status(pid: str) -> "dict[str, Any] | None":
 # HTTP call to the sidecar timed out, reset, or came back 502 from a killed CLI —
 # must ASSUME the transaction landed rather than re-fire on top of it. The one
 # outcome that is NOT here is `failed`, and it is reserved for responses that PROVE
-# nothing was attempted (no control URL, a 400 from the amount validator); anything
-# that reached the wire is `unknown`. See wallet_keeper._control_post.
+# no transaction could have reached Base mainnet: nothing was sent at all (no
+# control URL, a 400 from the amount validator), or the sidecar ran the buyer CLI
+# and classified its failure as provably pre-RPC (antseed/broadcast.js — a process
+# that never spawned, a module graph that would not load). Anything the sidecar
+# cannot place before the first RPC call is `unknown`, which notably includes
+# every failure once the CLI's on-chain step has started.
+# See wallet_keeper._control_post and antseed/broadcast.js.
 WALLET_OP_SPENT_OUTCOMES = ("pending", "fired", "effective", "ineffective", "unknown")
 # Outcomes of a deposit whose effect on `deposits_available` has been measured.
 WALLET_OP_SETTLED_OUTCOMES = ("effective", "ineffective")

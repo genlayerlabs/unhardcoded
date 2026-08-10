@@ -138,12 +138,35 @@ docker compose --profile antseed up -d --build antseed
   - three in a row that could not be *completed*. A deposit whose HTTP call
     timed out, reset, or came back `502`/`504` is recorded `unknown` and
     **counts against the daily cap and the cooldown** — it may have put a
-    transaction on Base mainnet. A response that proves the buyer CLI never ran
-    (a `400` from the amount validator, a `401` after a token rotation, a `429`
-    from the sidecar's queue gate) is recorded `failed`: it consumes no cap and
-    no cooldown, but it is **not free** — it still counts toward this breaker
-    and still backs the retry interval off exponentially, or a misconfigured
+    transaction on Base mainnet. A response that proves **no transaction could
+    have been broadcast** is recorded `failed`: it consumes no cap and no
+    cooldown, but it is **not free** — it still counts toward this breaker and
+    still backs the retry interval off exponentially, or a misconfigured
     endpoint would be retried every 60s forever.
+
+    That proof is the sidecar's to give, never the keeper's: the keeper only
+    ever sees `(stderr || stdout)[:600]` of the run, one stream and truncated,
+    while the buyer CLI prints its transaction hash on the other one. So
+    `attempted: false` comes either from a request that never reached the CLI (a
+    `400` from the amount validator, a `401` after a token rotation, a `429`
+    from the sidecar's queue gate) or from `antseed/broadcast.js` recognising a
+    CLI failure as provably pre-RPC — a process that never spawned, a module
+    graph that would not load.
+
+    It is a **narrow** set on purpose. `@antseed/cli` discards the transaction
+    hash when a deposit fails *after* broadcasting, so a receipt poll that 403s
+    is byte-identical to a 403 before signing; every failure from the moment the
+    CLI's on-chain step starts therefore stays `unknown`. Deciding otherwise
+    would move real USDC with the ledger recording nothing. Resolving that class
+    needs evidence from outside the CLI's stdio (the wallet nonce around the
+    run, or the escrow delta a status cycle later) and is not implemented.
+
+    Because every `unknown` consumes the cap, three strikes are not always
+    reachable — at the shipped knobs (cap 10, amount 5) only two deposits fit in
+    a 24h window. So the breaker also halts on **two** strikes once the cap can
+    no longer admit another attempt: at that point the keeper is not done
+    spending for the day, it is wedged, and the halt costs nothing it could
+    still have done.
 
   Both halts are cleared by an operator via `POST /x/wallet/clear-halt`
   (`{"kind": "topup"}` or `{"kind": "reclaim"}`); `GET /x/wallet/halts` shows
