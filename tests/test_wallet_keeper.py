@@ -426,10 +426,10 @@ def test_topup_refuses_to_fire_when_the_intent_row_cannot_be_persisted(monkeypat
 def test_a_deposit_that_never_reached_the_cli_is_failed_and_costs_nothing():
     """INVERTED, and narrowed. This test used to accept ANY unsuccessful
     response as `failed` — an outcome that consumes neither the daily cap nor the
-    cooldown — which is only sound when the buyer CLI provably never ran. Now the
-    sidecar says so explicitly (`attempted`), and only that answer keeps the
-    cheap outcome. Here: a 400 from the amount validator, rejected before the CLI
-    is invoked."""
+    cooldown — which is only sound when no transaction could have reached Base
+    mainnet. Now the sidecar says so explicitly (`attempted`), and only that
+    answer keeps the cheap outcome. Here: a 400 from the amount validator,
+    rejected before the CLI is invoked."""
     k = _FakeControl(responses={"deposit": {
         "ok": False, "attempted": False, "error": "amount must be positive"}})
     seed_buyer_status(PID, deposits_available="0.5", deposits_reserved="0.0")
@@ -781,6 +781,154 @@ def test_one_success_breaks_the_error_run():
     assert _run(bad._maybe_topup(PID, knobs, 0.5)) == "topup_unknown"
     assert bad._settle_topups(PID, 0.5, 0.0) != "error_halt"
     assert host_store.wallet_halted(PID, "topup") is False
+
+
+def test_the_daily_cap_can_no_longer_starve_the_error_breaker(caplog):
+    """The prod shape, and the hole it exposed. Every `unknown` consumes the cap,
+    so at the SHIPPED knobs (cap 10, amount 5) exactly two deposits fit in a 24h
+    window — and the breaker above waits for three. The third row could never be
+    written, so the cap silently absorbed the failure and the keeper went quiet
+    for a day: no halt, nothing above WARNING, nobody told.
+
+    Once the cap can no longer admit an attempt the keeper is not "done spending
+    today", it is wedged, so the shorter run is enough. The halt forfeits nothing
+    the cap was still going to allow."""
+    knobs = _knobs(topup_cooldown_s=0)          # the defaults: cap 10, amount 5
+    assert knobs.topup_daily_cap_usdc / knobs.topup_amount_usdc \
+        < wk.TOPUP_ERROR_STRIKES_TO_HALT, "the premise: 3 strikes are unreachable"
+    k = _failing_keeper()
+    seed_buyer_status(PID, deposits_available="0.5", deposits_reserved="0.0")
+    for _ in range(2):
+        _age_all_topups(-1)
+        assert _run(k._maybe_topup(PID, knobs, 0.5)) == "topup_unknown"
+    assert host_store.wallet_op_spend_since(PID, "topup", 0)["spent_usdc"] == 10.0
+
+    _age_all_topups(-1)
+    with caplog.at_level("ERROR"):
+        assert _run(k._maybe_topup(PID, knobs, 0.5)) == "error_halt"
+    assert "HARD HALT" in caplog.text
+    assert host_store.wallet_halted(PID, "topup") is True
+    assert len(k.calls) == 2, "the halt must not have fired a third deposit"
+    # ...and it is durable, so a restart does not resume the silent stall.
+    assert _run(_failing_keeper()._maybe_topup(PID, knobs, 0.5)) == "halted"
+
+
+def test_a_one_attempt_daily_cap_halts_after_the_first_unknown(caplog):
+    """A cap that admits only one deposit must not make even the shortened
+    breaker unreachable. Its first unknown consumes every permitted attempt, so
+    the following cap check has to turn that one strike into a durable halt."""
+    knobs = _knobs(topup_cooldown_s=0, topup_daily_cap_usdc=5.0)
+    assert knobs.topup_daily_cap_usdc / knobs.topup_amount_usdc == 1
+    k = _failing_keeper()
+    seed_buyer_status(PID, deposits_available="0.5", deposits_reserved="0.0")
+
+    _age_all_topups(-1)
+    assert _run(k._maybe_topup(PID, knobs, 0.5)) == "topup_unknown"
+    assert host_store.wallet_op_spend_since(
+        PID, "topup", 0)["spent_usdc"] == 5.0
+
+    _age_all_topups(-1)
+    with caplog.at_level("ERROR"):
+        assert _run(k._maybe_topup(PID, knobs, 0.5)) == "error_halt"
+    assert "HARD HALT" in caplog.text
+    assert host_store.wallet_halted(PID, "topup") is True
+    assert len(k.calls) == 1, "the halt must not fire a second deposit"
+
+
+def test_a_cap_reached_by_deposits_that_WORKED_is_just_the_cap():
+    """The other side of it: the halt above keys off the error run, not off the
+    cap alone. A keeper that funded itself twice today has done its job, and
+    halting there would need an operator to clear a breaker nothing tripped."""
+    knobs = _knobs(topup_cooldown_s=0)
+    k = _FakeControl()
+    seed_buyer_status(PID, deposits_available="0.5", deposits_reserved="0.0")
+    for _ in range(2):
+        _age_all_topups(-1)
+        assert _run(k._maybe_topup(PID, knobs, 0.5)) == "topup_fired"
+    _age_all_topups(-1)
+    assert _run(k._maybe_topup(PID, knobs, 0.5)) == "daily_cap"
+    assert host_store.wallet_halted(PID, "topup") is False
+
+
+def test_repeated_PRE_BROADCAST_failures_halt_without_spending_the_cap(caplog):
+    """The outcome antseed/broadcast.js newly produces, driven end to end. A
+    deposit that provably could not have broadcast consumes neither the cap nor
+    the cooldown — which is the whole point — so it must still be stopped by
+    something. It is: the backoff throttles each retry and the error breaker
+    halts the run, at the FULL three strikes, because the cap never binds."""
+    knobs = _knobs(topup_cooldown_s=0)
+    k = _FakeControl(responses={"deposit": {
+        "ok": False, "attempted": False,
+        "error": "buyer deposit failed before it could broadcast "
+                 "(execFile could not start the CLI (ENOENT)): cli failed"}})
+    seed_buyer_status(PID, deposits_available="0.5", deposits_reserved="0.0")
+
+    assert _run(k._maybe_topup(PID, knobs, 0.5)) == "topup_failed"
+    assert _run(k._maybe_topup(PID, knobs, 0.5)) == "backoff", \
+        "zero cost is not a licence to hammer at the 60s cycle rate"
+    for _ in range(wk.TOPUP_ERROR_STRIKES_TO_HALT - 1):
+        _age_all_topups(-1)
+        assert _run(k._maybe_topup(PID, knobs, 0.5)) == "topup_failed"
+
+    spend = host_store.wallet_op_spend_since(PID, "topup", 0)
+    assert spend["spent_usdc"] == 0.0 and spend["last_ts"] is None, \
+        "a pre-broadcast failure must cost the cap nothing at all"
+    with caplog.at_level("ERROR"):
+        assert k._settle_topups(PID, 0.5, 0.0) == "error_halt"
+    assert "HARD HALT" in caplog.text
+    # The reason must not claim these never reached the CLI — since
+    # broadcast.js, `failed` also covers a CLI that ran and died pre-RPC. The
+    # claim it may still make is about BROADCAST.
+    reason = str(host_store.wallet_ops_recent(PID, limit=50))
+    assert "reached the buyer CLI" not in reason
+    assert _run(k._maybe_topup(PID, knobs, 0.5)) == "halted"
+
+
+def test_outcome_for_reads_the_attempted_flag_and_nothing_else():
+    """C1's whole contract in one table. `failed` is reachable ONLY through an
+    explicit `attempted: false`; every other shape — including a missing flag —
+    is `unknown` and counts as spent."""
+    f = wk.WalletKeeper._outcome_for
+    assert f({"ok": True}) == "fired"
+    assert f({"ok": True, "attempted": False}) == "fired"
+    assert f({"ok": False, "attempted": False}) == "failed"
+    assert f({"ok": False, "attempted": True}) == "unknown"
+    assert f({"ok": False}) == "unknown", "a missing flag is not a proof"
+    for truthy in (0, "", None, "false", "no"):
+        assert f({"ok": False, "attempted": truthy}) == "unknown", \
+            f"only a real False may reach `failed`, not {truthy!r}"
+
+
+def test_the_sidecar_classifies_the_failure_the_keeper_only_names(monkeypatch):
+    """The keeper must NOT grow its own CLI-output parser. It is handed
+    `(stderr || stdout)[:600]` — one stream, truncated — while @antseed/cli
+    prints its transaction hash on the other one, so anything decided here would
+    be decided on strictly less evidence than the sidecar already had. This pins
+    the split: control.js routes its non-zero-exit branch through broadcast.js,
+    and the keeper only reads the resulting flag."""
+    control_js = (ROOT / "antseed" / "control.js").read_text()
+    assert "require('./broadcast.js')" in control_js, \
+        "control.js must classify the CLI failure, not hand it on unclassified"
+    assert re.search(r"classifyCliFailure\(r\)", control_js), \
+        "the deposit/withdraw branch must call the classifier"
+    # And the keeper stays out of it: no CLI prose anywhere in wallet_keeper.
+    keeper = (ROOT / "wallet_keeper.py").read_text()
+    for prose in ("Deposit failed", "SERVER_ERROR", "0x[0-9a-fA-F]{64}",
+                  "Depositing"):
+        assert prose not in keeper, \
+            f"wallet_keeper.py must not parse CLI output ({prose!r})"
+
+    # The one thing it does with the flag, end to end.
+    k = wk.WalletKeeper([PID])
+    _post_returning(monkeypatch, _Resp(502, {
+        "error": "buyer deposit failed before it could broadcast "
+                 "(execFile could not start the CLI (ENOENT)): cli failed",
+        "attempted": False}))
+    resp = _run(k._control_post("deposit", None, 1.0))
+    assert resp["attempted"] is False
+    assert k._outcome_for(resp) == "failed", \
+        "a 502 whose body proves no broadcast must beat the status-code fallback"
+    assert 502 not in wk.NOT_ATTEMPTED_STATUSES, "...and the fallback stays pessimistic"
 
 
 def _age_all_topups(ago_s):

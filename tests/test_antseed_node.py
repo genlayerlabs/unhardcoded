@@ -61,6 +61,18 @@ def test_antseed_reclaim_channel_selection():
     _run_node_test("antseed/ids.test.js")
 
 
+def test_antseed_pre_broadcast_classification():
+    """The pre-broadcast classifier (antseed/broadcast.js) — the thing that
+    decides whether a failed `antseed buyer deposit` is recorded as `failed`
+    (costs the router nothing) or `unknown` (costs a slot of the daily cap).
+
+    It lives in the sidecar rather than the keeper because only the sidecar has
+    the evidence: the keeper is handed `(stderr || stdout)[:600]`, one stream and
+    truncated, and the buyer CLI prints its transaction hash on the other one.
+    The fixtures are the real prod output byte for byte."""
+    _run_node_test("antseed/broadcast.test.js")
+
+
 _LOCAL_IMPORT = re.compile(
     r"""(?:require\(\s*|from\s+)['"](\./[^'"]+)['"]""")
 
