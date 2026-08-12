@@ -94,6 +94,9 @@ jobs:
             -v "$PWD/scripts/check_sidecar_modules.js:/tmp/check.js:ro" \
             --entrypoint node unhardcoded-antseed:ci /tmp/check.js
 
+      - name: AntSeed CLI resolves its package dependencies inside the image
+        run: docker run --rm --entrypoint antseed unhardcoded-antseed:ci --help >/dev/null
+
       # --network host so the container reaches the runner's postgres service on
       # localhost; a bridged container cannot. No `|| true` on the run: a
       # container that fails to start must fail the job, not fall through to a
