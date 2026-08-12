@@ -107,7 +107,7 @@ prefix is sugar for the common cases:
 |---------------------------------|---------------------------------------------------------|
 | `policy_ir` term in the body    | run that Σ_pol policy (the primary path)                |
 | `""` / unprefixed `model`       | the `default` policy                                    |
-| `model = "profile:NAME"`        | a named profile from the catalog (only `default` ships) |
+| `model = "profile:NAME"`        | a named profile from the catalog (`default` and `agent` ship) |
 | `model = "family:FAMILY"`       | default, pinned to a model family                       |
 | `model = "pin:PROVIDER/FAMILY"` | default, pinned to one (provider, family)               |
 
@@ -135,7 +135,7 @@ curl -s http://127.0.0.1:8080/x/policy/templates/cheapest-family \
   }'
 ```
 
-The three templates are:
+The four templates are:
 
 - `cheapest-family` — stay in one exact family and minimize expected token
   cost; `provider_strategy: "ordered"` instead enforces Codex → AntSeed →
@@ -143,6 +143,13 @@ The three templates are:
   breaker-open routes only as final fallbacks.
 - `smart-value` — minimize cost among the current top five intelligence models
   (the shortlist size and price/reliability rails are configurable).
+- `agent` — the reusable `profile:agent` policy for autonomous tool users:
+  require tools, 128k context, top-ten measured intelligence and reliable,
+  priced routes; prefer healthy Codex/direct providers before gateways and
+  trusted AntSeed peers; cap the cascade at eight candidates. The policy also
+  sets a 10s first-token and 22s per-attempt timeout and moves immediately to a
+  different candidate on provider failures, so a stalled first route cannot
+  consume the complete request deadline.
 - `default` — the actual policy used by OpenAI-compatible callers that send no
   policy: prefer a top-five intelligence model, then enforce Codex → AntSeed →
   Bedrock → OpenRouter and use a 75% cost / 25% intelligence value score inside

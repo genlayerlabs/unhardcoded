@@ -46,6 +46,34 @@ local DEFAULT_QUALITY_TOP_N = 5
 local DEFAULT_COST_WEIGHT = 0.75
 local DEFAULT_INTELLIGENCE_WEIGHT = 0.25
 
+-- Quality-first defaults for long-running tool agents.  Unlike the vanilla
+-- chat policy, each provider attempt is bounded inside the policy itself so a
+-- slow first route cannot consume the router's complete fallback deadline.
+local AGENT_PROVIDER_ORDER = {
+    { "openai_codex" },
+    { "openai", "anthropic", "gemini", "bedrock", "bedrock_market" },
+    { "openrouter", "openrouter_market" },
+    { "antseed" },
+}
+local AGENT_RELIABILITY_FLOOR = 0.8
+local AGENT_MIN_CONTEXT = 128000
+local AGENT_MAX_PRICE_IN = 15.0
+local AGENT_MAX_PRICE_OUT = 30.0
+local AGENT_QUALITY_TOP_N = 10
+local AGENT_TOP_K = 8
+local AGENT_INTELLIGENCE_WEIGHT = 0.60
+local AGENT_INPUT_COST_WEIGHT = 0.15
+local AGENT_RELIABILITY_WEIGHT = 0.25
+local AGENT_FIRST_TOKEN_TIMEOUT_MS = 10000
+local AGENT_ATTEMPT_TIMEOUT_MS = 22000
+local TRUSTED_ANTSEED_PEERS = {
+    "4668854ba3e8b094e6f48fbeb59cec1cfde162f2", -- Dark Signal
+    "9e8f9aaee684298b7f2af2ae008e3692f0e9f4f7", -- Venice.ai Proxy
+    "1d90f467689d499dc435e5744b4613c3203eb0aa", -- Open Forge
+    "ded67f398fcf7b7884ff7c669d9a4fe820d7657c", -- Chutes
+    "6ec1c8189340370220ea253612f23f6dfe9f5b75", -- The Seeder
+}
+
 local BALANCED_RETRY = {
     rate_limit        = { action = "next_candidate", open_breaker_ms = 30000 },
     timeout           = { action = "next_candidate" },
@@ -63,6 +91,25 @@ local BALANCED_RETRY = {
     -- A stream that died after content reached the client cannot fall through.
     stream_interrupted = { action = "abort" },
     -- Out of credits will not heal on retry; keep the breaker open for 5 min.
+    payment_required  = { action = "next_candidate", open_breaker_ms = 300000 },
+    unknown           = { action = "next_candidate" },
+}
+
+-- Retry a different route, not the same slow route.  With a 50 s outer request
+-- deadline this is what makes the ranked agent cascade operational rather than
+-- decorative.
+local AGENT_RETRY = {
+    rate_limit        = { action = "next_candidate", open_breaker_ms = 30000 },
+    timeout           = { action = "next_candidate" },
+    server_error      = { action = "next_candidate" },
+    auth_error        = { action = "disable_provider" },
+    bad_request       = { action = "next_candidate" },
+    content_filter    = { action = "next_candidate" },
+    bad_response      = { action = "next_candidate" },
+    model_unavailable = { action = "next_provider_same_model", mark_unavailable_ms = 300000 },
+    network_error     = { action = "next_candidate" },
+    context_overflow  = { action = "next_candidate" },
+    stream_interrupted = { action = "abort" },
     payment_required  = { action = "next_candidate", open_breaker_ms = 300000 },
     unknown           = { action = "next_candidate" },
 }
@@ -143,6 +190,68 @@ local function default_policy_ir()
         selector,
         { "id" },
         fail_plan(BALANCED_RETRY),
+    }
+end
+
+local function trusted_antseed_gate()
+    local gate = {
+        "or",
+        { "not", { "provider_eq", "antseed" } },
+        { "cmp", "reputation_score", "gt", 95 },
+    }
+    for _, peer in ipairs(TRUSTED_ANTSEED_PEERS) do
+        gate[#gate + 1] = { "served_by_eq", peer }
+    end
+    return gate
+end
+
+local function agent_policy_ir()
+    local provider_preds = {}
+    for _, group in ipairs(AGENT_PROVIDER_ORDER) do
+        provider_preds[#provider_preds + 1] = provider_pred(group)
+    end
+
+    local provider_selector = { "argmax" }
+    for i = #provider_preds, 1, -1 do
+        provider_selector = { "prefer", provider_preds[i], provider_selector }
+    end
+    local selector = {
+        "top_k",
+        AGENT_TOP_K,
+        {
+            "prefer",
+            { "not", { "is", "breaker_open" } },
+            provider_selector,
+        },
+    }
+
+    return {
+        "policy",
+        { "and",
+            { "meets_req" },
+            { "not", { "is", "disabled" } },
+            { "is", "cap_tools" },
+            { "cmp", "context", "ge", AGENT_MIN_CONTEXT },
+            { "cmp", "success_rate", "ge", AGENT_RELIABILITY_FLOOR },
+            { "cmp", "bench_intelligence_rank", "le", AGENT_QUALITY_TOP_N },
+            { "cmp", "price_in", "le", AGENT_MAX_PRICE_IN },
+            { "cmp", "price_out", "le", AGENT_MAX_PRICE_OUT },
+            trusted_antseed_gate(),
+        },
+        { "add",
+            { "scale", AGENT_INTELLIGENCE_WEIGHT,
+                { "normalize", { "field", "bench_intelligence" } } },
+            { "scale", AGENT_INPUT_COST_WEIGHT,
+                { "neg", { "normalize", { "field", "price_in" } } } },
+            { "scale", AGENT_RELIABILITY_WEIGHT,
+                { "field", "success_rate" } },
+        },
+        selector,
+        { "seq",
+            { "set_param", "first_token_timeout_ms", AGENT_FIRST_TOKEN_TIMEOUT_MS },
+            { "set_param", "timeout_ms", AGENT_ATTEMPT_TIMEOUT_MS },
+        },
+        fail_plan(AGENT_RETRY),
     }
 end
 
@@ -610,6 +719,15 @@ return {
     },
 
     profiles = {
+        -- Reusable default for autonomous/tool agents.  The profile owns its
+        -- attempt budgets and fast-fallback plan, so callers only need to send
+        -- model="profile:agent" instead of copying a policy term and timeout
+        -- knobs into every deployment.
+        agent = {
+            policy_ir    = agent_policy_ir(),
+            selector     = "top_k",
+            retry_policy = "agent",
+        },
         -- Callers may send their own policy_ir.  Plain OpenAI-compatible
         -- requests use this identified policy: healthy Codex -> AntSeed ->
         -- Bedrock -> OpenRouter, with safe price/reliability rails and the best
@@ -623,6 +741,7 @@ return {
 
     retry_policies = {
         balanced = BALANCED_RETRY,
+        agent    = AGENT_RETRY,
     },
 
     -- Model-level observation fields (registered traits from OpenRouter, read

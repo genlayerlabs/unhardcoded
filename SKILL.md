@@ -49,10 +49,14 @@ Every step is a request with the **same** `Authorization: Bearer <key>` you used
    lists the blessed choices. Compile one with
    `POST /x/policy/templates/{id}` (for example
    `{"family":"glm-5.2","provider_strategy":"ordered"}` against
-   `cheapest-family`). Author raw `policy_ir` only when the templates cannot
+   `cheapest-family`, or `agent` for a tool-running autonomous client). Author
+   raw `policy_ir` only when the templates cannot
    express the intent. The published `default` template is byte-for-byte
    equivalent after normalization to the policy used when an
    OpenAI-compatible request sends no `policy_ir`.
+   The published `agent` template is likewise identical to `profile:agent` and
+   owns its first-token/per-attempt budgets, trust gate, and fast-fallback plan;
+   callers should select the profile instead of copying its raw term.
 2. **Admit & identify — no spend.** `POST /x/policy/normalize` `{policy_ir}` → `{policy_ir, fingerprint, version}`. A `400` here pinpoints what's invalid (unknown op, undeclared field, …) so you fix the term before paying.
 3. **Preview the ranking — no spend.** `POST /x/rank` `{policy_ir}` → `{ranked, rejected}`: the candidates this host would admit and how it orders them, plus the ones it filtered out, each with the `reason` it failed. This is how you see *what your policy does* without a single call.
 4. **Run it for real.** `POST /v1/chat/completions` with `policy_ir` (or `flow_ir`) + `messages` (the example above). A real call — real spend.

@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 # operator shell env or .env loader that may contain non-JSON placeholders.
 os.environ["CALLER_KEYS_JSON"] = '{"internal":"default"}'
 os.environ["CALLER_KEYS_SHA256_JSON"] = "{}"
+os.environ["CALLER_KEYS_BOOTSTRAP_JSON"] = "{}"
 os.environ["DASHBOARD_TRUSTED_USER_HEADER"] = ""
 
 import auth_proxy  # noqa: E402
@@ -419,14 +420,14 @@ def test_policy_catalog_uses_policy_files_and_router_rank():
     catalog = auth_proxy._policy_catalog_snapshot()
     profiles = {row["name"]: row for row in catalog["profiles"]}
 
-    # No tiers: the catalog has only the declarative `default` fallback policy
-    # (callers send their own per-call policy_ir). It is declarative, not a
-    # closure file, so there are no policy_files.
-    assert list(profiles) == ["default"]
+    # No tiers: the catalog has the declarative vanilla and tool-agent policies.
+    # Both are IR, not closure files, so there are no policy_files.
+    assert set(profiles) == {"agent", "default"}
     assert catalog["source"].endswith("config.live.lua")
     assert catalog["metrics_source"].endswith("metrics.live.lua")
     assert catalog["policy_files"] == []
     assert profiles["default"]["candidate_count"] > 0
+    assert profiles["agent"]["candidate_count"] > 0
     assert "router.rank" in profiles["default"]["selection_note"]
 
 
@@ -1293,12 +1294,24 @@ def test_dashboard_builder_exposes_and_wires_safe_policy_templates():
         "bTemplateBar",
         "cheapest-family",
         "smart-value",
+        "Stable tool agent",
         "Default for vanilla clients",
         "/dashboard/api/policy/templates/",
         "$('bLoadTemplate').onclick=bCreateTemplate",
         "bTemplateChanged();",
     ):
         assert marker in html
+
+
+def test_gitops_bootstrap_keys_are_loaded_hash_only():
+    token = "llmr_reconciled"
+    loaded = auth_proxy._bootstrap_caller_key_hashes(
+        f'{{"{token}":"micromarkets-dev"}}')
+
+    assert loaded == {
+        hashlib.sha256(token.encode()).hexdigest(): "micromarkets-dev",
+    }
+    assert token not in loaded
 
 
 def test_policy_snapshot_prefers_live_ranks():

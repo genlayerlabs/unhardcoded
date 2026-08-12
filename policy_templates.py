@@ -41,6 +41,40 @@ DEFAULT_QUALITY_TOP_N = 5
 DEFAULT_COST_WEIGHT = 0.75
 DEFAULT_INTELLIGENCE_WEIGHT = 0.25
 
+# Long-running tool agents need a different posture from vanilla chat.  Keep
+# the quality floor hard, put subscription/direct routes ahead of gateways and
+# untrusted marketplaces, and bound each attempt so the outer request deadline
+# still has room to execute the fallback cascade.
+AGENT_PROVIDER_ORDER: tuple[tuple[str, ...], ...] = (
+    ("openai_codex",),
+    ("openai", "anthropic", "gemini", "bedrock", "bedrock_market"),
+    ("openrouter", "openrouter_market"),
+    ("antseed",),
+)
+AGENT_RELIABILITY_FLOOR = 0.8
+AGENT_MIN_CONTEXT = 128_000
+AGENT_MAX_PRICE_IN = 15.0
+AGENT_MAX_PRICE_OUT = 30.0
+AGENT_QUALITY_TOP_N = 10
+AGENT_TOP_K = 8
+AGENT_INTELLIGENCE_WEIGHT = 0.60
+AGENT_INPUT_COST_WEIGHT = 0.15
+AGENT_RELIABILITY_WEIGHT = 0.25
+AGENT_FIRST_TOKEN_TIMEOUT_MS = 10_000
+AGENT_ATTEMPT_TIMEOUT_MS = 22_000
+TRUSTED_ANTSEED_PEERS: tuple[str, ...] = (
+    # Dark Signal (GPT + MiniMax)
+    "4668854ba3e8b094e6f48fbeb59cec1cfde162f2",
+    # Venice.ai Proxy
+    "9e8f9aaee684298b7f2af2ae008e3692f0e9f4f7",
+    # Open Forge
+    "1d90f467689d499dc435e5744b4613c3203eb0aa",
+    # Chutes
+    "ded67f398fcf7b7884ff7c669d9a4fe820d7657c",
+    # The Seeder (Opus + Sonnet)
+    "6ec1c8189340370220ea253612f23f6dfe9f5b75",
+)
+
 _BALANCED_FAILURE_ACTIONS: dict[str, dict[str, Any]] = {
     "unknown": {"action": "next_candidate"},
     "rate_limit": {
@@ -76,7 +110,32 @@ _BALANCED_FAILURE_ACTIONS: dict[str, dict[str, Any]] = {
     },
 }
 
-_TEMPLATE_IDS = ("cheapest-family", "smart-value", "default")
+_AGENT_FAILURE_ACTIONS: dict[str, dict[str, Any]] = {
+    "unknown": {"action": "next_candidate"},
+    "rate_limit": {
+        "action": "next_candidate",
+        "open_breaker_ms": 30_000,
+    },
+    "timeout": {"action": "next_candidate"},
+    "server_error": {"action": "next_candidate"},
+    "auth_error": {"action": "disable_provider"},
+    "bad_request": {"action": "next_candidate"},
+    "content_filter": {"action": "next_candidate"},
+    "bad_response": {"action": "next_candidate"},
+    "model_unavailable": {
+        "action": "next_provider_same_model",
+        "mark_unavailable_ms": 300_000,
+    },
+    "network_error": {"action": "next_candidate"},
+    "context_overflow": {"action": "next_candidate"},
+    "stream_interrupted": {"action": "abort"},
+    "payment_required": {
+        "action": "next_candidate",
+        "open_breaker_ms": 300_000,
+    },
+}
+
+_TEMPLATE_IDS = ("cheapest-family", "smart-value", "agent", "default")
 _COMMON_OPTIONS = {
     "expected_input_share",
     "max_price_in",
@@ -90,6 +149,7 @@ _ALLOWED_OPTIONS = {
         "provider_strategy",
     },
     "smart-value": _COMMON_OPTIONS | {"top_n"},
+    "agent": set(),
     "default": set(),
 }
 
@@ -126,6 +186,27 @@ def template_catalog() -> list[dict[str, Any]]:
                 "reliability_floor": DEFAULT_RELIABILITY_FLOOR,
                 "max_price_in": DEFAULT_MAX_PRICE_IN,
                 "max_price_out": DEFAULT_MAX_PRICE_OUT,
+            },
+        },
+        {
+            "id": "agent",
+            "description": (
+                "Stable quality-first routing for tool agents: top-ten "
+                "intelligence, 128k context, trusted AntSeed peers, healthy "
+                "subscription/direct routes first, and bounded attempts that "
+                "leave room for the fallback cascade."
+            ),
+            "required": [],
+            "defaults": {
+                "top_n": AGENT_QUALITY_TOP_N,
+                "top_k": AGENT_TOP_K,
+                "min_context": AGENT_MIN_CONTEXT,
+                "reliability_floor": AGENT_RELIABILITY_FLOOR,
+                "max_price_in": AGENT_MAX_PRICE_IN,
+                "max_price_out": AGENT_MAX_PRICE_OUT,
+                "first_token_timeout_ms": AGENT_FIRST_TOKEN_TIMEOUT_MS,
+                "attempt_timeout_ms": AGENT_ATTEMPT_TIMEOUT_MS,
+                "provider_order": [list(group) for group in AGENT_PROVIDER_ORDER],
             },
         },
         {
@@ -314,14 +395,33 @@ def _balanced_fail_plan() -> list:
     return plan
 
 
-def _policy(pred: list, scorer: list, selector: list | None = None) -> list:
+def _agent_fail_plan() -> list:
+    plan: list = ["always", dict(_AGENT_FAILURE_ACTIONS["unknown"])]
+    for reason in sorted(_AGENT_FAILURE_ACTIONS):
+        if reason != "unknown":
+            plan = [
+                "override",
+                plan,
+                reason,
+                dict(_AGENT_FAILURE_ACTIONS[reason]),
+            ]
+    return plan
+
+
+def _policy(
+    pred: list,
+    scorer: list,
+    selector: list | None = None,
+    xform: list | None = None,
+    fail_plan: list | None = None,
+) -> list:
     return [
         "policy",
         pred,
         scorer,
         selector or ["argmax"],
-        ["id"],
-        _balanced_fail_plan(),
+        xform or ["id"],
+        fail_plan or _balanced_fail_plan(),
     ]
 
 
@@ -398,6 +498,75 @@ def _default() -> tuple[list, dict[str, Any]]:
     return _policy(_and(parts), value_score, selector), intent
 
 
+def _trusted_antseed_gate() -> list:
+    return _or([
+        ["not", ["provider_eq", "antseed"]],
+        ["cmp", "reputation_score", "gt", 95],
+        *[["served_by_eq", peer] for peer in TRUSTED_ANTSEED_PEERS],
+    ])
+
+
+def _agent() -> tuple[list, dict[str, Any]]:
+    parts = [
+        ["meets_req"],
+        ["not", ["is", "disabled"]],
+        ["is", "cap_tools"],
+        ["cmp", "context", "ge", AGENT_MIN_CONTEXT],
+        ["cmp", "success_rate", "ge", AGENT_RELIABILITY_FLOOR],
+        ["cmp", "bench_intelligence_rank", "le", AGENT_QUALITY_TOP_N],
+        ["cmp", "price_in", "le", AGENT_MAX_PRICE_IN],
+        ["cmp", "price_out", "le", AGENT_MAX_PRICE_OUT],
+        _trusted_antseed_gate(),
+    ]
+    _, provider_selector = _ordered_provider_selector(AGENT_PROVIDER_ORDER)
+    selector = [
+        "top_k",
+        AGENT_TOP_K,
+        _healthy_first(provider_selector),
+    ]
+    scorer = [
+        "add",
+        [
+            "scale",
+            AGENT_INTELLIGENCE_WEIGHT,
+            ["normalize", ["field", "bench_intelligence"]],
+        ],
+        [
+            "scale",
+            AGENT_INPUT_COST_WEIGHT,
+            ["neg", ["normalize", ["field", "price_in"]]],
+        ],
+        [
+            "scale",
+            AGENT_RELIABILITY_WEIGHT,
+            ["field", "success_rate"],
+        ],
+    ]
+    xform = [
+        "seq",
+        ["set_param", "first_token_timeout_ms", AGENT_FIRST_TOKEN_TIMEOUT_MS],
+        ["set_param", "timeout_ms", AGENT_ATTEMPT_TIMEOUT_MS],
+    ]
+    intent = {
+        "top_n": AGENT_QUALITY_TOP_N,
+        "top_k": AGENT_TOP_K,
+        "min_context": AGENT_MIN_CONTEXT,
+        "reliability_floor": AGENT_RELIABILITY_FLOOR,
+        "max_price_in": AGENT_MAX_PRICE_IN,
+        "max_price_out": AGENT_MAX_PRICE_OUT,
+        "first_token_timeout_ms": AGENT_FIRST_TOKEN_TIMEOUT_MS,
+        "attempt_timeout_ms": AGENT_ATTEMPT_TIMEOUT_MS,
+        "provider_order": [list(group) for group in AGENT_PROVIDER_ORDER],
+    }
+    return _policy(
+        _and(parts),
+        scorer,
+        selector,
+        xform,
+        _agent_fail_plan(),
+    ), intent
+
+
 def build_policy_template(template_id: str,
                           options: dict[str, Any] | None = None) -> tuple[list, dict[str, Any]]:
     """Compile a blessed template and return ``(policy_ir, normalized_intent)``.
@@ -421,6 +590,8 @@ def build_policy_template(template_id: str,
         term, intent = _cheapest_family(opts)
     elif template == "smart-value":
         term, intent = _smart_value(opts)
+    elif template == "agent":
+        term, intent = _agent()
     else:
         # A pinned, versioned product default.  Keep this in parity with the
         # default profile in config.live.lua (covered by a live-config test).
