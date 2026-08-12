@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -21,6 +22,7 @@ from typing import Any, Dict
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 import host_store
 from env_secrets import load_env_secrets
@@ -42,6 +44,15 @@ CALLER_KEYS_SHA256_JSON = os.getenv("CALLER_KEYS_SHA256_JSON", "{}")
 CALLER_KEYS_BOOTSTRAP_JSON = os.getenv("CALLER_KEYS_BOOTSTRAP_JSON", "{}")
 RATE_PER_MIN = int(os.getenv("RATE_PER_MIN", "600"))
 BURST = int(os.getenv("BURST", "200"))
+# Per-replica overload guard. Zero keeps the legacy unlimited behaviour for
+# local/single-pod installs; Kubernetes sets explicit bounds and autoscales from
+# the exported active+pending gauges.
+MAX_INFLIGHT_REQUESTS = max(0, int(os.getenv("MAX_INFLIGHT_REQUESTS", "0")))
+MAX_PENDING_REQUESTS = max(0, int(os.getenv("MAX_PENDING_REQUESTS", "0")))
+CAPACITY_QUEUE_TIMEOUT_S = max(0.0, float(os.getenv("CAPACITY_QUEUE_TIMEOUT_S", "2")))
+UPSTREAM_MAX_CONNECTIONS = max(1, int(os.getenv("UPSTREAM_MAX_CONNECTIONS", "100")))
+UPSTREAM_MAX_KEEPALIVE_CONNECTIONS = max(
+    1, int(os.getenv("UPSTREAM_MAX_KEEPALIVE_CONNECTIONS", "40")))
 RECENT_LIMIT = int(os.getenv("DASHBOARD_RECENT_LIMIT", "200"))
 DASHBOARD_STATS_RECENT_LIMIT = max(1, min(int(os.getenv("DASHBOARD_STATS_RECENT_LIMIT", "100")), 100))
 DASHBOARD_TRUSTED_USER_HEADER = os.getenv("DASHBOARD_TRUSTED_USER_HEADER", "").strip()
@@ -58,6 +69,8 @@ DASHBOARD_COOKIE_PATH = os.getenv("DASHBOARD_COOKIE_PATH", "/dashboard")
 DASHBOARD_KEY_ENV_PATH = os.getenv("DASHBOARD_KEY_ENV_PATH", "/run/llm-router/.env.secrets")
 CODEX_ACCOUNTS_DIR = os.getenv("CODEX_ACCOUNTS_DIR", "/codex/accounts")
 CODEX_AUTH_PATH = os.getenv("CODEX_AUTH_PATH") or None
+CODEX_BROKER_URL = os.getenv("CODEX_BROKER_URL", "").rstrip("/")
+CODEX_BROKER_TOKEN = os.getenv("CODEX_BROKER_TOKEN", "")
 DASHBOARD_KEY_PREFIX = os.getenv("DASHBOARD_KEY_PREFIX", "llmr")
 DEFAULT_ROTATION_GRACE_S = int(os.getenv("DASHBOARD_KEY_ROTATION_GRACE_S", "86400"))
 DASHBOARD_POLICY_CONFIG_PATH = os.getenv("DASHBOARD_POLICY_CONFIG_PATH", "config.live.lua")
@@ -66,6 +79,8 @@ DASHBOARD_POLICY_DIR = os.getenv("DASHBOARD_POLICY_DIR", "policies")
 ROUTER_CONTEXT_LENGTH = int(os.getenv("ROUTER_CONTEXT_LENGTH", "200000"))
 ROUTE_HEALTH_ROUTES = [r.strip() for r in os.getenv("DASHBOARD_ROUTE_HEALTH_ROUTES", "profile:default").split(",") if r.strip()]
 SYNTHETIC_PROBES_ENABLED = os.getenv("DASHBOARD_SYNTHETIC_PROBES_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
+RUN_COST_BACKFILL = os.getenv("RUN_COST_BACKFILL", "1").lower() not in {
+    "0", "false", "no", "off"}
 SYNTHETIC_PROBE_INTERVAL_S = float(os.getenv("DASHBOARD_SYNTHETIC_PROBE_INTERVAL_S", "300"))
 SYNTHETIC_PROBE_INITIAL_DELAY_S = float(os.getenv("DASHBOARD_SYNTHETIC_PROBE_INITIAL_DELAY_S", "45"))
 SYNTHETIC_PROBE_TIMEOUT_S = float(os.getenv("DASHBOARD_SYNTHETIC_PROBE_TIMEOUT_S", "45"))
@@ -106,9 +121,27 @@ log = logging.getLogger("llm-router-auth-proxy")
 app = FastAPI(title="llm-router auth proxy", docs_url=None, redoc_url=None)
 _client: httpx.AsyncClient | None = None
 _probe_task: asyncio.Task[None] | None = None
-_windows: dict[str, deque[float]] = defaultdict(deque)
 _started_wall = time.time()
 _stats_lock = RLock()
+
+# Event-loop-owned capacity state.  No thread lock is needed: every mutation is
+# made by an auth-proxy coroutine, and the synchronous metrics renderer only
+# snapshots it on that same loop.
+_capacity: asyncio.Semaphore | None = None
+_active_requests = 0
+_pending_requests = 0
+
+# Low-cardinality Prometheus state. Caller/model/provider labels are
+# deliberately absent: the durable ledger owns those dimensions and putting
+# them here would make autoscaling telemetry attacker-controlled.
+_metrics_lock = Lock()
+_metric_requests: dict[str, int] = defaultdict(int)
+_metric_rejects: dict[str, int] = defaultdict(int)
+_metric_store_errors: dict[str, int] = defaultdict(int)
+_duration_buckets = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 50.0, 60.0, 120.0)
+_metric_duration_bucket: dict[float, int] = defaultdict(int)
+_metric_duration_count = 0
+_metric_duration_sum = 0.0
 
 
 def _counter() -> dict[str, Any]:
@@ -154,6 +187,130 @@ def _new_stats() -> dict[str, Any]:
         "recent": deque(maxlen=RECENT_LIMIT),
         "synthetic_route_health": {},
     }
+
+
+async def _capacity_acquire() -> bool:
+    """Enter the bounded upstream section, queueing only a small burst.
+
+    HPA/KEDA cannot create a pod before the first burst arrives.  The short
+    bounded queue absorbs that reaction window; once both active and pending
+    budgets are full we shed immediately instead of letting arbitrary numbers
+    of 50-second requests consume sockets and kill the health loop.
+    """
+    global _active_requests, _pending_requests
+    if _capacity is None:
+        _active_requests += 1
+        return True
+
+    queued = _capacity.locked()
+    if queued:
+        if _pending_requests >= MAX_PENDING_REQUESTS:
+            return False
+        _pending_requests += 1
+    try:
+        if queued:
+            await asyncio.wait_for(
+                _capacity.acquire(), timeout=CAPACITY_QUEUE_TIMEOUT_S)
+        else:
+            await _capacity.acquire()
+    except (asyncio.TimeoutError, TimeoutError):
+        return False
+    finally:
+        if queued:
+            _pending_requests = max(0, _pending_requests - 1)
+    _active_requests += 1
+    return True
+
+
+def _capacity_release() -> None:
+    global _active_requests
+    _active_requests = max(0, _active_requests - 1)
+    if _capacity is not None:
+        _capacity.release()
+
+
+def _metric_request(status: int, latency_ms: float) -> None:
+    global _metric_duration_count, _metric_duration_sum
+    seconds = max(0.0, float(latency_ms) / 1000.0)
+    with _metrics_lock:
+        _metric_requests[str(int(status))] += 1
+        _metric_duration_count += 1
+        _metric_duration_sum += seconds
+        for bound in _duration_buckets:
+            if seconds <= bound:
+                _metric_duration_bucket[bound] += 1
+
+
+def _metric_reject(reason: str) -> None:
+    with _metrics_lock:
+        _metric_rejects[str(reason or "unknown")] += 1
+
+
+def _metric_store_error(kind: str) -> None:
+    with _metrics_lock:
+        _metric_store_errors[str(kind or "unknown")] += 1
+
+
+def _prometheus_metrics() -> str:
+    """Render the small autoscaling/availability surface without a dependency.
+
+    The endpoint is scraped directly on the pod's auth-proxy port. nginx blocks
+    it on the public listener in the Kubernetes manifest.
+    """
+    with _metrics_lock:
+        requests = dict(_metric_requests)
+        rejects = dict(_metric_rejects)
+        store_errors = dict(_metric_store_errors)
+        duration_buckets = dict(_metric_duration_bucket)
+        duration_count = _metric_duration_count
+        duration_sum = _metric_duration_sum
+    lines = [
+        "# HELP llm_router_inflight_requests Requests currently executing upstream.",
+        "# TYPE llm_router_inflight_requests gauge",
+        f"llm_router_inflight_requests {_active_requests}",
+        "# HELP llm_router_pending_requests Requests waiting for per-pod capacity.",
+        "# TYPE llm_router_pending_requests gauge",
+        f"llm_router_pending_requests {_pending_requests}",
+        "# HELP llm_router_capacity_requests Configured per-pod active request capacity.",
+        "# TYPE llm_router_capacity_requests gauge",
+        f"llm_router_capacity_requests {MAX_INFLIGHT_REQUESTS}",
+        "# HELP llm_router_requests_total Completed authenticated upstream requests.",
+        "# TYPE llm_router_requests_total counter",
+    ]
+    for status, count in sorted(requests.items()):
+        lines.append(f'llm_router_requests_total{{status="{status}"}} {count}')
+    lines.extend([
+        "# HELP llm_router_rejections_total Requests rejected before upstream.",
+        "# TYPE llm_router_rejections_total counter",
+    ])
+    for reason, count in sorted(rejects.items()):
+        safe = re.sub(r"[^A-Za-z0-9_.:-]", "_", reason)
+        lines.append(f'llm_router_rejections_total{{reason="{safe}"}} {count}')
+    lines.extend([
+        "# HELP llm_router_store_errors_total Admission-store failures.",
+        "# TYPE llm_router_store_errors_total counter",
+    ])
+    for kind, count in sorted(store_errors.items()):
+        safe = re.sub(r"[^A-Za-z0-9_.:-]", "_", kind)
+        lines.append(f'llm_router_store_errors_total{{kind="{safe}"}} {count}')
+    lines.extend([
+        "# HELP llm_router_request_duration_seconds End-to-end upstream request latency.",
+        "# TYPE llm_router_request_duration_seconds histogram",
+    ])
+    for bound in _duration_buckets:
+        lines.append(
+            f'llm_router_request_duration_seconds_bucket{{le="{bound:g}"}} '
+            f'{duration_buckets.get(bound, 0)}')
+    lines.extend([
+        f'llm_router_request_duration_seconds_bucket{{le="+Inf"}} {duration_count}',
+        f"llm_router_request_duration_seconds_sum {duration_sum:.6f}",
+        f"llm_router_request_duration_seconds_count {duration_count}",
+        "# HELP llm_router_process_uptime_seconds Auth-proxy process uptime.",
+        "# TYPE llm_router_process_uptime_seconds gauge",
+        f"llm_router_process_uptime_seconds {max(0.0, time.time() - _started_wall):.3f}",
+        "",
+    ])
+    return "\n".join(lines)
 
 
 _stats: dict[str, Any] = _new_stats()
@@ -403,7 +560,10 @@ def _issued_consumer_records() -> dict[str, dict[str, Any]]:
     return {name: _normalize_consumer_record(name, issued.get(name)) for name in consumers}
 
 
-def _write_issued_consumer_records(records: dict[str, dict[str, Any]]) -> bool:
+def _write_issued_consumer_records(
+        records: dict[str, dict[str, Any]], *,
+        key_digests: dict[str, str] | None = None,
+        delete_key_digests: list[tuple[str, str]] | None = None) -> bool:
     """Persist the consumer records; returns True on success, False on a
     persistence failure — a swallowed failure would let a key rotation/revocation
     be reported as saved while still working after a restart (a security hole)."""
@@ -413,7 +573,36 @@ def _write_issued_consumer_records(records: dict[str, dict[str, Any]]) -> bool:
         if normalized["status"] == "active" and not normalized["allowed_routes"] and normalized["rate_per_min"] is None and normalized["burst"] is None and not normalized["keys"]:
             continue
         compact[consumer] = normalized
-    return host_store.set_consumer_keys(compact)
+    return host_store.set_consumer_keys(
+        compact, key_digests=key_digests,
+        delete_key_digests=delete_key_digests)
+
+
+def _exact_consumer_key_digests(
+        *, hashes: dict[str, str] | None = None,
+        plaintext: dict[str, str] | None = None) -> dict[str, str]:
+    """Build the complete shared resolver map without retaining plaintext."""
+    out = dict(CALLER_KEY_HASHES if hashes is None else hashes)
+    for token, owner in (CALLER_KEYS if plaintext is None else plaintext).items():
+        out[hashlib.sha256(token.encode()).hexdigest()] = owner
+    return out
+
+
+def _publish_local_consumer_map(name: str, mapping: dict[str, str],
+                                target: dict[str, str]) -> None:
+    """Refresh this process and best-effort PVC mirror after a DB commit.
+
+    PostgreSQL is the cross-replica authority.  A PVC write failure must not
+    hide an already-issued credential from the operator; the database copy is
+    sufficient for current and future stateless replicas.
+    """
+    target.clear()
+    target.update(mapping)
+    try:
+        _upsert_env_json(Path(DASHBOARD_KEY_ENV_PATH), name, mapping)
+    except Exception as exc:  # noqa: BLE001
+        _metric_store_error("consumer_key_pvc_mirror")
+        log.warning("consumer key PVC mirror failed for %s: %s", name, exc)
 
 
 def _consumer_meta(consumer: str) -> dict[str, Any]:
@@ -523,8 +712,20 @@ def _caller_auth(token: str | None) -> dict[str, Any]:
         caller = CALLER_KEY_HASHES.get(digest)
         storage = "CALLER_KEYS_SHA256_JSON" if caller else None
     if not caller:
+        caller, store_ok = host_store.consumer_for_digest(digest)
+        if not store_ok:
+            return {"ok": False, "digest": digest,
+                    "error_code": "caller_auth_unavailable"}
+        storage = "host_store" if caller else None
+    if not caller:
         return {"ok": False, "error_code": "caller_auth"}
-    meta = _consumer_meta(caller)
+    # Authentication is an admission decision. Read only this caller's row;
+    # dashboard aggregation still uses the full-table helper separately.
+    issued, metadata_ok = host_store.get_consumer_key(caller)
+    if not metadata_ok:
+        return {"ok": False, "caller": caller, "digest": digest,
+                "storage": storage, "error_code": "caller_auth_unavailable"}
+    meta = _normalize_consumer_record(caller, issued)
     if meta.get("status") != "active":
         return {"ok": False, "caller": caller, "digest": digest, "storage": storage, "error_code": "caller_inactive"}
     allowed, key_error = _key_record_allows(digest, meta)
@@ -533,20 +734,12 @@ def _caller_auth(token: str | None) -> dict[str, Any]:
     return {"ok": True, "caller": caller, "digest": digest, "storage": storage, "meta": meta}
 
 
-def _rate_ok(caller: str) -> bool:
-    meta = _consumer_meta(caller)
+def _rate_ok(caller: str, meta: dict[str, Any] | None = None) \
+        -> tuple[bool, bool, float]:
+    meta = meta or _consumer_meta(caller)
     rate_per_min = int(meta.get("rate_per_min") or RATE_PER_MIN)
     burst = int(meta.get("burst") or BURST)
-    now = time.monotonic()
-    q = _windows[caller]
-    cutoff = now - 60.0
-    while q and q[0] < cutoff:
-        q.popleft()
-    allowed = max(rate_per_min, burst)
-    if len(q) >= allowed:
-        return False
-    q.append(now)
-    return True
+    return host_store.consume_rate_token(caller, rate_per_min, burst)
 
 
 def _requested_route_from(path: str, body: bytes | None) -> str | None:
@@ -578,8 +771,9 @@ def _route_matches(pattern: str, route: str) -> bool:
     return False
 
 
-def _route_allowed(caller: str, route: str | None) -> bool:
-    allowed_routes = _consumer_meta(caller).get("allowed_routes") or []
+def _route_allowed(caller: str, route: str | None,
+                   meta: dict[str, Any] | None = None) -> bool:
+    allowed_routes = (meta or _consumer_meta(caller)).get("allowed_routes") or []
     if not allowed_routes:
         return True
     if not route:
@@ -1022,15 +1216,29 @@ _backfill_task: "asyncio.Task | None" = None
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _client, _probe_task, _backfill_task
+    global _client, _probe_task, _backfill_task, _capacity
     # The ingress is the owner of the operational store (consumer keys, the ledger,
     # operator-config writes); all operator state lives in Postgres now (the legacy
     # JSON backfill was retired once prod confirmed the tables were populated).
-    _client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0))
+    _capacity = (asyncio.Semaphore(MAX_INFLIGHT_REQUESTS)
+                 if MAX_INFLIGHT_REQUESTS else None)
+    _client = httpx.AsyncClient(
+        timeout=httpx.Timeout(90.0, connect=10.0),
+        limits=httpx.Limits(
+            max_connections=UPSTREAM_MAX_CONNECTIONS,
+            max_keepalive_connections=UPSTREAM_MAX_KEEPALIVE_CONNECTIONS))
+    digests_ok = await asyncio.to_thread(
+        host_store.upsert_consumer_key_digests,
+        _exact_consumer_key_digests())
+    if not digests_ok:
+        _metric_store_error("consumer_digest_startup")
+        log.warning("consumer digest startup backfill failed; shared auth will fail closed")
     if SYNTHETIC_PROBES_ENABLED and ROUTE_HEALTH_ROUTES:
         _probe_task = asyncio.create_task(_synthetic_probe_loop())
     # Off the event loop: batched UPDATEs, potentially many rows on first deploy.
-    _backfill_task = asyncio.create_task(asyncio.to_thread(_run_cost_backfill))
+    if RUN_COST_BACKFILL:
+        _backfill_task = asyncio.create_task(
+            asyncio.to_thread(_run_cost_backfill))
 
 
 @app.on_event("shutdown")
@@ -1053,6 +1261,13 @@ async def healthz() -> Response:
         return JSONResponse(status_code=r.status_code, content=r.json())
     except Exception as exc:
         return JSONResponse(status_code=502, content={"ok": False, "error": str(exc)})
+
+
+@app.get("/metrics")
+async def metrics() -> Response:
+    return Response(
+        content=_prometheus_metrics(),
+        media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.get("/favicon.ico")
@@ -2588,23 +2803,26 @@ async def dashboard_revoke_key(request: Request) -> Response:
     new_hashes = {digest: owner for digest, owner in CALLER_KEY_HASHES.items() if not (owner == consumer and digest.startswith(prefix))}
     removed = len(CALLER_KEY_HASHES) - len(new_hashes)
     if removed:
-        CALLER_KEY_HASHES.clear()
-        CALLER_KEY_HASHES.update(new_hashes)
-        _upsert_env_json(Path(DASHBOARD_KEY_ENV_PATH), "CALLER_KEYS_SHA256_JSON", new_hashes)
         found = True
     new_plaintext = {token: owner for token, owner in CALLER_KEYS.items() if not (owner == consumer and hashlib.sha256(token.encode()).hexdigest().startswith(prefix))}
     removed_plaintext = len(CALLER_KEYS) - len(new_plaintext)
     if removed_plaintext:
-        CALLER_KEYS.clear()
-        CALLER_KEYS.update(new_plaintext)
-        _upsert_env_json(Path(DASHBOARD_KEY_ENV_PATH), "CALLER_KEYS_JSON", new_plaintext)
         found = True
     if not found:
         return JSONResponse(status_code=404, content={"error": {"message": "key prefix not found for consumer", "type": "not_found", "code": "key_not_found"}})
     meta["updated_at"] = now
     records[consumer] = meta
-    if not _write_issued_consumer_records(records):
+    if not _write_issued_consumer_records(
+            records, delete_key_digests=[(consumer, prefix)]):
         return JSONResponse(status_code=500, content={"ok": False, "error": "failed to persist key revocation"})
+    # Publish the local/PVC mirror only after the shared authority commits.  A
+    # failed SQL write must never revoke on one replica while others accept it.
+    if removed:
+        _publish_local_consumer_map(
+            "CALLER_KEYS_SHA256_JSON", new_hashes, CALLER_KEY_HASHES)
+    if removed_plaintext:
+        _publish_local_consumer_map(
+            "CALLER_KEYS_JSON", new_plaintext, CALLER_KEYS)
     _log({"event": "dashboard_key_revoked", "consumer": consumer, "viewer": caller, "sha256_prefix": prefix, "removed_hashes": removed, "removed_plaintext": removed_plaintext})
     return JSONResponse(content={"ok": True, "consumer": consumer, "sha256_prefix": prefix, "removed_hashes": removed, "removed_plaintext": removed_plaintext})
 
@@ -2889,10 +3107,18 @@ async def _reload_codex_router() -> tuple[bool, str | None]:
     goes live. On failure the change still loads at the next router restart."""
     try:
         if _client is not None:
-            r = await _client.post(f"{UPSTREAM}/x/codex/reload", timeout=10.0)
+            if CODEX_BROKER_URL:
+                if not CODEX_BROKER_TOKEN:
+                    return False, "CODEX_BROKER_TOKEN is not configured"
+                url = f"{CODEX_BROKER_URL}/v1/reload"
+                headers = {"authorization": f"Bearer {CODEX_BROKER_TOKEN}"}
+            else:
+                url = f"{UPSTREAM}/x/codex/reload"
+                headers = None
+            r = await _client.post(url, headers=headers, timeout=10.0)
             if r.status_code == 200:
                 return True, None
-            return False, f"router /x/codex/reload returned {r.status_code}"
+            return False, f"Codex reload returned {r.status_code}"
     except Exception as exc:
         return False, str(exc)
     return False, "router client unavailable"
@@ -3437,16 +3663,16 @@ async def dashboard_create_key(request: Request) -> Response:
             return JSONResponse(status_code=404, content={"error": {"message": "sha256_prefix does not match an active key for this consumer", "type": "not_found", "code": "key_not_found"}})
     new_hashes = dict(CALLER_KEY_HASHES)
     new_hashes[token_hash] = consumer
-    _upsert_env_json(Path(DASHBOARD_KEY_ENV_PATH), "CALLER_KEYS_SHA256_JSON", new_hashes)
-    CALLER_KEY_HASHES.clear()
-    CALLER_KEY_HASHES.update(new_hashes)
     meta.setdefault("keys", [])
     meta["keys"].append({"sha256_prefix": token_hash[:12], "status": "active", "created_at": now, "viewer": caller})
     meta["status"] = meta.get("status") or "active"
     meta["updated_at"] = now
     records[consumer] = meta
-    if not _write_issued_consumer_records(records):
+    if not _write_issued_consumer_records(
+            records, key_digests={token_hash: consumer}):
         return JSONResponse(status_code=500, content={"ok": False, "error": "failed to persist the issued key"})
+    _publish_local_consumer_map(
+        "CALLER_KEYS_SHA256_JSON", new_hashes, CALLER_KEY_HASHES)
     _log({"event": "dashboard_key_created", "consumer": consumer, "viewer": caller, "rotate": rotate, "rotated_prefix": rotate_prefix or None})
     return JSONResponse(content={"ok": True, "consumer": consumer, "api_key": token, "sha256_prefix": token_hash[:12], "rotate": rotate, "grace_period_s": None if not rotate else (DEFAULT_ROTATION_GRACE_S if grace_period_s is None else grace_period_s), "warning": "Copy now. The raw key is shown once and only hashed key metadata is persisted."})
 
@@ -3512,16 +3738,17 @@ async def dashboard_create_key_batch(request: Request) -> Response:
                        "consumer": consumer, "api_key": token,
                        "sha256_prefix": digest[:12], "budget_usd": budget_usd})
 
-    _upsert_env_json(Path(DASHBOARD_KEY_ENV_PATH), "CALLER_KEYS_SHA256_JSON", new_hashes)
-    CALLER_KEY_HASHES.clear()
-    CALLER_KEY_HASHES.update(new_hashes)
-    if not _write_issued_consumer_records(records):
-        _upsert_env_json(Path(DASHBOARD_KEY_ENV_PATH), "CALLER_KEYS_SHA256_JSON", old_hashes)
-        CALLER_KEY_HASHES.clear()
-        CALLER_KEY_HASHES.update(old_hashes)
+    created_hashes = {
+        digest: owner for digest, owner in new_hashes.items()
+        if digest not in old_hashes
+    }
+    if not _write_issued_consumer_records(
+            records, key_digests=created_hashes):
         return JSONResponse(status_code=500, content={"error": {
             "message": "failed to persist key batch", "type": "server_error",
             "code": "key_batch_persistence"}})
+    _publish_local_consumer_map(
+        "CALLER_KEYS_SHA256_JSON", new_hashes, CALLER_KEY_HASHES)
     _log({"event": "dashboard_key_batch_created", "batch": batch,
           "count": count, "budget_usd": budget_usd, "viewer": viewer})
     return JSONResponse(content={"ok": True, "batch": batch, "count": count,
@@ -3630,11 +3857,15 @@ async def proxy(path: str, request: Request) -> Response:
         return JSONResponse(status_code=404, content={"error": {"message": "not found", "type": "invalid_request_error", "code": None}})
     started = time.perf_counter()
     token = _extract_token(request)
-    auth = _caller_auth(token)
+    auth = await asyncio.to_thread(_caller_auth, token)
     caller = auth.get("caller")
     if not auth.get("ok"):
         code = auth.get("error_code") or "caller_auth"
-        status_code = 403 if code in {"caller_inactive", "caller_key_revoked", "caller_key_expired"} else 401
+        if code == "caller_auth_unavailable":
+            status_code = 503
+            _metric_store_error("consumer_auth")
+        else:
+            status_code = 403 if code in {"caller_inactive", "caller_key_revoked", "caller_key_expired"} else 401
         _record_reject(reason=code, path="/" + path, caller=caller, status=status_code, remote=request.client.host if request.client else None)
         _log({"event": "reject", "reason": code, "path": "/" + path, "caller": caller, "remote": request.client.host if request.client else None})
         messages = {
@@ -3642,20 +3873,39 @@ async def proxy(path: str, request: Request) -> Response:
             "caller_inactive": "caller is inactive",
             "caller_key_revoked": "caller key is revoked",
             "caller_key_expired": "caller key is expired",
+            "caller_auth_unavailable": "caller authentication is temporarily unavailable",
         }
-        return JSONResponse(status_code=status_code, content={"error": {"message": messages.get(code, "caller not authorized"), "type": "auth_error", "code": code}})
+        error_type = "server_error" if status_code == 503 else "auth_error"
+        return JSONResponse(status_code=status_code, content={"error": {"message": messages.get(code, "caller not authorized"), "type": error_type, "code": code}})
 
     caller = str(caller)
+    consumer_meta = auth.get("meta") or {}
     body = await request.body()
     requested_route = _requested_route_from(path, body)
-    if not _route_allowed(caller, requested_route):
+    if not _route_allowed(caller, requested_route, consumer_meta):
         _record_reject(reason="route_not_allowed", path="/" + path, caller=caller, status=403, route=requested_route)
         _log({"event": "reject", "reason": "route_not_allowed", "caller": caller, "path": "/" + path, "route": requested_route})
         return JSONResponse(status_code=403, content={"error": {"message": "caller is not allowed to use this route", "type": "auth_error", "code": "caller_route_not_allowed"}})
-    if not _rate_ok(caller):
+    rate_result = await asyncio.to_thread(_rate_ok, caller, consumer_meta)
+    # Compatibility for embedders/tests that supplied the pre-HA boolean hook.
+    if isinstance(rate_result, tuple):
+        rate_allowed, rate_store_ok, retry_after_s = rate_result
+    else:
+        rate_allowed, rate_store_ok, retry_after_s = bool(rate_result), True, 0.0
+    if not rate_store_ok:
+        _metric_store_error("rate_limit")
+        _record_reject(reason="rate_limit_unavailable", path="/" + path,
+                       caller=caller, status=503)
+        return JSONResponse(status_code=503, content={"error": {
+            "message": "caller rate-limit state is temporarily unavailable",
+            "type": "server_error", "code": "caller_rate_limit_unavailable"}})
+    if not rate_allowed:
         _record_reject(reason="rate_limit", path="/" + path, caller=caller, status=429)
         _log({"event": "reject", "reason": "rate_limit", "caller": caller, "path": "/" + path})
-        return JSONResponse(status_code=429, content={"error": {"message": "caller rate limit exceeded", "type": "rate_limit_error", "code": "caller_rate_limit"}})
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(max(1, math.ceil(retry_after_s)))},
+            content={"error": {"message": "caller rate limit exceeded", "type": "rate_limit_error", "code": "caller_rate_limit"}})
 
     if path == "api/show" and request.method.upper() == "POST":
         requested_model = None
@@ -3671,7 +3921,7 @@ async def proxy(path: str, request: Request) -> Response:
         _log({"event": "metadata_probe", "caller": caller, "method": request.method, "path": "/" + path, "status": 200, "latency_ms": latency_ms, "requested_model": requested_model})
         return JSONResponse(content=_ollama_show_response(requested_model))
 
-    budget_usd = _optional_float((auth.get("meta") or {}).get("budget_usd"), min_value=0.01)
+    budget_usd = _optional_float(consumer_meta.get("budget_usd"), min_value=0.01)
     if budget_usd is not None:
         spent_usd, spend_ok = await asyncio.to_thread(host_store.consumer_spend_usd, caller)
         if not spend_ok:
@@ -3687,6 +3937,16 @@ async def proxy(path: str, request: Request) -> Response:
                 "budget_usd": budget_usd, "spent_usd": spent_usd}})
 
     assert _client is not None
+    if not await _capacity_acquire():
+        _record_reject(reason="router_overloaded", path="/" + path,
+                       caller=caller, status=503, route=requested_route)
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": str(max(1, math.ceil(CAPACITY_QUEUE_TIMEOUT_S)))},
+            content={"error": {
+                "message": "router capacity is temporarily exhausted; retry shortly",
+                "type": "server_error", "code": "router_overloaded"}})
+
     upstream_url = f"{UPSTREAM}/{path}"
     if request.url.query:
         upstream_url += f"?{request.url.query}"
@@ -3710,6 +3970,7 @@ async def proxy(path: str, request: Request) -> Response:
     decision_trace = None
     error_type = error_code = error_message = None
     record_in_finally = True
+    capacity_released = False
     # The per-session meter DERIVES from this ledger (host_store.calls.session):
     # without the sid recorded here, /v1/session/{sid} answers 404 for everyone
     # even though the shim pinned the session fine. Same precedence as the shim:
@@ -3718,9 +3979,17 @@ async def proxy(path: str, request: Request) -> Response:
     session_id = request.headers.get("x-unhardcoded-session")
 
     def _finish():
+        nonlocal capacity_released
+        if capacity_released:
+            return
+        capacity_released = True
         latency_ms = round((time.perf_counter() - started) * 1000, 1)
-        _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
-        _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
+        try:
+            _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
+            _metric_request(status, latency_ms)
+            _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
+        finally:
+            _capacity_release()
 
     try:
         if body:
@@ -3743,6 +4012,14 @@ async def proxy(path: str, request: Request) -> Response:
             # recorded AFTER the stream ends — with tokens, cost, provider and
             # full-stream latency — instead of in the outer finally.
             record_in_finally = False
+            upstream_closed = False
+
+            async def _close_upstream_stream() -> None:
+                nonlocal upstream_closed
+                if upstream_closed:
+                    return
+                upstream_closed = True
+                await r.aclose()
 
             async def _passthrough():
                 nonlocal provider, model_family, served_model_id, served_by, \
@@ -3755,7 +4032,7 @@ async def proxy(path: str, request: Request) -> Response:
                         _trim_sse_tail(tail)
                         yield chunk
                 finally:
-                    await r.aclose()
+                    await _close_upstream_stream()
                     try:
                         meta = _parse_stream_tail(bytes(tail))
                         xr = meta.get("x_router") or {}
@@ -3783,7 +4060,18 @@ async def proxy(path: str, request: Request) -> Response:
                     except Exception:
                         pass
                     _finish()
-            return StreamingResponse(_passthrough(), status_code=status, media_type=content_type)
+
+            async def _stream_background() -> None:
+                # Starlette normally closes the async generator on disconnect.
+                # The background fallback also covers a client that disconnects
+                # before the first iteration, so neither the upstream socket nor
+                # the admission permit can leak indefinitely.
+                await _close_upstream_stream()
+                _finish()
+
+            return StreamingResponse(
+                _passthrough(), status_code=status, media_type=content_type,
+                background=BackgroundTask(_stream_background))
         content = await r.aread()
         await r.aclose()
         if content_type.startswith("application/json"):
@@ -3831,6 +4119,7 @@ def _record_reject(**event: Any) -> None:
     # rejects were dual-written to usage-history; with that file retired, the
     # persistent stats are per-LLM-call and rejects are a runtime view.)
     stored = {"ts": int(time.time()), "event": "reject", **event}
+    _metric_reject(str(event.get("reason") or "unknown"))
     with _stats_lock:
         _stats["total_rejects"] += 1
         _stats["recent"].appendleft(stored)
