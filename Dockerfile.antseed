@@ -10,7 +10,12 @@ FROM node:22-slim AS antseed-dependencies
 # releases undeployable; none of this toolchain is copied into the runtime.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 make g++ \
-    && npm install -g @antseed/cli@0.1.128 pg@8.16.3 \
+    && for install_attempt in 1 2 3; do \
+         if npm install -g @antseed/cli@0.1.128 pg@8.16.3; then break; fi; \
+         rm -rf /usr/local/lib/node_modules/@antseed \
+           /usr/local/lib/node_modules/pg /usr/local/bin/antseed; \
+         if [ "${install_attempt}" = 3 ]; then exit 1; fi; \
+       done \
     && rm -rf /var/lib/apt/lists/*
 
 FROM node:22-slim
@@ -23,7 +28,9 @@ RUN apt-get update \
 # `pg` is the market writer's Postgres client (write-market.js upserts peer_offers
 # into the shared host store). NODE_PATH lets the scripts require these globals.
 COPY --from=antseed-dependencies /usr/local/lib/node_modules /usr/local/lib/node_modules
-COPY --from=antseed-dependencies /usr/local/bin/antseed /usr/local/bin/antseed
+# Docker COPY dereferences the npm-created bin symlink. Recreate it explicitly
+# so Node resolves package imports from @antseed/cli instead of /usr/local/bin.
+RUN ln -s ../lib/node_modules/@antseed/cli/dist/cli/index.js /usr/local/bin/antseed
 ENV NODE_PATH=/usr/local/lib/node_modules
 
 # Every non-test file under antseed/ — an explicit list silently ships a module
