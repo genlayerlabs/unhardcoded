@@ -141,15 +141,11 @@ WEDGE_MIN_ATTEMPTS = 10
 # than a measured miss, hence one more strike before the same hard halt.
 TOPUP_ERROR_STRIKES_TO_HALT = 3
 # ...but three strikes are not always REACHABLE, and that was a hole. Every
-# `unknown` consumes the daily cap, so at the shipped knobs (cap 10, amount 5)
-# exactly two deposits fit in a 24h window: the third row the breaker is waiting
-# for can never be written, the cap silently absorbs the failure, and the keeper
-# goes quiet for a day with nothing logged above WARNING and no halt for anyone
-# to find. That is the prod shape — two `unknown` rows, cap exhausted, no alert.
-# So once the cap can no longer admit another attempt, a shorter run is enough:
-# at that point the keeper is not "done spending today", it is wedged, and a
-# halt costs nothing it was still able to do while making it loud and durable.
-TOPUP_ERROR_STRIKES_TO_HALT_CAPPED = 2
+# `unknown` consumes the daily cap. Once the cap can no longer admit another
+# attempt, the breaker threshold must be no larger than the number of full
+# deposits that configuration allowed in the first place. Otherwise a cap that
+# admits only one or two attempts makes the normal three-strike breaker
+# unreachable and the keeper goes quiet for a day without a durable alarm.
 # Retry backoff between error strikes. The floor exists because the cooldown knob
 # can legitimately be 0 (an operator wanting prompt refunding), and 0 × any
 # backoff is still 0 — which is the hammering this exists to stop.
@@ -915,7 +911,11 @@ class WalletKeeper:
             # stall into a persisted, operator-cleared alarm.
             strikes = self._error_strikes(pid, "topup",
                                           TOPUP_ERROR_STRIKES_TO_HALT)
-            if strikes >= TOPUP_ERROR_STRIKES_TO_HALT_CAPPED:
+            attempts_per_cap = max(
+                1, int(knobs.topup_daily_cap_usdc / knobs.topup_amount_usdc))
+            capped_strikes_to_halt = min(
+                TOPUP_ERROR_STRIKES_TO_HALT, attempts_per_cap)
+            if strikes >= capped_strikes_to_halt:
                 return self._halt_topups(pid, "error_halt",
                     f"{strikes} consecutive deposits could not be completed and "
                     f"the {knobs.topup_daily_cap_usdc} USDC daily cap can no "

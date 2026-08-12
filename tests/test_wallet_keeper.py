@@ -813,6 +813,28 @@ def test_the_daily_cap_can_no_longer_starve_the_error_breaker(caplog):
     assert _run(_failing_keeper()._maybe_topup(PID, knobs, 0.5)) == "halted"
 
 
+def test_a_one_attempt_daily_cap_halts_after_the_first_unknown(caplog):
+    """A cap that admits only one deposit must not make even the shortened
+    breaker unreachable. Its first unknown consumes every permitted attempt, so
+    the following cap check has to turn that one strike into a durable halt."""
+    knobs = _knobs(topup_cooldown_s=0, topup_daily_cap_usdc=5.0)
+    assert knobs.topup_daily_cap_usdc / knobs.topup_amount_usdc == 1
+    k = _failing_keeper()
+    seed_buyer_status(PID, deposits_available="0.5", deposits_reserved="0.0")
+
+    _age_all_topups(-1)
+    assert _run(k._maybe_topup(PID, knobs, 0.5)) == "topup_unknown"
+    assert host_store.wallet_op_spend_since(
+        PID, "topup", 0)["spent_usdc"] == 5.0
+
+    _age_all_topups(-1)
+    with caplog.at_level("ERROR"):
+        assert _run(k._maybe_topup(PID, knobs, 0.5)) == "error_halt"
+    assert "HARD HALT" in caplog.text
+    assert host_store.wallet_halted(PID, "topup") is True
+    assert len(k.calls) == 1, "the halt must not fire a second deposit"
+
+
 def test_a_cap_reached_by_deposits_that_WORKED_is_just_the_cap():
     """The other side of it: the halt above keys off the error run, not off the
     cap alone. A keeper that funded itself twice today has done its job, and
