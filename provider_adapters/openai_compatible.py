@@ -5,7 +5,8 @@ import asyncio
 import json
 import os
 import time
-from contextlib import AsyncExitStack
+import uuid
+from contextlib import AsyncExitStack, suppress
 from typing import Awaitable, Callable, Any
 
 from provider_adapters.common import (
@@ -211,14 +212,173 @@ def make_http_call_provider(
 
 
 _PEER_GATES: dict[str, asyncio.Semaphore] = {}
+_PEER_GATE_LOCK: asyncio.Lock | None = None
+
+# Maximum idle time (seconds) before a peer gate is evicted to prevent
+# unbounded memory growth when peers are dynamically discovered and retired.
+_PEER_GATE_TTL: float = 600.0
+_PEER_GATE_TIMESTAMPS: dict[str, float] = {}
 
 
-def _peer_gate(peer_id: str, cap: int) -> asyncio.Semaphore:
-    sem = _PEER_GATES.get(peer_id)
-    if sem is None:
-        sem = asyncio.Semaphore(cap)
-        _PEER_GATES[peer_id] = sem
-    return sem
+def _peer_gate_lock() -> asyncio.Lock:
+    """Lazy-initialised lock to avoid creating asyncio primitives at import time
+    (which may happen outside an event loop in test/synchronous contexts)."""
+    global _PEER_GATE_LOCK
+    if _PEER_GATE_LOCK is None:
+        _PEER_GATE_LOCK = asyncio.Lock()
+    return _PEER_GATE_LOCK
+
+
+async def _peer_gate(peer_id: str, cap: int) -> asyncio.Semaphore:
+    """Return a per-peer concurrency semaphore, creating one if needed.
+
+    Uses a lock to prevent a race where two concurrent coroutines both see
+    ``None`` and create separate semaphores for the same peer_id — the
+    second would overwrite the first, silently dropping any coroutines
+    already waiting on it.
+
+    Old entries are evicted after ``_PEER_GATE_TTL`` seconds of inactivity
+    so that the dict does not grow without bound when AntSeed peers are
+    dynamically discovered and later retired.
+    """
+    import time as _time
+
+    lock = _peer_gate_lock()
+    async with lock:
+        # Evict stale entries first (best-effort, not on every call to
+        # avoid quadratic sweep cost — only when the lock is already held
+        # and the dict is getting large).
+        if len(_PEER_GATES) > 256:
+            now = _time.monotonic()
+            stale = [k for k, ts in _PEER_GATE_TIMESTAMPS.items()
+                     if now - ts > _PEER_GATE_TTL]
+            for k in stale:
+                _PEER_GATES.pop(k, None)
+                _PEER_GATE_TIMESTAMPS.pop(k, None)
+
+        sem = _PEER_GATES.get(peer_id)
+        if sem is None:
+            sem = asyncio.Semaphore(cap)
+            _PEER_GATES[peer_id] = sem
+        _PEER_GATE_TIMESTAMPS[peer_id] = _time.monotonic()
+        return sem
+
+
+def _enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _peer_gate_wait_s(call_timeout_s: float) -> float:
+    raw = os.getenv("PEER_GATE_WAIT_S", "").strip()
+    if not raw:
+        return max(0.01, float(call_timeout_s))
+    try:
+        return max(0.01, min(float(call_timeout_s), float(raw)))
+    except (TypeError, ValueError):
+        return max(0.01, float(call_timeout_s))
+
+
+def _peer_lease_ttl_s() -> float:
+    try:
+        return max(15.0, min(3600.0, float(os.getenv(
+            "PEER_LEASE_TTL_S", "120"))))
+    except (TypeError, ValueError):
+        return 120.0
+
+
+class _PeerCapacitySlot:
+    """One local semaphore permit or one renewable cross-replica DB lease."""
+
+    def __init__(self, *, semaphore: asyncio.Semaphore | None = None,
+                 peer_id: str | None = None, lease_id: str | None = None,
+                 ttl_s: float = 120.0):
+        self._semaphore = semaphore
+        self._peer_id = peer_id
+        self._lease_id = lease_id
+        self._ttl_s = ttl_s
+        self._heartbeat: asyncio.Task[None] | None = None
+        self._released = False
+        if peer_id and lease_id:
+            self._heartbeat = asyncio.create_task(self._renew_loop())
+
+    async def _renew_loop(self) -> None:
+        import host_store
+
+        while True:
+            await asyncio.sleep(max(5.0, self._ttl_s / 3.0))
+            ok = await asyncio.to_thread(
+                host_store.renew_peer_lease,
+                self._peer_id, self._lease_id, ttl_s=self._ttl_s)
+            if not ok:
+                return
+
+    async def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self._heartbeat is not None:
+            self._heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._heartbeat
+        if self._peer_id and self._lease_id:
+            import host_store
+            await asyncio.to_thread(
+                host_store.release_peer_lease,
+                self._peer_id, self._lease_id)
+        elif self._semaphore is not None:
+            self._semaphore.release()
+
+
+async def _acquire_peer_capacity(
+        request: dict, call_timeout_s: float) \
+        -> tuple[_PeerCapacitySlot | None, str | None]:
+    """Acquire the selected seller's cap locally or across all replicas.
+
+    The distributed path is enabled only by Kubernetes. Local development keeps
+    the in-process semaphore and does not require PostgreSQL.
+    """
+    offer = request.get("offer") or {}
+    peer_id = offer.get("peer_id")
+    cap = offer.get("max_concurrency")
+    if not peer_id or not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0:
+        return None, None
+    peer_id = str(peer_id).strip().lower()
+    wait_s = _peer_gate_wait_s(call_timeout_s)
+    if not _enabled("DISTRIBUTED_PEER_GATES"):
+        gate = await _peer_gate(peer_id, cap)
+        try:
+            await asyncio.wait_for(gate.acquire(), timeout=wait_s)
+        except (asyncio.TimeoutError, TimeoutError):
+            return None, "saturated"
+        return _PeerCapacitySlot(semaphore=gate), None
+
+    import host_store
+
+    lease_id = uuid.uuid4().hex
+    ttl_s = _peer_lease_ttl_s()
+    deadline = time.monotonic() + wait_s
+    while True:
+        acquired, store_ok = await asyncio.to_thread(
+            host_store.try_acquire_peer_lease,
+            peer_id, lease_id, cap, ttl_s=ttl_s)
+        if not store_ok:
+            return None, "unavailable"
+        if acquired:
+            return _PeerCapacitySlot(
+                peer_id=peer_id, lease_id=lease_id, ttl_s=ttl_s), None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, "saturated"
+        await asyncio.sleep(min(0.1, remaining))
+
+
+def _peer_capacity_error(peer_id: str, cap: int, reason: str,
+                         started: float) -> dict:
+    kind = "network_error" if reason == "unavailable" else "rate_limit"
+    detail = ("shared peer gate unavailable" if reason == "unavailable" else
+              f"in-flight cap {cap} saturated")
+    return _err(kind, 0, _elapsed_ms(started),
+                f"antseed peer {peer_id[:10]} {detail}")
 
 
 def make_async_call_provider(
@@ -252,17 +412,19 @@ def make_async_call_provider(
         offer = request.get("offer") or {}
         peer_id = offer.get("peer_id")
         cap = offer.get("max_concurrency")
-        gate = _peer_gate(peer_id, cap) if (
-            peer_id and isinstance(cap, int) and cap > 0) else None
-        if gate is not None:
-            try:
-                await asyncio.wait_for(gate.acquire(), timeout=timeout)
-            except (asyncio.TimeoutError, TimeoutError):
-                return _err("rate_limit", 0, _elapsed_ms(t0),
-                            f"antseed peer {peer_id[:10]} in-flight cap {cap} saturated")
+        # The stream-under-the-hood branch acquires inside the streaming
+        # adapter. Acquiring here as well would deadlock a cap=1 peer against
+        # this same request.
+        uses_streaming_backend = request.get("first_token_timeout_ms") is not None
+        slot = None
+        if not uses_streaming_backend:
+            slot, gate_error = await _acquire_peer_capacity(request, timeout)
+            if gate_error:
+                return _peer_capacity_error(
+                    str(peer_id or ""), int(cap or 0), gate_error, t0)
         try:
             try:
-                if request.get("first_token_timeout_ms") is not None:
+                if uses_streaming_backend:
                     # Reuse the streaming backend (defined below in this module) to
                     # get a first-token bound, discarding deltas — a non-stream call.
                     async def _ignore_delta(_delta: str) -> None:
@@ -296,8 +458,8 @@ def make_async_call_provider(
                 result = _err("network_error", 0, _elapsed_ms(t0), str(e))
             return result
         finally:
-            if gate is not None:
-                gate.release()
+            if slot is not None:
+                await slot.release()
 
     return call
 
@@ -341,11 +503,20 @@ async def stream_openai_compatible(
     body["stream"] = True
     rules = (provider_rules or {}).get(request.get("provider_id")) or {}
 
-    if client is None:
+    t0 = time.monotonic()
+    offer = request.get("offer") or {}
+    peer_id = offer.get("peer_id")
+    cap = offer.get("max_concurrency")
+    slot, gate_error = await _acquire_peer_capacity(request, timeout)
+    if gate_error:
+        return _peer_capacity_error(
+            str(peer_id or ""), int(cap or 0), gate_error, t0)
+
+    _owns_client = client is None
+    if _owns_client:
         import httpx
         client = httpx.AsyncClient()
 
-    t0 = time.monotonic()
     emitted = False
     text_parts: list[str] = []
     tool_calls_acc: dict[int, dict] = {}
@@ -365,92 +536,100 @@ async def stream_openai_compatible(
         return first_token_timeout_err(first_timeout_s, _latency())
 
     try:
-        async with AsyncExitStack() as stack:
-            try:
-                resp = await before_first_output(stack.enter_async_context(
-                    client.stream("POST", url, json=body, headers=headers,
-                                  timeout=timeout)), first_timeout_s, t0, _saw_output)
-            except (asyncio.TimeoutError, TimeoutError):
-                return _timeout_err()
-            if not (200 <= resp.status_code < 300):
-                raw = (await resp.aread()).decode("utf-8", "replace")[:500]
-                kind = _classify_from_map(raw, rules.get("error_map")) \
-                    or _classify_status(resp.status_code, raw)
-                return _err(kind, resp.status_code, _latency(), raw)
-
-            lines = resp.aiter_lines().__aiter__()
-            while True:
+        try:
+            async with AsyncExitStack() as stack:
                 try:
-                    line = await before_first_output(
-                        lines.__anext__(), first_timeout_s, t0, _saw_output)
-                except StopAsyncIteration:
-                    break
+                    resp = await before_first_output(stack.enter_async_context(
+                        client.stream("POST", url, json=body, headers=headers,
+                                      timeout=timeout)), first_timeout_s, t0, _saw_output)
                 except (asyncio.TimeoutError, TimeoutError):
-                    if not saw_output:
-                        return _timeout_err()
-                    raise
-                if not line or not line.startswith("data:"):
-                    continue
-                data = line[len("data:"):].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except ValueError:
-                    continue
-                if raw_model is None:
-                    raw_model = chunk.get("model")
-                if chunk.get("usage"):
-                    usage = chunk["usage"]
-                for choice in chunk.get("choices") or []:
-                    delta = choice.get("delta") or {}
-                    if choice.get("finish_reason"):
-                        finish_reason = choice["finish_reason"]
-                    content = delta.get("content")
-                    if content:
-                        saw_output = True
-                        text_parts.append(content)
-                        await emit(content)
-                        emitted = True
-                    for tc in delta.get("tool_calls") or []:
-                        saw_output = True
-                        idx = tc.get("index", 0)
-                        acc = tool_calls_acc.setdefault(idx, {
-                            "id": None, "type": "function",
-                            "function": {"name": "", "arguments": ""}})
-                        if tc.get("id"):
-                            acc["id"] = tc["id"]
-                        fn = tc.get("function") or {}
-                        if fn.get("name"):
-                            acc["function"]["name"] = fn["name"]
-                        if fn.get("arguments"):
-                            acc["function"]["arguments"] += fn["arguments"]
-    except Exception as exc:  # noqa: BLE001 — classified below
-        partial = "".join(text_parts)
-        if emitted:
-            return _err("stream_interrupted", 0, _latency(),
-                        f"{type(exc).__name__}: {exc} (partial: {partial[:200]!r})")
-        return _err("network_error", 0, _latency(), f"{type(exc).__name__}: {exc}")
+                    return _timeout_err()
+                if not (200 <= resp.status_code < 300):
+                    raw = (await resp.aread()).decode("utf-8", "replace")[:500]
+                    kind = _classify_from_map(raw, rules.get("error_map")) \
+                        or _classify_status(resp.status_code, raw)
+                    return _err(kind, resp.status_code, _latency(), raw)
 
-    tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)] or None
-    text = "".join(text_parts)
-    if not text.strip() and not tool_calls:
-        return _err("bad_response", 200, _latency(), "empty assistant content")
-    return {
-        "ok": True,
-        "latency_ms": _latency(),
-        "response": {
-            "text": text,
-            "tool_calls": tool_calls,
-            "finish_reason": finish_reason,
-            "tokens_in": usage.get("prompt_tokens"),
-            "tokens_out": usage.get("completion_tokens"),
-            "tokens_total": usage.get("total_tokens"),
-            "tokens_cached": _cached_tokens(usage),
-            "cost_reported": usage.get("cost"),
-            "raw_model": raw_model,
-        },
-    }
+                lines = resp.aiter_lines().__aiter__()
+                while True:
+                    try:
+                        line = await before_first_output(
+                            lines.__anext__(), first_timeout_s, t0, _saw_output)
+                    except StopAsyncIteration:
+                        break
+                    except (asyncio.TimeoutError, TimeoutError):
+                        if not saw_output:
+                            return _timeout_err()
+                        raise
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        continue
+                    if raw_model is None:
+                        raw_model = chunk.get("model")
+                    if chunk.get("usage"):
+                        usage = chunk["usage"]
+                    for choice in chunk.get("choices") or []:
+                        delta = choice.get("delta") or {}
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                        content = delta.get("content")
+                        if content:
+                            saw_output = True
+                            text_parts.append(content)
+                            await emit(content)
+                            emitted = True
+                        for tc in delta.get("tool_calls") or []:
+                            saw_output = True
+                            idx = tc.get("index", 0)
+                            acc = tool_calls_acc.setdefault(idx, {
+                                "id": None, "type": "function",
+                                "function": {"name": "", "arguments": ""}})
+                            if tc.get("id"):
+                                acc["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                acc["function"]["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                acc["function"]["arguments"] += fn["arguments"]
+        except Exception as exc:  # noqa: BLE001 — classified below
+            partial = "".join(text_parts)
+            if emitted:
+                return _err("stream_interrupted", 0, _latency(),
+                            f"{type(exc).__name__}: {exc} (partial: {partial[:200]!r})")
+            return _err("network_error", 0, _latency(), f"{type(exc).__name__}: {exc}")
+
+        tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)] or None
+        text = "".join(text_parts)
+        if not text.strip() and not tool_calls:
+            return _err("bad_response", 200, _latency(), "empty assistant content")
+        return {
+            "ok": True,
+            "latency_ms": _latency(),
+            "response": {
+                "text": text,
+                "tool_calls": tool_calls,
+                "finish_reason": finish_reason,
+                "tokens_in": usage.get("prompt_tokens"),
+                "tokens_out": usage.get("completion_tokens"),
+                "tokens_total": usage.get("total_tokens"),
+                "tokens_cached": _cached_tokens(usage),
+                "cost_reported": usage.get("cost"),
+                "raw_model": raw_model,
+            },
+        }
+    finally:
+        # Close the client if we created it, to prevent connection leaks.
+        # Caller-owned clients are their responsibility.
+        if _owns_client:
+            await client.aclose()
+        if slot is not None:
+            await slot.release()
 
 
 def _parse_openai_response(

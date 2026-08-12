@@ -163,6 +163,12 @@ def test_set_returns_bool_contract(store):
     assert hs.set_provider_overlays({"groq": {"auth_env": "G", "added_at": 1}}) is True
 
 
+def test_pool_sizes_are_bounded_and_min_never_exceeds_max(monkeypatch):
+    monkeypatch.setenv("HOST_STORE_POOL_MIN_SIZE", "20")
+    monkeypatch.setenv("HOST_STORE_POOL_MAX_SIZE", "2")
+    assert hs._pool_sizes() == (2, 2)
+
+
 def test_set_is_atomic_and_returns_false_on_failure(store, monkeypatch):
     # A set_* is ONE transaction: a failure mid-write rolls back (existing data
     # intact, no half-applied DELETE) and returns False. With the pool model each
@@ -195,6 +201,118 @@ def test_set_is_atomic_and_returns_false_on_failure(store, monkeypatch):
 
     assert ok is False                                     # failure surfaced, not swallowed
     assert hs.get_consumer_keys()[0] == {"crm": {"status": "active"}}  # rolled back, intact
+
+
+def test_consumer_key_digest_roundtrip_upsert_and_targeted_revoke(store):
+    first = "a" * 64
+    second = "b" * 64
+    assert store.set_consumer_keys(
+        {"crm": {"status": "active"}},
+        key_digests={first: "crm"}) is True
+    assert store.consumer_for_digest(first) == ("crm", True)
+
+    # A startup backfill is additive: a stateless replica does not know the
+    # dashboard-created hashes already stored by the stateful owner.
+    assert store.upsert_consumer_key_digests({second: "bootstrap"}) is True
+    assert store.consumer_for_digest(first) == ("crm", True)
+    assert store.consumer_for_digest(second) == ("bootstrap", True)
+
+    # Metadata-only writes preserve the resolver, while a targeted revoke
+    # removes only the selected owner's matching digest.
+    assert store.set_consumer_keys(
+        {"crm": {"status": "inactive"}},
+        delete_key_digests=[("crm", first[:12])]) is True
+    assert store.consumer_for_digest(first) == (None, True)
+    assert store.consumer_for_digest(second) == ("bootstrap", True)
+
+
+def test_get_one_consumer_key_does_not_load_other_records(store):
+    assert store.set_consumer_keys({
+        "first": {"status": "active"},
+        "second": {"status": "inactive"},
+    })
+    assert store.get_consumer_key("second") == ({"status": "inactive"}, True)
+    assert store.get_consumer_key("missing") == (None, True)
+
+
+def test_consumer_digest_validation_fails_as_one_write(store):
+    assert store.set_consumer_keys(
+        {"crm": {"status": "active"}},
+        key_digests={"not-a-sha256": "crm"}) is False
+    assert store.get_consumer_keys() == ({}, True)
+
+
+def test_global_token_bucket_enforces_burst_and_refills(store):
+    decisions = [
+        store.consume_rate_token("crm", rate_per_min=5, burst=2, now=1000.0)
+        for _ in range(3)
+    ]
+    assert [allowed for allowed, ok, _ in decisions] == [True, True, False]
+    assert all(ok for _, ok, _ in decisions)
+    assert decisions[-1][2] == pytest.approx(12.0)
+    assert store.consume_rate_token(
+        "crm", rate_per_min=5, burst=2, now=1012.0)[0] is True
+    # Buckets are isolated by consumer.
+    assert store.consume_rate_token(
+        "other", rate_per_min=5, burst=1, now=1000.0)[0] is True
+
+
+def test_global_token_bucket_serializes_concurrent_replicas(store):
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = [
+            pool.submit(
+                store.consume_rate_token, "shared", 60, 5, now=2000.0)
+            for _ in range(20)
+        ]
+    decisions = [future.result() for future in futures]
+    assert sum(1 for allowed, ok, _ in decisions if allowed and ok) == 5
+    assert all(ok for _, ok, _ in decisions)
+
+
+def test_peer_concurrency_leases_are_global_and_released(store):
+    first = "1" * 32
+    second = "2" * 32
+    third = "3" * 32
+    assert store.try_acquire_peer_lease(
+        "peer-a", first, 1) == (True, True)
+    assert store.try_acquire_peer_lease(
+        "peer-a", second, 1) == (False, True)
+    # Another seller has an independent budget.
+    assert store.try_acquire_peer_lease(
+        "peer-b", third, 1) == (True, True)
+    assert store.renew_peer_lease("peer-a", first) is True
+    assert store.release_peer_lease("peer-a", first) is True
+    assert store.try_acquire_peer_lease(
+        "peer-a", second, 1) == (True, True)
+
+
+def test_peer_concurrency_lease_acquisition_serializes_replicas(store):
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = [
+            pool.submit(
+                store.try_acquire_peer_lease,
+                "shared-peer", f"{idx:032x}", 3)
+            for idx in range(12)
+        ]
+    decisions = [future.result() for future in futures]
+    assert sum(1 for acquired, ok in decisions if acquired and ok) == 3
+    assert all(ok for _, ok in decisions)
+
+
+def test_expired_peer_lease_is_reclaimed(store):
+    assert store.try_acquire_peer_lease(
+        "peer-expired", "a" * 32, 1) == (True, True)
+    with store._get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE peer_concurrency_leases SET expires_at=0"
+            " WHERE peer_id='peer-expired'")
+    assert store.try_acquire_peer_lease(
+        "peer-expired", "b" * 32, 1) == (True, True)
+    assert store.renew_peer_lease("peer-expired", "a" * 32) is False
 
 
 # ---- peer_offers (antseed market book; sidecar writes, host reads) -------------

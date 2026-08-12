@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from typing import Any
@@ -149,6 +150,38 @@ _SCHEMA_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS consumer_keys (
         consumer TEXT PRIMARY KEY, record TEXT NOT NULL, updated_at BIGINT NOT NULL
     )""",
+    # Exact, one-way API-key digests used by every ingress replica.  The JSON
+    # consumer record intentionally exposes only a short fingerprint for the
+    # dashboard; that is not enough to resolve a key on another pod.  Keeping
+    # the full SHA-256 in a normalized table makes dashboard-created keys work
+    # across a horizontally scaled auth tier without storing plaintext keys.
+    """CREATE TABLE IF NOT EXISTS consumer_key_digests (
+        digest TEXT PRIMARY KEY,
+        consumer TEXT NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_consumer_key_digests_consumer"
+    " ON consumer_key_digests(consumer)",
+    # A PostgreSQL-backed token bucket is the global admission authority.  The
+    # old deque lived in one Python process, so N replicas multiplied every
+    # caller's quota by N.  One row per consumer keeps sustained rate + burst
+    # semantics stable as the ingress pool scales.
+    """CREATE TABLE IF NOT EXISTS consumer_rate_buckets (
+        consumer TEXT PRIMARY KEY,
+        tokens DOUBLE PRECISION NOT NULL,
+        updated_at DOUBLE PRECISION NOT NULL
+    )""",
+    # Short renewable leases make a marketplace seller's advertised
+    # max_concurrency global across router replicas. A crashed pod stops
+    # renewing and its slots become reclaimable without operator cleanup.
+    """CREATE TABLE IF NOT EXISTS peer_concurrency_leases (
+        lease_id TEXT PRIMARY KEY,
+        peer_id TEXT NOT NULL,
+        expires_at DOUBLE PRECISION NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_peer_concurrency_leases_peer_expiry"
+    " ON peer_concurrency_leases(peer_id, expires_at)",
     """CREATE TABLE IF NOT EXISTS consumer_budget_usage (
         consumer TEXT PRIMARY KEY, spent_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
         updated_at BIGINT NOT NULL
@@ -287,6 +320,20 @@ def _pool_timeout() -> float:
         return 30.0
 
 
+def _pool_sizes() -> tuple[int, int]:
+    try:
+        minimum = max(0, min(8, int(os.getenv(
+            "HOST_STORE_POOL_MIN_SIZE", "1"))))
+    except (TypeError, ValueError):
+        minimum = 1
+    try:
+        maximum = max(1, min(32, int(os.getenv(
+            "HOST_STORE_POOL_MAX_SIZE", "8"))))
+    except (TypeError, ValueError):
+        maximum = 8
+    return min(minimum, maximum), maximum
+
+
 def _get_pool() -> ConnectionPool:
     """The process-wide connection pool, created (and schema-applied) on first
     use. The pool is thread-safe, so operations need no extra locking."""
@@ -294,10 +341,11 @@ def _get_pool() -> ConnectionPool:
     if _pool is None:
         with _pool_lock:
             if _pool is None:
+                minimum, maximum = _pool_sizes()
                 p = ConnectionPool(
                     _dsn(),
-                    min_size=1,
-                    max_size=8,
+                    min_size=minimum,
+                    max_size=maximum,
                     open=True,
                     timeout=_pool_timeout(),
                 )
@@ -578,23 +626,269 @@ def get_consumer_keys() -> "tuple[dict[str, Any], bool]":
         return {}, False
 
 
-def set_consumer_keys(records: dict[str, Any]) -> bool:
+def get_consumer_key(consumer: str) -> "tuple[Any | None, bool]":
+    """Read one consumer's admission metadata without scanning every key row."""
+    try:
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT record FROM consumer_keys WHERE consumer=%s",
+                (consumer,)).fetchone()
+        if row is None:
+            return None, True
+        try:
+            value = json.loads(row[0])
+        except (TypeError, ValueError):
+            _log.warning("host_store: undecodable consumer_keys row %r;"
+                         " failing closed", consumer)
+            return None, False
+        # Shape validation belongs to the caller's fail-closed normalizer. A
+        # syntactically valid but malformed value means "inactive", whereas an
+        # undecodable row means the authority itself is unavailable/corrupt.
+        return value, True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store get_consumer_key failed: %s", exc)
+        return None, False
+
+
+def set_consumer_keys(records: dict[str, Any],
+                      key_digests: "dict[str, str] | None" = None,
+                      delete_key_digests: "list[tuple[str, str]] | None" = None
+                      ) -> bool:
     """Replace the FULL set of consumer records. Returns True on success, False on
     a persistence failure — a swallowed failure here would let a key revocation be
-    reported as saved while still working after restart."""
+    reported as saved while still working after restart.
+
+    ``key_digests`` contains new/updated exact hashes; ``delete_key_digests``
+    contains targeted ``(consumer, digest_prefix)`` revocations.  Both are
+    optional so metadata-only edits keep the existing API.  All changes land in
+    the SAME transaction, without replacing hashes a concurrent replica may
+    have learned."""
     try:
         now = int(time.time())
         rows = [(consumer, json.dumps(rec), now)
                 for consumer, rec in (records or {}).items()]
+        digest_rows = _valid_consumer_digest_rows(key_digests or {}, now)
+        digest_deletions = _valid_consumer_digest_deletions(
+            delete_key_digests or [])
         with _get_pool().connection() as conn:
             conn.execute("DELETE FROM consumer_keys")
             if rows:
                 conn.cursor().executemany(
                     "INSERT INTO consumer_keys(consumer, record, updated_at)"
                     " VALUES (%s,%s,%s)", rows)
+            if digest_rows:
+                conn.cursor().executemany(
+                    "INSERT INTO consumer_key_digests"
+                    " (digest,consumer,created_at,updated_at)"
+                    " VALUES (%s,%s,%s,%s)"
+                    " ON CONFLICT(digest) DO UPDATE SET"
+                    " consumer=EXCLUDED.consumer, updated_at=EXCLUDED.updated_at",
+                    digest_rows)
+            if digest_deletions:
+                conn.cursor().executemany(
+                    "DELETE FROM consumer_key_digests"
+                    " WHERE consumer=%s AND digest LIKE %s",
+                    [(consumer, prefix + "%")
+                     for consumer, prefix in digest_deletions])
         return True
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store set_consumer_keys failed: %s", exc)
+        return False
+
+
+def _valid_consumer_digest_rows(mapping: dict[str, str], now: int) -> list[tuple]:
+    """Validate an exact digest map before it crosses the SQL boundary.
+
+    Invalid entries are rejected as a unit: silently dropping one key from a
+    batch would hand an operator credentials that only fail after distribution.
+    """
+    rows: list[tuple] = []
+    for digest, consumer in mapping.items():
+        digest = str(digest or "").strip().lower()
+        consumer = str(consumer or "").strip()
+        if not re.fullmatch(r"[a-f0-9]{64}", digest):
+            raise ValueError("consumer key digest must be 64 lowercase hex characters")
+        if not consumer or len(consumer) > 80:
+            raise ValueError("consumer key owner must be 1-80 characters")
+        rows.append((digest, consumer, now, now))
+    return rows
+
+
+def _valid_consumer_digest_deletions(
+        deletions: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for consumer, prefix in deletions:
+        consumer = str(consumer or "").strip()
+        prefix = str(prefix or "").strip().lower()
+        if not consumer or len(consumer) > 80:
+            raise ValueError("consumer key owner must be 1-80 characters")
+        if not re.fullmatch(r"[a-f0-9]{8,64}", prefix):
+            raise ValueError("consumer key digest prefix must be 8-64 lowercase hex characters")
+        rows.append((consumer, prefix))
+    return rows
+
+
+def upsert_consumer_key_digests(mapping: dict[str, str]) -> bool:
+    """Backfill exact hashes from static/PVC env maps into the shared resolver.
+
+    This is deliberately UPSERT-only.  A stateless replica may know only the
+    IaC-provisioned subset, so treating its local map as a full replacement
+    would delete dashboard-created keys owned by another replica.
+    """
+    try:
+        now = int(time.time())
+        rows = _valid_consumer_digest_rows(mapping or {}, now)
+        if not rows:
+            return True
+        with _get_pool().connection() as conn:
+            conn.cursor().executemany(
+                "INSERT INTO consumer_key_digests"
+                " (digest,consumer,created_at,updated_at)"
+                " VALUES (%s,%s,%s,%s)"
+                " ON CONFLICT(digest) DO UPDATE SET"
+                " consumer=EXCLUDED.consumer, updated_at=EXCLUDED.updated_at",
+                rows)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store upsert_consumer_key_digests failed: %s", exc)
+        return False
+
+
+def consumer_for_digest(digest: str) -> "tuple[str | None, bool]":
+    """Resolve one exact SHA-256 digest to its consumer.
+
+    ``ok=False`` distinguishes an unavailable authority from a definitive miss;
+    ingress fails the former with 503 and the latter with 401.
+    """
+    digest = str(digest or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{64}", digest):
+        return None, True
+    try:
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT consumer FROM consumer_key_digests WHERE digest=%s",
+                (digest,)).fetchone()
+        return (str(row[0]), True) if row else (None, True)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store consumer_for_digest failed: %s", exc)
+        return None, False
+
+
+def consume_rate_token(consumer: str, rate_per_min: int, burst: int, *,
+                       now: "float | None" = None) -> "tuple[bool, bool, float]":
+    """Atomically consume one token from a global per-consumer token bucket.
+
+    Returns ``(allowed, store_ok, retry_after_s)``.  The row is locked for one
+    short transaction, so replicas cannot independently admit the same quota.
+    ``rate_per_min`` is the refill rate and ``burst`` the bucket capacity — the
+    semantics operators expect, unlike the former ``max(rate, burst)`` deque.
+    """
+    try:
+        rate = max(1, int(rate_per_min))
+        capacity = max(1, int(burst))
+        stamp = float(time.time() if now is None else now)
+        refill_per_s = rate / 60.0
+        with _get_pool().connection() as conn:
+            # Establish the row before locking it. Concurrent first requests
+            # serialize on the unique key via ON CONFLICT, then FOR UPDATE.
+            conn.execute(
+                "INSERT INTO consumer_rate_buckets(consumer,tokens,updated_at)"
+                " VALUES (%s,%s,%s) ON CONFLICT(consumer) DO NOTHING",
+                (consumer, float(capacity), stamp))
+            row = conn.execute(
+                "SELECT tokens,updated_at FROM consumer_rate_buckets"
+                " WHERE consumer=%s FOR UPDATE", (consumer,)).fetchone()
+            tokens = min(float(capacity), float(row[0]) +
+                         max(0.0, stamp - float(row[1])) * refill_per_s)
+            allowed = tokens >= 1.0
+            if allowed:
+                tokens -= 1.0
+            conn.execute(
+                "UPDATE consumer_rate_buckets SET tokens=%s,updated_at=%s"
+                " WHERE consumer=%s", (tokens, stamp, consumer))
+        retry_after = 0.0 if allowed else max(0.01, (1.0 - tokens) / refill_per_s)
+        return allowed, True, retry_after
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store consume_rate_token failed: %s", exc)
+        return False, False, 0.0
+
+
+def _peer_lease_args(peer_id: str, lease_id: str, ttl_s: float = 120.0) \
+        -> tuple[str, str, float]:
+    peer = str(peer_id or "").strip().lower()
+    lease = str(lease_id or "").strip().lower()
+    ttl = max(5.0, min(3600.0, float(ttl_s)))
+    if not peer or len(peer) > 200:
+        raise ValueError("peer_id must be 1-200 characters")
+    if not re.fullmatch(r"[a-f0-9]{32}", lease):
+        raise ValueError("lease_id must be 32 lowercase hex characters")
+    return peer, lease, ttl
+
+
+def try_acquire_peer_lease(peer_id: str, lease_id: str, cap: int, *,
+                           ttl_s: float = 120.0) -> "tuple[bool, bool]":
+    """Atomically claim one global concurrency slot for a marketplace peer.
+
+    Returns ``(acquired, store_ok)``. The transaction-scoped advisory lock is
+    keyed by peer, so replicas cannot both observe the last free slot. Expired
+    leases are removed before counting; live calls renew in the background.
+    """
+    try:
+        peer, lease, ttl = _peer_lease_args(peer_id, lease_id, ttl_s)
+        capacity = max(1, min(1000, int(cap)))
+        with _get_pool().connection() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer,))
+            conn.execute(
+                "DELETE FROM peer_concurrency_leases"
+                " WHERE peer_id=%s"
+                " AND expires_at <= EXTRACT(EPOCH FROM clock_timestamp())",
+                (peer,))
+            used = int(conn.execute(
+                "SELECT COUNT(*) FROM peer_concurrency_leases"
+                " WHERE peer_id=%s", (peer,)).fetchone()[0])
+            if used >= capacity:
+                return False, True
+            conn.execute(
+                "INSERT INTO peer_concurrency_leases"
+                " (lease_id,peer_id,expires_at) VALUES"
+                " (%s,%s,EXTRACT(EPOCH FROM clock_timestamp()) + %s)",
+                (lease, peer, ttl))
+        return True, True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store try_acquire_peer_lease failed: %s", exc)
+        return False, False
+
+
+def renew_peer_lease(peer_id: str, lease_id: str, *,
+                     ttl_s: float = 120.0) -> bool:
+    """Extend one live lease. False means it expired/disappeared or DB failed."""
+    try:
+        peer, lease, ttl = _peer_lease_args(peer_id, lease_id, ttl_s)
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "UPDATE peer_concurrency_leases"
+                " SET expires_at=EXTRACT(EPOCH FROM clock_timestamp()) + %s"
+                " WHERE peer_id=%s AND lease_id=%s RETURNING lease_id",
+                (ttl, peer, lease)).fetchone()
+        return row is not None
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store renew_peer_lease failed: %s", exc)
+        return False
+
+
+def release_peer_lease(peer_id: str, lease_id: str) -> bool:
+    """Release a global peer slot; expiry remains the crash-safe fallback."""
+    try:
+        peer, lease, _ttl = _peer_lease_args(peer_id, lease_id)
+        with _get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM peer_concurrency_leases"
+                " WHERE peer_id=%s AND lease_id=%s", (peer, lease))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store release_peer_lease failed: %s", exc)
         return False
 
 
@@ -1852,5 +2146,7 @@ def truncate_all_for_tests() -> None:
     """Test helper: wipe every table for isolation against a shared Postgres."""
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
-                     " consumer_keys, consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
+                     " consumer_keys, consumer_key_digests, consumer_rate_buckets,"
+                     " peer_concurrency_leases,"
+                     " consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
                      " login_history, provider_prices, wallet_ops")

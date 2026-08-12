@@ -467,7 +467,6 @@ def _with_consumer_auth(monkeypatch, tmp_path, token="crm-token", consumer="crm"
     auth_proxy.CALLER_KEYS.clear()
     auth_proxy.CALLER_KEY_HASHES.clear()
     auth_proxy.CALLER_KEY_HASHES.update({digest: consumer})
-    auth_proxy._windows.clear()
     if issued is not None:
         _set_issued({consumer: issued})
     return token, digest, original_plaintext, original_hashes
@@ -478,7 +477,6 @@ def _restore_auth_maps(original_plaintext, original_hashes):
     auth_proxy.CALLER_KEYS.update(original_plaintext)
     auth_proxy.CALLER_KEY_HASHES.clear()
     auth_proxy.CALLER_KEY_HASHES.update(original_hashes)
-    auth_proxy._windows.clear()
 
 
 class _CannedResp:
@@ -796,7 +794,6 @@ def test_legacy_plaintext_keys_can_be_rotated_and_revoked(monkeypatch, tmp_path)
     auth_proxy.CALLER_KEYS.clear()
     auth_proxy.CALLER_KEYS[token] = "crm"
     auth_proxy.CALLER_KEY_HASHES.clear()
-    auth_proxy._windows.clear()
     try:
         client = _dashboard_client(monkeypatch)
         rotated = client.post("/dashboard/api/keys", json={"consumer": "crm", "rotate": True, "grace_period_s": 0})
@@ -949,8 +946,10 @@ def test_consumer_budget_rejects_before_upstream(monkeypatch):
     monkeypatch.setattr(auth_proxy, "_caller_auth", lambda token: {
         "ok": True, "caller": "validators-001", "digest": "a" * 64,
         "meta": {"status": "active", "budget_usd": 5.0}})
-    monkeypatch.setattr(auth_proxy, "_route_allowed", lambda caller, route: True)
-    monkeypatch.setattr(auth_proxy, "_rate_ok", lambda caller: True)
+    monkeypatch.setattr(
+        auth_proxy, "_route_allowed", lambda caller, route, meta=None: True)
+    monkeypatch.setattr(
+        auth_proxy, "_rate_ok", lambda caller, meta=None: True)
     monkeypatch.setattr(host_store, "consumer_spend_usd", lambda caller: (5.0, True))
     resp = TestClient(auth_proxy.app).post(
         "/v1/chat/completions", headers={"Authorization": "Bearer test"},
@@ -979,11 +978,13 @@ def test_malformed_issued_key_metadata_fails_closed(monkeypatch, tmp_path):
             assert resp.json()["error"]["code"] in {"caller_inactive", "caller_key_revoked"}
             auth_proxy._issued_keys_load_failed = False
 
-        # A store LOAD FAILURE (the old unparseable file) also fails closed.
-        monkeypatch.setattr(host_store, "get_consumer_keys", lambda: ({}, False))
+        # A store LOAD FAILURE fails closed but remains distinguishable from a
+        # genuinely inactive key, so clients can retry an infrastructure fault.
+        monkeypatch.setattr(host_store, "get_consumer_key",
+                            lambda _consumer: (None, False))
         resp = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"}, json={"model": "profile:edge", "messages": []})
-        assert resp.status_code == 403
-        assert resp.json()["error"]["code"] in {"caller_inactive", "caller_key_revoked"}
+        assert resp.status_code == 503
+        assert resp.json()["error"]["code"] == "caller_auth_unavailable"
         auth_proxy._issued_keys_load_failed = False
     finally:
         _restore_auth_maps(original_plaintext, original_hashes)
@@ -1403,6 +1404,7 @@ def test_proxy_passes_sse_through_unbuffered(monkeypatch):
     monkeypatch.setattr(auth_proxy, "_caller_auth",
                         lambda token: {"ok": True, "caller": "tester", "digest": None})
     monkeypatch.setattr(auth_proxy, "_client", FakeClient())
+    active_before = auth_proxy._active_requests
     client = TestClient(auth_proxy.app)  # no context: startup must not replace _client
     r = client.post("/v1/chat/completions", headers={"Authorization": "Bearer k"},
                     json={"model": "profile:edge", "messages": [], "stream": True})
@@ -1410,6 +1412,7 @@ def test_proxy_passes_sse_through_unbuffered(monkeypatch):
     assert r.headers["content-type"].startswith("text/event-stream")
     assert b"data: one" in r.content and b"[DONE]" in r.content
     assert fake_resp.aread_called is False   # streamed, not buffered
+    assert auth_proxy._active_requests == active_before
 
 
 # ---- market tab -------------------------------------------------------------
@@ -1837,7 +1840,8 @@ def test_consumer_skill_endpoint_authed_by_consumer_key(monkeypatch):
 
     monkeypatch.setattr(auth_proxy, "_fetch_live_market", _m)
     monkeypatch.setattr(auth_proxy, "_fetch_live_fields", _f)
-    monkeypatch.setattr(auth_proxy, "_consumer_meta", lambda c: {"status": "active"})
+    monkeypatch.setattr(host_store, "get_consumer_key",
+                        lambda _consumer: ({"status": "active"}, True))
     client = TestClient(auth_proxy.app)
 
     # no key / bad key -> 401 (reuses the same key auth as /v1/*)

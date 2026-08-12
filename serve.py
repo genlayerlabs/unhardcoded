@@ -70,12 +70,6 @@ def main() -> None:
     if loaded:
         print(f"env secrets loaded from PVC: {len(loaded)} keys")
 
-    # Native api_kind providers get dedicated adapters; OpenAI-compatible
-    # providers stay on the default HTTP backend. The Codex backend reads
-    # auth.json lazily on first use.
-    from codex_auth import CodexAuthStore     # noqa: E402
-    from codex_backend import make_codex_async_call_provider  # noqa: E402
-
     # The job: refresh the registered model_meta.lua (OpenRouter benchmarks/
     # modalities/capabilities) BEFORE the config is loaded, so config.live.lua
     # picks up fresh per-family traits at init. Best-effort: a network blip or
@@ -125,22 +119,63 @@ def main() -> None:
         for pid, p in (catalog.get("providers") or {}).items()
         if isinstance(p, dict) and p.get("error_map")
     }
-    # Multi-account: self-discovers /codex/accounts/*.json (managed from the
-    # dashboard) and keeps the legacy single /codex/auth.json as the `default`
-    # account. Drop-in for a single CodexAuth (serves the first account until
-    # the policy drives per-call selection — a follow-up).
-    codex_auth = CodexAuthStore(legacy_path=args.codex_auth)
-    if codex_auth.names():
-        print(f"codex accounts: {', '.join(codex_auth.names())}")
+    # One reusable pool per router process. Long-running agent streams otherwise
+    # create a client/socket per attempt; under bursts that is exactly the kind
+    # of resource churn that turns latency into intermittent 502s.
+    import httpx
+    provider_http = httpx.AsyncClient(
+        limits=httpx.Limits(max_connections=100,
+                            max_keepalive_connections=40))
+
+    # Codex account refresh credentials remain on one RWO-PVC owner. A stateless
+    # router uses the authenticated internal broker; a local install keeps the
+    # original in-process store.
+    codex_broker_url = os.getenv("CODEX_BROKER_URL", "").strip()
+    codex_broker_token = os.getenv("CODEX_BROKER_TOKEN", "").strip()
+    codex_store = None
+    remote_codex = None
+    if codex_broker_url:
+        from remote_codex import RemoteCodexClient
+        remote_codex = RemoteCodexClient(
+            codex_broker_url, codex_broker_token,
+            timeout_s=max(120.0, args.timeout_s))
+
+        async def codex_call(request):
+            return await remote_codex.call(request, observe=observe)
+
+        async def codex_stream(request, emit):
+            return await remote_codex.stream(request, emit, observe=observe)
+        print(f"codex broker: {codex_broker_url}")
+    else:
+        from codex_auth import CodexAuthStore
+        from codex_backend import make_codex_async_call_provider
+        from streaming import stream_codex
+
+        codex_store = CodexAuthStore(legacy_path=args.codex_auth)
+        if codex_store.names():
+            print(f"codex accounts: {', '.join(codex_store.names())}")
+        codex_call = make_codex_async_call_provider(
+            codex_store, observe=observe, client=provider_http)
+
+        async def codex_stream(request, emit):
+            account = codex_store.select_account()
+            if account is None:
+                from provider_adapters.common import _err
+                return _err("auth_error", 0, 0,
+                            "no codex access token (run `codex login`)")
+            return await stream_codex(
+                request, emit, auth=account, observe=observe,
+                client=provider_http)
     # The native api_kind adapters (anthropic/bedrock/google) come from the
     # modular provider registry; codex is wired here because its backend takes
     # the `observe` hook that feeds its scarcity-price source.
     _native = providers.native_adapter_handlers(args.timeout_s)
     call_async = make_api_kind_dispatcher(
         default=make_async_call_provider(timeout_s=args.timeout_s,
-                                         provider_rules=provider_rules),
+                                         provider_rules=provider_rules,
+                                         client=provider_http),
         handlers={**_native,
-                  "openai_codex": make_codex_async_call_provider(codex_auth, observe=observe)},
+                  "openai_codex": codex_call},
     )
     host.set_async_call_hook(call_async)
 
@@ -149,20 +184,18 @@ def main() -> None:
 
     from streaming import (
         make_streaming_dispatcher,
-        stream_codex,
         stream_openai_compatible,
     )
     _native_streaming = providers.native_streaming_adapter_handlers(args.timeout_s)
     streaming_call = make_streaming_dispatcher(
         default=functools.partial(stream_openai_compatible,
                                   timeout_s=args.timeout_s,
-                                  provider_rules=provider_rules),
+                                  provider_rules=provider_rules,
+                                  client=provider_http),
         # Native providers and Codex have real streaming twins; Codex also feeds
         # `observe` for quota/scarcity pricing.
         handlers={**_native_streaming,
-                  "openai_codex": functools.partial(stream_codex,
-                                                    auth=codex_auth,
-                                                    observe=observe)},
+                  "openai_codex": codex_stream},
     )
 
     from shim import create_app  # local import: keeps argparse errors fast
@@ -170,8 +203,12 @@ def main() -> None:
     app = create_app(host, default_profile=args.default_profile,
                      streaming_call=streaming_call,
                      default_max_tokens=args.default_max_tokens or None,
-                     codex_store=codex_auth)
-    attach_sources(app, host, catalog=catalog, registry=registry)
+                     codex_store=codex_store)
+    closeables = [provider_http]
+    if remote_codex is not None:
+        closeables.append(remote_codex)
+    attach_sources(app, host, catalog=catalog, registry=registry,
+                   closeables=closeables)
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)
@@ -209,11 +246,20 @@ def make_discover_hook(registry):
     return hook
 
 
-def attach_sources(app, host, catalog=None, registry=None) -> None:
+def _enabled(name: str, default: bool = True) -> bool:
+    import os
+    fallback = "1" if default else "0"
+    return os.getenv(name, fallback).strip().lower() not in {
+        "0", "false", "no", "off"}
+
+
+def attach_sources(app, host, catalog=None, registry=None,
+                   closeables=()) -> None:
     """Wire the provider-sources refresh loop into the app's lifespan.
 
     Wraps any existing lifespan so both run. Uses the lifespan API directly:
     FastAPI 0.13x removed the on_event/add_event_handler path."""
+    import asyncio
     import contextlib
 
     import providers
@@ -237,12 +283,14 @@ def attach_sources(app, host, catalog=None, registry=None) -> None:
             seeded = sources_mod.seed_credits(host, registry)
             if seeded:
                 print(f"credits seeded for {seeded} provider(s)")
-            tasks = sources_mod.start_refresh_tasks(host, catalog, registry)
+            tasks = (sources_mod.start_refresh_tasks(host, catalog, registry)
+                     if _enabled("RUN_SOURCE_REFRESHERS") else [])
             # The autonomous AntSeed funding loop lives HERE, in the router: the
             # buyer identity + sqlite are on an RWO PVC bound to this pod and the
             # sidecar control server is pod-local. Ships dark — it re-reads
             # `antseed.keeper_enabled` (default 0) every cycle.
-            keeper = wallet_keeper.start(catalog)
+            keeper = (wallet_keeper.start(catalog)
+                      if _enabled("RUN_WALLET_KEEPER") else None)
             if keeper is not None:
                 tasks.append(keeper)
             try:
@@ -250,6 +298,10 @@ def attach_sources(app, host, catalog=None, registry=None) -> None:
             finally:
                 for t in tasks:
                     t.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                for closeable in closeables:
+                    await closeable.aclose()
 
     app.router.lifespan_context = lifespan
 

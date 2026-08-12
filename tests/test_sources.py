@@ -765,6 +765,43 @@ def test_attach_sources_starts_and_stops_refresh_tasks(monkeypatch):
     src.SOURCE_STATE.clear()
 
 
+def test_attach_sources_can_disable_singleton_work_and_closes_clients(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    import serve
+    import wallet_keeper
+
+    class Host:
+        def catalog(self):
+            return {"providers": {}, "models": {}}
+
+        def update_metrics(self, *_args, **_kwargs):
+            pass
+
+    class Closeable:
+        closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    closeable = Closeable()
+    monkeypatch.setenv("RUN_SOURCE_REFRESHERS", "0")
+    monkeypatch.setenv("RUN_WALLET_KEEPER", "0")
+    monkeypatch.setattr(
+        src, "start_refresh_tasks",
+        lambda *_args, **_kwargs: pytest.fail("refreshers must stay disabled"))
+    monkeypatch.setattr(
+        wallet_keeper, "start",
+        lambda *_args, **_kwargs: pytest.fail("keeper must stay disabled"))
+
+    app = FastAPI()
+    serve.attach_sources(app, Host(), catalog={"providers": {}, "models": {}},
+                         registry=[], closeables=[closeable])
+    with TestClient(app) as client:
+        assert client.get("/not-found").status_code == 404
+    assert closeable.closed is True
+
+
 # ---- adapter error_map ------------------------------------------------------
 
 def test_error_map_overrides_status_classification():
