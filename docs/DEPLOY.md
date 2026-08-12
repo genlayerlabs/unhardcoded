@@ -93,6 +93,11 @@ Routing model:
 - `router` is not published; only the `ingress` proxy can reach it on the Compose network.
 - `ingress` binds `127.0.0.1:${LLM_ROUTER_HOST_PORT:-8080}` only. Put a private LB, Tailscale, service mesh, or Caddy internal-only route in front if other hosts need access.
 - The ingress checks the OpenAI-SDK bearer token against `CALLER_KEYS_JSON`; each token maps to a caller name for audit logs.
+- GitOps-managed workload tokens should use `CALLER_KEYS_BOOTSTRAP_JSON`. It is
+  hashed in memory at boot and merged into the hash-only key map, so it is not
+  revealable through the dashboard and a later dashboard write cannot replace
+  the reconciled map. Keep the raw JSON in a Secret, never in a Deployment
+  manifest.
 - Provider secrets and OAuth files are read only by the router/sidecars from env/secrets or host mounts. Clients never receive provider keys.
 - Logs are JSON lines with caller, route, status, latency, and router-chosen provider/model when available.
 

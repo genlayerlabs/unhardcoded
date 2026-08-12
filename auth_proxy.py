@@ -34,6 +34,12 @@ load_env_secrets()
 UPSTREAM = os.getenv("ROUTER_UPSTREAM", "http://router:18080").rstrip("/")
 CALLER_KEYS_JSON = os.getenv("CALLER_KEYS_JSON", "{}")
 CALLER_KEYS_SHA256_JSON = os.getenv("CALLER_KEYS_SHA256_JSON", "{}")
+# GitOps/bootstrap keys arrive from a reconciled workload Secret. Keep them in
+# a separate channel because load_env_secrets() intentionally lets the
+# dashboard-managed PVC override CALLER_KEYS_JSON; replacing the whole map
+# would otherwise make a reconciled workload key disappear after the first
+# dashboard-issued key is persisted.
+CALLER_KEYS_BOOTSTRAP_JSON = os.getenv("CALLER_KEYS_BOOTSTRAP_JSON", "{}")
 RATE_PER_MIN = int(os.getenv("RATE_PER_MIN", "600"))
 BURST = int(os.getenv("BURST", "200"))
 RECENT_LIMIT = int(os.getenv("DASHBOARD_RECENT_LIMIT", "200"))
@@ -79,8 +85,21 @@ def _load_caller_map(raw: str, name: str) -> Dict[str, str]:
         raise RuntimeError(f"invalid {name}: {exc}") from exc
 
 
-CALLER_KEYS: Dict[str, str] = _load_caller_map(CALLER_KEYS_JSON, "CALLER_KEYS_JSON")
-CALLER_KEY_HASHES: Dict[str, str] = _load_caller_map(CALLER_KEYS_SHA256_JSON, "CALLER_KEYS_SHA256_JSON")
+def _bootstrap_caller_key_hashes(raw: str) -> Dict[str, str]:
+    """Load GitOps keys as hashes so the dashboard can never reveal them."""
+    return {
+        hashlib.sha256(token.encode()).hexdigest(): owner
+        for token, owner in _load_caller_map(
+            raw, "CALLER_KEYS_BOOTSTRAP_JSON").items()
+    }
+
+
+CALLER_KEYS: Dict[str, str] = _load_caller_map(
+    CALLER_KEYS_JSON, "CALLER_KEYS_JSON")
+CALLER_KEY_HASHES: Dict[str, str] = _bootstrap_caller_key_hashes(
+    CALLER_KEYS_BOOTSTRAP_JSON)
+CALLER_KEY_HASHES.update(_load_caller_map(
+    CALLER_KEYS_SHA256_JSON, "CALLER_KEYS_SHA256_JSON"))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
 log = logging.getLogger("llm-router-auth-proxy")
@@ -4940,6 +4959,7 @@ def _dashboard_html() -> str:
         <select id='bTemplate' class='select' style='width:auto'>
           <option value='cheapest-family'>Cheapest in one family</option>
           <option value='smart-value'>Smart value</option>
+          <option value='agent'>Stable tool agent</option>
           <option value='default'>Default for vanilla clients</option>
         </select>
         <input id='bTemplateFamily' class='input' list='familyOptions' placeholder='model family, e.g. glm-5.2' style='min-width:220px'>
@@ -5215,7 +5235,7 @@ async function bDownload(){$('bError').style.display='none';try{const term=bCurr
 async function bTest(){$('bError').style.display='none';$('bTestResult').innerHTML='<div class="muted small" style="margin-top:8px">Running…</div>';try{const term=bCurrentTerm();const prompt=$('bTestPrompt').value.trim()||'Reply exactly: pong';const r=await fetch('/dashboard/api/policy/test',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({policy_ir:term,prompt})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||(typeof d.error==='string'?d.error:'test '+r.status));const okc=d.ok?'':'bad';const out=d.text?`<pre class="mono small" style="white-space:pre-wrap;margin-top:8px;background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:8px;padding:8px">${esc(d.text)}</pre>`:`<div class="bad small" style="margin-top:8px">${esc(d.error||'no output')}</div>`;$('bTestResult').innerHTML=`<div class="actMeta" style="margin-top:8px"><span class="pill ${okc}">status ${esc(d.status)}</span><span class="pill">${esc(d.provider||'—')}${d.served_model_id?' · '+esc(d.served_model_id):''}</span></div><div class="label small" style="margin-top:12px">How it routed — executed live, real spend</div>${actDetail(d)}<div class="label small" style="margin-top:12px">Answer</div>${out}<div class="muted small" style="margin-top:6px">Also recorded in <b>Activity</b>.</div>`;toast('Test call done')}catch(e){bFail(e.message)}}
 async function loadBuilderFamilies(){try{const r=await fetch('/dashboard/api/policies',{credentials:'same-origin'});if(!r.ok)return;const d=await r.json();const fams=new Set();(d.profiles||[]).forEach(p=>(p.models||[]).forEach(m=>{if(m.name)fams.add(m.name)}));$('familyOptions').innerHTML=[...fams].sort().map(f=>`<option value="${esc(f)}">`).join('')}catch(e){}}
 async function loadBuilderFields(){try{const r=await fetch('/dashboard/api/fields',{credentials:'same-origin'});if(!r.ok)return;const d=await r.json();const num=[],bool=[];(d.fields||[]).forEach(f=>{const e={name:f.name,group:f.group||'model'};if(f.sort==='Bool')bool.push(e);else if(f.sort==='Num')num.push(e)});if(num.length)bFields.num=num;bFields.bool=bool;if(activeTab==='builder'&&!bRawMode)bRender()}catch(e){}}
-function bTemplateChanged(){const id=$('bTemplate').value,family=id==='cheapest-family';$('bTemplateFamily').style.display=family?'':'none';$('bTemplateStrategy').style.display=family?'':'none';$('bTemplateHelp').textContent=family?'Stays inside the exact family; unavailable providers are skipped.':id==='default'?'The actual no-policy default: top-five first, then Codex → AntSeed → Bedrock → OpenRouter.':'Chooses the cheapest reliable route inside the top-five intelligence shortlist.'}
+function bTemplateChanged(){const id=$('bTemplate').value,family=id==='cheapest-family';$('bTemplateFamily').style.display=family?'':'none';$('bTemplateStrategy').style.display=family?'':'none';$('bTemplateHelp').textContent=family?'Stays inside the exact family; unavailable providers are skipped.':id==='agent'?'Quality-first tool routing with trusted peers and attempt budgets that leave room for failover.':id==='default'?'The actual no-policy default: top-five first, then Codex → AntSeed → Bedrock → OpenRouter.':'Chooses the cheapest reliable route inside the top-five intelligence shortlist.'}
 async function bCreateTemplate(){$('bError').style.display='none';const id=$('bTemplate').value,opts={};if(id==='cheapest-family'){const family=$('bTemplateFamily').value.trim();if(!family){bFail('Choose a model family first.');$('bTemplateFamily').focus();return}opts.family=family;opts.provider_strategy=$('bTemplateStrategy').value}const btn=$('bLoadTemplate'),old=btn.textContent;btn.disabled=true;btn.textContent='Creating…';try{const r=await fetch('/dashboard/api/policy/templates/'+encodeURIComponent(id),{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(opts)});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`template ${r.status}`);bSetMode('raw');$('bRawTerm').value=JSON.stringify(d.policy_ir,null,2);lastBuiltPolicy=d;await bReview();toast('Template created and previewed')}catch(e){bFail(e.message)}finally{btn.disabled=false;btn.textContent=old}}
 // One-click teaching policies, authored as structured state (filters/scores/pick).
 const B_EXAMPLES={ex1:{filters:[{field:'in_top_k',k:'5',by:'bench_intelligence'},{field:'in_top_k',k:'5',by:'bench_coding'}],scores:[{field:'field:price_in',w:'1',norm:true,inv:true}],gate:false,selector:'argmax',topn:''},ex2:{filters:[],scores:[{field:'field:bench_intelligence',w:'1',norm:true,inv:false},{field:'field:bench_coding',w:'1',norm:true,inv:false},{field:'field:bench_agentic',w:'1',norm:true,inv:false}],gate:false,selector:'argmax',topn:'3'}};

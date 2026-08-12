@@ -139,10 +139,11 @@ def _providers(host, term):
     return [row["candidate"]["provider_id"] for row in ranked]
 
 
-def test_template_catalog_exposes_three_product_intents():
+def test_template_catalog_exposes_four_product_intents():
     assert [item["id"] for item in template_catalog()] == [
         "cheapest-family",
         "smart-value",
+        "agent",
         "default",
     ]
 
@@ -171,6 +172,59 @@ def test_parameterless_default_template_needs_no_request_body(template_host):
     response = client.post("/x/policy/templates/default")
     assert response.status_code == 200, response.text
     assert response.json()["intent"]["template"] == "default"
+
+
+def test_parameterless_agent_template_needs_no_request_body(template_host):
+    client = TestClient(create_app(template_host, default_profile="default"))
+    response = client.post("/x/policy/templates/agent")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["intent"]["template"] == "agent"
+    assert body["intent"]["first_token_timeout_ms"] == 10_000
+
+
+def test_agent_template_owns_quality_privacy_and_liveness_rails():
+    term, intent = build_policy_template("agent")
+    _, pred, scorer, selector, xform, fail_plan = term
+    predicates = pred[1:]
+
+    assert ["is", "cap_tools"] in predicates
+    assert ["cmp", "context", "ge", 128_000] in predicates
+    assert ["cmp", "success_rate", "ge", 0.8] in predicates
+    assert ["cmp", "bench_intelligence_rank", "le", 10] in predicates
+    assert ["cmp", "price_in", "le", 15.0] in predicates
+    assert ["cmp", "price_out", "le", 30.0] in predicates
+
+    antseed_gate = next(
+        item for item in predicates
+        if item[0] == "or" and ["not", ["provider_eq", "antseed"]] in item
+    )
+    assert ["cmp", "reputation_score", "gt", 95] in antseed_gate
+    assert len([item for item in antseed_gate if item[0] == "served_by_eq"]) == 5
+
+    assert scorer[0] == "add"
+    assert selector[:2] == ["top_k", 8]
+    assert selector[2][0:2] == [
+        "prefer",
+        ["not", ["is", "breaker_open"]],
+    ]
+    assert xform == [
+        "seq",
+        ["set_param", "first_token_timeout_ms", 10_000],
+        ["set_param", "timeout_ms", 22_000],
+    ]
+    assert intent["provider_order"][0] == ["openai_codex"]
+    assert intent["provider_order"][-1] == ["antseed"]
+
+    actions = {}
+    cursor = fail_plan
+    while cursor[0] == "override":
+        actions[cursor[2]] = cursor[3]
+        cursor = cursor[1]
+    actions["unknown"] = cursor[1]
+    assert actions["timeout"] == {"action": "next_candidate"}
+    assert actions["server_error"] == {"action": "next_candidate"}
+    assert actions["network_error"] == {"action": "next_candidate"}
 
 
 def test_cheapest_family_is_family_strict_and_really_cost_first(template_host):
@@ -342,6 +396,70 @@ def test_live_default_profile_is_exactly_the_published_default_template():
     ]
     assert configured_pairs == generated_pairs
     assert configured_pairs[0] == ("openai_codex", "gpt-5.5")
+
+
+def test_live_agent_profile_is_exactly_the_published_agent_template():
+    import asyncio
+
+    host = LLMRouterHost(
+        router_path=ROOT / "core" / "router.lua",
+        config_path=ROOT / "config.live.lua",
+        metrics_path=ROOT / "metrics.live.lua",
+        env={
+            "OPENAI_API_KEY": "test",
+            "OPENROUTER_API_KEY": "test",
+        },
+        now_ms=lambda: 1_000,
+        enforce_provider_auth=False,
+    )
+    host.init()
+    generated, _ = build_policy_template("agent")
+    configured = host.catalog()["profiles"]["agent"]["policy_ir"]
+    assert (
+        host.normalize_policy(configured)["fingerprint"]
+        == host.normalize_policy(generated)["fingerprint"]
+    )
+
+    configured_rank, _ = host.rank({
+        "profile": "agent",
+        "requirements": {"context": 128_000},
+    })
+    generated_rank, _ = host.rank({
+        "policy_ir": generated,
+        "requirements": {"context": 128_000},
+    })
+    configured_pairs = [
+        (row["candidate"]["provider_id"], row["candidate"]["model_family"])
+        for row in configured_rank
+    ]
+    generated_pairs = [
+        (row["candidate"]["provider_id"], row["candidate"]["model_family"])
+        for row in generated_rank
+    ]
+    assert configured_pairs == generated_pairs
+    assert 1 <= len(configured_pairs) <= 8
+    assert configured_pairs[0][0] == "openai_codex"
+
+    seen = []
+
+    async def override(request):
+        seen.append(request)
+        if len(seen) == 1:
+            return {"ok": False, "error_kind": "timeout", "latency_ms": 1}
+        return {
+            "ok": True,
+            "latency_ms": 1,
+            "response": {"text": "fallback", "finish_reason": "stop"},
+        }
+
+    result = asyncio.run(host.execute_async({
+        "prompt": "hi",
+        "profile": "agent",
+    }, call_override=override))
+    assert result["ok"] and result["response"]["text"] == "fallback"
+    assert len(seen) == 2
+    assert all(req["first_token_timeout_ms"] == 10_000 for req in seen)
+    assert all(req["timeout_ms"] == 22_000 for req in seen)
 
 
 @pytest.mark.parametrize(
