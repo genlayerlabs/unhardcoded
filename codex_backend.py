@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import AsyncExitStack
 from typing import Any, Iterable
 
@@ -23,6 +24,21 @@ from provider_adapters.common import (
 )
 
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+
+
+# The quota signal the router can never re-fetch: polling the codex endpoint
+# would burn the very quota it measures, so observation of real traffic is the
+# only safe source. A header dropped here is therefore lost for good — which is
+# why the match covers WHEN the limit lifts (`*-reset-*`, `retry-after`) and not
+# only how much is used. Deliberately still narrow: response headers can carry
+# cookies and tokens, and this map is stored and rendered on the dashboard.
+_QUOTA_HEADER_RE = re.compile(r"ratelimit|usage|quota|percent|reset|^retry-after$", re.I)
+
+
+def quota_headers(headers) -> dict:
+    """The quota-relevant subset of a response's headers, lowercased."""
+    return {k.lower(): v for k, v in dict(headers or {}).items()
+            if _QUOTA_HEADER_RE.search(k)}
 
 
 def _err(kind: str, status: int, latency_ms: int, message: str) -> dict:
@@ -311,9 +327,8 @@ def make_codex_async_call_provider(
         if observe is None:
             return
         try:
-            hdrs = {k.lower(): v for k, v in dict(headers or {}).items()
-                    if _re.search(r"ratelimit|usage|quota|percent", k, _re.I)}
-            observe({"status": status, "headers": hdrs, "ts": int(time.time())})
+            observe({"status": status, "headers": quota_headers(headers),
+                     "ts": int(time.time())})
         except Exception:
             pass
 
