@@ -72,7 +72,8 @@ const UPSERT = `INSERT INTO peer_offers
     price_in=EXCLUDED.price_in, price_out=EXCLUDED.price_out,
     price_cached_in=EXCLUDED.price_cached_in,
     max_concurrency=EXCLUDED.max_concurrency, reputation=EXCLUDED.reputation,
-    last_seen=EXCLUDED.last_seen, last_reached_at=EXCLUDED.last_reached_at,
+    last_seen=EXCLUDED.last_seen,
+    last_reached_at=COALESCE(EXCLUDED.last_reached_at, peer_offers.last_reached_at),
     observed_at=EXCLUDED.observed_at,
     fetched_at=EXCLUDED.fetched_at`;  // first_seen preserved across conflicts
 

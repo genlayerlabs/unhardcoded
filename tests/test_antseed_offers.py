@@ -14,6 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import host_store  # noqa: E402
 import route_reliability as rr  # noqa: E402
 from sources.antseed import AntSeedSource  # noqa: E402
 from conftest import seed_peer_offers as _seed_market, seed_route_obs  # noqa: E402
@@ -77,6 +78,17 @@ def test_offers_sync_stamps_host_measured_reliability(tmp_path):
     by_peer = {o["peer_id"]: o for o in offers}
     assert by_peer["peerA"]["success_rate"] == 1.0
     assert by_peer["peerB"]["success_rate"] is None
+
+
+def test_market_refresh_preserves_known_reachability_when_payload_omits_it():
+    now = int(time.time() * 1000)
+    reached_at = now - 500
+    _seed_market([_peer("peerA", 0.5, last_reached_at=reached_at)],
+                 observed_at=now - 100)
+    # A later DHT browse can contain the offer without the buyer proxy's local
+    # liveness stamp. Keep the stronger fact and let its age expire naturally.
+    _seed_market([_peer("peerA", 0.5)], observed_at=now)
+    assert host_store.peer_offers()[0]["last_reached_at"] == reached_at
 
 
 def test_recent_failed_route_is_cooled_before_top_n(tmp_path):

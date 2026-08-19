@@ -107,7 +107,7 @@ def seed_peer_offers(peers, observed_at=None):
                 " price_cached_in=EXCLUDED.price_cached_in,"
                 " max_concurrency=EXCLUDED.max_concurrency,"
                 " reputation=EXCLUDED.reputation, last_seen=EXCLUDED.last_seen,"
-                " last_reached_at=EXCLUDED.last_reached_at,"
+                " last_reached_at=COALESCE(EXCLUDED.last_reached_at, peer_offers.last_reached_at),"
                 " observed_at=EXCLUDED.observed_at, fetched_at=EXCLUDED.fetched_at",
                 rows)
 

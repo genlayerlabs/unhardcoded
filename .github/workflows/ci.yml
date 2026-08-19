@@ -102,7 +102,7 @@ jobs:
       # a fresh pod does not need npm access before it can join the P2P network.
       - name: Vendored AntSeed router plugin loads without runtime npm
         run: >-
-          docker run --rm --entrypoint node unhardcoded-antseed:ci
+          docker run --rm --network none --entrypoint node unhardcoded-antseed:ci
           --input-type=module --eval
           "const {loadRouterPlugin}=await import('/usr/local/lib/node_modules/@antseed/cli/dist/plugins/loader.js');
           const plugin=await loadRouterPlugin('local');
