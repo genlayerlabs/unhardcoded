@@ -25,6 +25,7 @@ const { createQueue } = require('./queue.js');
 // reasoning about what is and is not provable from CLI stdio is long enough to
 // deserve a file. See antseed/broadcast.js.
 const { classifyCliFailure } = require('./broadcast.js');
+const { walletCommandArgs } = require('./cli-args.js');
 
 const path = require('path');
 
@@ -197,7 +198,7 @@ const server = http.createServer(async (req, res) => {
       return refuse(res, 400, 'amount must be a positive USDC value (<=6 decimals, <=' + MAX_AMOUNT_USDC + ')');
     }
     return serialize(async () => {
-      const r = await run(['buyer', verb, amount], DEPOSIT_TIMEOUT_MS);
+      const r = await run(walletCommandArgs(verb, amount), DEPOSIT_TIMEOUT_MS);
       if (r.code !== 0) {
         const why = (r.stderr || r.stdout || 'cli failed').slice(0, 600);
         // A CLI we KILLED on the timeout may already have broadcast the

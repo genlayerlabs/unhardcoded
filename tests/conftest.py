@@ -85,13 +85,14 @@ def seed_peer_offers(peers, observed_at=None):
         maxc = peer.get("maxConcurrency")
         rep = peer.get("onChainReputationScore")
         last_seen = peer.get("lastSeen")
+        last_reached_at = peer.get("lastReachedAt")
         for pricing in (peer.get("providerPricing") or {}).values():
             for service, sp in ((pricing or {}).get("services") or {}).items():
                 rows.append((
                     peer["peerId"], service,
                     sp.get("inputUsdPerMillion"), sp.get("outputUsdPerMillion"),
                     sp.get("cachedInputUsdPerMillion"),
-                    maxc, rep, last_seen, obs, obs, obs))
+                    maxc, rep, last_seen, last_reached_at, obs, obs, obs))
     with host_store._get_pool().connection() as conn:
         if rows:
             # UPSERT, mirroring the real writer (antseed/write-market.js): a peer
@@ -99,13 +100,14 @@ def seed_peer_offers(peers, observed_at=None):
             conn.cursor().executemany(
                 "INSERT INTO peer_offers (peer_id, service, price_in, price_out,"
                 " price_cached_in, max_concurrency, reputation, last_seen,"
-                " observed_at, first_seen, fetched_at)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                " last_reached_at, observed_at, first_seen, fetched_at)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
                 " ON CONFLICT (peer_id, service) DO UPDATE SET"
                 " price_in=EXCLUDED.price_in, price_out=EXCLUDED.price_out,"
                 " price_cached_in=EXCLUDED.price_cached_in,"
                 " max_concurrency=EXCLUDED.max_concurrency,"
                 " reputation=EXCLUDED.reputation, last_seen=EXCLUDED.last_seen,"
+                " last_reached_at=EXCLUDED.last_reached_at,"
                 " observed_at=EXCLUDED.observed_at, fetched_at=EXCLUDED.fetched_at",
                 rows)
 
@@ -126,19 +128,21 @@ def seed_call(session=None, provider=None, family=None, served_by=None, status=2
 
 
 def seed_route_obs(provider, family, served_by, ok, latency_ms=None, n=1, ts=None,
-                   tools_requested=False, tool_calls_emitted=False):
+                   tools_requested=False, tool_calls_emitted=False,
+                   error_kind=None, http_status=None):
     """Seed n per-attempt route_observations for a route (the raw from which
     route_stats / tool_incapable_routes derive on the fly)."""
     import time
     t = int(time.time() * 1000) if ts is None else ts
     rows = [(t, provider, family, served_by, ok, latency_ms,
+             error_kind, http_status,
              tools_requested, tool_calls_emitted) for _ in range(n)]
     with host_store._get_pool().connection() as conn:
         conn.cursor().executemany(
             "INSERT INTO route_observations"
             " (ts, provider_id, model_family, served_by, ok, latency_ms,"
-            " tools_requested, tool_calls_emitted)"
-            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", rows)
+            " error_kind, http_status, tools_requested, tool_calls_emitted)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", rows)
 
 
 def seed_buyer_status(pid, pinned_peer_id=None, deposits_available=None,

@@ -73,6 +73,12 @@ def test_antseed_pre_broadcast_classification():
     _run_node_test("antseed/broadcast.test.js")
 
 
+def test_antseed_wallet_cli_arguments():
+    """The control API keeps direct on-chain deposit semantics across the
+    @antseed/cli 0.1.137 command redesign (`deposit --onchain <amount>`)."""
+    _run_node_test("antseed/cli-args.test.js")
+
+
 _LOCAL_IMPORT = re.compile(
     r"""(?:require\(\s*|from\s+)['"](\./[^'"]+)['"]""")
 

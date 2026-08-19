@@ -160,7 +160,8 @@ PROVIDERS: "list[Provider]" = [
             "offers_top_n": {
                 "type": "int", "default": env_int("ANTSEED_OFFERS_TOP_N", 3),
                 "min": 1, "max": 10, "label": "Offers per family (top-N peers)",
-                "help": "Cheapest distinct seller peers surfaced per family to rotate between on failure."},
+                "help": "Best viable distinct sellers per family after route health, "
+                        "reachability and reputation admission; price ranks inside that set."},
             "reputation_min": {
                 "type": "float", "default": env_float("ANTSEED_REPUTATION_MIN", 0),
                 "min": 0, "max": 100, "label": "Min peer on-chain reputation",

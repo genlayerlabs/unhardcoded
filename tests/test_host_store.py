@@ -320,28 +320,32 @@ def test_expired_peer_lease_is_reclaimed(store):
 def _insert_peer_offer(store, peer_id, service, observed_at, **over):
     row = {"price_in": 0.5, "price_out": 1.0, "price_cached_in": None,
            "max_concurrency": 5, "reputation": None, "last_seen": 1,
+           "last_reached_at": None,
            "first_seen": observed_at, "fetched_at": observed_at}
     row.update(over)
     with store._get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO peer_offers (peer_id, service, price_in, price_out,"
             " price_cached_in, max_concurrency, reputation, last_seen,"
-            " observed_at, first_seen, fetched_at)"
-            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            " last_reached_at, observed_at, first_seen, fetched_at)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (peer_id, service, row["price_in"], row["price_out"],
              row["price_cached_in"], row["max_concurrency"], row["reputation"],
-             row["last_seen"], observed_at, row["first_seen"], row["fetched_at"]))
+             row["last_seen"], row["last_reached_at"], observed_at,
+             row["first_seen"], row["fetched_at"]))
 
 
 def test_peer_offers_returns_rows_in_reader_shape(store):
     now = int(time.time() * 1000)
-    _insert_peer_offer(store, "peerA", "gpt-5", now, reputation=80.0)
+    _insert_peer_offer(store, "peerA", "gpt-5", now, reputation=80.0,
+                       last_reached_at=now - 500)
     rows = store.peer_offers()
     assert len(rows) == 1
     r = rows[0]
     assert r == {"peer_id": "peerA", "service": "gpt-5", "price_in": 0.5,
                  "price_out": 1.0, "price_cached_in": None, "max_concurrency": 5,
-                 "reputation": 80.0, "last_seen": 1}
+                 "reputation": 80.0, "last_seen": 1,
+                 "last_reached_at": now - 500}
 
 
 def test_peer_offers_window_filters_stale_rows(store):
@@ -414,6 +418,56 @@ def test_route_stats_window_excludes_old_observations(store):
     seed_route_obs("p", "m", "stale", ok=True, ts=now - 20 * 60 * 1000)  # 20 min ago
     assert set(store.route_stats(window_ms=15 * 60 * 1000)) == {"p|m|fresh"}
     assert set(store.route_stats(window_ms=30 * 60 * 1000)) == {"p|m|fresh", "p|m|stale"}
+
+
+def test_marketplace_health_tracks_route_and_peer_fault_scope(store):
+    from conftest import seed_route_obs
+    now = int(time.time() * 1000)
+    # A model 404 is route-specific.
+    seed_route_obs("antseed", "m404", "peerA", ok=False, ts=now - 30,
+                   error_kind="model_unavailable", http_status=404)
+    # A newer timeout is both route- and peer-attributable.
+    seed_route_obs("antseed", "mtimeout", "peerA", ok=False, ts=now - 20,
+                   error_kind="timeout", http_status=504)
+    health = store.marketplace_route_health("antseed")
+    assert health["routes"]["antseed|m404|peerA"]["consecutive_failures"] == 1
+    timeout = health["routes"]["antseed|mtimeout|peerA"]
+    assert timeout["latest_error_kind"] == "timeout"
+    assert timeout["latest_http_status"] == 504
+    # The 404 is neutral at peer scope; only the timeout contributes.
+    assert health["peers"]["peerA"]["consecutive_failures"] == 1
+
+
+def test_marketplace_health_success_resets_failure_streak(store):
+    from conftest import seed_route_obs
+    now = int(time.time() * 1000)
+    seed_route_obs("antseed", "m", "peerA", ok=False, ts=now - 30,
+                   error_kind="timeout", http_status=504)
+    seed_route_obs("antseed", "m", "peerA", ok=True, ts=now - 20)
+    state = store.marketplace_route_health("antseed")["routes"]["antseed|m|peerA"]
+    assert state["consecutive_failures"] == 0
+    assert state["last_success_at"] == now - 20
+
+
+@pytest.mark.parametrize("error_kind,http_status", [
+    ("bad_request", 400),
+    ("payment_required", 402),
+])
+def test_marketplace_health_ignores_non_route_faults(
+        store, error_kind, http_status):
+    from conftest import seed_route_obs
+    seed_route_obs("antseed", "m", "peerA", ok=False,
+                   error_kind=error_kind, http_status=http_status)
+    assert store.marketplace_route_health("antseed") == {"routes": {}, "peers": {}}
+
+
+def test_marketplace_health_keeps_stream_break_route_scoped(store):
+    from conftest import seed_route_obs
+    seed_route_obs("antseed", "m", "peerA", ok=False,
+                   error_kind="stream_interrupted", http_status=200)
+    health = store.marketplace_route_health("antseed")
+    assert health["routes"]["antseed|m|peerA"]["consecutive_failures"] == 1
+    assert health["peers"] == {}
 
 
 # ---- wallet_ops: the keeper's audit trail + rate-cap ledger -------------------

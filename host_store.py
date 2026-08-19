@@ -132,6 +132,8 @@ _SCHEMA_STATEMENTS = [
         served_by          TEXT,
         ok                 BOOLEAN NOT NULL,
         latency_ms         DOUBLE PRECISION,
+        error_kind         TEXT,
+        http_status        INTEGER,
         tools_requested    BOOLEAN,
         tool_calls_emitted BOOLEAN
     )""",
@@ -139,6 +141,8 @@ _SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_route_obs_route"
     " ON route_observations(provider_id, model_family, served_by, ts)",
     # #4c: learned tool capability is derived from these per-attempt signals.
+    "ALTER TABLE route_observations ADD COLUMN IF NOT EXISTS error_kind TEXT",
+    "ALTER TABLE route_observations ADD COLUMN IF NOT EXISTS http_status INTEGER",
     "ALTER TABLE route_observations ADD COLUMN IF NOT EXISTS tools_requested BOOLEAN",
     "ALTER TABLE route_observations ADD COLUMN IF NOT EXISTS tool_calls_emitted BOOLEAN",
     """CREATE TABLE IF NOT EXISTS settings_overrides (
@@ -224,11 +228,13 @@ _SCHEMA_STATEMENTS = [
         max_concurrency INTEGER,
         reputation      DOUBLE PRECISION,
         last_seen       BIGINT,
+        last_reached_at BIGINT,
         observed_at     BIGINT NOT NULL,
         first_seen      BIGINT,
         fetched_at      BIGINT,
         PRIMARY KEY (peer_id, service)
     )""",
+    "ALTER TABLE peer_offers ADD COLUMN IF NOT EXISTS last_reached_at BIGINT",
     "CREATE INDEX IF NOT EXISTS idx_peer_offers_observed ON peer_offers(observed_at)",
     # The antseed buyer's status (escrow + session pin + wallet), one row per
     # buyer pid. WRITTEN by the antseed sidecar (write-status.js on the poll loop
@@ -901,12 +907,14 @@ def _insert_route_observation(row: dict[str, Any]) -> None:
             conn.execute(
                 "INSERT INTO route_observations"
                 " (ts, provider_id, model_family, served_by, ok, latency_ms,"
-                " tools_requested, tool_calls_emitted)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                " error_kind, http_status, tools_requested, tool_calls_emitted)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (int(row.get("ts") or time.time() * 1000),
                  row.get("provider_id"), row.get("model_family"), row.get("served_by"),
                  bool(row.get("ok")),
                  float(row["latency_ms"]) if row.get("latency_ms") is not None else None,
+                 row.get("error_kind"),
+                 int(row["http_status"]) if row.get("http_status") is not None else None,
                  bool(row.get("tools_requested")), bool(row.get("tool_calls_emitted"))))
     except Exception as exc:  # noqa: BLE001 — the fold must never break a request
         _log.warning("host_store route observation insert failed: %s", exc)
@@ -940,6 +948,107 @@ def route_stats(window_ms: int = 900_000) -> dict[str, dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001 — measurement read is best-effort
         _log.warning("host_store route_stats failed: %s", exc)
         return {}
+
+
+# Failures in these classes describe the request rather than the route. They
+# remain in route_stats() for backwards-compatible measured reliability, but do
+# not put a marketplace seller into a durable cooldown.
+_ROUTE_HEALTH_NEUTRAL_ERRORS = frozenset({
+    "bad_request", "content_filter", "context_overflow", "payment_required",
+})
+
+# A failure in one service can prove the whole peer unhealthy only for transport,
+# capacity and server faults. A model_unavailable/404 is deliberately absent: it
+# quarantines that peer+family route without hiding the peer's other models.
+_PEER_HEALTH_FAILURE_ERRORS = frozenset({
+    "rate_limit", "timeout", "server_error", "network_error", "auth_error",
+    "bad_response", "unknown",
+})
+
+
+def _fold_health_rows(rows: list[tuple], provider_id: str, *, peer: bool) -> dict:
+    """Fold newest-first observation rows into consecutive attributable failures.
+
+    The SQL caps each identity to a bounded recent sample. A success ends the
+    current failure streak; client/request faults are ignored. Old observations
+    have no error_kind, so they remain route evidence (the safe migration
+    direction) but are not promoted to peer-wide blame.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for family, served_by, ts, ok, error_kind, http_status in rows:
+        key = served_by if peer else f"{provider_id}|{family}|{served_by}"
+        state = out.setdefault(key, {
+            "consecutive_failures": 0,
+            "last_failure_at": None,
+            "last_success_at": None,
+            "latest_error_kind": None,
+            "latest_http_status": None,
+            "sample_count": 0,
+            "_ended": False,
+        })
+        state["sample_count"] += 1
+        if state["_ended"]:
+            continue
+        if ok:
+            state["last_success_at"] = int(ts)
+            state["_ended"] = True
+            continue
+        kind = str(error_kind) if error_kind else None
+        attributable = (
+            kind in _PEER_HEALTH_FAILURE_ERRORS if peer
+            else kind not in _ROUTE_HEALTH_NEUTRAL_ERRORS
+        )
+        if not attributable:
+            continue
+        state["consecutive_failures"] += 1
+        if state["last_failure_at"] is None:
+            state["last_failure_at"] = int(ts)
+            state["latest_error_kind"] = kind
+            state["latest_http_status"] = (
+                int(http_status) if http_status is not None else None)
+    for key in list(out):
+        state = out[key]
+        state.pop("_ended", None)
+        # A group containing only neutral failures carries no health evidence.
+        if not state["consecutive_failures"] and state["last_success_at"] is None:
+            out.pop(key)
+    return out
+
+
+def marketplace_route_health(provider_id: str, window_ms: int = 86_400_000,
+                             sample_limit: int = 64) -> dict[str, dict]:
+    """Bounded durable health for one marketplace provider.
+
+    Returns ``{"routes": {provider|family|peer: state}, "peers": {peer: state}}``.
+    Route state drives service-specific cooldowns; peer state is restricted to
+    failures that can safely be attributed across services. Both are derived
+    from the shared Postgres ledger, so replicas and restarts agree.
+    """
+    try:
+        cutoff = int(time.time() * 1000) - max(0, window_ms)
+        limit = max(1, min(int(sample_limit), 512))
+
+        def read(partition: str, order_prefix: str) -> list[tuple]:
+            with _get_pool().connection() as conn:
+                cur = conn.execute(
+                    "SELECT model_family,served_by,ts,ok,error_kind,http_status"
+                    " FROM (SELECT id,model_family,served_by,ts,ok,error_kind,http_status,"
+                    f" row_number() OVER (PARTITION BY {partition} ORDER BY ts DESC,id DESC) AS rn"
+                    " FROM route_observations WHERE provider_id=%s AND ts >= %s) recent"
+                    " WHERE rn <= %s"
+                    f" ORDER BY {order_prefix},ts DESC,id DESC",
+                    (provider_id, cutoff, limit))
+                return list(cur.fetchall())
+
+        route_rows = read("model_family,served_by", "served_by,model_family")
+        peer_rows = read("served_by", "served_by")
+        return {
+            "routes": _fold_health_rows(route_rows, provider_id, peer=False),
+            "peers": _fold_health_rows(peer_rows, provider_id, peer=True),
+        }
+    except Exception as exc:  # noqa: BLE001 — admission degrades to legacy behavior
+        _log.warning("host_store marketplace_route_health failed: %s", exc)
+        return {"routes": {}, "peers": {}}
 
 
 def provider_attempt_counts(provider_id: str, window_ms: int = 3_600_000) -> dict[str, int]:
@@ -1752,7 +1861,7 @@ def recent_logins(limit: int = 100) -> list[dict[str, Any]]:
 # window/housekeeping columns (observed_at/first_seen/fetched_at) stay internal.
 _PEER_OFFER_FIELDS = ("peer_id", "service", "price_in", "price_out",
                       "price_cached_in", "max_concurrency", "reputation",
-                      "last_seen")
+                      "last_seen", "last_reached_at")
 
 
 def peer_offers(window_ms: int = 900_000) -> list[dict[str, Any]]:

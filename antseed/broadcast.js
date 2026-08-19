@@ -26,7 +26,7 @@
 // ---------------------------------------------------------------------------
 // WHAT CANNOT BE PROVED FROM CLI OUTPUT — read this before widening the rule.
 //
-// `@antseed/cli@0.1.128`'s `buyer deposit` runs SIX RPC calls inside one ora
+// `@antseed/cli@0.1.153`'s `buyer deposit --onchain` runs several RPC calls inside one ora
 // spinner, and TWO of them are broadcasts (an unconditional ERC-20 `approve`,
 // then the deposit itself), each followed by a `wait()` receipt poll:
 //
