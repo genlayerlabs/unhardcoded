@@ -1,8 +1,7 @@
 """
-Host half of the reliability form: offers_sync surfaces the OFFERS_TOP_N cheapest
-distinct peers per family (routes to rotate between) and stamps each offer with
-this route's host-measured reliability (offer.success_rate), which the algebra
-reads pointwise (llm-router #14).
+Host half of marketplace health: offers_sync applies durable route/peer cooldowns
+before selecting OFFERS_TOP_N distinct sellers, then stamps each retained offer
+with the route's measured reliability for the algebra to read pointwise.
 """
 from __future__ import annotations
 
@@ -15,6 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import host_store  # noqa: E402
 import route_reliability as rr  # noqa: E402
 from sources.antseed import AntSeedSource  # noqa: E402
 from conftest import seed_peer_offers as _seed_market, seed_route_obs  # noqa: E402
@@ -40,13 +40,19 @@ CATALOG = {
 FAMILY = "qwen3-235b-a22b"
 
 
-def _peer(pid, price_in, maxc=5, service=FAMILY):
-    return {
+def _peer(pid, price_in, maxc=5, service=FAMILY, *, reputation=None,
+          last_reached_at=None):
+    peer = {
         "peerId": pid, "maxConcurrency": maxc, "lastSeen": 1,
         "providerPricing": {"x": {"services": {
             service: {"inputUsdPerMillion": price_in,
                       "outputUsdPerMillion": price_in * 2}}}},
     }
+    if reputation is not None:
+        peer["onChainReputationScore"] = reputation
+    if last_reached_at is not None:
+        peer["lastReachedAt"] = last_reached_at
+    return peer
 
 
 def test_offers_sync_surfaces_top_n_distinct_peers(tmp_path):
@@ -66,12 +72,87 @@ def test_offers_sync_surfaces_top_n_distinct_peers(tmp_path):
 
 def test_offers_sync_stamps_host_measured_reliability(tmp_path):
     _seed_market([_peer("peerA", 0.5), _peer("peerB", 1.0)])
-    # peerA observed failing -> demoted; peerB never observed -> unstamped
-    seed_route_obs("antseed", FAMILY, "peerA", ok=False)
+    # peerA observed succeeding; peerB never observed -> unstamped
+    seed_route_obs("antseed", FAMILY, "peerA", ok=True)
     offers = AntSeedSource(CATALOG).offers_sync("antseed")
     by_peer = {o["peer_id"]: o for o in offers}
-    assert by_peer["peerA"]["success_rate"] == 0.0
+    assert by_peer["peerA"]["success_rate"] == 1.0
     assert by_peer["peerB"]["success_rate"] is None
+
+
+def test_market_refresh_preserves_known_reachability_when_payload_omits_it():
+    now = int(time.time() * 1000)
+    reached_at = now - 500
+    _seed_market([_peer("peerA", 0.5, last_reached_at=reached_at)],
+                 observed_at=now - 100)
+    # A later DHT browse can contain the offer without the buyer proxy's local
+    # liveness stamp. Keep the stronger fact and let its age expire naturally.
+    _seed_market([_peer("peerA", 0.5)], observed_at=now)
+    assert host_store.peer_offers()[0]["last_reached_at"] == reached_at
+
+
+def test_recent_failed_route_is_cooled_before_top_n(tmp_path):
+    _seed_market([_peer("broken", 0.01), _peer("healthy", 9.0)])
+    seed_route_obs("antseed", FAMILY, "broken", ok=False,
+                   error_kind="model_unavailable", http_status=404)
+    source = AntSeedSource(CATALOG)
+    offers = source.offers_sync("antseed")
+    assert [o["peer_id"] for o in offers] == ["healthy"]
+    assert source.snapshot_stats()["cooling_down"] == 1
+
+
+def test_failed_route_half_opens_after_bounded_cooldown(tmp_path):
+    from sources.antseed import MODEL_UNAVAILABLE_COOLDOWN_MAX_MS
+    now = int(time.time() * 1000)
+    _seed_market([_peer("peerA", 0.5)])
+    seed_route_obs(
+        "antseed", FAMILY, "peerA", ok=False,
+        error_kind="model_unavailable", http_status=404,
+        ts=now - MODEL_UNAVAILABLE_COOLDOWN_MAX_MS - 1,
+    )
+    source = AntSeedSource(CATALOG)
+    assert [o["peer_id"] for o in source.offers_sync("antseed")] == ["peerA"]
+    assert source.snapshot_stats()["half_open"] == 1
+
+
+def test_proven_healthy_seller_is_selected_before_cheaper_unknown(tmp_path, monkeypatch):
+    import settings
+    monkeypatch.setattr(settings, "_overrides", {"antseed.offers_top_n": 1})
+    _seed_market([_peer("cheap", 0.01), _peer("proven", 8.0)])
+    seed_route_obs("antseed", FAMILY, "proven", ok=True)
+    offers = AntSeedSource(CATALOG).offers_sync("antseed")
+    assert [o["peer_id"] for o in offers] == ["proven"]
+
+
+def test_recently_reached_seller_precedes_known_stale_seller(tmp_path, monkeypatch):
+    import settings
+    monkeypatch.setattr(settings, "_overrides", {"antseed.offers_top_n": 1})
+    now = int(time.time() * 1000)
+    _seed_market([
+        _peer("stale", 0.01, reputation=100,
+              last_reached_at=now - 7 * 24 * 60 * 60 * 1000),
+        _peer("recent", 1.0, reputation=10, last_reached_at=now),
+    ])
+    assert [o["peer_id"] for o in AntSeedSource(CATALOG).offers_sync("antseed")] \
+        == ["recent"]
+
+
+def test_transport_failure_cools_every_route_for_that_peer(tmp_path):
+    _seed_market([_peer("peerA", 0.5), _peer("peerB", 1.0)])
+    # The timeout was on another model, but it proves the peer transport/server
+    # unhealthy and must keep peerA out of this family's candidate set too.
+    seed_route_obs("antseed", "different-family", "peerA", ok=False,
+                   error_kind="timeout", http_status=504)
+    assert [o["peer_id"] for o in AntSeedSource(CATALOG).offers_sync("antseed")] \
+        == ["peerB"]
+
+
+def test_model_unavailable_does_not_cool_other_routes_on_same_peer(tmp_path):
+    _seed_market([_peer("peerA", 0.5)])
+    seed_route_obs("antseed", "different-family", "peerA", ok=False,
+                   error_kind="model_unavailable", http_status=404)
+    assert [o["peer_id"] for o in AntSeedSource(CATALOG).offers_sync("antseed")] \
+        == ["peerA"]
 
 
 def test_offers_sync_stamps_host_measured_latency(tmp_path):

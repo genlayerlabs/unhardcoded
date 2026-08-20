@@ -47,13 +47,18 @@ for (const peer of fresh.peers) {
   const maxc = posIntOrNull(peer.maxConcurrency);
   const rep = numOrNull(peer.onChainReputationScore);
   const lastSeen = numOrNull(peer.lastSeen);
+  // `lastSeen` is only a DHT advertisement sighting. `lastReachedAt` is the
+  // buyer's stronger signal that it actually connected to the peer; retain both
+  // so host admission never mistakes a repeatedly re-announced dead seller for
+  // an inference-ready one.
+  const lastReachedAt = numOrNull(peer.lastReachedAt);
   for (const pricing of Object.values(peer.providerPricing || {})) {
     for (const [service, sp] of Object.entries((pricing || {}).services || {})) {
       rows.push([
         peer.peerId, service,
         numOr0(sp.inputUsdPerMillion), numOr0(sp.outputUsdPerMillion),
         numOrNull(sp.cachedInputUsdPerMillion),
-        maxc, rep, lastSeen, now, now, now,
+        maxc, rep, lastSeen, lastReachedAt, now, now, now,
       ]);
     }
   }
@@ -61,13 +66,15 @@ for (const peer of fresh.peers) {
 
 const UPSERT = `INSERT INTO peer_offers
   (peer_id, service, price_in, price_out, price_cached_in, max_concurrency,
-   reputation, last_seen, observed_at, first_seen, fetched_at)
-  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+   reputation, last_seen, last_reached_at, observed_at, first_seen, fetched_at)
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
   ON CONFLICT (peer_id, service) DO UPDATE SET
     price_in=EXCLUDED.price_in, price_out=EXCLUDED.price_out,
     price_cached_in=EXCLUDED.price_cached_in,
     max_concurrency=EXCLUDED.max_concurrency, reputation=EXCLUDED.reputation,
-    last_seen=EXCLUDED.last_seen, observed_at=EXCLUDED.observed_at,
+    last_seen=EXCLUDED.last_seen,
+    last_reached_at=COALESCE(EXCLUDED.last_reached_at, peer_offers.last_reached_at),
+    observed_at=EXCLUDED.observed_at,
     fetched_at=EXCLUDED.fetched_at`;  // first_seen preserved across conflicts
 
 (async () => {

@@ -11,9 +11,17 @@ FROM node:22-slim AS antseed-dependencies
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 make g++ \
     && for install_attempt in 1 2 3; do \
-         if npm install -g @antseed/cli@0.1.128 pg@8.16.3; then break; fi; \
+         if npm install -g @antseed/cli@0.1.153 pg@8.16.3; then break; fi; \
          rm -rf /usr/local/lib/node_modules/@antseed \
            /usr/local/lib/node_modules/pg /usr/local/bin/antseed; \
+         if [ "${install_attempt}" = 3 ]; then exit 1; fi; \
+       done \
+    && mkdir -p /opt/antseed-plugins \
+    && cd /opt/antseed-plugins \
+    && npm init -y \
+    && for install_attempt in 1 2 3; do \
+         if npm install --ignore-scripts --save-exact @antseed/router-local@0.1.45; then break; fi; \
+         rm -rf node_modules package-lock.json; \
          if [ "${install_attempt}" = 3 ]; then exit 1; fi; \
        done \
     && rm -rf /var/lib/apt/lists/*
@@ -28,10 +36,15 @@ RUN apt-get update \
 # `pg` is the market writer's Postgres client (write-market.js upserts peer_offers
 # into the shared host store). NODE_PATH lets the scripts require these globals.
 COPY --from=antseed-dependencies /usr/local/lib/node_modules /usr/local/lib/node_modules
+# Since CLI 0.1.153 the default buyer router is a separately installed plugin.
+# Vendor the compatible release in the exact directory the CLI loads from so a
+# fresh container never reaches npm before it can join the P2P network.
+COPY --from=antseed-dependencies /opt/antseed-plugins /root/.antseed/plugins
 # Docker COPY dereferences the npm-created bin symlink. Recreate it explicitly
 # so Node resolves package imports from @antseed/cli instead of /usr/local/bin.
 RUN ln -s ../lib/node_modules/@antseed/cli/dist/cli/index.js /usr/local/bin/antseed
-ENV NODE_PATH=/usr/local/lib/node_modules
+ENV NODE_PATH=/usr/local/lib/node_modules \
+    ANTSEED_SKIP_PLUGIN_UPDATE_CHECK=1
 
 # Every non-test file under antseed/ — an explicit list silently ships a module
 # whose `require('./x.js')` has no target, and the control server then dies at

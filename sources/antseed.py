@@ -32,6 +32,66 @@ STALE_AFTER_S = 900
 # exists to prevent. Surfaced as `wallet_health` on the source stats.
 WEDGE_CONSECUTIVE_FAILURES = 10
 
+# Marketplace admission remembers failures longer than the algebra's 15-minute
+# reliability window. Otherwise a peer with zero successes becomes optimistically
+# healthy again every quarter hour and is retried forever. Cooldowns are bounded
+# and automatically half-open, so a recovered seller always gets another probe.
+ROUTE_HEALTH_WINDOW_MS = 24 * 60 * 60 * 1000
+ROUTE_COOLDOWN_BASE_MS = 15 * 60 * 1000
+ROUTE_COOLDOWN_MAX_MS = 60 * 60 * 1000
+MODEL_UNAVAILABLE_COOLDOWN_BASE_MS = 30 * 60 * 1000
+MODEL_UNAVAILABLE_COOLDOWN_MAX_MS = 6 * 60 * 60 * 1000
+PEER_COOLDOWN_BASE_MS = 5 * 60 * 1000
+PEER_RATE_LIMIT_COOLDOWN_BASE_MS = 60 * 1000
+PEER_COOLDOWN_MAX_MS = 60 * 60 * 1000
+REACHABILITY_FRESH_MS = STALE_AFTER_S * 1000
+
+
+def _cooldown_until(state: "dict | None", *, peer: bool = False) -> int:
+    """End of the exponential cooldown for one route/peer health state."""
+    if not state:
+        return 0
+    failures = int(state.get("consecutive_failures") or 0)
+    failed_at = state.get("last_failure_at")
+    if failures <= 0 or not isinstance(failed_at, (int, float)):
+        return 0
+    kind = state.get("latest_error_kind")
+    if peer:
+        base = (PEER_RATE_LIMIT_COOLDOWN_BASE_MS
+                if kind == "rate_limit" else PEER_COOLDOWN_BASE_MS)
+        maximum = PEER_COOLDOWN_MAX_MS
+    elif kind == "model_unavailable":
+        base = MODEL_UNAVAILABLE_COOLDOWN_BASE_MS
+        maximum = MODEL_UNAVAILABLE_COOLDOWN_MAX_MS
+    else:
+        base = ROUTE_COOLDOWN_BASE_MS
+        maximum = ROUTE_COOLDOWN_MAX_MS
+    # Bound the exponent before shifting: a hostile/noisy peer may have millions
+    # of failures, but no integer that large should enter admission arithmetic.
+    multiplier = 1 << min(max(failures - 1, 0), 10)
+    return int(failed_at) + min(maximum, base * multiplier)
+
+
+def _route_health_tier(state: "dict | None") -> int:
+    """0 proven healthy, 1 unexplored, 2 failed-but-half-open."""
+    if not state:
+        return 1
+    if int(state.get("consecutive_failures") or 0) > 0:
+        return 2
+    return 0 if state.get("last_success_at") is not None else 1
+
+
+def _reachability_tier(last_reached_at: Any, now_ms: int) -> int:
+    """0 recently connected, 1 never tried/invalid, 2 known stale."""
+    if not isinstance(last_reached_at, (int, float)) or isinstance(last_reached_at, bool):
+        return 1
+    age = now_ms - int(last_reached_at)
+    # A clock far in the future is not proof of reachability. Small negative ages
+    # are ordinary pod skew and count as fresh.
+    if age < -120_000:
+        return 1
+    return 0 if age <= REACHABILITY_FRESH_MS else 2
+
 # How many unbound wire names snapshot_stats() ranks. The point of the list is a
 # curation QUEUE an operator works top-down, not an inventory.
 UNBOUND_TOP_N = 20
@@ -259,11 +319,12 @@ class AntSeedSource:
 
     def _load_market(self) -> list[dict]:
         """[{peer_id, service, price_in, price_out, price_cached_in,
-        max_concurrency, reputation, last_seen}] per peer-service row from the
+        max_concurrency, reputation, last_seen, last_reached_at}] per peer-service row from the
         host store (written by the antseed sidecar within the sliding window), or
         [] when none are fresh (degraded: no antseed candidates). The fields are
         raw seller announcements: cap mirroring (price_cached_in), per-peer gating
-        (max_concurrency), reputation admission and dashboard freshness (last_seen)
+        (max_concurrency), reputation admission and reachability ranking
+        (last_seen/last_reached_at)
         are applied downstream in offers_sync / market_book."""
         rows = host_store.peer_offers(STALE_AFTER_S * 1000)
         self._stats["stale"] = not rows
@@ -585,6 +646,9 @@ class AntSeedSource:
         self._stats["rejected_by_buyer"] = 0
         self._stats["rejected_by_reputation"] = 0
         self._stats["denied"] = 0
+        self._stats["cooling_down"] = 0
+        self._stats["half_open"] = 0
+        self._stats["stale_reachability"] = 0
         self._stats["offers"] = 0
         self._stats["unbound_top"] = []
 
@@ -644,6 +708,14 @@ class AntSeedSource:
         rejected_by_buyer = 0
         rejected_by_reputation = 0
         denied = 0
+        cooling_down = 0
+        half_open = 0
+        stale_reachability = 0
+        now_ms = int(time.time() * 1000)
+        durable_health = host_store.marketplace_route_health(
+            provider_id, window_ms=ROUTE_HEALTH_WINDOW_MS)
+        route_health = durable_health.get("routes") or {}
+        peer_health = durable_health.get("peers") or {}
         # unbound wire name -> the distinct peers selling it (the curation queue)
         unbound: dict[str, set[str]] = {}
         # family -> rows, one per advertising peer
@@ -689,14 +761,43 @@ class AntSeedSource:
                          "variant": None}
                 uncurated += 1
                 unbound.setdefault(row["service"], set()).add(row["peer_id"])
-            by_family.setdefault(bound["family"], []).append({**row, **bound})
-        # Surface the OFFERS_TOP_N cheapest *distinct peers* per family as separate
-        # routable offers (not just the single cheapest), so the router can rotate
-        # to another seller via next_candidate when the cheapest is broken.
+            family = bound["family"]
+            rkey = _route_reliability.route_key(provider_id, family, row["peer_id"])
+            rhealth = route_health.get(rkey)
+            phealth = peer_health.get(row["peer_id"])
+            route_until = _cooldown_until(rhealth)
+            peer_until = _cooldown_until(phealth, peer=True)
+            if now_ms < route_until or now_ms < peer_until:
+                cooling_down += 1
+                continue
+            health_tier = max(_route_health_tier(rhealth),
+                              _route_health_tier(phealth))
+            if health_tier == 2:
+                half_open += 1
+            reachability_tier = _reachability_tier(
+                row.get("last_reached_at"), now_ms)
+            if reachability_tier == 2:
+                stale_reachability += 1
+            by_family.setdefault(family, []).append({
+                **row, **bound,
+                "_health_tier": health_tier,
+                "_reachability_tier": reachability_tier,
+            })
+        # Admission happens BEFORE OFFERS_TOP_N. The old price-first truncation
+        # let three cheap dead peers hide a healthy fourth peer forever. Prefer
+        # host-proven health, recent reachability and on-chain reputation when
+        # deciding which distinct sellers make the candidate set; the policy
+        # still compares their actual prices afterwards.
         top_n = settings.get("antseed.offers_top_n")
         kept_rows: list[dict] = []
         for rows in by_family.values():
-            rows.sort(key=lambda r: (r["price_in"], r["price_out"]))
+            rows.sort(key=lambda r: (
+                r["_health_tier"],
+                r["_reachability_tier"],
+                r.get("reputation") is None,
+                -(r.get("reputation") or 0),
+                r["price_in"], r["price_out"], r["peer_id"], r["service"],
+            ))
             seen_peers: set[str] = set()
             for r in rows:
                 if r["peer_id"] in seen_peers:
@@ -709,6 +810,9 @@ class AntSeedSource:
         self._stats["rejected_by_buyer"] = rejected_by_buyer
         self._stats["rejected_by_reputation"] = rejected_by_reputation
         self._stats["denied"] = denied
+        self._stats["cooling_down"] = cooling_down
+        self._stats["half_open"] = half_open
+        self._stats["stale_reachability"] = stale_reachability
         self._stats["offers"] = len(kept_rows)
         # WHICH names are unbound, ranked — a count alone can't be curated against.
         self._stats["unbound_top"] = self._unbound_top(unbound)
@@ -888,6 +992,7 @@ class AntSeedSource:
                     "price_in": r["price_in"],
                     "price_out": r["price_out"],
                     "last_seen": r.get("last_seen"),
+                    "last_reached_at": r.get("last_reached_at"),
                     "pinned_by": pinned.get(r["peer_id"], []),
                     "tradable_via": tradable_via,
                 })

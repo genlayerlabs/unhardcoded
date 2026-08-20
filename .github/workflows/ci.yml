@@ -97,6 +97,17 @@ jobs:
       - name: AntSeed CLI resolves its package dependencies inside the image
         run: docker run --rm --entrypoint antseed unhardcoded-antseed:ci --help >/dev/null
 
+      # CLI >=0.1.153 moved the default buyer router into a separately installed
+      # plugin. Loading it here (with runtime updates disabled by the image) proves
+      # a fresh pod does not need npm access before it can join the P2P network.
+      - name: Vendored AntSeed router plugin loads without runtime npm
+        run: >-
+          docker run --rm --network none --entrypoint node unhardcoded-antseed:ci
+          --input-type=module --eval
+          "const {loadRouterPlugin}=await import('/usr/local/lib/node_modules/@antseed/cli/dist/plugins/loader.js');
+          const plugin=await loadRouterPlugin('local');
+          if (plugin.type !== 'router') throw new Error('local router plugin did not load');"
+
       # --network host so the container reaches the runner's postgres service on
       # localhost; a bridged container cannot. No `|| true` on the run: a
       # container that fails to start must fail the job, not fall through to a
