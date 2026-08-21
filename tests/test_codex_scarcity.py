@@ -81,3 +81,58 @@ async def test_pricing_returns_scarcity_for_each_family():
     fams = {p["model_family"]: p for p in prices}
     assert set(fams) == {"gpt-5.5", "gpt-5.3-codex-spark"}
     assert fams["gpt-5.5"]["price_in_usd_per_mtok"] == 5.0
+
+
+# --- reset-aware hold -------------------------------------------------------
+# A 429 says "you are out"; the reset header says "until when". Without the
+# second, the ramp decays after quota_429_window_s (120s) and the router
+# re-probes a subscription it already knows is exhausted, every couple of
+# minutes, paying the full failed-call latency at the head of the cascade.
+
+
+def test_reset_header_holds_full_demote_until_it_passes():
+    s, h = _src()
+    now = int(time.time())
+    # ONE 429 (the 429 ramp alone would give 1/3), plus a reset an hour out.
+    s.ingest("openai_codex", {
+        "status": 429,
+        "headers": {"x-codex-primary-reset-after-seconds": "3600"},
+        "ts": now,
+    })
+    assert _price_in(h) == 5.0  # held fully demoted until the quota resets
+
+
+def test_reset_already_elapsed_falls_back_to_the_429_ramp():
+    s, h = _src()
+    now = int(time.time())
+    s.ingest("openai_codex", {
+        "status": 429,
+        "headers": {"x-codex-primary-reset-after-seconds": "1"},
+        "ts": now - 600,  # observed 10 min ago, so the 1s reset is long past
+    })
+    # the 429 itself has also aged out of the 120s window → recovered
+    assert _price_in(h) == 0.0
+
+
+def test_epoch_form_reset_header_is_understood():
+    s, h = _src()
+    now = int(time.time())
+    s.ingest("openai_codex", {
+        "status": 429,
+        "headers": {"x-codex-primary-reset-at": str(now + 3600)},
+        "ts": now,
+    })
+    assert _price_in(h) == 5.0
+
+
+def test_reset_header_without_a_429_does_not_demote():
+    s, h = _src()
+    now = int(time.time())
+    # a healthy 200 that merely reports when the window rolls over must not
+    # be read as exhaustion
+    s.ingest("openai_codex", {
+        "status": 200,
+        "headers": {"x-codex-primary-reset-after-seconds": "3600"},
+        "ts": now,
+    })
+    assert _price_in(h) == 0.0
