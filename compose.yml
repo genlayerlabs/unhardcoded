@@ -32,6 +32,7 @@ services:
       # ingress stamps). Both unset -> feature off, platform keys only.
       CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-}
       CONTROL_PLANE_INTERNAL_SECRET: ${CONTROL_PLANE_INTERNAL_SECRET:-}
+      SAAS_SHARED_PROVIDERS: ${SAAS_SHARED_PROVIDERS:-}
     depends_on:
       postgres:
         condition: service_healthy

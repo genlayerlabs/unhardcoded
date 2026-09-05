@@ -118,6 +118,7 @@ _SCHEMA_STATEMENTS = [
     # tautological; 'subscription' = $0). Lets the cost-accuracy panel flag only
     # rows with real signal instead of training the operator to ignore drift.
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS cost_basis TEXT",
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS routing_summary JSONB",
     # Per-ATTEMPT route observations (one row per provider call the engine made,
     # including failed fallback tries — a grain `calls` does NOT have: `calls` is
     # per-REQUEST, final route only). The RAW from which reliability/latency are
@@ -380,6 +381,22 @@ def _route_key(provider: "str | None", family: "str | None",
 
 # ---- calls ledger (best-effort telemetry) --------------------------------------
 
+def routing_summary(trace) -> dict | None:
+    """Bounded explanation only: never persist prompts, output, raw error bodies
+    or the full candidate catalog in the tenant activity ledger."""
+    if not isinstance(trace, dict):
+        return None
+    summary = {key: str(trace[key])[:100] for key in ('route', 'route_revision', 'policy_id', 'routing_preference')
+               if trace.get(key) is not None}
+    summary['attempts'] = [
+        {key: str(step[key])[:160] for key in ('provider_id', 'model_family', 'error_kind')
+         if step.get(key) is not None}
+        for step in (trace.get('decision_path') or [])[:32]
+        if isinstance(step, dict) and step.get('event') == 'attempted'
+    ]
+    summary['deadline_exceeded'] = trace.get('request_deadline_exceeded') is True
+    return summary
+
 def insert_call(row: dict[str, Any]) -> None:
     """Record one call into the ledger from a usage-history-shaped row. Fail-soft:
     never raises into the request path. Best-effort telemetry."""
@@ -406,6 +423,7 @@ def insert_call(row: dict[str, Any]) -> None:
             # route stats from. Raw here; combining into a route key is a later step.
             row.get("served_by"),
             row.get("cost_basis"),   # how cost_usd was determined (reported/computed/…)
+            json.dumps(routing_summary(row.get("decision_trace"))),
         )
         with _get_pool().connection() as conn:   # one transaction, auto commit/rollback
             conn.execute(
@@ -413,8 +431,8 @@ def insert_call(row: dict[str, Any]) -> None:
                 " caller, route_key, provider_id, model_family, served_model_id,"
                 " requested_model, status, error_type, latency_ms, tokens_in,"
                 " tokens_out, tokens_total, tokens_cached, cost_usd, served_by,"
-                " cost_basis)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", values)
+                " cost_basis, routing_summary)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)", values)
             caller = row.get("caller")
             cost = row.get("cost_usd")
             if caller and isinstance(cost, (int, float)) and float(cost) > 0:

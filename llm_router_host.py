@@ -126,6 +126,9 @@ class LLMRouterHost:
         logger: Logger | None = None,
         enforce_provider_auth: bool | None = None,
     ):
+        self._source_paths = (router_path, config_path, metrics_path)
+        self._tenant_id = None
+        self._tenant_allowed = None
         self.lua = LuaRuntime(unpack_returned_tuples=True)
 
         self._custom_call_hook = call_provider is not None
@@ -232,18 +235,76 @@ end
             "version": self.router.ir.VERSION,
         }
 
-    def normalize_policy(self, policy_ir: list) -> dict:
+    def normalize_policy(self, policy_ir: list, *, admit: bool = False) -> dict:
         """Normalize a raw Σ_pol term and stamp its identity — the builder's
-        download/identify step when the frontend composes the IR directly
-        (rather than via the declarative elaborate surface). Like build_policy,
-        the term is canonicalized but NOT admitted; admission happens where it
-        is used (rank preview / execution)."""
-        nf = self.router.ir.term.normalize(_to_lua(self.lua, policy_ir))
+        download/identify step when the frontend composes the IR directly.
+        Optional admission uses the engine's field schema; execution additionally
+        applies the host envelope. The default retains the existing normalize-only
+        API. SHA-256 hashes the engine's canonical encoding."""
+        import hashlib
+        term = _to_lua(self.lua, policy_ir)
+        if admit:
+            self._flow_module()
+            nf = self.router.ir.compile(term, _to_lua(self.lua, {"schema": self._flow_schema})).term
+        else:
+            nf = self.router.ir.term.normalize(term)
+        encoded = self.router.ir.term.encode(nf)
         return {
             "policy_ir": _to_py(nf),
             "fingerprint": self.router.ir.term.fingerprint(nf),
             "version": self.router.ir.VERSION,
+            "policy_id": hashlib.sha256(encoded.encode()).hexdigest(),
         }
+
+    def for_tenant(self, tenant_id: int, env: dict, managed_providers=(), connections=None):
+        """A request-local engine: credential failures cannot disable other tenants.
+
+        Reuses the same engine, catalog files, live discovery and HTTP adapters.
+        Only the Lua runtime and credential set are isolated. No tenant VM cache
+        retains secrets after the request finishes.
+        """
+        from provider_connections import auth_env, shared_provider_ids
+        catalog = self.catalog()
+        managed = set(managed_providers).intersection(shared_provider_ids(catalog))
+        scoped_env = dict(env)
+        scoped_env['SAAS_TENANT_SCOPE'] = str(tenant_id)
+        allowed = set(managed)
+        for pid, provider in (catalog.get('providers') or {}).items():
+            key = auth_env(provider)
+            if key and env.get(key):
+                allowed.add(pid)
+                managed.discard(pid)  # BYO credentials take precedence for this provider.
+            elif key and pid in managed and self._env.get(key):
+                scoped_env[key] = self._env[key]
+        from tenant_providers import configure
+        byo = connections or {}
+        byo_ids = configure(catalog, scoped_env, byo)
+        allowed.update(byo_ids)
+        managed.difference_update(byo_ids)
+        child = type(self)(*self._source_paths, env=scoped_env, now_ms=self._now_ms,
+                           call_provider_async=self._async_call_hook,
+                           call_provider=self._call_hook, discover=self._discover_hook,
+                           enforce_provider_auth=True)
+        # Include runtime-added providers/models, not just the initial files.
+        child.config.providers = _to_lua(child.lua, catalog.get('providers') or {})
+        child.config.models = _to_lua(child.lua, catalog.get('models') or {})
+        child._tenant_id = tenant_id
+        child._tenant_allowed = allowed
+        child._tenant_managed = managed
+        child._tenant_connections = byo
+        child._tenant_offers = {}
+        child._mock_responses = self._mock_responses
+        child.init()
+        # Copy model observations only; operator credential health is unrelated.
+        state = child.dump_state()
+        live = self.dump_state()
+        state["ema_metrics"] = {key: value for key, value in (live.get("ema_metrics") or {}).items()
+                                if not key.startswith('__credits|') or key.split('|', 1)[1] in managed}
+        for slot in ('circuit_breakers', 'disabled_providers'):
+            state.setdefault(slot, {}).update({pid: value for pid, value in (live.get(slot) or {}).items()
+                                              if pid in managed})
+        child.restore_state(state)
+        return child
 
     # ---- Σ_flow: composition over Σ_pol ---------------------------------
 
@@ -536,7 +597,9 @@ end
         # observation too, the host-owned perf the algebra reads (derived) and the
         # market view surfaces (#15/#4a). Mocks record as well, so a mocked call
         # is measured exactly like a live one.
-        _fold_route_outcome(request, result, session=session)
+        if not (self._tenant_id is not None and result.get("error_kind") in
+                {"auth_error", "rate_limit", "payment_required"}):
+            _fold_route_outcome(request, result, session=session)
         return result
 
     def dump_state(self) -> dict:
@@ -561,6 +624,8 @@ end
         OAuth providers that do not expose an env-backed token are left to their
         adapter because their readiness is backend-specific and refreshable.
         """
+        if self._tenant_allowed is not None and provider_id not in self._tenant_allowed:
+            return False
         auth = provider.get("auth") if isinstance(provider.get("auth"), dict) else None
         kind = auth.get("kind") if auth else None
         env = provider.get("auth_env") or (auth.get("env") if auth else None)
@@ -709,11 +774,21 @@ end
         return _to_lua(self.lua, resp)
 
     def _h_discover(self, discovery_id):
+        if discovery_id in getattr(self, '_tenant_offers', {}):
+            return _to_lua(self.lua, {'ok': True, 'offers': self._tenant_offers[discovery_id]})
+        if self._tenant_allowed is not None:
+            allowed = any(pid in self._tenant_allowed and p.discovery_id == discovery_id
+                          for pid, p in self.config.providers.items())
+            if not allowed:
+                return _to_lua(self.lua, {"ok": False, "error": "provider_not_connected"})
         if not self._discover_hook:
             return _to_lua(self.lua, {"ok": False, "error": "no_discover_hook"})
         return _to_lua(self.lua, self._discover_hook(discovery_id))
 
     def _h_price_multiplier(self, provider_id, source_name=None) -> float:
+        if self._tenant_id is not None:
+            # Operator subsidies/shadow prices do not describe BYO token bills.
+            return 1.0
         import settings
 
         for name in (provider_id, source_name):

@@ -150,8 +150,10 @@ class BedrockSource:
             return self._bedrock_client
         if self._bedrock_client_factory is not None:
             return self._bedrock_client_factory(region)
-        import boto3
-        return boto3.client("bedrock", region_name=region)
+        from provider_adapters.aws_credentials import client
+        from botocore.config import Config
+        return client("bedrock", region, self._env_get,
+                      config=Config(connect_timeout=5, read_timeout=10, retries={'max_attempts': 1}))
 
     async def _bedrock_catalog(self, region: str) -> list[dict]:
         client = self._aws_client(region)

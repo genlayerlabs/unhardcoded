@@ -125,7 +125,7 @@ def _parse_resolved(data: Any) -> ResolvedKey:
         return out if out > 0 else None
 
     consumer = str(data.get("consumer") or "").strip() or None
-    active = bool(data.get("active")) and consumer is not None
+    active = bool(data.get("active")) and consumer is not None and _opt_int(data.get("tenant_id")) is not None
     return ResolvedKey(
         active=active,
         consumer=consumer if active else None,
@@ -211,7 +211,7 @@ async def resolve_key(digest: str) -> ResolvedKey | None:
 
 async def tenant_env(tenant_id: int) -> dict[str, str]:
     """Cached BYO provider env for a tenant, filtered through ENV_ALLOWLIST.
-    Fail-soft: refetch error -> stale within grace -> {} (platform keys)."""
+    A missing map is an empty tenant credential set, never platform credentials."""
     if not enabled():
         return {}
     now = time.monotonic()
@@ -225,7 +225,9 @@ async def tenant_env(tenant_id: int) -> dict[str, str]:
         )
         resp.raise_for_status()
         raw = resp.json().get("env")
-    except (httpx.HTTPError, ValueError) as exc:
+        if not isinstance(raw, dict):
+            raise ValueError("invalid credential map")
+    except (httpx.HTTPError, ValueError, AttributeError) as exc:
         if cached is not None and now - cached[1] <= TENANT_ENV_TTL_S + TENANT_ENV_STALE_GRACE_S:
             log.warning(json.dumps({"event": "tenant_env_stale_grace", "tenant_id": tenant_id}))
             return cached[0]
@@ -242,8 +244,29 @@ async def tenant_env(tenant_id: int) -> dict[str, str]:
     return env
 
 
+async def tenant_connections(tenant_id: int, allowed_env: set[str]) -> tuple[dict, dict]:
+    """Fresh closed credential scope and encrypted structured BYO connections.
+    The loaded catalog, not a second hardcoded list, declares credential names.
+    An unavailable control plane grants nothing; no stale authorization."""
+    if not enabled():
+        return {}, {}
+    try:
+        response = await _get_client().get(
+            f"{CONTROL_PLANE_URL}/internal/tenants/{int(tenant_id)}/provider-env",
+            headers={"x-internal-secret": CONTROL_PLANE_INTERNAL_SECRET})
+        response.raise_for_status()
+        data = response.json()
+        raw, connections = data.get('env'), data.get('connections', {})
+        if not isinstance(raw, dict) or not isinstance(connections, dict):
+            raise ValueError('invalid connection scope')
+        return ({k: v for k, v in raw.items() if k in allowed_env and isinstance(v, str) and v},
+                {p: c for p, c in connections.items() if p in {'bedrock', 'antseed'} and isinstance(c, dict)})
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return {}, {}
+
+
 def activate_tenant_env(env: dict[str, str] | None) -> contextvars.Token:
-    return _TENANT_ENV.set(env or None)
+    return _TENANT_ENV.set(env)
 
 
 def reset_tenant_env(token: contextvars.Token) -> None:
@@ -251,11 +274,34 @@ def reset_tenant_env(token: contextvars.Token) -> None:
 
 
 def env_get(name: str) -> str | None:
-    """Adapter credential lookup: per-request tenant map first, then process env."""
+    """Tenant credentials are a closed set. Only operator calls use process env."""
     override = _TENANT_ENV.get()
-    if override and name in override:
-        return override[name]
+    if override is not None:
+        return override.get(name)
     return os.environ.get(name)
+
+
+class RouteUnavailable(RuntimeError):
+    pass
+
+
+async def resolve_route(tenant_id: int, name: str) -> dict:
+    """Resolve the published revision on every call, so publish/pause is immediate."""
+    try:
+        response = await _get_client().get(
+            f"{CONTROL_PLANE_URL}/internal/tenants/{tenant_id}/routes/{name}",
+            headers={"x-internal-secret": CONTROL_PLANE_INTERNAL_SECRET},
+        )
+        response.raise_for_status()
+        data = response.json()
+        if (not isinstance(data.get("policy_ir"), list)
+                or not isinstance(data.get("policy_id"), str) or len(data["policy_id"]) != 64
+                or not isinstance(data.get("revision"), int) or data["revision"] <= 0
+                or not isinstance(data.get("execution", {}), dict)):
+            raise ValueError("invalid route contract")
+        return data
+    except (httpx.HTTPError, ValueError, AttributeError) as exc:
+        raise RouteUnavailable("This route is unavailable or has not been published.") from exc
 
 
 def log_collision_once(consumer: str) -> None:

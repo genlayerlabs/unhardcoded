@@ -7,6 +7,7 @@ shared Postgres fixture (host_store_clean).
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sys
 import time
@@ -47,6 +48,11 @@ class _FakeCPClient:
         self.calls = 0
 
     async def get(self, url, params=None, headers=None):
+        if '/routes/' in url:
+            return httpx.Response(200, request=httpx.Request('GET', url), json={
+                'route':'route:production', 'revision':2, 'policy_id':'a'*64,
+                'policy_ir':['policy', ['top'], ['zero'], ['ordered'], ['id'], ['always', {'action':'abort'}]],
+                'execution':{'timeout_ms':8000, 'first_token_timeout_ms':8000}})
         self.calls += 1
         item = self.payloads.pop(0)
         if isinstance(item, Exception):
@@ -72,7 +78,7 @@ class _FakeUpstream:
         self.requests: list[dict] = []
 
     def build_request(self, method, url, content=None, headers=None):
-        self.requests.append({"method": method, "url": url, "headers": headers or {}})
+        self.requests.append({"method": method, "url": url, "headers": headers or {}, "body": content})
         return object()
 
     async def send(self, req, stream=True):
@@ -82,12 +88,10 @@ class _FakeUpstream:
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     cpc.reset_for_tests()
-    auth_proxy._windows.clear()
     monkeypatch.setattr(cpc, "CONTROL_PLANE_URL", "http://cp.test")
     monkeypatch.setattr(cpc, "CONTROL_PLANE_INTERNAL_SECRET", "s3cret")
     yield
     cpc.reset_for_tests()
-    auth_proxy._windows.clear()
 
 
 def _cp(monkeypatch, payloads) -> _FakeCPClient:
@@ -106,7 +110,7 @@ def _post_chat(client, token: str, extra_headers: dict | None = None):
     headers = {"Authorization": f"Bearer {token}"}
     headers.update(extra_headers or {})
     return client.post("/v1/chat/completions", headers=headers,
-                       json={"model": "profile:default", "messages": []})
+                       json={"model": "route:production", "messages": []})
 
 
 # ---- key resolution ----------------------------------------------------------
@@ -133,7 +137,10 @@ def test_cp_resolved_key_proxies_with_caller_and_tenant_headers(monkeypatch):
     fwd = upstream.requests[0]["headers"]
     assert fwd["x-llm-router-caller"] == "acme"
     assert fwd["x-llm-router-tenant"] == "7"          # authed value, not the smuggled 999
-    assert "x-internal-secret" not in fwd
+    assert fwd["x-internal-secret"] == "s3cret"
+    assert fwd["x-unhardcoded-revision"] == "2"
+    assert fwd["x-unhardcoded-policy-id"] == 'a'*64
+    assert json.loads(upstream.requests[0]['body'])['policy_ir'][0] == 'policy'
 
 
 def test_second_request_served_from_resolve_cache(monkeypatch):
@@ -208,6 +215,113 @@ def test_cp_caller_lands_in_the_ledger_under_the_tenant_slug(monkeypatch):
     rows = host_store.recent_calls(caller="acme")
     assert len(rows) == 1
     assert rows[0]["caller"] == "acme"
+
+
+def test_saas_policy_override_and_endpoint_escape_are_blocked(monkeypatch):
+    require_host_store()
+    _cp(monkeypatch, [{'active':True, 'consumer':'acme', 'tenant_id':7}])
+    upstream = _upstream(monkeypatch)
+    client = TestClient(auth_proxy.app)
+    headers = {'Authorization':'Bearer tok-route', 'x-unhardcoded-policy-id':'forged'}
+    for model in ('pin:platform/forbidden', 'profile:default'):
+        assert client.post('/v1/chat/completions', headers=headers, json={'model':model}).status_code == 400
+    assert client.get('/v1/models', headers=headers).status_code == 400
+    r = client.post('/v1/chat/completions', headers=headers, json={
+        'model':'route:production', 'messages':[], 'policy_ir':['forged'],
+        'flow_ir':['forged'], 'timeout_ms':999999, 'first_token_timeout_ms':999999})
+    assert r.status_code == 200
+    body = json.loads(upstream.requests[0]['body'])
+    assert body['policy_ir'][0] == 'policy' and 'flow_ir' not in body
+    assert body['timeout_ms'] == body['first_token_timeout_ms'] == 8000
+    assert upstream.requests[0]['headers']['x-unhardcoded-policy-id'] == 'a'*64
+
+
+@pytest.mark.parametrize('path', ['/v1/chat/completions', '/v1/responses'])
+def test_only_published_preferences_reach_upstream(monkeypatch, path):
+    require_host_store()
+    _cp(monkeypatch, [{'active':True, 'consumer':'acme', 'tenant_id':7}])
+    upstream = _upstream(monkeypatch)
+    default = ['policy', ['top'], ['zero'], ['ordered'], ['id'], ['always', {'action':'abort'}]]
+    variant = ['policy', ['bottom'], ['zero'], ['ordered'], ['id'], ['always', {'action':'abort'}]]
+    async def resolve(*args):
+        return {'revision': 1, 'policy_ir': default, 'policy_id': 'a'*64,
+                'execution': {'timeout_ms': 8000, 'first_token_timeout_ms': 8000},
+                'preferences': {'cost': {'policy_ir': variant, 'policy_id': 'b'*64}}}
+    monkeypatch.setattr(cpc, 'resolve_route', resolve)
+    client = TestClient(auth_proxy.app)
+    headers = {'Authorization':'Bearer preferences', 'x-unhardcoded-preference':'forged'}
+    body = {'model':'route:production', 'messages':[], 'routing_preference':'speed'}
+    response = client.post(path, headers=headers, json=body)
+    assert response.status_code == 400 and response.json()['error']['code'] == 'preference_not_allowed'
+    assert upstream.requests == []
+    response = client.post(path, headers=headers, json={**body, 'routing_preference':'cost',
+        'policy_ir':['forged'], 'timeout_ms': 999999, 'flow_ir':['forged']})
+    assert response.status_code == 200
+    routed = json.loads(upstream.requests[0]['body'])
+    assert routed['policy_ir'] == variant
+    assert routed['timeout_ms'] == 8000 and 'flow_ir' not in routed and 'routing_preference' not in routed
+    assert upstream.requests[0]['headers']['x-unhardcoded-policy-id'] == 'b'*64
+    assert upstream.requests[0]['headers']['x-unhardcoded-preference'] == 'cost'
+
+
+def test_route_resolution_failure_does_not_call_router(monkeypatch):
+    require_host_store()
+    _cp(monkeypatch, [{'active':True, 'consumer':'acme', 'tenant_id':7}])
+    upstream = _upstream(monkeypatch)
+    async def unavailable(*args):
+        raise cpc.RouteUnavailable('Route unavailable')
+    monkeypatch.setattr(cpc, 'resolve_route', unavailable)
+    assert _post_chat(TestClient(auth_proxy.app), 'tok-route').status_code == 503
+    assert upstream.requests == []
+
+
+@pytest.mark.parametrize('path', ['/v1/chat/completions', '/v1/responses'])
+def test_full_ingress_to_engine_alias_and_failover(monkeypatch, path):
+    """Actual ingress + shim + Lua, with only CP HTTP and providers faked."""
+    require_host_store()
+    import asyncio
+    from llm_router_host import LLMRouterHost
+    from saas_routes import compile_intent
+    from shim import create_app
+    term = compile_intent({'targets':['openai|primary', 'anthropic|backup']})
+    host = LLMRouterHost(ROOT/'core/router.lua', ROOT/'tests/fixtures/saas.lua')
+    host.init()
+    seen = []
+    async def call(request):
+        seen.append((request['provider_id'], cpc.env_get('OPENAI_API_KEY')))
+        if request['provider_id'] == 'openai':
+            return {'ok':False, 'error_kind':'server_error'}
+        return {'ok':True, 'latency_ms':10, 'response':{'text':'Fallback works', 'tokens_in':2, 'tokens_out':3}}
+    host.set_async_call_hook(call)
+    def cp_http(request):
+        if request.url.path.endswith('/provider-env'):
+            data = {'env':{'OPENAI_API_KEY':'sk-tenant', 'ANTHROPIC_API_KEY':'sk-backup'}}
+        elif '/routes/' in request.url.path:
+            data = {'policy_ir':term, 'policy_id':host.normalize_policy(term)['policy_id'],
+                    'revision':3, 'execution':{'timeout_ms':8000}, 'route':'route:production'}
+        else:
+            data = {'active':True, 'consumer':'acme', 'tenant_id':7}
+        return httpx.Response(200, json=data)
+    cp_client = httpx.AsyncClient(transport=httpx.MockTransport(cp_http))
+    shim_client = httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(host)), base_url='http://router.test')
+    monkeypatch.setattr(cpc, '_client', cp_client)
+    monkeypatch.setattr(auth_proxy, '_client', shim_client)
+    body = {'model':'route:production', 'messages':[{'role':'user','content':'hi'}]} if 'chat' in path else {'model':'route:production','input':'hi'}
+    try:
+        r = TestClient(auth_proxy.app).post(path, headers={'Authorization':'Bearer full-chain'}, json=body)
+        assert r.status_code == 200, r.text
+        trace = r.json()['x_router']['decision_trace']
+        assert trace['route_revision'] == '3'
+        assert trace['route'] == 'route:production'
+        assert [s['provider_id'] for s in trace['decision_path'] if s['event'] == 'attempted'] == ['openai', 'anthropic']
+        assert seen == [('openai','sk-tenant'), ('anthropic','sk-tenant')]
+        host_store._write_q.join()
+        row = host_store.recent_calls(caller='acme')[0]
+        assert row['routing_summary']['route_revision'] == '3'
+        assert row['routing_summary']['attempts'][0]['error_kind'] == 'server_error'
+    finally:
+        asyncio.run(cp_client.aclose())
+        asyncio.run(shim_client.aclose())
 
 
 # ---- /internal/usage surface ---------------------------------------------------

@@ -37,6 +37,10 @@ def test_antseed_node_unit_tests():
     _run_node_test("antseed/db.test.js")
 
 
+def test_antseed_byo_gateway():
+    _run_node_test('antseed/byo-gateway.test.js')
+
+
 def test_antseed_control_amount_cap():
     """The control server's deposit-amount guard (antseed/amount.js). /deposit is
     now called autonomously by the router's wallet keeper, so the per-deposit

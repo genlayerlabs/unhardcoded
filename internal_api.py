@@ -92,6 +92,7 @@ async def internal_usage_recent(request: Request, caller: str = "",
             "tokens_cached": row.get("tokens_cached"),
             "cost_usd": row.get("cost_usd"),
             "error_type": row.get("error_type"),
+            "routing_summary": row.get("routing_summary"),
             "key_sha256_prefix": (row.get("consumer_sha") or "")[:12] or None,
         })
     return JSONResponse({"caller": caller, "calls": calls})

@@ -3930,6 +3930,28 @@ async def proxy(path: str, request: Request) -> Response:
     consumer_meta = auth.get("meta") or {}
     body = await request.body()
     requested_route = _requested_route_from(path, body)
+    published_route = None
+    if auth.get("tenant_id") is not None:
+        # SaaS keys address published routes only. Raw policies, profiles and
+        # pins cannot replace the workspace's published restrictions.
+        import re
+        if (request.method != "POST" or path not in {"v1/chat/completions", "v1/responses"}
+                or not re.fullmatch(r"route:[a-z0-9][a-z0-9-]{0,79}", requested_route or "")):
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "Use a published route, for example model='route:production'.",
+                "type": "invalid_request_error", "code": "route_required"}})
+        from route_contract import apply_contract, PreferenceNotAllowed
+        try:
+            published_route = await control_plane_client.resolve_route(
+                auth["tenant_id"], requested_route[6:])
+            payload, published_route = apply_contract(json.loads(body), published_route)
+            body = json.dumps(payload, separators=(",", ":")).encode()
+        except PreferenceNotAllowed as exc:
+            return JSONResponse(status_code=400, content={'error': {
+                'message': str(exc), 'type': 'invalid_request_error', 'code': 'preference_not_allowed'}})
+        except control_plane_client.RouteUnavailable as exc:
+            return JSONResponse(status_code=503, content={"error": {
+                "message": str(exc), "type": "server_error", "code": "route_unavailable"}})
     if not _route_allowed(caller, requested_route, consumer_meta):
         _record_reject(reason="route_not_allowed", path="/" + path, caller=caller, status=403, route=requested_route)
         _log({"event": "reject", "reason": "route_not_allowed", "caller": caller, "path": "/" + path, "route": requested_route})
@@ -4002,7 +4024,8 @@ async def proxy(path: str, request: Request) -> Response:
     headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in {"authorization", "host", "connection", "content-length",
-                             "x-llm-router-tenant", "x-internal-secret"}
+                             "x-llm-router-tenant", "x-internal-secret",
+                             "x-unhardcoded-route", "x-unhardcoded-revision", "x-unhardcoded-policy-id", "x-unhardcoded-preference"}
     }
     headers["x-llm-router-caller"] = caller
     # Tenant identity for per-tenant provider credentials (BYO keys): set ONLY
@@ -4010,6 +4033,11 @@ async def proxy(path: str, request: Request) -> Response:
     # so it can never be smuggled past auth.
     if auth.get("tenant_id") is not None:
         headers["x-llm-router-tenant"] = str(auth["tenant_id"])
+        headers["x-internal-secret"] = control_plane_client.CONTROL_PLANE_INTERNAL_SECRET
+        headers["x-unhardcoded-route"] = requested_route
+        headers["x-unhardcoded-revision"] = str(published_route["revision"])
+        headers["x-unhardcoded-policy-id"] = published_route["policy_id"]
+        headers['x-unhardcoded-preference'] = published_route.get('routing_preference', 'default')
 
     status = 502
     provider = None
@@ -4033,11 +4061,16 @@ async def proxy(path: str, request: Request) -> Response:
     session_id = request.headers.get("x-unhardcoded-session")
 
     def _finish():
-        nonlocal capacity_released
+        nonlocal capacity_released, decision_trace
         if capacity_released:
             return
         capacity_released = True
         latency_ms = round((time.perf_counter() - started) * 1000, 1)
+        if published_route:
+            decision_trace = {**(decision_trace or {}), 'route': requested_route,
+                              'route_revision': published_route['revision'],
+                              'policy_id': published_route['policy_id'],
+                              'routing_preference': published_route.get('routing_preference', 'default')}
         try:
             _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
             _metric_request(status, latency_ms)

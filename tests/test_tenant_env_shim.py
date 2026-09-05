@@ -59,8 +59,7 @@ def _clean(monkeypatch):
 def host():
     h = LLMRouterHost(
         router_path=ROOT / "core" / "router.lua",
-        config_path=ROOT / "core" / "config.example.lua",
-        metrics_path=ROOT / "core" / "metrics.example.lua",
+        config_path=ROOT / "tests" / "fixtures" / "saas.lua",
         now_ms=lambda: 1_000_000,
         # The custom call hook below would otherwise turn on auth enforcement
         # and pre-disable every example provider (their env keys are unset here).
@@ -90,7 +89,7 @@ def _capture_hook(seen: list):
 
 
 def _chat(client, tenant: int | None):
-    headers = {"x-llm-router-tenant": str(tenant)} if tenant is not None else {}
+    headers = {"x-llm-router-tenant": str(tenant), "x-internal-secret": "s3cret"} if tenant is not None else {}
     return client.post("/v1/chat/completions", headers=headers,
                        json={"model": "profile:default",
                              "messages": [{"role": "user", "content": "hi"}]})
@@ -118,7 +117,40 @@ def test_no_header_uses_platform_key(host, monkeypatch):
     assert fake.calls == []
 
 
-def test_feature_off_ignores_header(host, monkeypatch):
+def test_missing_tenant_credentials_never_use_platform_or_other_providers(host, monkeypatch):
+    monkeypatch.setenv('OPENAI_API_KEY', 'sk-platform')
+    monkeypatch.setattr(cpc, '_client', _FakeCPClient({}))
+    seen = []
+    host.set_async_call_hook(_capture_hook(seen))
+    client = TestClient(create_app(host, default_profile='default'))
+    assert _chat(client, tenant=7).status_code != 200
+    assert seen == []
+    assert cpc.env_get('OPENAI_API_KEY') == 'sk-platform'
+
+
+def test_untrusted_context_and_internal_catalog_are_rejected(host):
+    client = TestClient(create_app(host))
+    assert client.get('/x/saas/catalog').status_code == 403
+    assert client.post('/v1/chat/completions', headers={'x-llm-router-tenant':'7'}, json={}).status_code == 403
+    assert client.get('/x/runtime', headers={'x-llm-router-tenant':'7', 'x-internal-secret':'s3cret'}).status_code == 404
+
+
+def test_tenant_preview_uses_engine_without_provider_call(host, monkeypatch):
+    monkeypatch.setattr(cpc, '_client', _FakeCPClient({7:{'OPENAI_API_KEY':'sk-tenant'}}))
+    seen = []
+    host.set_async_call_hook(_capture_hook(seen))
+    client = TestClient(create_app(host))
+    headers = {'x-llm-router-tenant':'7', 'x-internal-secret':'s3cret'}
+    catalog = client.get('/x/saas/catalog', headers=headers).json()['models']
+    assert {m['provider'] for m in catalog} == {'openai'}
+    preview = client.post('/x/saas/preview', headers=headers, json={'targets':['openai|primary']})
+    assert preview.status_code == 200, preview.text
+    assert preview.json()['ranked'][0]['family'] == 'primary'
+    assert len(preview.json()['policy_id']) == 64
+    assert seen == []
+
+
+def test_feature_off_rejects_tenant_header(host, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-platform")
     monkeypatch.setattr(cpc, "CONTROL_PLANE_URL", "")
     fake = _FakeCPClient({7: {"OPENAI_API_KEY": "sk-tenant"}})
@@ -126,8 +158,8 @@ def test_feature_off_ignores_header(host, monkeypatch):
     seen: list = []
     host.set_async_call_hook(_capture_hook(seen))
     client = TestClient(create_app(host, default_profile="default"))
-    assert _chat(client, tenant=7).status_code == 200
-    assert seen == ["sk-platform"]
+    assert _chat(client, tenant=7).status_code == 403
+    assert seen == []
     assert fake.calls == []
 
 
@@ -150,9 +182,9 @@ def test_concurrent_tenants_are_isolated(host, monkeypatch):
                     "messages": [{"role": "user", "content": "hi"}]}
             r1, r2, r3 = await asyncio.gather(
                 c.post("/v1/chat/completions", json=body,
-                       headers={"x-llm-router-tenant": "1"}),
+                       headers={"x-llm-router-tenant": "1", "x-internal-secret": "s3cret"}),
                 c.post("/v1/chat/completions", json=body,
-                       headers={"x-llm-router-tenant": "2"}),
+                       headers={"x-llm-router-tenant": "2", "x-internal-secret": "s3cret"}),
                 c.post("/v1/chat/completions", json=body),
             )
             assert r1.status_code == r2.status_code == r3.status_code == 200
@@ -170,14 +202,14 @@ def test_streaming_request_carries_tenant_env(host, monkeypatch):
 
     async def streaming_call(request, emit):
         seen.append(cpc.env_get("OPENAI_API_KEY"))
-        emit({"delta": "hi"})
+        await emit({"delta": "hi"})
         return _ok_result()
 
     host.set_async_call_hook(_capture_hook(seen))
     client = TestClient(create_app(host, default_profile="default",
                                    streaming_call=streaming_call))
     r = client.post("/v1/chat/completions",
-                    headers={"x-llm-router-tenant": "7"},
+                    headers={"x-llm-router-tenant": "7", "x-internal-secret": "s3cret"},
                     json={"model": "profile:default", "stream": True,
                           "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 200

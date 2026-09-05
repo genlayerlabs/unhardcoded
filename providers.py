@@ -95,16 +95,13 @@ def _anthropic_stream_adapter(timeout_s, env_get=None):
 
 
 def _bedrock_adapter(timeout_s, env_get=None):
-    # env_get intentionally ignored: bedrock auths via the AWS chain, and tenant
-    # BYO credentials never apply to it (platform-only provider).
     from provider_adapters.bedrock import make_bedrock_async_call_provider
-    return make_bedrock_async_call_provider(timeout_s=timeout_s)
+    return make_bedrock_async_call_provider(timeout_s=timeout_s, env_get=env_get)
 
 
 def _bedrock_stream_adapter(timeout_s, env_get=None):
-    # env_get intentionally ignored (see _bedrock_adapter).
     from provider_adapters.bedrock import stream_bedrock
-    return functools.partial(stream_bedrock, timeout_s=timeout_s)
+    return functools.partial(stream_bedrock, timeout_s=timeout_s, env_get=env_get)
 
 
 def _google_adapter(timeout_s, env_get=None):

@@ -186,7 +186,7 @@ def test_tenant_env_filters_through_allowlist_and_caches(monkeypatch):
     assert fake.calls[0]["url"].endswith("/internal/tenants/7/provider-env")
 
 
-def test_tenant_env_fail_soft_to_platform_keys(monkeypatch):
+def test_tenant_env_outage_returns_empty_scope(monkeypatch):
     _install(monkeypatch, [httpx.ConnectError("down")])
     assert asyncio.run(cpc.tenant_env(9)) == {}
 
@@ -204,13 +204,14 @@ def test_tenant_env_stale_grace_then_empty(monkeypatch):
 
 # ---- env_get / context isolation ---------------------------------------------
 
-def test_env_get_prefers_active_tenant_map_then_process_env(monkeypatch):
+def test_env_get_never_falls_back_to_platform_in_tenant_scope(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-platform")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-platform-router")
     assert cpc.env_get("OPENAI_API_KEY") == "sk-platform"
     token = cpc.activate_tenant_env({"OPENAI_API_KEY": "sk-tenant"})
     try:
         assert cpc.env_get("OPENAI_API_KEY") == "sk-tenant"
-        assert cpc.env_get("OPENROUTER_API_KEY") == os.environ.get("OPENROUTER_API_KEY")
+        assert cpc.env_get("OPENROUTER_API_KEY") is None
     finally:
         cpc.reset_tenant_env(token)
     assert cpc.env_get("OPENAI_API_KEY") == "sk-platform"

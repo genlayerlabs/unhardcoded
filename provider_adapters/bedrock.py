@@ -44,6 +44,8 @@ _SERVER_CODES = {
 
 
 def _aws_region(request: dict, env_get: Callable[[str], str | None]) -> str:
+    if env_get('SAAS_TENANT_SCOPE'):
+        return env_get('BEDROCK_REGION') or 'us-east-1'
     return (
         request.get("region")
         or request.get("aws_region")
@@ -235,12 +237,11 @@ def _next_stream_event(events):
         return None
 
 
-def _bedrock_client(region: str, timeout_s: float):
-    import boto3
+def _bedrock_client(region: str, timeout_s: float, env_get=os.environ.get):
+    from provider_adapters.aws_credentials import client
     from botocore.config import Config
-    return boto3.client(
-        "bedrock-runtime",
-        region_name=region,
+    return client(
+        "bedrock-runtime", region, env_get,
         config=Config(read_timeout=timeout_s, connect_timeout=min(timeout_s, 10)),
     )
 
@@ -263,7 +264,7 @@ async def stream_bedrock(
     _env_get = env_get or os.environ.get
     region = _aws_region(request, _env_get)
     bedrock = client or (client_factory(region) if client_factory
-                         else _bedrock_client(region, timeout_s))
+                         else _bedrock_client(region, timeout_s, _env_get))
     body = _bedrock_request(request)
     t0 = time.monotonic()
     saw_output = False
@@ -398,7 +399,7 @@ def make_bedrock_async_call_provider(
             return client
         if client_factory is not None:
             return client_factory(region)
-        return _bedrock_client(region, timeout_s)
+        return _bedrock_client(region, timeout_s, _env_get)
 
     async def call(request: dict) -> dict:
         api_kind = request.get("api_kind")
