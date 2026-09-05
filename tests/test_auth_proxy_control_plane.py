@@ -411,3 +411,43 @@ def test_internal_usage_is_not_proxied_upstream(monkeypatch):
                                        headers={"x-internal-secret": "s3cret"})
     assert r.status_code == 400          # caller_required, answered locally
     assert upstream.requests == []
+
+
+def test_scoped_usage_filters_before_aggregate_and_recent_limit():
+    require_host_store()
+    now = int(time.time())
+    for caller, project, env, tokens in [('acme', 1, 10, 7), ('acme', 1, 11, 90),
+                                        ('acme', 2, 10, 800), ('other', 1, 10, 900),
+                                        ('acme', None, None, 1000)]:
+        trace = {'project_id': project, 'environment_id': env} if project else None
+        host_store.insert_call({'ts': now, 'caller': caller, 'status': 200, 'tokens_in': tokens,
+                                'decision_trace': trace, 'cost_usd': tokens / 1000})
+    client = TestClient(auth_proxy.app)
+    headers = {'x-internal-secret': 's3cret'}
+    scope = {'caller': 'acme', 'project_id': 1, 'environment_id': 10}
+    response = client.get('/internal/usage', params={**scope, 'bucket': 'day'}, headers=headers)
+    assert response.status_code == 200
+    data = response.json()
+    assert data['runs'] == 1 and data['tokens_in'] == 7
+    assert data['cost_usd'] == pytest.approx(.007)
+    assert sum(b['runs'] for b in data['buckets']) == 1
+    assert {k: data[k] for k in scope} == scope
+    assert data['scope_version'] == 2
+    response = client.get('/internal/usage/recent', params={**scope, 'limit': 1}, headers=headers)
+    assert response.status_code == 200
+    assert response.json()['calls'][0]['tokens_in'] == 7
+    for path in ('/internal/usage', '/internal/usage/recent'):
+        for invalid in ({'project_id': 1}, {'environment_id': 10}, {'project_id': 0, 'environment_id': 10}):
+            assert client.get(path, params={'caller': 'acme', **invalid}, headers=headers).status_code == 400
+
+
+def test_scoped_metering_outage_is_unavailable_not_successful_zero(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise RuntimeError('database unavailable')
+    monkeypatch.setattr(host_store, '_get_pool', unavailable)
+    client = TestClient(auth_proxy.app)
+    for path in ('/internal/usage', '/internal/usage/recent'):
+        result = client.get(path, params={'caller': 'acme', 'project_id': 1, 'environment_id': 2},
+                            headers={'x-internal-secret': 's3cret'})
+        assert result.status_code == 503
+        assert result.json() == {'error': 'ledger_unavailable'}

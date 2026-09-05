@@ -52,3 +52,20 @@ control-plane instance cannot keep editing the original credential tables after
 their encrypted blobs are migrated. Preserve originals for recovery; do not roll
 back across subsequent project configuration changes without a validated restore
 plan. No production deployment is authorized by these changes.
+
+## Scoped usage and activity
+
+The internal `/internal/usage` and `/internal/usage/recent` endpoints accept
+`project_id` and `environment_id` together with the required caller slug. Partial
+or nonpositive scopes are rejected. PostgreSQL applies all three filters before
+aggregation or the recent-call limit; historical rows without a scope do not
+appear in environment reports. Responses echo `scope_version: 2` and both IDs so
+Cloud can reject an old ingress that ignores the new filters. Database errors
+return 503; reads run off the ingress event loop and have a statement deadline.
+The ledger is best-effort telemetry, not billing-grade accounting.
+
+The companion Cloud #3 now wires scope through the entire dashboard. It includes
+an opt-in two-process test using the actual Django bridge and this dataplane,
+with concurrent Chat Completions/Responses, streaming/fallback, scope forgery,
+revoked cached keys and removed connection assignments. Provider calls are fake;
+this verifies isolation/recovery rather than a production throughput target.
