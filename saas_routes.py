@@ -27,7 +27,8 @@ class ScopedHost:
     async def execute_async(self, contract, **kwargs):
         host = _active.get() or self.base
         if host._tenant_id is not None and contract.get("session"):
-            contract = {**contract, "session": f"tenant:{host._tenant_id}:{contract['session']}"}
+            scope_id = host._env.get('SAAS_TENANT_SCOPE', str(host._tenant_id))
+            contract = {**contract, "session": f"tenant:{scope_id}:{contract['session']}"}
         result = await host.execute_async(contract, **kwargs)
         if revision := _revision.get():
             result.setdefault("trace", {}).update(revision)
@@ -168,7 +169,11 @@ def install(app, scoped, handle_chat, chat_request):
     @app.middleware("http")
     async def tenant_context(request: Request, call_next):
         raw = request.headers.get("x-llm-router-tenant")
+        scope_headers = [request.headers.get(name) for name in (
+            "x-unhardcoded-scope-version", "x-unhardcoded-project", "x-unhardcoded-environment")]
         if raw is None:
+            if any(value is not None for value in scope_headers):
+                return JSONResponse({"error": {"message": "Scope requires trusted tenant context"}}, status_code=403)
             return await call_next(request)
         if not cp.enabled() or not cp.internal_secret_ok(request.headers):
             return JSONResponse({"error": {"message": "Untrusted tenant context"}}, status_code=403)
@@ -178,13 +183,27 @@ def install(app, scoped, handle_chat, chat_request):
                 raise ValueError()
         except ValueError:
             return JSONResponse({"error": {"message": "Invalid tenant"}}, status_code=400)
+        scope = {}
+        if any(value is not None for value in scope_headers):
+            try:
+                version, project, environment = scope_headers
+                if version != "2" or any(not value or not value.isascii() or not value.isdigit() for value in (project, environment)):
+                    raise ValueError()
+                scope = {"project_id": int(project), "environment_id": int(environment)}
+                if min(scope.values()) <= 0:
+                    raise ValueError()
+            except (ValueError, TypeError):
+                return JSONResponse({"error": {"message": "Invalid project/environment scope"}}, status_code=400)
         allowed = {"/v1/chat/completions", "/v1/responses", "/x/saas/catalog", "/x/saas/preview", "/x/saas/test", "/x/saas/connections"}
         if request.url.path not in allowed:
             return JSONResponse({"error": {"message": "Unsupported tenant endpoint"}}, status_code=404)
         # Read current credentials for each request: revocation/rotation is immediate.
         # The bounded request-local VM cannot retain stale tenant secrets/health.
-        env, connections_config = await cp.tenant_connections(tenant_id, credential_names(scoped.base.catalog()))
-        child = await asyncio.to_thread(scoped.base.for_tenant, tenant_id, env, (), connections_config)
+        try:
+            env, connections_config = await cp.tenant_connections(tenant_id, credential_names(scoped.base.catalog()), **scope)
+        except cp.RouteUnavailable:
+            return JSONResponse({"error": {"message": "Scoped credentials unavailable"}}, status_code=503)
+        child = await asyncio.to_thread(scoped.base.for_tenant, tenant_id, env, (), connections_config, **scope)
         if request.url.path != '/x/saas/connections':
             from tenant_providers import prepare
             await prepare(child)
@@ -196,6 +215,7 @@ def install(app, scoped, handle_chat, chat_request):
                 "route_revision": request.headers.get("x-unhardcoded-revision"),
                 "policy_id": request.headers.get("x-unhardcoded-policy-id"),
                 'routing_preference': request.headers.get('x-unhardcoded-preference'),
+                **scope,
             })
             try:
                 return await call_next(request)

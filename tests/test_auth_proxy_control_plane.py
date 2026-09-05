@@ -276,7 +276,8 @@ def test_route_resolution_failure_does_not_call_router(monkeypatch):
 
 
 @pytest.mark.parametrize('path', ['/v1/chat/completions', '/v1/responses'])
-def test_full_ingress_to_engine_alias_and_failover(monkeypatch, path):
+@pytest.mark.parametrize('scoped', [False, True])
+def test_full_ingress_to_engine_alias_and_failover(monkeypatch, path, scoped):
     """Actual ingress + shim + Lua, with only CP HTTP and providers faked."""
     require_host_store()
     import asyncio
@@ -293,7 +294,12 @@ def test_full_ingress_to_engine_alias_and_failover(monkeypatch, path):
             return {'ok':False, 'error_kind':'server_error'}
         return {'ok':True, 'latency_ms':10, 'response':{'text':'Fallback works', 'tokens_in':2, 'tokens_out':3}}
     host.set_async_call_hook(call)
+    scope = {'scope_version': 2, 'tenant_id': 7, 'project_id': 8, 'environment_id': 9} if scoped else {}
     def cp_http(request):
+        if scoped and ('/provider-env' in request.url.path or '/routes/' in request.url.path):
+            assert '/projects/8/environments/9/' in request.url.path
+        if scoped and '/routes/' in request.url.path:
+            assert request.url.params['key_sha256'] == hashlib.sha256(b'full-chain').hexdigest()
         if request.url.path.endswith('/provider-env'):
             data = {'env':{'OPENAI_API_KEY':'sk-tenant', 'ANTHROPIC_API_KEY':'sk-backup'}}
         elif '/routes/' in request.url.path:
@@ -301,18 +307,24 @@ def test_full_ingress_to_engine_alias_and_failover(monkeypatch, path):
                     'revision':3, 'execution':{'timeout_ms':8000}, 'route':'route:production'}
         else:
             data = {'active':True, 'consumer':'acme', 'tenant_id':7}
-        return httpx.Response(200, json=data)
+        return httpx.Response(200, json={**data, **scope})
     cp_client = httpx.AsyncClient(transport=httpx.MockTransport(cp_http))
     shim_client = httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(host)), base_url='http://router.test')
     monkeypatch.setattr(cpc, '_client', cp_client)
     monkeypatch.setattr(auth_proxy, '_client', shim_client)
     body = {'model':'route:production', 'messages':[{'role':'user','content':'hi'}]} if 'chat' in path else {'model':'route:production','input':'hi'}
     try:
-        r = TestClient(auth_proxy.app).post(path, headers={'Authorization':'Bearer full-chain'}, json=body)
+        r = TestClient(auth_proxy.app).post(path, headers={'Authorization':'Bearer full-chain',
+            'x-unhardcoded-scope-version': '2', 'x-unhardcoded-project': '999',
+            'x-unhardcoded-environment': '999'}, json=body)
         assert r.status_code == 200, r.text
         trace = r.json()['x_router']['decision_trace']
         assert trace['route_revision'] == '3'
         assert trace['route'] == 'route:production'
+        if scoped:
+            assert trace['project_id'] == 8 and trace['environment_id'] == 9
+        else:
+            assert 'project_id' not in trace and 'environment_id' not in trace
         assert [s['provider_id'] for s in trace['decision_path'] if s['event'] == 'attempted'] == ['openai', 'anthropic']
         assert seen == [('openai','sk-tenant'), ('anthropic','sk-tenant')]
         host_store._write_q.join()

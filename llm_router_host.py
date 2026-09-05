@@ -256,7 +256,7 @@ end
             "policy_id": hashlib.sha256(encoded.encode()).hexdigest(),
         }
 
-    def for_tenant(self, tenant_id: int, env: dict, managed_providers=(), connections=None):
+    def for_tenant(self, tenant_id: int, env: dict, managed_providers=(), connections=None, *, project_id=None, environment_id=None):
         """A request-local engine: credential failures cannot disable other tenants.
 
         Reuses the same engine, catalog files, live discovery and HTTP adapters.
@@ -268,6 +268,8 @@ end
         managed = set(managed_providers).intersection(shared_provider_ids(catalog))
         scoped_env = dict(env)
         scoped_env['SAAS_TENANT_SCOPE'] = str(tenant_id)
+        if environment_id is not None:
+            scoped_env['SAAS_TENANT_SCOPE'] = f"{tenant_id}:{project_id}:{environment_id}"
         allowed = set(managed)
         for pid, provider in (catalog.get('providers') or {}).items():
             key = auth_env(provider)
@@ -289,6 +291,8 @@ end
         child.config.providers = _to_lua(child.lua, catalog.get('providers') or {})
         child.config.models = _to_lua(child.lua, catalog.get('models') or {})
         child._tenant_id = tenant_id
+        child._project_id = project_id
+        child._environment_id = environment_id
         child._tenant_allowed = allowed
         child._tenant_managed = managed
         child._tenant_connections = byo

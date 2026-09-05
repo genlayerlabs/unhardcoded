@@ -386,7 +386,7 @@ def routing_summary(trace) -> dict | None:
     or the full candidate catalog in the tenant activity ledger."""
     if not isinstance(trace, dict):
         return None
-    summary = {key: str(trace[key])[:100] for key in ('route', 'route_revision', 'policy_id', 'routing_preference')
+    summary = {key: str(trace[key])[:100] for key in ('route', 'route_revision', 'policy_id', 'routing_preference', 'project_id', 'environment_id')
                if trace.get(key) is not None}
     summary['attempts'] = [
         {key: str(step[key])[:160] for key in ('provider_id', 'model_family', 'error_kind')

@@ -777,6 +777,8 @@ async def _caller_auth_async(token: str | None) -> dict[str, Any]:
            "storage": "control_plane", "meta": meta}
     if resolved.tenant_id is not None:
         out["tenant_id"] = resolved.tenant_id
+    if resolved.scope_version == 2:
+        out.update(scope_version=2, project_id=resolved.project_id, environment_id=resolved.environment_id)
     return out
 
 
@@ -3942,8 +3944,10 @@ async def proxy(path: str, request: Request) -> Response:
                 "type": "invalid_request_error", "code": "route_required"}})
         from route_contract import apply_contract, PreferenceNotAllowed
         try:
+            scope = ({"project_id": auth["project_id"], "environment_id": auth["environment_id"],
+                      "key_digest": auth["digest"]} if auth.get("scope_version") == 2 else {})
             published_route = await control_plane_client.resolve_route(
-                auth["tenant_id"], requested_route[6:])
+                auth["tenant_id"], requested_route[6:], **scope)
             payload, published_route = apply_contract(json.loads(body), published_route)
             body = json.dumps(payload, separators=(",", ":")).encode()
         except PreferenceNotAllowed as exc:
@@ -4025,6 +4029,7 @@ async def proxy(path: str, request: Request) -> Response:
         k: v for k, v in request.headers.items()
         if k.lower() not in {"authorization", "host", "connection", "content-length",
                              "x-llm-router-tenant", "x-internal-secret",
+                             "x-unhardcoded-scope-version", "x-unhardcoded-project", "x-unhardcoded-environment",
                              "x-unhardcoded-route", "x-unhardcoded-revision", "x-unhardcoded-policy-id", "x-unhardcoded-preference"}
     }
     headers["x-llm-router-caller"] = caller
@@ -4034,6 +4039,10 @@ async def proxy(path: str, request: Request) -> Response:
     if auth.get("tenant_id") is not None:
         headers["x-llm-router-tenant"] = str(auth["tenant_id"])
         headers["x-internal-secret"] = control_plane_client.CONTROL_PLANE_INTERNAL_SECRET
+        if auth.get("scope_version") == 2:
+            headers["x-unhardcoded-scope-version"] = "2"
+            headers["x-unhardcoded-project"] = str(auth["project_id"])
+            headers["x-unhardcoded-environment"] = str(auth["environment_id"])
         headers["x-unhardcoded-route"] = requested_route
         headers["x-unhardcoded-revision"] = str(published_route["revision"])
         headers["x-unhardcoded-policy-id"] = published_route["policy_id"]
@@ -4071,6 +4080,8 @@ async def proxy(path: str, request: Request) -> Response:
                               'route_revision': published_route['revision'],
                               'policy_id': published_route['policy_id'],
                               'routing_preference': published_route.get('routing_preference', 'default')}
+            if auth.get('scope_version') == 2:
+                decision_trace.update(project_id=auth['project_id'], environment_id=auth['environment_id'])
         try:
             _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
             _metric_request(status, latency_ms)
