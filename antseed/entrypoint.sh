@@ -62,6 +62,9 @@ socat "TCP-LISTEN:${PORT_PUBLIC},fork,reuseaddr" "TCP:127.0.0.1:${PORT_PROXY}" &
 # Self-disables when ANTSEED_CONTROL_TOKEN is unset. See antseed/control.js.
 node "$LIB/control.js" &
 
+# Separate inference + read-only discovery token; no wallet control authority.
+node "$LIB/byo-gateway.js" &
+
 write_market() {
     raw="$MARKET_DIR/.market.raw.$$"
     timeout -k 5 "$CLI_TIMEOUT" antseed network browse --services --top "$TOP" --json > "$raw" 2>/dev/null || true

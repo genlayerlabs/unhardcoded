@@ -37,6 +37,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
+import control_plane_client
 from env_coerce import env_int
 import host_store
 from policy_templates import (
@@ -297,6 +298,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 },
             }
 
+    from saas_routes import ScopedHost, install as install_saas
+    host = ScopedHost(host)
     app = FastAPI(title="llm-router shim", docs_url=None, redoc_url=None)
 
     # subscription backends (codex) are billed $0 per request — their ranking
@@ -1109,9 +1112,14 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         sealed = {"role": "system", "content": _SEAL_PREFIX + summary}
         return _costed({"messages": frozen + [sealed] + recent, "compacted": True})
 
+    async def _activate_tenant(request: Request) -> None:
+        # Tenant context is established and verified once by SaaS middleware.
+        pass
+
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest, request: Request):
         _session_from_header(req, request)
+        await _activate_tenant(request)
         return await _handle_chat(req)
 
     @app.post("/{profile_name}/v1/chat/completions")
@@ -1124,6 +1132,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         instead of a `profile:` model prefix.
         """
         _session_from_header(req, request)
+        await _activate_tenant(request)
         return await _handle_chat(req, profile_name=profile_name)
 
     def _session_from_header(req: ChatRequest, request: Request) -> None:
@@ -1152,12 +1161,14 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     @app.post("/v1/responses")
     async def responses(req: ResponsesRequest, request: Request):
         _session_from_header(req, request)
+        await _activate_tenant(request)
         return await _handle_responses(req)
 
     @app.post("/{profile_name}/v1/responses")
     async def responses_profiled(profile_name: str, req: ResponsesRequest,
                                  request: Request):
         _session_from_header(req, request)
+        await _activate_tenant(request)
         return await _handle_responses(req, profile_name=profile_name)
 
     def _responses_object_with_router(result: dict, req: ResponsesRequest,
@@ -1475,6 +1486,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             yield _streaming.encode_error_event(err, err)
         yield _streaming.DONE_EVENT
 
+    install_saas(app, host, _handle_chat, ChatRequest)
     return app
 
 

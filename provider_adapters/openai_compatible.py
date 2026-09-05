@@ -163,6 +163,11 @@ def _prepare_openai_call(
             auth_headers = {}
 
     headers = {"Content-Type": "application/json", **auth_headers, **extra}
+    from byo_http import is_byo_buyer
+    if is_byo_buyer(request, env_get):
+        # Never trust an offer's endpoint to choose where a tenant secret goes.
+        url = env_get('ANTSEED_BYO_URL').rstrip('/') + '/v1/chat/completions'
+        headers['Authorization'] = 'Bearer ' + env_get('ANTSEED_BYO_TOKEN')
     peer_id = offer.get("peer_id")
     if peer_id:
         headers["x-antseed-pin-peer"] = peer_id
@@ -441,7 +446,11 @@ def make_async_call_provider(
                         provider_rules=provider_rules,
                     )
                 else:
-                    if client is not None:
+                    from byo_http import buyer_client, is_byo_buyer
+                    if is_byo_buyer(request, _env_get):
+                        async with buyer_client() as buyer:
+                            resp = await buyer.post(url, json=body, headers=headers, timeout=timeout)
+                    elif client is not None:
                         resp = await client.post(
                             url, json=body, headers=headers, timeout=timeout)
                     else:
@@ -512,10 +521,12 @@ async def stream_openai_compatible(
         return _peer_capacity_error(
             str(peer_id or ""), int(cap or 0), gate_error, t0)
 
-    _owns_client = client is None
+    from byo_http import buyer_client, is_byo_buyer
+    _byo = is_byo_buyer(request, env_get or os.environ.get)
+    _owns_client = client is None or _byo
     if _owns_client:
         import httpx
-        client = httpx.AsyncClient()
+        client = buyer_client() if _byo else httpx.AsyncClient()
 
     emitted = False
     text_parts: list[str] = []

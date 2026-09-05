@@ -118,6 +118,7 @@ _SCHEMA_STATEMENTS = [
     # tautological; 'subscription' = $0). Lets the cost-accuracy panel flag only
     # rows with real signal instead of training the operator to ignore drift.
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS cost_basis TEXT",
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS routing_summary JSONB",
     # Per-ATTEMPT route observations (one row per provider call the engine made,
     # including failed fallback tries — a grain `calls` does NOT have: `calls` is
     # per-REQUEST, final route only). The RAW from which reliability/latency are
@@ -380,6 +381,22 @@ def _route_key(provider: "str | None", family: "str | None",
 
 # ---- calls ledger (best-effort telemetry) --------------------------------------
 
+def routing_summary(trace) -> dict | None:
+    """Bounded explanation only: never persist prompts, output, raw error bodies
+    or the full candidate catalog in the tenant activity ledger."""
+    if not isinstance(trace, dict):
+        return None
+    summary = {key: str(trace[key])[:100] for key in ('route', 'route_revision', 'policy_id', 'routing_preference')
+               if trace.get(key) is not None}
+    summary['attempts'] = [
+        {key: str(step[key])[:160] for key in ('provider_id', 'model_family', 'error_kind')
+         if step.get(key) is not None}
+        for step in (trace.get('decision_path') or [])[:32]
+        if isinstance(step, dict) and step.get('event') == 'attempted'
+    ]
+    summary['deadline_exceeded'] = trace.get('request_deadline_exceeded') is True
+    return summary
+
 def insert_call(row: dict[str, Any]) -> None:
     """Record one call into the ledger from a usage-history-shaped row. Fail-soft:
     never raises into the request path. Best-effort telemetry."""
@@ -406,6 +423,7 @@ def insert_call(row: dict[str, Any]) -> None:
             # route stats from. Raw here; combining into a route key is a later step.
             row.get("served_by"),
             row.get("cost_basis"),   # how cost_usd was determined (reported/computed/…)
+            json.dumps(routing_summary(row.get("decision_trace"))),
         )
         with _get_pool().connection() as conn:   # one transaction, auto commit/rollback
             conn.execute(
@@ -413,8 +431,8 @@ def insert_call(row: dict[str, Any]) -> None:
                 " caller, route_key, provider_id, model_family, served_model_id,"
                 " requested_model, status, error_type, latency_ms, tokens_in,"
                 " tokens_out, tokens_total, tokens_cached, cost_usd, served_by,"
-                " cost_basis)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", values)
+                " cost_basis, routing_summary)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)", values)
             caller = row.get("caller")
             cost = row.get("cost_usd")
             if caller and isinstance(cost, (int, float)) and float(cost) > 0:
@@ -511,13 +529,15 @@ def observe_route_call_async(row: dict[str, Any]) -> None:
     _enqueue(lambda: _insert_route_observation(snap))
 
 
-def recent_calls(limit: int = 100) -> list[dict[str, Any]]:
-    """The most recent calls, newest first (operator view / verification)."""
+def recent_calls(limit: int = 100, caller: "str | None" = None) -> list[dict[str, Any]]:
+    """The most recent calls, newest first (operator view / verification).
+    Optionally scoped to one caller (control-plane activity feed)."""
     try:
+        where, params = ("", []) if caller is None else (" WHERE caller = %s", [caller])
         with _get_pool().connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute("SELECT * FROM calls ORDER BY id DESC LIMIT %s",
-                            (int(limit),))
+                cur.execute(f"SELECT * FROM calls{where} ORDER BY id DESC LIMIT %s",
+                            params + [int(limit)])
                 return cur.fetchall()
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store recent_calls failed: %s", exc)
@@ -1444,6 +1464,38 @@ def usage_aggregate(since_ts: "int | None" = None, caller: "str | None" = None,
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store usage_aggregate failed: %s", exc)
         return _empty_usage_aggregate()
+
+
+def usage_totals(since_ts: "int | None" = None,
+                 caller: "str | None" = None) -> dict[str, Any]:
+    """One-row window totals over `calls`, including cached tokens (which the
+    dashboard aggregate doesn't sum) — the control-plane metering read.
+    Fail-soft -> zeros (same keys)."""
+    zeros = {"requests": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0,
+             "tokens_cached": 0, "tokens_total": 0, "cost_usd": 0.0, "priced": 0}
+    try:
+        where, params = _usage_where(since_ts=since_ts, caller=caller)
+        sql = (
+            "SELECT count(*),"
+            " count(*) FILTER (WHERE COALESCE(status,0) >= 400),"
+            " COALESCE(sum(COALESCE(tokens_in,0)),0),"
+            " COALESCE(sum(COALESCE(tokens_out,0)),0),"
+            " COALESCE(sum(COALESCE(tokens_cached,0)),0),"
+            " COALESCE(sum(CASE WHEN COALESCE(tokens_total,0) <> 0 THEN tokens_total"
+            " ELSE COALESCE(tokens_in,0)+COALESCE(tokens_out,0) END),0),"
+            " round(COALESCE(sum(GREATEST(cost_usd,0)),0)::numeric,6)::float8,"
+            " count(cost_usd)"
+            f" FROM calls{where}")
+        with _get_pool().connection() as conn:
+            row = conn.execute(sql, params).fetchone()
+        requests, errors, tin, tout, tcached, ttotal, cost, priced = row
+        return {"requests": int(requests), "errors": int(errors),
+                "tokens_in": int(tin), "tokens_out": int(tout),
+                "tokens_cached": int(tcached), "tokens_total": int(ttotal),
+                "cost_usd": float(cost), "priced": int(priced)}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store usage_totals failed: %s", exc)
+        return zeros
 
 
 def policy_backtest_groups(since_ts: "int | None" = None,

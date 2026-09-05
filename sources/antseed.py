@@ -287,7 +287,8 @@ class AntSeedSource:
     name = "antseed"
     poll_interval_s = 300
 
-    def __init__(self, catalog: dict):
+    def __init__(self, catalog: dict, store=None):
+        self._store = store if store is not None else host_store
         self._models = catalog.get("models") or {}
         # provider_id -> its marketplace config (cap, aliases, endpoint)
         self._providers: dict[str, dict] = {
@@ -326,7 +327,7 @@ class AntSeedSource:
         (max_concurrency), reputation admission and reachability ranking
         (last_seen/last_reached_at)
         are applied downstream in offers_sync / market_book."""
-        rows = host_store.peer_offers(STALE_AFTER_S * 1000)
+        rows = self._store.peer_offers(STALE_AFTER_S * 1000)
         self._stats["stale"] = not rows
         return rows
 
@@ -335,7 +336,7 @@ class AntSeedSource:
         Browse mode leaves it null and the host pins per request instead (the
         offer carries peer_id -> x-antseed-pin-peer); when a session pin IS set,
         restrict offers to that peer's services to match what the proxy serves."""
-        data = host_store.buyer_status(provider_id)
+        data = self._store.buyer_status(provider_id)
         return (data or {}).get("pinned_peer_id") or None
 
     def _family_vendor(self, fam: str, canon: str) -> str | None:
@@ -666,7 +667,7 @@ class AntSeedSource:
         cap_in = float(cap.get("input", float("inf")))
         cap_out = float(cap.get("output", float("inf")))
         # ONE buyer_status read serves both the session pin and the funds gate.
-        status = host_store.buyer_status(provider_id) or {}
+        status = self._store.buyer_status(provider_id) or {}
         pinned = status.get("pinned_peer_id") or None
         available = as_float(status.get("deposits_available"))
         self._stats["deposits_available"] = available
@@ -712,7 +713,7 @@ class AntSeedSource:
         half_open = 0
         stale_reachability = 0
         now_ms = int(time.time() * 1000)
-        durable_health = host_store.marketplace_route_health(
+        durable_health = self._store.marketplace_route_health(
             provider_id, window_ms=ROUTE_HEALTH_WINDOW_MS)
         route_health = durable_health.get("routes") or {}
         peer_health = durable_health.get("peers") or {}
@@ -819,8 +820,8 @@ class AntSeedSource:
         # #4a/#4c: reliability + latency + learned tool-incapability are derived on
         # the fly from route_observations (one query each per offers_sync, not per
         # candidate), keyed by route identity.
-        stats = host_store.route_stats()
-        incapable = host_store.tool_incapable_routes()
+        stats = self._store.route_stats()
+        incapable = self._store.tool_incapable_routes()
         offers = []
         for row in kept_rows:
             family = row["family"]
@@ -919,7 +920,7 @@ class AntSeedSource:
             recent: list[bool] = []
             health = None
             for pid in self.provider_ids:
-                rows = host_store.provider_recent_ok(
+                rows = self._store.provider_recent_ok(
                     pid, limit=WEDGE_CONSECUTIVE_FAILURES)
                 if len(rows) >= WEDGE_CONSECUTIVE_FAILURES and not any(rows):
                     health = "wedged"      # any wedged proxy wedges the source
@@ -1059,7 +1060,7 @@ class AntSeedSource:
         and the first healthy refresh tick opens it a few minutes later."""
         out: dict[str, float] = {}
         for pid in self.provider_ids:
-            status = host_store.buyer_status(pid)
+            status = self._store.buyer_status(pid)
             if not self._status_is_fresh(status):
                 if status:
                     _log.warning("antseed: not seeding credits for %s — its "
@@ -1089,7 +1090,7 @@ class AntSeedSource:
         # offer counts it reads are current.
         self._refresh_wallet_health()
         for pid in self.provider_ids:
-            data = host_store.buyer_status(pid)
+            data = self._store.buyer_status(pid)
             fresh = self._status_is_fresh(data)
             available: "float | None" = None
             if fresh:
