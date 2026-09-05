@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from typing import Any
@@ -48,6 +49,17 @@ _SCHEMA_LOCK_KEY = 0x686F7374_73746F72
 
 _PRUNE_EVERY = 500          # run a retention sweep once per this many inserts
 _WRITE_QUEUE_MAX = 10_000   # cap the background ledger-write backlog
+
+
+def _set_dashboard_statement_timeout(conn: Any) -> None:
+    """Bound dashboard reads inside the current transaction at PostgreSQL level."""
+    raw = os.getenv("DASHBOARD_DB_STATEMENT_TIMEOUT_MS", "10000")
+    try:
+        timeout_ms = max(100, min(int(raw), 60_000))
+    except (TypeError, ValueError):
+        timeout_ms = 10_000
+    conn.execute("SELECT set_config('statement_timeout', %s, true)",
+                 [str(timeout_ms)])
 
 
 def _retention_days() -> int:
@@ -94,6 +106,7 @@ _SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_calls_route    ON calls(route_key, ts)",
     "CREATE INDEX IF NOT EXISTS idx_calls_session  ON calls(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_calls_consumer ON calls(consumer_sha, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_calls_caller   ON calls(caller, ts)",
     # Evolve the existing `calls` fact table in place — CREATE TABLE IF NOT EXISTS
     # never alters a table that already exists. Idempotent both ways: a no-op on a
     # fresh DB (the CREATE above already has these columns), the actual migration
@@ -119,6 +132,8 @@ _SCHEMA_STATEMENTS = [
         served_by          TEXT,
         ok                 BOOLEAN NOT NULL,
         latency_ms         DOUBLE PRECISION,
+        error_kind         TEXT,
+        http_status        INTEGER,
         tools_requested    BOOLEAN,
         tool_calls_emitted BOOLEAN
     )""",
@@ -126,6 +141,8 @@ _SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_route_obs_route"
     " ON route_observations(provider_id, model_family, served_by, ts)",
     # #4c: learned tool capability is derived from these per-attempt signals.
+    "ALTER TABLE route_observations ADD COLUMN IF NOT EXISTS error_kind TEXT",
+    "ALTER TABLE route_observations ADD COLUMN IF NOT EXISTS http_status INTEGER",
     "ALTER TABLE route_observations ADD COLUMN IF NOT EXISTS tools_requested BOOLEAN",
     "ALTER TABLE route_observations ADD COLUMN IF NOT EXISTS tool_calls_emitted BOOLEAN",
     """CREATE TABLE IF NOT EXISTS settings_overrides (
@@ -136,6 +153,63 @@ _SCHEMA_STATEMENTS = [
     )""",
     """CREATE TABLE IF NOT EXISTS consumer_keys (
         consumer TEXT PRIMARY KEY, record TEXT NOT NULL, updated_at BIGINT NOT NULL
+    )""",
+    # Exact, one-way API-key digests used by every ingress replica.  The JSON
+    # consumer record intentionally exposes only a short fingerprint for the
+    # dashboard; that is not enough to resolve a key on another pod.  Keeping
+    # the full SHA-256 in a normalized table makes dashboard-created keys work
+    # across a horizontally scaled auth tier without storing plaintext keys.
+    """CREATE TABLE IF NOT EXISTS consumer_key_digests (
+        digest TEXT PRIMARY KEY,
+        consumer TEXT NOT NULL,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_consumer_key_digests_consumer"
+    " ON consumer_key_digests(consumer)",
+    # A PostgreSQL-backed token bucket is the global admission authority.  The
+    # old deque lived in one Python process, so N replicas multiplied every
+    # caller's quota by N.  One row per consumer keeps sustained rate + burst
+    # semantics stable as the ingress pool scales.
+    """CREATE TABLE IF NOT EXISTS consumer_rate_buckets (
+        consumer TEXT PRIMARY KEY,
+        tokens DOUBLE PRECISION NOT NULL,
+        updated_at DOUBLE PRECISION NOT NULL
+    )""",
+    # Short renewable leases make a marketplace seller's advertised
+    # max_concurrency global across router replicas. A crashed pod stops
+    # renewing and its slots become reclaimable without operator cleanup.
+    """CREATE TABLE IF NOT EXISTS peer_concurrency_leases (
+        lease_id TEXT PRIMARY KEY,
+        peer_id TEXT NOT NULL,
+        expires_at DOUBLE PRECISION NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_peer_concurrency_leases_peer_expiry"
+    " ON peer_concurrency_leases(peer_id, expires_at)",
+    """CREATE TABLE IF NOT EXISTS consumer_budget_usage (
+        consumer TEXT PRIMARY KEY, spent_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+        updated_at BIGINT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS analytics_hourly (
+        bucket_start BIGINT NOT NULL,
+        caller TEXT NOT NULL, key_prefix TEXT NOT NULL, provider_id TEXT NOT NULL,
+        model_family TEXT NOT NULL, requested_model TEXT NOT NULL,
+        served_model_id TEXT NOT NULL, status INTEGER NOT NULL,
+        requests BIGINT NOT NULL, errors BIGINT NOT NULL,
+        tokens_in BIGINT NOT NULL, tokens_out BIGINT NOT NULL,
+        tokens_total BIGINT NOT NULL, tokens_cached BIGINT NOT NULL DEFAULT 0,
+        cost_usd DOUBLE PRECISION NOT NULL,
+        priced BIGINT NOT NULL, last_seen BIGINT,
+        PRIMARY KEY(bucket_start, caller, key_prefix, provider_id, model_family,
+                    requested_model, served_model_id, status)
+    )""",
+    "ALTER TABLE analytics_hourly ADD COLUMN IF NOT EXISTS tokens_cached BIGINT NOT NULL DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS idx_analytics_hourly_caller ON analytics_hourly(caller,bucket_start)",
+    "CREATE INDEX IF NOT EXISTS idx_analytics_hourly_provider ON analytics_hourly(provider_id,bucket_start)",
+    "CREATE INDEX IF NOT EXISTS idx_analytics_hourly_model ON analytics_hourly(model_family,bucket_start)",
+    """CREATE TABLE IF NOT EXISTS analytics_rollup_state (
+        name TEXT PRIMARY KEY, covered_from BIGINT, covered_until BIGINT,
+        updated_at BIGINT NOT NULL
     )""",
     # The antseed marketplace book. One RAW row per (peer, advertised service) —
     # the seller's announced prices/caps/reputation, stored as columns, not
@@ -154,11 +228,13 @@ _SCHEMA_STATEMENTS = [
         max_concurrency INTEGER,
         reputation      DOUBLE PRECISION,
         last_seen       BIGINT,
+        last_reached_at BIGINT,
         observed_at     BIGINT NOT NULL,
         first_seen      BIGINT,
         fetched_at      BIGINT,
         PRIMARY KEY (peer_id, service)
     )""",
+    "ALTER TABLE peer_offers ADD COLUMN IF NOT EXISTS last_reached_at BIGINT",
     "CREATE INDEX IF NOT EXISTS idx_peer_offers_observed ON peer_offers(observed_at)",
     # The antseed buyer's status (escrow + session pin + wallet), one row per
     # buyer pid. WRITTEN by the antseed sidecar (write-status.js on the poll loop
@@ -174,6 +250,38 @@ _SCHEMA_STATEMENTS = [
         connection_state   TEXT,
         fetched_at         BIGINT
     )""",
+    # The wallet keeper's operation ledger — the audit trail, the rate-cap ledger
+    # and the dashboard feed in ONE table. Every row is an INTENT written BEFORE
+    # the transaction fires and updated with its outcome after, so a crash between
+    # the two leaves a `pending` row to reconcile instead of an invisible spend on
+    # Base mainnet. The cooldown and the daily cap are DERIVED from these rows
+    # (not from process memory) so a pod restart cannot reset either. Deliberately
+    # NOT pruned by the retention sweep: it is a money audit trail, and it grows a
+    # handful of rows per day. ts / updated_at in SECONDS.
+    """CREATE TABLE IF NOT EXISTS wallet_ops (
+        id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        ts             BIGINT NOT NULL,
+        pid            TEXT NOT NULL,
+        op             TEXT NOT NULL,
+        amount_usdc    DOUBLE PRECISION,
+        reason         TEXT,
+        pre_available  DOUBLE PRECISION,
+        post_available DOUBLE PRECISION,
+        pre_reserved   DOUBLE PRECISION,
+        post_reserved  DOUBLE PRECISION,
+        outcome        TEXT NOT NULL,
+        detail         TEXT,
+        updated_at     BIGINT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_ops_pid_ts ON wallet_ops(pid, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_wallet_ops_open ON wallet_ops(pid, op, outcome)",
+    # The escrow RATCHET moves USDC from deposits_available to deposits_reserved,
+    # so `available` alone cannot tell a deposit that never landed from a deposit
+    # that landed and was immediately reserved by an opening channel. Both sides
+    # are recorded so the money-pump breaker can score the SUM (see
+    # wallet_keeper._settle_topups). Added after the table shipped, hence ALTER.
+    "ALTER TABLE wallet_ops ADD COLUMN IF NOT EXISTS pre_reserved DOUBLE PRECISION",
+    "ALTER TABLE wallet_ops ADD COLUMN IF NOT EXISTS post_reserved DOUBLE PRECISION",
     # Dashboard login audit (#5) — replaces dashboard-logins.jsonl. A small record
     # read whole by the dashboard, so it follows the consumer_keys pattern: the
     # row as a JSON record in TEXT (not analysed by column). ts in SECONDS.
@@ -218,6 +326,20 @@ def _pool_timeout() -> float:
         return 30.0
 
 
+def _pool_sizes() -> tuple[int, int]:
+    try:
+        minimum = max(0, min(8, int(os.getenv(
+            "HOST_STORE_POOL_MIN_SIZE", "1"))))
+    except (TypeError, ValueError):
+        minimum = 1
+    try:
+        maximum = max(1, min(32, int(os.getenv(
+            "HOST_STORE_POOL_MAX_SIZE", "8"))))
+    except (TypeError, ValueError):
+        maximum = 8
+    return min(minimum, maximum), maximum
+
+
 def _get_pool() -> ConnectionPool:
     """The process-wide connection pool, created (and schema-applied) on first
     use. The pool is thread-safe, so operations need no extra locking."""
@@ -225,10 +347,11 @@ def _get_pool() -> ConnectionPool:
     if _pool is None:
         with _pool_lock:
             if _pool is None:
+                minimum, maximum = _pool_sizes()
                 p = ConnectionPool(
                     _dsn(),
-                    min_size=1,
-                    max_size=8,
+                    min_size=minimum,
+                    max_size=maximum,
                     open=True,
                     timeout=_pool_timeout(),
                 )
@@ -292,6 +415,16 @@ def insert_call(row: dict[str, Any]) -> None:
                 " tokens_out, tokens_total, tokens_cached, cost_usd, served_by,"
                 " cost_basis)"
                 " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", values)
+            caller = row.get("caller")
+            cost = row.get("cost_usd")
+            if caller and isinstance(cost, (int, float)) and float(cost) > 0:
+                conn.execute(
+                    "INSERT INTO consumer_budget_usage(consumer,spent_usd,updated_at)"
+                    " VALUES (%s,%s,%s)"
+                    " ON CONFLICT(consumer) DO UPDATE SET"
+                    " spent_usd=consumer_budget_usage.spent_usd+EXCLUDED.spent_usd,"
+                    " updated_at=EXCLUDED.updated_at",
+                    [str(caller), float(cost), int(time.time())])
         with _prune_lock:
             _inserts_since_prune += 1
             due = _inserts_since_prune >= _PRUNE_EVERY
@@ -501,23 +634,269 @@ def get_consumer_keys() -> "tuple[dict[str, Any], bool]":
         return {}, False
 
 
-def set_consumer_keys(records: dict[str, Any]) -> bool:
+def get_consumer_key(consumer: str) -> "tuple[Any | None, bool]":
+    """Read one consumer's admission metadata without scanning every key row."""
+    try:
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT record FROM consumer_keys WHERE consumer=%s",
+                (consumer,)).fetchone()
+        if row is None:
+            return None, True
+        try:
+            value = json.loads(row[0])
+        except (TypeError, ValueError):
+            _log.warning("host_store: undecodable consumer_keys row %r;"
+                         " failing closed", consumer)
+            return None, False
+        # Shape validation belongs to the caller's fail-closed normalizer. A
+        # syntactically valid but malformed value means "inactive", whereas an
+        # undecodable row means the authority itself is unavailable/corrupt.
+        return value, True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store get_consumer_key failed: %s", exc)
+        return None, False
+
+
+def set_consumer_keys(records: dict[str, Any],
+                      key_digests: "dict[str, str] | None" = None,
+                      delete_key_digests: "list[tuple[str, str]] | None" = None
+                      ) -> bool:
     """Replace the FULL set of consumer records. Returns True on success, False on
     a persistence failure — a swallowed failure here would let a key revocation be
-    reported as saved while still working after restart."""
+    reported as saved while still working after restart.
+
+    ``key_digests`` contains new/updated exact hashes; ``delete_key_digests``
+    contains targeted ``(consumer, digest_prefix)`` revocations.  Both are
+    optional so metadata-only edits keep the existing API.  All changes land in
+    the SAME transaction, without replacing hashes a concurrent replica may
+    have learned."""
     try:
         now = int(time.time())
         rows = [(consumer, json.dumps(rec), now)
                 for consumer, rec in (records or {}).items()]
+        digest_rows = _valid_consumer_digest_rows(key_digests or {}, now)
+        digest_deletions = _valid_consumer_digest_deletions(
+            delete_key_digests or [])
         with _get_pool().connection() as conn:
             conn.execute("DELETE FROM consumer_keys")
             if rows:
                 conn.cursor().executemany(
                     "INSERT INTO consumer_keys(consumer, record, updated_at)"
                     " VALUES (%s,%s,%s)", rows)
+            if digest_rows:
+                conn.cursor().executemany(
+                    "INSERT INTO consumer_key_digests"
+                    " (digest,consumer,created_at,updated_at)"
+                    " VALUES (%s,%s,%s,%s)"
+                    " ON CONFLICT(digest) DO UPDATE SET"
+                    " consumer=EXCLUDED.consumer, updated_at=EXCLUDED.updated_at",
+                    digest_rows)
+            if digest_deletions:
+                conn.cursor().executemany(
+                    "DELETE FROM consumer_key_digests"
+                    " WHERE consumer=%s AND digest LIKE %s",
+                    [(consumer, prefix + "%")
+                     for consumer, prefix in digest_deletions])
         return True
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store set_consumer_keys failed: %s", exc)
+        return False
+
+
+def _valid_consumer_digest_rows(mapping: dict[str, str], now: int) -> list[tuple]:
+    """Validate an exact digest map before it crosses the SQL boundary.
+
+    Invalid entries are rejected as a unit: silently dropping one key from a
+    batch would hand an operator credentials that only fail after distribution.
+    """
+    rows: list[tuple] = []
+    for digest, consumer in mapping.items():
+        digest = str(digest or "").strip().lower()
+        consumer = str(consumer or "").strip()
+        if not re.fullmatch(r"[a-f0-9]{64}", digest):
+            raise ValueError("consumer key digest must be 64 lowercase hex characters")
+        if not consumer or len(consumer) > 80:
+            raise ValueError("consumer key owner must be 1-80 characters")
+        rows.append((digest, consumer, now, now))
+    return rows
+
+
+def _valid_consumer_digest_deletions(
+        deletions: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for consumer, prefix in deletions:
+        consumer = str(consumer or "").strip()
+        prefix = str(prefix or "").strip().lower()
+        if not consumer or len(consumer) > 80:
+            raise ValueError("consumer key owner must be 1-80 characters")
+        if not re.fullmatch(r"[a-f0-9]{8,64}", prefix):
+            raise ValueError("consumer key digest prefix must be 8-64 lowercase hex characters")
+        rows.append((consumer, prefix))
+    return rows
+
+
+def upsert_consumer_key_digests(mapping: dict[str, str]) -> bool:
+    """Backfill exact hashes from static/PVC env maps into the shared resolver.
+
+    This is deliberately UPSERT-only.  A stateless replica may know only the
+    IaC-provisioned subset, so treating its local map as a full replacement
+    would delete dashboard-created keys owned by another replica.
+    """
+    try:
+        now = int(time.time())
+        rows = _valid_consumer_digest_rows(mapping or {}, now)
+        if not rows:
+            return True
+        with _get_pool().connection() as conn:
+            conn.cursor().executemany(
+                "INSERT INTO consumer_key_digests"
+                " (digest,consumer,created_at,updated_at)"
+                " VALUES (%s,%s,%s,%s)"
+                " ON CONFLICT(digest) DO UPDATE SET"
+                " consumer=EXCLUDED.consumer, updated_at=EXCLUDED.updated_at",
+                rows)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store upsert_consumer_key_digests failed: %s", exc)
+        return False
+
+
+def consumer_for_digest(digest: str) -> "tuple[str | None, bool]":
+    """Resolve one exact SHA-256 digest to its consumer.
+
+    ``ok=False`` distinguishes an unavailable authority from a definitive miss;
+    ingress fails the former with 503 and the latter with 401.
+    """
+    digest = str(digest or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{64}", digest):
+        return None, True
+    try:
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT consumer FROM consumer_key_digests WHERE digest=%s",
+                (digest,)).fetchone()
+        return (str(row[0]), True) if row else (None, True)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store consumer_for_digest failed: %s", exc)
+        return None, False
+
+
+def consume_rate_token(consumer: str, rate_per_min: int, burst: int, *,
+                       now: "float | None" = None) -> "tuple[bool, bool, float]":
+    """Atomically consume one token from a global per-consumer token bucket.
+
+    Returns ``(allowed, store_ok, retry_after_s)``.  The row is locked for one
+    short transaction, so replicas cannot independently admit the same quota.
+    ``rate_per_min`` is the refill rate and ``burst`` the bucket capacity — the
+    semantics operators expect, unlike the former ``max(rate, burst)`` deque.
+    """
+    try:
+        rate = max(1, int(rate_per_min))
+        capacity = max(1, int(burst))
+        stamp = float(time.time() if now is None else now)
+        refill_per_s = rate / 60.0
+        with _get_pool().connection() as conn:
+            # Establish the row before locking it. Concurrent first requests
+            # serialize on the unique key via ON CONFLICT, then FOR UPDATE.
+            conn.execute(
+                "INSERT INTO consumer_rate_buckets(consumer,tokens,updated_at)"
+                " VALUES (%s,%s,%s) ON CONFLICT(consumer) DO NOTHING",
+                (consumer, float(capacity), stamp))
+            row = conn.execute(
+                "SELECT tokens,updated_at FROM consumer_rate_buckets"
+                " WHERE consumer=%s FOR UPDATE", (consumer,)).fetchone()
+            tokens = min(float(capacity), float(row[0]) +
+                         max(0.0, stamp - float(row[1])) * refill_per_s)
+            allowed = tokens >= 1.0
+            if allowed:
+                tokens -= 1.0
+            conn.execute(
+                "UPDATE consumer_rate_buckets SET tokens=%s,updated_at=%s"
+                " WHERE consumer=%s", (tokens, stamp, consumer))
+        retry_after = 0.0 if allowed else max(0.01, (1.0 - tokens) / refill_per_s)
+        return allowed, True, retry_after
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store consume_rate_token failed: %s", exc)
+        return False, False, 0.0
+
+
+def _peer_lease_args(peer_id: str, lease_id: str, ttl_s: float = 120.0) \
+        -> tuple[str, str, float]:
+    peer = str(peer_id or "").strip().lower()
+    lease = str(lease_id or "").strip().lower()
+    ttl = max(5.0, min(3600.0, float(ttl_s)))
+    if not peer or len(peer) > 200:
+        raise ValueError("peer_id must be 1-200 characters")
+    if not re.fullmatch(r"[a-f0-9]{32}", lease):
+        raise ValueError("lease_id must be 32 lowercase hex characters")
+    return peer, lease, ttl
+
+
+def try_acquire_peer_lease(peer_id: str, lease_id: str, cap: int, *,
+                           ttl_s: float = 120.0) -> "tuple[bool, bool]":
+    """Atomically claim one global concurrency slot for a marketplace peer.
+
+    Returns ``(acquired, store_ok)``. The transaction-scoped advisory lock is
+    keyed by peer, so replicas cannot both observe the last free slot. Expired
+    leases are removed before counting; live calls renew in the background.
+    """
+    try:
+        peer, lease, ttl = _peer_lease_args(peer_id, lease_id, ttl_s)
+        capacity = max(1, min(1000, int(cap)))
+        with _get_pool().connection() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (peer,))
+            conn.execute(
+                "DELETE FROM peer_concurrency_leases"
+                " WHERE peer_id=%s"
+                " AND expires_at <= EXTRACT(EPOCH FROM clock_timestamp())",
+                (peer,))
+            used = int(conn.execute(
+                "SELECT COUNT(*) FROM peer_concurrency_leases"
+                " WHERE peer_id=%s", (peer,)).fetchone()[0])
+            if used >= capacity:
+                return False, True
+            conn.execute(
+                "INSERT INTO peer_concurrency_leases"
+                " (lease_id,peer_id,expires_at) VALUES"
+                " (%s,%s,EXTRACT(EPOCH FROM clock_timestamp()) + %s)",
+                (lease, peer, ttl))
+        return True, True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store try_acquire_peer_lease failed: %s", exc)
+        return False, False
+
+
+def renew_peer_lease(peer_id: str, lease_id: str, *,
+                     ttl_s: float = 120.0) -> bool:
+    """Extend one live lease. False means it expired/disappeared or DB failed."""
+    try:
+        peer, lease, ttl = _peer_lease_args(peer_id, lease_id, ttl_s)
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "UPDATE peer_concurrency_leases"
+                " SET expires_at=EXTRACT(EPOCH FROM clock_timestamp()) + %s"
+                " WHERE peer_id=%s AND lease_id=%s RETURNING lease_id",
+                (ttl, peer, lease)).fetchone()
+        return row is not None
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store renew_peer_lease failed: %s", exc)
+        return False
+
+
+def release_peer_lease(peer_id: str, lease_id: str) -> bool:
+    """Release a global peer slot; expiry remains the crash-safe fallback."""
+    try:
+        peer, lease, _ttl = _peer_lease_args(peer_id, lease_id)
+        with _get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM peer_concurrency_leases"
+                " WHERE peer_id=%s AND lease_id=%s", (peer, lease))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store release_peer_lease failed: %s", exc)
         return False
 
 
@@ -530,12 +909,14 @@ def _insert_route_observation(row: dict[str, Any]) -> None:
             conn.execute(
                 "INSERT INTO route_observations"
                 " (ts, provider_id, model_family, served_by, ok, latency_ms,"
-                " tools_requested, tool_calls_emitted)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                " error_kind, http_status, tools_requested, tool_calls_emitted)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (int(row.get("ts") or time.time() * 1000),
                  row.get("provider_id"), row.get("model_family"), row.get("served_by"),
                  bool(row.get("ok")),
                  float(row["latency_ms"]) if row.get("latency_ms") is not None else None,
+                 row.get("error_kind"),
+                 int(row["http_status"]) if row.get("http_status") is not None else None,
                  bool(row.get("tools_requested")), bool(row.get("tool_calls_emitted"))))
     except Exception as exc:  # noqa: BLE001 — the fold must never break a request
         _log.warning("host_store route observation insert failed: %s", exc)
@@ -569,6 +950,145 @@ def route_stats(window_ms: int = 900_000) -> dict[str, dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001 — measurement read is best-effort
         _log.warning("host_store route_stats failed: %s", exc)
         return {}
+
+
+# Failures in these classes describe the request rather than the route. They
+# remain in route_stats() for backwards-compatible measured reliability, but do
+# not put a marketplace seller into a durable cooldown.
+_ROUTE_HEALTH_NEUTRAL_ERRORS = frozenset({
+    "bad_request", "content_filter", "context_overflow", "payment_required",
+})
+
+# A failure in one service can prove the whole peer unhealthy only for transport,
+# capacity and server faults. A model_unavailable/404 is deliberately absent: it
+# quarantines that peer+family route without hiding the peer's other models.
+_PEER_HEALTH_FAILURE_ERRORS = frozenset({
+    "rate_limit", "timeout", "server_error", "network_error", "auth_error",
+    "bad_response", "unknown",
+})
+
+
+def _fold_health_rows(rows: list[tuple], provider_id: str, *, peer: bool) -> dict:
+    """Fold newest-first observation rows into consecutive attributable failures.
+
+    The SQL caps each identity to a bounded recent sample. A success ends the
+    current failure streak; client/request faults are ignored. Old observations
+    have no error_kind, so they remain route evidence (the safe migration
+    direction) but are not promoted to peer-wide blame.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for family, served_by, ts, ok, error_kind, http_status in rows:
+        key = served_by if peer else f"{provider_id}|{family}|{served_by}"
+        state = out.setdefault(key, {
+            "consecutive_failures": 0,
+            "last_failure_at": None,
+            "last_success_at": None,
+            "latest_error_kind": None,
+            "latest_http_status": None,
+            "sample_count": 0,
+            "_ended": False,
+        })
+        state["sample_count"] += 1
+        if state["_ended"]:
+            continue
+        if ok:
+            state["last_success_at"] = int(ts)
+            state["_ended"] = True
+            continue
+        kind = str(error_kind) if error_kind else None
+        attributable = (
+            kind in _PEER_HEALTH_FAILURE_ERRORS if peer
+            else kind not in _ROUTE_HEALTH_NEUTRAL_ERRORS
+        )
+        if not attributable:
+            continue
+        state["consecutive_failures"] += 1
+        if state["last_failure_at"] is None:
+            state["last_failure_at"] = int(ts)
+            state["latest_error_kind"] = kind
+            state["latest_http_status"] = (
+                int(http_status) if http_status is not None else None)
+    for key in list(out):
+        state = out[key]
+        state.pop("_ended", None)
+        # A group containing only neutral failures carries no health evidence.
+        if not state["consecutive_failures"] and state["last_success_at"] is None:
+            out.pop(key)
+    return out
+
+
+def marketplace_route_health(provider_id: str, window_ms: int = 86_400_000,
+                             sample_limit: int = 64) -> dict[str, dict]:
+    """Bounded durable health for one marketplace provider.
+
+    Returns ``{"routes": {provider|family|peer: state}, "peers": {peer: state}}``.
+    Route state drives service-specific cooldowns; peer state is restricted to
+    failures that can safely be attributed across services. Both are derived
+    from the shared Postgres ledger, so replicas and restarts agree.
+    """
+    try:
+        cutoff = int(time.time() * 1000) - max(0, window_ms)
+        limit = max(1, min(int(sample_limit), 512))
+
+        def read(partition: str, order_prefix: str) -> list[tuple]:
+            with _get_pool().connection() as conn:
+                cur = conn.execute(
+                    "SELECT model_family,served_by,ts,ok,error_kind,http_status"
+                    " FROM (SELECT id,model_family,served_by,ts,ok,error_kind,http_status,"
+                    f" row_number() OVER (PARTITION BY {partition} ORDER BY ts DESC,id DESC) AS rn"
+                    " FROM route_observations WHERE provider_id=%s AND ts >= %s) recent"
+                    " WHERE rn <= %s"
+                    f" ORDER BY {order_prefix},ts DESC,id DESC",
+                    (provider_id, cutoff, limit))
+                return list(cur.fetchall())
+
+        route_rows = read("model_family,served_by", "served_by,model_family")
+        peer_rows = read("served_by", "served_by")
+        return {
+            "routes": _fold_health_rows(route_rows, provider_id, peer=False),
+            "peers": _fold_health_rows(peer_rows, provider_id, peer=True),
+        }
+    except Exception as exc:  # noqa: BLE001 — admission degrades to legacy behavior
+        _log.warning("host_store marketplace_route_health failed: %s", exc)
+        return {"routes": {}, "peers": {}}
+
+
+def provider_attempt_counts(provider_id: str, window_ms: int = 3_600_000) -> dict[str, int]:
+    """{ok, failed, total} attempts for one provider over the last `window_ms`,
+    across every family and peer. The wallet keeper's "is this provider fully
+    wedged?" evidence: `ok == 0` with a non-zero `total` means every routed call
+    failed, which is what distinguishes a stuck escrow from an idle provider (a
+    quiet provider has total == 0 and must NOT trigger a reclaim).
+
+    Fail-soft in the SAFE direction: a store error reports ok=-1, which the keeper
+    reads as "cannot prove wedged" and declines to force-close channels."""
+    try:
+        cutoff = int(time.time() * 1000) - max(0, window_ms)
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT coalesce(sum(CASE WHEN ok THEN 1 ELSE 0 END),0), count(*)"
+                " FROM route_observations WHERE provider_id=%s AND ts >= %s",
+                (provider_id, cutoff)).fetchone()
+        ok, total = int(row[0] or 0), int(row[1] or 0)
+        return {"ok": ok, "failed": total - ok, "total": total}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store provider_attempt_counts failed: %s", exc)
+        return {"ok": -1, "failed": -1, "total": -1}
+
+
+def provider_recent_ok(provider_id: str, limit: int = 10) -> list[bool]:
+    """The last `limit` per-attempt ok flags for a provider, NEWEST FIRST — the
+    wedge detector's raw. Fail-soft -> [] (no evidence, no warning)."""
+    try:
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT ok FROM route_observations WHERE provider_id=%s"
+                " ORDER BY ts DESC, id DESC LIMIT %s",
+                (provider_id, max(1, min(int(limit), 1000))))
+            return [bool(r[0]) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store provider_recent_ok failed: %s", exc)
+        return []
 
 
 def tool_incapable_routes(window_ms: int = 1_800_000, min_samples: int = 20) -> "set[str]":
@@ -802,6 +1322,7 @@ def usage_rows_page(since_ts: "int | None" = None, caller: "str | None" = None,
                                      consumer_sha=consumer_sha, provider=provider,
                                      model_family=model_family)
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             cur = conn.execute(
                 f"SELECT {', '.join(_USAGE_COLS)} FROM calls{where}"
                 " ORDER BY ts DESC, id ASC LIMIT %s", params + [int(limit)])
@@ -828,11 +1349,15 @@ def usage_rows_page(since_ts: "int | None" = None, caller: "str | None" = None,
 #   * rejects are never persisted to `calls`, so they don't appear here.
 
 _AGG_INNER = (
-    "SELECT id, ts, status, tokens_in, tokens_out, tokens_total, cost_usd,"
+    "SELECT id, ts, status, tokens_in, tokens_out, tokens_total, tokens_cached, cost_usd,"
     " requested_model, model_family, provider_id,"
     " COALESCE(NULLIF(caller,''),'unknown') AS caller_k,"
     " COALESCE(NULLIF(provider_id,''),'unknown') AS provider_k,"
-    " COALESCE(NULLIF(model_family,''),'unknown') AS family_k,"
+    # Error/aux rows carry no served model_family (it comes from the upstream
+    # x_router, absent on failure) — fall back to the model the caller ASKED
+    # for so failures attribute to a real model instead of piling into a single
+    # opaque "unknown" bucket. Served family stays the primary key for 2xx rows.
+    " COALESCE(NULLIF(model_family,''),NULLIF(requested_model,''),'unknown') AS family_k,"
     " COALESCE(NULLIF(requested_model,''),'unknown') AS route_k,"
     " COALESCE(NULLIF(served_model_id,''),'unknown') AS served_k,"
     " COALESCE(NULLIF(substr(consumer_sha,1,12),''),'unknown') AS prefix_k,"
@@ -848,6 +1373,7 @@ _AGG_MEASURES = (
     " COALESCE(sum(COALESCE(tokens_out,0)),0) AS tokens_out,"
     " COALESCE(sum(CASE WHEN COALESCE(tokens_total,0) <> 0 THEN tokens_total"
     " ELSE COALESCE(tokens_in,0)+COALESCE(tokens_out,0) END),0) AS tokens_total,"
+    " COALESCE(sum(COALESCE(tokens_cached,0)),0) AS tokens_cached,"
     " round(COALESCE(sum(GREATEST(cost_usd,0)),0)::numeric,6)::float8 AS cost_usd,"
     " count(cost_usd) AS priced,"
     " max(ts) AS last_seen"
@@ -855,17 +1381,24 @@ _AGG_MEASURES = (
 
 
 def _agg_counter(row: tuple) -> dict[str, Any]:
-    requests, errors, tin, tout, ttotal, cost, priced, last_seen = row
-    return {"requests": int(requests), "errors": int(errors),
+    requests, errors, tin, tout, ttotal, cached, cost, priced, last_seen = row
+    requests, tin, ttotal, cached = int(requests), int(tin), int(ttotal), int(cached)
+    cost = float(cost)
+    return {"requests": requests, "errors": int(errors),
             "tokens_in": int(tin), "tokens_out": int(tout),
-            "tokens_total": int(ttotal), "cost_usd": float(cost),
+            "tokens_total": ttotal, "tokens_cached": cached, "cost_usd": cost,
+            "cost_per_mtok": round(cost * 1_000_000 / ttotal, 4) if ttotal else None,
+            "cost_per_request": round(cost / requests, 6) if requests else None,
+            "cache_hit_rate": round(cached / tin, 4) if tin else None,
             "priced": int(priced),
             "last_seen": int(last_seen) if last_seen is not None else None}
 
 
 def _empty_usage_aggregate() -> dict[str, Any]:
     return {"totals": {"requests": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0,
-                       "tokens_total": 0, "cost_usd": 0.0, "priced": 0,
+                       "tokens_total": 0, "tokens_cached": 0, "cost_usd": 0.0,
+                       "cost_per_mtok": None, "cost_per_request": None,
+                       "cache_hit_rate": None, "priced": 0,
                        "last_seen": None},
             "by_caller": {}, "by_provider": {}, "by_model_family": {},
             "by_route": {}, "by_served_model": {}, "by_status": {}, "by_day": {}}
@@ -898,6 +1431,7 @@ def usage_aggregate(since_ts: "int | None" = None, caller: "str | None" = None,
                 123: ("by_served_model", 5), 126: ("by_day", 7)}
         out = _empty_usage_aggregate()
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             for row in conn.execute(sql, params):
                 gset = int(row[0])
                 counter = _agg_counter(row[8:])
@@ -1051,11 +1585,142 @@ def policy_backtest_groups(since_ts: "int | None" = None,
         }
 
 
+_ANALYTICS_LOCK_KEY = 0x616E616C_79746963
+_ANALYTICS_STATE_NAME = "hourly-v2-cache"
+
+
+def rollup_analytics(start_ts: int, end_ts: int) -> dict[str, Any]:
+    """Idempotently replace hourly aggregates for [start_ts, end_ts)."""
+    start = (int(start_ts) // 3600) * 3600
+    end = ((int(end_ts) + 3599) // 3600) * 3600
+    if end <= start:
+        raise ValueError("analytics rollup end must be after start")
+    with _get_pool().connection() as conn:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", [_ANALYTICS_LOCK_KEY])
+        conn.execute("SELECT set_config('statement_timeout', %s, true)",
+                     [os.getenv("ANALYTICS_ROLLUP_TIMEOUT_MS", "120000")])
+        conn.execute("DELETE FROM analytics_hourly WHERE bucket_start >= %s AND bucket_start < %s",
+                     [start, end])
+        cur = conn.execute(
+            "INSERT INTO analytics_hourly("
+            " bucket_start,caller,key_prefix,provider_id,model_family,requested_model,served_model_id,status,"
+            " requests,errors,tokens_in,tokens_out,tokens_total,tokens_cached,cost_usd,priced,last_seen)"
+            " SELECT (ts/3600)*3600,"
+            " COALESCE(NULLIF(caller,''),'unknown'),"
+            " COALESCE(NULLIF(substr(consumer_sha,1,12),''),'unknown'),"
+            " COALESCE(NULLIF(provider_id,''),'unknown'),"
+            " COALESCE(NULLIF(model_family,''),NULLIF(requested_model,''),'unknown'),"
+            " COALESCE(NULLIF(requested_model,''),'unknown'),"
+            " COALESCE(NULLIF(served_model_id,''),'unknown'), COALESCE(status,0),"
+            " count(*), count(*) FILTER(WHERE COALESCE(status,0)>=400),"
+            " COALESCE(sum(COALESCE(tokens_in,0)),0),"
+            " COALESCE(sum(COALESCE(tokens_out,0)),0),"
+            " COALESCE(sum(CASE WHEN COALESCE(tokens_total,0)<>0 THEN tokens_total"
+            " ELSE COALESCE(tokens_in,0)+COALESCE(tokens_out,0) END),0),"
+            " COALESCE(sum(COALESCE(tokens_cached,0)),0),"
+            " COALESCE(sum(GREATEST(cost_usd,0)),0)::float8, count(cost_usd), max(ts)"
+            " FROM calls WHERE ts >= %s AND ts < %s"
+            " GROUP BY 1,2,3,4,5,6,7,8",
+            [start, end])
+        rows = cur.rowcount
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO analytics_rollup_state(name,covered_from,covered_until,updated_at)"
+            " VALUES(%s,%s,%s,%s) ON CONFLICT(name) DO UPDATE SET"
+            " covered_from=LEAST(analytics_rollup_state.covered_from,EXCLUDED.covered_from),"
+            " covered_until=GREATEST(analytics_rollup_state.covered_until,EXCLUDED.covered_until),"
+            " updated_at=EXCLUDED.updated_at", [_ANALYTICS_STATE_NAME, start, end, now])
+    return {"start": start, "end": end, "rows": int(rows or 0), "updated_at": now}
+
+
+def analytics_rollup_state() -> dict[str, Any]:
+    try:
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT covered_from,covered_until,updated_at FROM analytics_rollup_state"
+                " WHERE name=%s", [_ANALYTICS_STATE_NAME]).fetchone()
+        return {"covered_from": row[0], "covered_until": row[1],
+                "updated_at": row[2]} if row else {}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store analytics_rollup_state failed: %s", exc)
+        return {}
+
+
+def analytics_aggregate(since_ts: int, caller: str | None = None,
+                        provider: str | None = None,
+                        model_family: str | None = None,
+                        consumer_sha: str | None = None) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    """Dashboard-shaped counters from hourly rollups, never from raw calls."""
+    out = _empty_usage_aggregate()
+    try:
+        clauses = ["bucket_start >= %s"]
+        params: list[Any] = [(int(since_ts) // 3600) * 3600]
+        for column, value in (("caller", caller), ("provider_id", provider),
+                              ("model_family", model_family)):
+            if value:
+                clauses.append(f"{column} = %s")
+                params.append(value)
+        if consumer_sha:
+            clauses.append("key_prefix = %s")
+            params.append(str(consumer_sha)[:12])
+        where = " WHERE " + " AND ".join(clauses)
+        measures = (" COALESCE(sum(requests),0), COALESCE(sum(errors),0),"
+                    " COALESCE(sum(tokens_in),0), COALESCE(sum(tokens_out),0),"
+                    " COALESCE(sum(tokens_total),0), COALESCE(sum(tokens_cached),0),"
+                    " round(COALESCE(sum(cost_usd),0)::numeric,6)::float8,"
+                    " COALESCE(sum(priced),0), max(last_seen)")
+        with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
+            total = conn.execute("SELECT" + measures + " FROM analytics_hourly" + where,
+                                 params).fetchone()
+            out["totals"] = _agg_counter(total)
+            for bucket, column in (("by_caller", "caller"), ("by_provider", "provider_id"),
+                                   ("by_model_family", "model_family"),
+                                   ("by_route", "requested_model"),
+                                   ("by_served_model", "served_model_id")):
+                for row in conn.execute("SELECT " + column + "," + measures +
+                                        " FROM analytics_hourly" + where + " GROUP BY " + column,
+                                        params):
+                    out[bucket][str(row[0])] = _agg_counter(row[1:])
+            for status, count in conn.execute(
+                    "SELECT status,sum(requests) FROM analytics_hourly" + where +
+                    " GROUP BY status", params):
+                out["by_status"][str(status)] = int(count)
+            for day, *counter in conn.execute(
+                    "SELECT to_char(to_timestamp(bucket_start) AT TIME ZONE 'UTC','YYYY-MM-DD')," +
+                    measures + " FROM analytics_hourly" + where + " GROUP BY 1", params):
+                out["by_day"][str(day)] = _agg_counter(tuple(counter))
+            state_row = conn.execute(
+                "SELECT covered_from,covered_until,updated_at FROM analytics_rollup_state"
+                " WHERE name=%s", [_ANALYTICS_STATE_NAME]).fetchone()
+        state = {"covered_from": state_row[0], "covered_until": state_row[1],
+                 "updated_at": state_row[2]} if state_row else {}
+        return out, state, True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store analytics_aggregate failed: %s", exc)
+        return out, {}, False
+
+
+def consumer_spend_usd(caller: str) -> tuple[float, bool]:
+    """Authoritative persisted spend for budget admission. Fail closed."""
+    try:
+        with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
+            row = conn.execute(
+                "SELECT spent_usd FROM consumer_budget_usage WHERE consumer = %s",
+                [caller]).fetchone()
+            return round(float(row[0] if row else 0.0), 6), True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store consumer_spend_usd failed: %s", exc)
+        return 0.0, False
+
+
 def usage_count(since_ts: "int | None" = None) -> int:
     """Row count in the window (the dashboard's history_events_all). Fail-soft -> 0."""
     try:
         where, params = _usage_where(since_ts=since_ts)
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             return int(conn.execute(
                 f"SELECT count(*) FROM calls{where}", params).fetchone()[0])
     except Exception as exc:  # noqa: BLE001
@@ -1073,6 +1738,7 @@ def usage_provider_stats(since_ts: "int | None" = None) -> dict[str, dict[str, A
         where, params = _usage_where(since_ts=since_ts)
         out: dict[str, dict[str, Any]] = {}
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             cur = conn.execute(
                 "SELECT provider_k," + _AGG_MEASURES +
                 f" FROM ({_AGG_INNER}{where}) c GROUP BY provider_k", params)
@@ -1084,7 +1750,7 @@ def usage_provider_stats(since_ts: "int | None" = None) -> dict[str, dict[str, A
                 f" FROM ({_AGG_INNER}{where}) c"
                 " ORDER BY provider_k, ts DESC, id DESC", params)
             for provider_k, ts, status, route, family in cur.fetchall():
-                item = out.setdefault(str(provider_k), _agg_counter((0,) * 7 + (None,)))
+                item = out.setdefault(str(provider_k), _agg_counter((0,) * 8 + (None,)))
                 item.update({"last_ts": ts, "last_status": status,
                              "last_route": route, "last_model_family": family})
         return out
@@ -1102,6 +1768,7 @@ def usage_connections(since_ts: "int | None" = None,
         where, params = _usage_where(since_ts=since_ts, caller=caller)
         grouped: dict[tuple[str, str], dict[str, Any]] = {}
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             cur = conn.execute(
                 "SELECT caller_k, prefix_k, count(*),"
                 " count(*) FILTER (WHERE COALESCE(status,0) >= 400),"
@@ -1228,7 +1895,7 @@ def recent_logins(limit: int = 100) -> list[dict[str, Any]]:
 # window/housekeeping columns (observed_at/first_seen/fetched_at) stay internal.
 _PEER_OFFER_FIELDS = ("peer_id", "service", "price_in", "price_out",
                       "price_cached_in", "max_concurrency", "reputation",
-                      "last_seen")
+                      "last_seen", "last_reached_at")
 
 
 def peer_offers(window_ms: int = 900_000) -> list[dict[str, Any]]:
@@ -1250,14 +1917,26 @@ def peer_offers(window_ms: int = 900_000) -> list[dict[str, Any]]:
 
 # ---- buyer_status (antseed buyer escrow/pin/wallet; written by the sidecar) ----
 
+# `fetched_at` (epoch MS, the sidecar's write stamp) is surfaced deliberately:
+# every funding gate downstream — the offer tourniquet, the envelope's `credits`
+# clause and the wallet keeper — decides from this row, and a row with no
+# readable age cannot be distinguished from a current one. A dead sidecar plus a
+# drained escrow is exactly the state where a stale row reads "funded" and every
+# gate fails OPEN together. Consumers bound the age themselves (the keeper fails
+# closed on it; see sources/antseed.STALE_AFTER_S for the shared bound).
 _BUYER_STATUS_FIELDS = ("pid", "pinned_peer_id", "deposits_available",
-                        "deposits_reserved", "wallet_address", "connection_state")
+                        "deposits_reserved", "wallet_address", "connection_state",
+                        "fetched_at")
 
 
 def buyer_status(pid: str) -> "dict[str, Any] | None":
     """The antseed buyer's latest status row (session pin + escrow + wallet) for
     `pid`, or None when absent / on a store error (degraded: no pin, no balance),
-    exactly as a missing status file was. Fail-soft."""
+    exactly as a missing status file was. Fail-soft.
+
+    Carries `fetched_at` (epoch MS) so callers can bound its age — the row is
+    written every 60s by the sidecar, and a row that stopped being written is not
+    evidence of anything."""
     try:
         cols = ", ".join(_BUYER_STATUS_FIELDS)
         with _get_pool().connection() as conn:
@@ -1268,6 +1947,277 @@ def buyer_status(pid: str) -> "dict[str, Any] | None":
     except Exception as exc:  # noqa: BLE001 — status read is best-effort
         _log.warning("host_store buyer_status failed: %s", exc)
         return None
+
+
+# ---- wallet_ops (the wallet keeper's audit trail + rate-cap ledger; DURABLE) ---
+# Unlike the ledger these writes are NOT best-effort: the keeper moves real USDC,
+# so a write failure must STOP it (`wallet_op_begin` returning None means "do not
+# fire"). Reads are fail-soft in the SAFE direction — a read failure looks like
+# "already spent / already halted", never like "free to spend".
+
+# Outcomes that count as money having left the wallet for cap + cooldown purposes.
+# `pending` and `unknown` count too: a keeper that died mid-deposit — or one whose
+# HTTP call to the sidecar timed out, reset, or came back 502 from a killed CLI —
+# must ASSUME the transaction landed rather than re-fire on top of it. The one
+# outcome that is NOT here is `failed`, and it is reserved for responses that PROVE
+# no transaction could have reached Base mainnet: nothing was sent at all (no
+# control URL, a 400 from the amount validator), or the sidecar ran the buyer CLI
+# and classified its failure as provably pre-RPC (antseed/broadcast.js — a process
+# that never spawned, a module graph that would not load). Anything the sidecar
+# cannot place before the first RPC call is `unknown`, which notably includes
+# every failure once the CLI's on-chain step has started.
+# See wallet_keeper._control_post and antseed/broadcast.js.
+WALLET_OP_SPENT_OUTCOMES = ("pending", "fired", "effective", "ineffective", "unknown")
+# Outcomes of a deposit whose effect on `deposits_available` has been measured.
+WALLET_OP_SETTLED_OUTCOMES = ("effective", "ineffective")
+# Outcomes that will never change again — the row is closed out. `pending`/`fired`
+# are still in flight and `halted` is not an op at all (see wallet_halt).
+WALLET_OP_TERMINAL_OUTCOMES = ("effective", "ineffective", "ok", "failed", "unknown")
+# Terminal outcomes that mean the op did NOT demonstrably work. The money-pump
+# breaker scores `ineffective` (measured); the error breaker scores the other two
+# (unmeasurable), which is why they are counted separately by the keeper.
+WALLET_OP_ERROR_OUTCOMES = ("failed", "unknown")
+
+_WALLET_OP_FIELDS = ("id", "ts", "pid", "op", "amount_usdc", "reason",
+                     "pre_available", "post_available", "pre_reserved",
+                     "post_reserved", "outcome", "detail", "updated_at")
+
+
+def wallet_op_begin(pid: str, op: str, amount_usdc: "float | None" = None,
+                    reason: "str | None" = None,
+                    pre_available: "float | None" = None,
+                    pre_reserved: "float | None" = None) -> "int | None":
+    """Record the INTENT to run a wallet op and return its row id. Call this
+    BEFORE firing the transaction. Returns None when the row could NOT be
+    persisted — the caller must then abort: an unlogged on-chain spend is worse
+    than a missed top-up (no audit trail, no cap accounting, no reconciliation).
+
+    `pre_reserved` is recorded alongside `pre_available` so the effect check can
+    net out the escrow ratchet (a deposit that lands and is immediately reserved
+    by an opening channel raised the escrow, just not the spendable half)."""
+    try:
+        now = int(time.time())
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "INSERT INTO wallet_ops (ts, pid, op, amount_usdc, reason,"
+                " pre_available, pre_reserved, outcome, updated_at)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,'pending',%s) RETURNING id",
+                (now, pid, op,
+                 float(amount_usdc) if amount_usdc is not None else None,
+                 reason,
+                 float(pre_available) if pre_available is not None else None,
+                 float(pre_reserved) if pre_reserved is not None else None,
+                 now)).fetchone()
+            return int(row[0]) if row else None
+    except Exception as exc:  # noqa: BLE001 — surfaced to the caller as "do not fire"
+        _log.warning("host_store wallet_op_begin failed: %s", exc)
+        return None
+
+
+def wallet_op_finish(op_id: int, outcome: str,
+                     post_available: "float | None" = None,
+                     detail: "str | None" = None,
+                     post_reserved: "float | None" = None) -> bool:
+    """Close out an intent row with its observed outcome. False on a persistence
+    failure so the caller can log it; the row then stays `pending` and startup
+    reconciliation treats it conservatively (as spent)."""
+    try:
+        with _get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE wallet_ops SET outcome=%s, post_available=%s,"
+                " post_reserved=%s, detail=%s, updated_at=%s WHERE id=%s",
+                (outcome,
+                 float(post_available) if post_available is not None else None,
+                 float(post_reserved) if post_reserved is not None else None,
+                 str(detail)[:2000] if detail is not None else None,
+                 int(time.time()), int(op_id)))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_op_finish failed: %s", exc)
+        return False
+
+
+def wallet_ops_recent(pid: "str | None" = None, limit: int = 50) -> list[dict[str, Any]]:
+    """The newest wallet ops (audit feed for the dashboard). Fail-soft -> []."""
+    try:
+        cols = ", ".join(_WALLET_OP_FIELDS)
+        with _get_pool().connection() as conn:
+            if pid is None:
+                cur = conn.execute(
+                    f"SELECT {cols} FROM wallet_ops ORDER BY id DESC LIMIT %s",
+                    (max(1, min(int(limit), 1000)),))
+            else:
+                cur = conn.execute(
+                    f"SELECT {cols} FROM wallet_ops WHERE pid=%s"
+                    " ORDER BY id DESC LIMIT %s",
+                    (pid, max(1, min(int(limit), 1000))))
+            return [dict(zip(_WALLET_OP_FIELDS, r)) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_ops_recent failed: %s", exc)
+        return []
+
+
+def wallet_ops_open(pid: str, op: "str | None" = None) -> list[dict[str, Any]]:
+    """Ops still awaiting an outcome (`pending`, or `fired` awaiting the effect
+    check). The startup reconciliation and the money-pump breaker both read this.
+    Fail-soft -> []."""
+    try:
+        cols = ", ".join(_WALLET_OP_FIELDS)
+        sql = (f"SELECT {cols} FROM wallet_ops WHERE pid=%s"
+               " AND outcome IN ('pending','fired')")
+        params: list[Any] = [pid]
+        if op is not None:
+            sql += " AND op=%s"
+            params.append(op)
+        with _get_pool().connection() as conn:
+            cur = conn.execute(sql + " ORDER BY id", params)
+            return [dict(zip(_WALLET_OP_FIELDS, r)) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_ops_open failed: %s", exc)
+        return []
+
+
+def wallet_op_spend_since(pid: str, op: str, since_ts: int) -> dict[str, Any]:
+    """{spent_usdc, last_ts, count} over the ops of this kind since `since_ts`
+    that COUNT as spent — the daily-cap and cooldown ledger. Fail-soft in the SAFE
+    direction: a store error reports the cap as fully consumed and the cooldown as
+    just started, so a broken read can never authorize a spend."""
+    now = int(time.time())
+    try:
+        placeholders = ",".join(["%s"] * len(WALLET_OP_SPENT_OUTCOMES))
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT coalesce(sum(amount_usdc),0), max(ts), count(*)"
+                " FROM wallet_ops WHERE pid=%s AND op=%s AND ts >= %s"
+                f" AND outcome IN ({placeholders})",
+                (pid, op, int(since_ts), *WALLET_OP_SPENT_OUTCOMES)).fetchone()
+        return {"spent_usdc": float(row[0] or 0.0),
+                "last_ts": int(row[1]) if row[1] is not None else None,
+                "count": int(row[2] or 0)}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_op_spend_since failed: %s", exc)
+        return {"spent_usdc": float("inf"), "last_ts": now, "count": -1,
+                "unreadable": True}
+
+
+def wallet_ops_settled(pid: str, op: str, limit: int = 2) -> list[dict[str, Any]]:
+    """The newest ops of this kind whose EFFECT has been measured, newest first —
+    the money-pump breaker's input. Fail-soft -> []."""
+    try:
+        cols = ", ".join(_WALLET_OP_FIELDS)
+        placeholders = ",".join(["%s"] * len(WALLET_OP_SETTLED_OUTCOMES))
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                f"SELECT {cols} FROM wallet_ops WHERE pid=%s AND op=%s"
+                f" AND outcome IN ({placeholders}) ORDER BY id DESC LIMIT %s",
+                (pid, op, *WALLET_OP_SETTLED_OUTCOMES, max(1, min(int(limit), 100))))
+            return [dict(zip(_WALLET_OP_FIELDS, r)) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_ops_settled failed: %s", exc)
+        return []
+
+
+def wallet_ops_terminal(pid: str, op: str, limit: int = 5) -> list[dict[str, Any]]:
+    """The newest CLOSED-OUT ops of this kind, newest first — the input to the
+    keeper's consecutive-error breaker.
+
+    Wider than `wallet_ops_settled`: it includes the outcomes whose effect could
+    never be measured (`failed`, `unknown`). Those are exactly the ones that used
+    to escape every guardrail — a deposit that errors is invisible to the
+    money-pump breaker, so a permanently failing top-up re-fired every cycle
+    forever. Fail-soft -> [], which the keeper reads as "no strikes on record"
+    and pairs with the fail-closed cap/cooldown readers above."""
+    try:
+        cols = ", ".join(_WALLET_OP_FIELDS)
+        placeholders = ",".join(["%s"] * len(WALLET_OP_TERMINAL_OUTCOMES))
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                f"SELECT {cols} FROM wallet_ops WHERE pid=%s AND op=%s"
+                f" AND outcome IN ({placeholders}) ORDER BY id DESC LIMIT %s",
+                (pid, op, *WALLET_OP_TERMINAL_OUTCOMES,
+                 max(1, min(int(limit), 100))))
+            return [dict(zip(_WALLET_OP_FIELDS, r)) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_ops_terminal failed: %s", exc)
+        return []
+
+
+def wallet_ops_last_ts(pid: str, ops: "tuple[str, ...]") -> "int | None":
+    """When any of these op kinds last FIRED, or None if none ever has — the
+    reclaim cooldown's ledger (so a pod restart cannot reset it).
+
+    Separate from `wallet_op_spend_since`, which filters to the outcomes that
+    count as USDC leaving the WALLET. A reclaim moves money between the escrow
+    and its channels, settles as `ok`, and is therefore invisible to that filter
+    — it needs "did this fire at all", not "did this spend".
+
+    Fail-soft in the SAFE direction: a store error reports NOW, i.e. the cooldown
+    has only just started, so a broken read can never authorize a transaction."""
+    now = int(time.time())
+    try:
+        placeholders = ",".join(["%s"] * len(ops))
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                f"SELECT max(ts) FROM wallet_ops WHERE pid=%s AND op IN ({placeholders})"
+                " AND outcome <> 'halted'", (pid, *ops)).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_ops_last_ts failed: %s", exc)
+        return now
+
+
+def wallet_halt(pid: str, kind: str, reason: str) -> bool:
+    """Persist a HARD halt for one class of keeper action (e.g. `topup`). Durable
+    and deliberately sticky: only an operator clears it (`wallet_clear_halt`).
+
+    Returns True only when the halt is PERSISTED. The de-duplication is done in
+    the same statement rather than by calling `wallet_halted` first: that reader
+    fails soft to True, so a store outage used to make this function report a
+    halt it had not written — the keeper logged "HARD HALT" and the next process
+    to read a working store found nothing there."""
+    try:
+        now = int(time.time())
+        with _get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO wallet_ops (ts, pid, op, reason, outcome, updated_at)"
+                " SELECT %s,%s,%s,%s,'halted',%s WHERE NOT EXISTS ("
+                "  SELECT 1 FROM wallet_ops WHERE pid=%s AND op=%s"
+                "  AND outcome='halted')",
+                (now, pid, f"halt:{kind}", str(reason)[:2000], now,
+                 pid, f"halt:{kind}"))
+        return True
+    except Exception as exc:  # noqa: BLE001 — the caller must not claim a halt it
+        # could not write; an unpersisted halt evaporates on the next restart.
+        _log.error("host_store wallet_halt FAILED to persist for %s/%s: %s",
+                   pid, kind, exc)
+        return False
+
+
+def wallet_halted(pid: str, kind: str) -> bool:
+    """Is this class of keeper action hard-halted? Fail-soft to TRUE — an
+    unreadable store must stop the keeper, never silently un-halt it."""
+    try:
+        with _get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM wallet_ops WHERE pid=%s AND op=%s"
+                " AND outcome='halted' LIMIT 1", (pid, f"halt:{kind}")).fetchone()
+        return row is not None
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_halted failed (treating as halted): %s", exc)
+        return True
+
+
+def wallet_clear_halt(pid: str, kind: str) -> bool:
+    """Operator reset of a hard halt (also the test hook). Not called by the
+    keeper — a breaker that re-arms itself is not a breaker."""
+    try:
+        with _get_pool().connection() as conn:
+            conn.execute("DELETE FROM wallet_ops WHERE pid=%s AND op=%s"
+                         " AND outcome='halted'", (pid, f"halt:{kind}"))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store wallet_clear_halt failed: %s", exc)
+        return False
 
 
 # ---- provider_prices (direct-provider list prices; written by sources/official_pricing) ----
@@ -1339,5 +2289,7 @@ def truncate_all_for_tests() -> None:
     """Test helper: wipe every table for isolation against a shared Postgres."""
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
-                     " consumer_keys, peer_offers, buyer_status, route_observations,"
-                     " login_history, provider_prices")
+                     " consumer_keys, consumer_key_digests, consumer_rate_buckets,"
+                     " peer_concurrency_leases,"
+                     " consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
+                     " login_history, provider_prices, wallet_ops")

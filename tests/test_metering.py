@@ -83,3 +83,52 @@ def test_session_owner_binds_first_writer_wins(host_store_clean):
     seed_call(session="sidA", caller="keyB", ts=200)
     assert host_store.session_owner("sidA") == "keyA"
     assert host_store.session_owner(None) is None           # no session -> None, never raises
+
+
+def test_error_rows_attribute_to_requested_model_not_unknown(host_store_clean):
+    """An errored/aux call carries no served model_family (it comes from the
+    upstream x_router, absent on failure). The by_model_family aggregate must
+    fall back to the REQUESTED model so failures attribute to a real model
+    instead of piling into one opaque 'unknown' bucket."""
+    import auth_proxy
+    import host_store
+
+    common = dict(caller="keyF", method="POST", path="/v1/chat/completions",
+                  requested_model="gpt-5.5", key_sha256="cd" * 32)
+    # a served success (family present) + a failure (family absent)
+    auth_proxy._record_request(status=200, latency_ms=1.0, provider="openai",
+                               model_family="gpt-5.5", served_model_id="m",
+                               tokens_in=3, tokens_out=1, tokens_total=4,
+                               cost_usd=0.001, **common)
+    auth_proxy._record_request(status=500, latency_ms=2.0, provider=None,
+                               model_family=None, served_model_id=None,
+                               tokens_in=0, tokens_out=0, tokens_total=0,
+                               cost_usd=None, error_type="upstream", **common)
+
+    fam = host_store.usage_aggregate()["by_model_family"]
+    assert "unknown" not in fam, "error row leaked into the opaque bucket"
+    assert fam["gpt-5.5"]["requests"] == 2
+    assert fam["gpt-5.5"]["errors"] == 1
+
+
+def test_ingress_record_carries_session_to_the_ledger(host_store_clean):
+    """The per-session meter DERIVES from the ingress call ledger: a request
+    recorded with a session must make the sid resolvable (owner + totals).
+    Regression: the proxy built its event without `session`, every row landed
+    with session=NULL, and /v1/session/{sid} answered 404 for every consumer
+    even though the shim had pinned the session fine."""
+    import auth_proxy
+    import host_store
+
+    auth_proxy._record_request(
+        caller="keyZ", method="POST", path="/v1/chat/completions", status=200,
+        latency_ms=1.0, session="sid-ledger", provider="p", model_family="f",
+        served_model_id="m", served_by="p", requested_model=None,
+        tokens_in=5, tokens_out=2, tokens_total=7, tokens_cached=0,
+        cost_usd=0.001, key_sha256="ab" * 32)
+
+    assert host_store.session_owner("sid-ledger") == "keyZ"
+    totals = host_store.session_totals("sid-ledger")
+    assert totals["calls"] == 1
+    assert totals["tokens_in"] == 5
+    assert totals["tokens_out"] == 2

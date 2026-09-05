@@ -38,7 +38,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 import control_plane_client
+from env_coerce import env_int
 import host_store
+from policy_templates import (
+    PolicyTemplateError,
+    build_policy_template,
+    template_catalog,
+)
 
 _log = logging.getLogger("unhardcoded.shim")
 
@@ -54,6 +60,12 @@ DEFAULT_PROFILE_FALLBACK = "default"
 # create_app(default_max_tokens=...); pass None to keep the strict
 # omit-when-absent behaviour.
 DEFAULT_MAX_TOKENS_FALLBACK = 4096
+
+# Hard ceiling for one router execution, including retries and fallbacks. This
+# deliberately stays below the production ALB's 60 s idle timeout so unary
+# requests finish with a structured router error instead of being cut off as an
+# opaque gateway 503. Override with ROUTER_REQUEST_DEADLINE_MS.
+DEFAULT_REQUEST_DEADLINE_MS = 50_000
 
 
 class ChatRequest(BaseModel):
@@ -76,6 +88,9 @@ class ChatRequest(BaseModel):
     # Optional upstream liveness guard. For OpenAI-compatible streaming-capable
     # routes, fail/fallback if no content/tool delta arrives before this budget.
     first_token_timeout_ms: int | None = None
+    # Hard timeout for each provider attempt. This is separate from the
+    # server-side request deadline, which caps the complete fallback chain.
+    timeout_ms: int | None = None
     # Σ_pol per-call policy: a TERM (plain JSON array, e.g.
     # ["policy", ["ev_zero"], ["meets_req"], ...]). Data, never code: the
     # core admits it (sorts/arity/depth/node bounds) and ∧-composes the
@@ -117,6 +132,7 @@ class ResponsesRequest(BaseModel):
     max_output_tokens: int | None = None
     temperature: float | None = None
     first_token_timeout_ms: int | None = None
+    timeout_ms: int | None = None
     policy_ir: list | None = None
     session: str | None = None
     caller: str | None = None
@@ -223,6 +239,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                streaming_call=None,
                default_max_tokens: int | None = DEFAULT_MAX_TOKENS_FALLBACK,
                codex_store=None,
+               request_deadline_ms: int | None = None,
                ) -> FastAPI:
     """Build a FastAPI app wired to a pre-initialized LLMRouterHost.
 
@@ -234,10 +251,52 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     (streaming.make_streaming_dispatcher). Without it, `stream: true`
     requests still work via the pseudo-stream path (complete result encoded
     as SSE) — which is also what mocked backends produce.
+
+    `request_deadline_ms` caps the complete router execution (all retries and
+    fallbacks). When omitted, ROUTER_REQUEST_DEADLINE_MS is read once at app
+    startup, defaulting to 50 seconds.
     """
     import asyncio
 
     import streaming as _streaming
+
+    if request_deadline_ms is None:
+        request_deadline_ms = env_int(
+            "ROUTER_REQUEST_DEADLINE_MS", DEFAULT_REQUEST_DEADLINE_MS)
+    if request_deadline_ms <= 0:
+        raise ValueError("request_deadline_ms must be greater than zero")
+    request_deadline_s = request_deadline_ms / 1000.0
+
+    async def _execute_with_deadline(awaitable):
+        """Await one complete router run and cancel it at the outer deadline.
+
+        asyncio.timeout propagates cancellation into the active provider call,
+        so an expired request does not leave an orphan fallback chain running
+        after the HTTP response has finished.
+        """
+        deadline = asyncio.timeout(request_deadline_s)
+        try:
+            async with deadline:
+                return await awaitable
+        except TimeoutError:
+            # Do not relabel a TimeoutError raised by the host itself: only the
+            # timeout context's own expiry is the outer request deadline.
+            if not deadline.expired():
+                raise
+            _log.warning(
+                "router request deadline exceeded after %d ms",
+                request_deadline_ms,
+            )
+            return {
+                "ok": False,
+                "error": "timeout",
+                "trace": {
+                    "decision_path": [],
+                    "request_deadline_exceeded": True,
+                    "request_deadline_ms": request_deadline_ms,
+                    "total_latency_ms": request_deadline_ms,
+                },
+            }
 
     app = FastAPI(title="llm-router shim", docs_url=None, redoc_url=None)
 
@@ -353,7 +412,24 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             pass
         return _antseed_wallet_view()
 
+    def _antseed_pid() -> str:
+        """The buyer proxy these dashboard ops act on — the ledger key. Matches
+        the sidecar's ANTSEED_BUYER_PID default when the catalog has none."""
+        import wallet_keeper as _wk
+        pids = _wk.antseed_provider_ids(host.catalog())
+        return pids[0] if pids else "antseed"
+
     async def _wallet_mutate(op: str, body: dict):
+        """A HUMAN-initiated deposit/withdraw from the dashboard.
+
+        Ledgered, for the same reason the keeper's are: this endpoint reaches the
+        same buyer CLI and the same hot wallet, and a dashboard deposit whose
+        HTTP call timed out while the CLI was still executing used to leave NO
+        record anywhere — real USDC moved, `wallet_ops` said nothing, and the
+        operator saw only "wallet control unreachable". Recorded under
+        `topup_manual`/`withdraw_manual` rather than the keeper's own `topup`, so
+        the audit trail is complete without a human top-up silently consuming the
+        keeper's daily cap (two actors, two budgets, one wallet)."""
         url, token = _wallet_control()
         if not url:
             return JSONResponse(status_code=503, content={"error": {
@@ -364,24 +440,67 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             return JSONResponse(status_code=400, content={"error": {
                 "message": "amount must be a positive USDC value (<=6 decimals)",
                 "type": "invalid_request", "code": "wallet_amount"}})
+        import wallet_keeper as _wk
+        pid = _antseed_pid()
+        op_id = host_store.wallet_op_begin(
+            pid, f"{op}_manual", amount_usdc=float(amount),
+            reason=f"dashboard-initiated {op}")
         import httpx
         try:
             async with httpx.AsyncClient() as c:
+                # The client budget must strictly EXCEED the sidecar's own worst
+                # case for this endpoint, or the timeout is a lie: the control
+                # server goes on executing a request this side has written off.
                 r = await c.post(f"{url}/{op}", json={"amount": amount},
-                                 headers={"x-antseed-control-token": token}, timeout=130.0)
-        except httpx.HTTPError as e:
+                                 headers={"x-antseed-control-token": token},
+                                 timeout=_wk.DEPOSIT_TIMEOUT_S)
+        except (httpx.InvalidURL, httpx.UnsupportedProtocol) as e:
+            if op_id is not None:
+                host_store.wallet_op_finish(op_id, "failed", detail=str(e)[:2000])
             return JSONResponse(status_code=502, content={"error": {
-                "message": f"wallet control unreachable: {e}",
+                "message": f"wallet control misconfigured: {e}",
+                "type": "wallet_error", "code": "wallet_control_unreachable"}})
+        except Exception as e:  # noqa: BLE001 — timeout, reset, DNS, TLS, ...
+            # The request reached the wire, so the CLI may have broadcast a Base
+            # mainnet transaction. `unknown`, never `failed`.
+            if op_id is not None:
+                host_store.wallet_op_finish(
+                    op_id, "unknown",
+                    detail=f"{type(e).__name__}: {e} (the transaction may have landed)")
+            return JSONResponse(status_code=502, content={"error": {
+                "message": f"wallet control unreachable: {e} — the {op} may still "
+                           "have executed; check the wallet ops ledger before retrying",
                 "type": "wallet_error", "code": "wallet_control_unreachable"}})
         if r.status_code != 200:
             try:
-                detail = (r.json() or {}).get("error")
+                payload = r.json() or {}
             except Exception:  # noqa: BLE001
-                detail = (r.text or "")[:300]
+                payload = {}
+            detail = payload.get("error") or (r.text or "")[:300]
+            attempted = payload.get("attempted")
+            if not isinstance(attempted, bool):
+                attempted = r.status_code not in _wk.NOT_ATTEMPTED_STATUSES
+            if op_id is not None:
+                host_store.wallet_op_finish(
+                    op_id, "unknown" if attempted else "failed",
+                    detail=str(detail)[:2000])
             return JSONResponse(status_code=502, content={"error": {
                 "message": str(detail), "type": "wallet_error", "code": "wallet_op_failed"}})
+        if op_id is not None:
+            host_store.wallet_op_finish(op_id, "ok", detail=str(
+                (r.json() or {}).get("stdout") if r.headers.get("content-type", "")
+                .startswith("application/json") else "")[:2000])
         return {"ok": True, "action": op, "amount": amount,
                 "wallet": await _refresh_antseed_wallet()}
+
+    @app.get("/x/wallet")
+    async def wallet_view():
+        # Read-only balance snapshot for the dashboard wallet panel (no on-chain
+        # tx). Falls back to a live refresh if the source cache is empty.
+        w = _antseed_wallet_view()
+        if w is None:
+            w = await _refresh_antseed_wallet()
+        return {"ok": True, "wallet": w}
 
     @app.post("/x/wallet/deposit")
     async def wallet_deposit(body: dict):
@@ -403,6 +522,100 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             except httpx.HTTPError:
                 pass
         return {"ok": True, "wallet": await _refresh_antseed_wallet()}
+
+    async def _wallet_reclaim(op: str, timeout: float, with_wallet: bool):
+        # Channel reclaim: recover USDC reserved in idle payment channels.
+        #   scan          read-only enumeration of on-chain reclaimable funds
+        #   request-close start the ~15-min on-chain challenge (one tx/channel)
+        #   withdraw      pull funds from channels whose window has elapsed
+        url, token = _wallet_control()
+        if not url:
+            return JSONResponse(status_code=503, content={"error": {
+                "message": "antseed wallet control not configured",
+                "type": "wallet_error", "code": "wallet_control_unavailable"}})
+        import httpx
+        try:
+            async with httpx.AsyncClient() as c:
+                r = await c.post(f"{url}/reclaim/{op}",
+                                 headers={"x-antseed-control-token": token}, timeout=timeout)
+        except httpx.HTTPError as e:
+            return JSONResponse(status_code=502, content={"error": {
+                "message": f"wallet control unreachable: {e}",
+                "type": "wallet_error", "code": "wallet_control_unreachable"}})
+        try:
+            payload = r.json() or {}
+        except Exception:  # noqa: BLE001
+            payload = {}
+        if r.status_code != 200:
+            detail = payload.get("error") or (r.text or "")[:300]
+            return JSONResponse(status_code=502, content={"error": {
+                "message": str(detail), "type": "wallet_error", "code": "reclaim_failed"}})
+        if with_wallet:
+            payload["wallet"] = await _refresh_antseed_wallet()
+        return payload
+
+    # Budgets are the keeper's, which are derived from the sidecar's OWN
+    # published worst case (antseed/control.js /budgets). A shorter one here
+    # would be a lie in the same way the keeper's used to be: the control server
+    # keeps working on a request this side has already given up on.
+    @app.post("/x/wallet/reclaim/scan")
+    async def wallet_reclaim_scan():
+        import wallet_keeper as _wk
+        return await _wallet_reclaim("scan", _wk.RECLAIM_SCAN_TIMEOUT_S,
+                                     with_wallet=False)
+
+    @app.post("/x/wallet/reclaim/set-operator")
+    async def wallet_reclaim_set_operator():
+        # One-time: assign the buyer wallet as its own deposits operator so
+        # requestClose/withdraw stop reverting NotAuthorized(). Moves no funds.
+        import wallet_keeper as _wk
+        return await _wallet_reclaim("set-operator", _wk.RECLAIM_TX_TIMEOUT_S,
+                                     with_wallet=False)
+
+    @app.post("/x/wallet/reclaim/request-close")
+    async def wallet_reclaim_request_close():
+        import wallet_keeper as _wk
+        return await _wallet_reclaim("request-close", _wk.RECLAIM_TX_TIMEOUT_S,
+                                     with_wallet=False)
+
+    @app.post("/x/wallet/reclaim/withdraw")
+    async def wallet_reclaim_withdraw():
+        import wallet_keeper as _wk
+        return await _wallet_reclaim("withdraw", _wk.RECLAIM_TX_TIMEOUT_S,
+                                     with_wallet=True)
+
+    # ---- keeper hard halts: the operator's way back ----------------------
+    # Both breakers are sticky and deliberately not self-clearing, and the docs
+    # say "until an operator clears the flag" — but nothing outside the tests
+    # ever called `wallet_clear_halt`, so the only recovery was psql. A breaker
+    # with no reset is not a breaker, it is a trap.
+
+    @app.get("/x/wallet/halts")
+    async def wallet_halts():
+        pid = _antseed_pid()
+        return {"ok": True, "provider": pid, "halts": {
+            kind: {
+                "halted": host_store.wallet_halted(pid, kind),
+                "rows": [r for r in host_store.wallet_ops_recent(pid, limit=100)
+                         if r["op"] == f"halt:{kind}"],
+            } for kind in ("topup", "reclaim")}}
+
+    @app.post("/x/wallet/clear-halt")
+    async def wallet_clear_halt(body: dict):
+        kind = str((body or {}).get("kind", "")).strip()
+        if kind not in ("topup", "reclaim"):
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "kind must be 'topup' or 'reclaim'",
+                "type": "invalid_request", "code": "wallet_halt_kind"}})
+        pid = _antseed_pid()
+        if not host_store.wallet_clear_halt(pid, kind):
+            return JSONResponse(status_code=502, content={"error": {
+                "message": "could not clear the halt (store unavailable)",
+                "type": "wallet_error", "code": "wallet_halt_clear_failed"}})
+        _log.warning("wallet keeper: %s halt CLEARED for %s by an operator",
+                     kind, pid)
+        return {"ok": True, "provider": pid, "kind": kind,
+                "halted": host_store.wallet_halted(pid, kind)}
 
     @app.get("/healthz")
     def healthz():
@@ -432,12 +645,16 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         disabled providers, EMA metrics (incl. live prices), source freshness
         and balances. Internal — the ingress proxy hides /x/* from consumer
         callers and fetches this server-side."""
+        import host_store as _host_store
         import sources as _sources
+        import wallet_keeper as _wallet_keeper
         state = host.dump_state() or {}
         balances: dict = {}
         sources_view: dict = {}
         for name, s in _sources.SOURCE_STATE.items():
             balances.update(s.get("balances") or {})
+            # `stats` rides along here (offers kept/suppressed, wallet_health);
+            # only the bulky per-row views are stripped.
             sources_view[name] = {k: v for k, v in s.items()
                                   if k not in ("balances", "book")}
         return {
@@ -447,6 +664,11 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             "ema_metrics": state.get("ema_metrics") or {},
             "balances": balances,
             "sources": sources_view,
+            # The autonomous funding loop's last decision per buyer proxy, plus
+            # its recent wallet ops — the audit trail for money the router moved
+            # on its own. Read-only.
+            "keeper": dict(_wallet_keeper.KEEPER_STATE),
+            "wallet_ops": _host_store.wallet_ops_recent(limit=20),
         }
 
     @app.get("/x/market")
@@ -743,6 +965,38 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 "message": msg[idx + 11:] if idx != -1 else msg,
                 "type": "invalid_request_error", "code": "invalid_policy_spec"}})
 
+    @app.get("/x/policy/templates")
+    def policy_templates():
+        """List the blessed intent-level templates and their safe defaults."""
+        return {"templates": template_catalog()}
+
+    @app.post("/x/policy/templates/{template_id}")
+    def policy_template_build(
+        template_id: str,
+        body: dict[str, Any] | None = None,
+    ):
+        """Compile a product intent to normalized sigma-pol/v2 data.
+
+        This is deliberately a small, safe surface over the raw algebra.  The
+        returned term goes through the same identity and later admission path
+        as a hand-authored policy_ir; preview it with POST /x/rank.
+        """
+        try:
+            term, intent = build_policy_template(template_id, body)
+            built = host.normalize_policy(term)
+            return {**built, "intent": intent}
+        except PolicyTemplateError as exc:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": str(exc),
+                "type": "invalid_request_error",
+                "code": "invalid_policy_template",
+            }})
+        except Exception as exc:
+            admission = _policy_admission_error(exc)
+            if admission is not None:
+                return _invalid_policy_response(admission)
+            raise
+
     @app.get("/x/fields")
     def list_fields():
         """The observable fields (core vocabulary + config.fields extensions)
@@ -804,7 +1058,15 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         message array into one cheaply-routed summary and splice it back so the
         frozen prefix and the recent tail are byte-identical — keeping everything
         upstream cache-hot. Returns {messages, compacted}. The agent owns its
-        context; the host stores nothing."""
+        context; the host stores nothing.
+
+        Cost accounting (additive wire contract): the seal is a real billable
+        LLM leg, so every response that FOLLOWS host.execute_async — the sealed
+        success AND the compacted:false seal-failure — also carries "usage"
+        (OpenAI token shape, the summarizer call's tokens) and "x_router" (the
+        same block _build_x_router puts on chat responses), so a metering proxy
+        in front can record the seal's spend instead of a $0 row. Early returns
+        that precede execution made no call and carry neither key."""
         msgs = req.messages or []
         keep = max(1, req.keep_recent)
         # frozen prefix = a leading system message (the skill/tools/rules), if any
@@ -828,17 +1090,25 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             "max_tokens": req.max_tokens or 512,
         }
         try:
-            res = await host.execute_async(contract)
+            res = await _execute_with_deadline(host.execute_async(contract))
         except Exception as exc:
             admission = _policy_admission_error(exc)
             if admission is not None:
                 return _invalid_policy_response(admission)
             raise
+
+        def _costed(body: dict) -> dict:
+            usage = _openai_usage(res.get("response") or {})
+            if usage:
+                body["usage"] = usage
+            body["x_router"] = _build_x_router(res, subscription_providers)
+            return body
+
         summary = ((res.get("response") or {}).get("text") or "").strip()
         if not summary:                     # seal failed -> never lose content
-            return {"messages": msgs, "compacted": False}
+            return _costed({"messages": msgs, "compacted": False})
         sealed = {"role": "system", "content": _SEAL_PREFIX + summary}
-        return {"messages": frozen + [sealed] + recent, "compacted": True}
+        return _costed({"messages": frozen + [sealed] + recent, "compacted": True})
 
     async def _activate_tenant(request: Request) -> None:
         """Load the caller tenant's BYO provider env into the request context.
@@ -941,6 +1211,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             temperature=req.temperature,
             max_tokens=req.max_output_tokens,
             first_token_timeout_ms=req.first_token_timeout_ms,
+            timeout_ms=req.timeout_ms,
             policy_ir=req.policy_ir,
             session=req.session,
         )
@@ -950,7 +1221,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
 
         if not req.stream:
             try:
-                result = await host.execute_async(contract)
+                result = await _execute_with_deadline(host.execute_async(contract))
             except Exception as exc:
                 admission = _policy_admission_error(exc)
                 if admission is None:
@@ -963,7 +1234,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
 
     async def _handle_responses_stream(contract: dict, req: ResponsesRequest):
         import responses_api as _rapi
-        task = asyncio.create_task(host.execute_async(contract))
+        task = asyncio.create_task(
+            _execute_with_deadline(host.execute_async(contract)))
         done, _ = await asyncio.wait({task}, timeout=_EARLY_FAIL_S,
                                      return_when=asyncio.FIRST_COMPLETED)
         if task in done:
@@ -1065,7 +1337,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             # Async driver: the Lua VM is touched only between awaits, so one
             # shared LuaRuntime overlaps many concurrent requests on one loop.
             try:
-                result = await host.execute_async(contract)
+                result = await _execute_with_deadline(host.execute_async(contract))
             except Exception as exc:
                 admission = _policy_admission_error(exc)
                 if admission is None:
@@ -1096,7 +1368,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                     await queue.put(delta)
                 return await streaming_call(request, emit)
 
-        task = asyncio.create_task(host.execute_async(contract, call_override=override))
+        task = asyncio.create_task(_execute_with_deadline(
+            host.execute_async(contract, call_override=override)))
 
         # A single-model policy is fast: keep the exact prior behavior — wait for
         # the commit point or completion; a pre-delta failure is a clean JSON
@@ -1131,15 +1404,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     def _final_chunk_parts(result: dict, session: str | None = None,
                            owner: str | None = None):
         resp = result.get("response") or {}
-        usage = {}
-        for src_key, dst_key in (("tokens_in", "prompt_tokens"),
-                                 ("tokens_out", "completion_tokens"),
-                                 ("tokens_total", "total_tokens")):
-            if resp.get(src_key) is not None:
-                usage[dst_key] = resp[src_key]
-        # Standard OpenAI cache field so clients parse cache reads natively.
-        if resp.get("tokens_cached"):
-            usage["prompt_tokens_details"] = {"cached_tokens": resp["tokens_cached"]}
+        usage = _openai_usage(resp)
         # x_router + the per-session fold are shared with the unary path; the
         # streaming final chunk folds the session here so stream:true clients
         # (e.g. opencode) still accumulate into the session total.
@@ -1281,6 +1546,8 @@ def _request_to_contract(
         contract["max_tokens"] = max_tokens
     if req.first_token_timeout_ms is not None:
         contract["first_token_timeout_ms"] = req.first_token_timeout_ms
+    if req.timeout_ms is not None:
+        contract["timeout_ms"] = req.timeout_ms
     if req.policy_ir is not None:
         # Forwarded verbatim: the CORE is the admission boundary (check ->
         # normalize -> eval, bounded), and it ∧-applies the host envelope.
@@ -1501,6 +1768,26 @@ def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> floa
     return max(0.0, round(cost, 6))
 
 
+def _openai_usage(response: dict) -> dict:
+    """OpenAI-shape `usage` block from a router response — the single builder
+    shared by the unary chat body, the streaming final chunk and /v1/compact.
+    Empty dict when the provider reported no token counts (caller omits the
+    key, per the additive wire contract)."""
+    usage: dict = {}
+    for src_key, dst_key in (("tokens_in", "prompt_tokens"),
+                             ("tokens_out", "completion_tokens"),
+                             ("tokens_total", "total_tokens")):
+        if response.get(src_key) is not None:
+            usage[dst_key] = response[src_key]
+    # Standard OpenAI cache field so clients (opencode, etc.) parse cache reads
+    # natively — not just our x_router. `is not None`, not truthiness: an
+    # explicit tokens_cached: 0 means caching was evaluated with no hits, and
+    # x_router already passes that 0 through — the OpenAI block must agree.
+    if response.get("tokens_cached") is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": response["tokens_cached"]}
+    return usage
+
+
 def _build_x_router(result: dict, subscription_providers=frozenset(),
                     session: str | None = None, owner: str | None = None) -> dict:
     """The `x_router` metadata block shared by every response surface (chat
@@ -1569,17 +1856,7 @@ def _router_response_to_openai(result: dict, requested_model: str,
         }],
     }
 
-    usage = {}
-    if response.get("tokens_in") is not None:
-        usage["prompt_tokens"] = response["tokens_in"]
-    if response.get("tokens_out") is not None:
-        usage["completion_tokens"] = response["tokens_out"]
-    if response.get("tokens_total") is not None:
-        usage["total_tokens"] = response["tokens_total"]
-    # Standard OpenAI cache field so clients (opencode, etc.) parse cache reads
-    # natively — not just our x_router. Mirrors usage.prompt_tokens_details.
-    if response.get("tokens_cached"):
-        usage["prompt_tokens_details"] = {"cached_tokens": response["tokens_cached"]}
+    usage = _openai_usage(response)
     if usage:
         out["usage"] = usage
 

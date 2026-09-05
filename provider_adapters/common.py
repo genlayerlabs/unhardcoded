@@ -24,6 +24,18 @@ def cached_tokens(usage: dict) -> "int | None":
     return usage.get("cache_read_input_tokens")
 
 
+CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def anthropic_cache_family(request: dict) -> bool:
+    """Whether the chosen route serves an Anthropic-class model — the only
+    family whose prompt cache is OPT-IN per request (`cache_control`
+    breakpoints). Only the router can inject them: policy-driven clients are
+    model-agnostic by design and never know the winner (#74)."""
+    fam = str(request.get("model_family") or request.get("served_model_id") or "")
+    return "claude" in fam.lower()
+
+
 def auth_token(
     request: dict,
     env_get: Callable[[str], str | None],

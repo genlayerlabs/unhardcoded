@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -15,12 +16,13 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import Any, Dict
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 import control_plane_client
 import host_store
@@ -36,9 +38,25 @@ load_env_secrets()
 UPSTREAM = os.getenv("ROUTER_UPSTREAM", "http://router:18080").rstrip("/")
 CALLER_KEYS_JSON = os.getenv("CALLER_KEYS_JSON", "{}")
 CALLER_KEYS_SHA256_JSON = os.getenv("CALLER_KEYS_SHA256_JSON", "{}")
+# GitOps/bootstrap keys arrive from a reconciled workload Secret. Keep them in
+# a separate channel because load_env_secrets() intentionally lets the
+# dashboard-managed PVC override CALLER_KEYS_JSON; replacing the whole map
+# would otherwise make a reconciled workload key disappear after the first
+# dashboard-issued key is persisted.
+CALLER_KEYS_BOOTSTRAP_JSON = os.getenv("CALLER_KEYS_BOOTSTRAP_JSON", "{}")
 RATE_PER_MIN = int(os.getenv("RATE_PER_MIN", "600"))
 BURST = int(os.getenv("BURST", "200"))
+# Per-replica overload guard. Zero keeps the legacy unlimited behaviour for
+# local/single-pod installs; Kubernetes sets explicit bounds and autoscales from
+# the exported active+pending gauges.
+MAX_INFLIGHT_REQUESTS = max(0, int(os.getenv("MAX_INFLIGHT_REQUESTS", "0")))
+MAX_PENDING_REQUESTS = max(0, int(os.getenv("MAX_PENDING_REQUESTS", "0")))
+CAPACITY_QUEUE_TIMEOUT_S = max(0.0, float(os.getenv("CAPACITY_QUEUE_TIMEOUT_S", "2")))
+UPSTREAM_MAX_CONNECTIONS = max(1, int(os.getenv("UPSTREAM_MAX_CONNECTIONS", "100")))
+UPSTREAM_MAX_KEEPALIVE_CONNECTIONS = max(
+    1, int(os.getenv("UPSTREAM_MAX_KEEPALIVE_CONNECTIONS", "40")))
 RECENT_LIMIT = int(os.getenv("DASHBOARD_RECENT_LIMIT", "200"))
+DASHBOARD_STATS_RECENT_LIMIT = max(1, min(int(os.getenv("DASHBOARD_STATS_RECENT_LIMIT", "100")), 100))
 DASHBOARD_TRUSTED_USER_HEADER = os.getenv("DASHBOARD_TRUSTED_USER_HEADER", "").strip()
 DASHBOARD_TRUSTED_USER_SECRET = os.getenv("DASHBOARD_TRUSTED_USER_SECRET", "")
 DASHBOARD_PASSWORD_SHA256 = os.getenv("DASHBOARD_PASSWORD_SHA256", "")
@@ -53,6 +71,8 @@ DASHBOARD_COOKIE_PATH = os.getenv("DASHBOARD_COOKIE_PATH", "/dashboard")
 DASHBOARD_KEY_ENV_PATH = os.getenv("DASHBOARD_KEY_ENV_PATH", "/run/llm-router/.env.secrets")
 CODEX_ACCOUNTS_DIR = os.getenv("CODEX_ACCOUNTS_DIR", "/codex/accounts")
 CODEX_AUTH_PATH = os.getenv("CODEX_AUTH_PATH") or None
+CODEX_BROKER_URL = os.getenv("CODEX_BROKER_URL", "").rstrip("/")
+CODEX_BROKER_TOKEN = os.getenv("CODEX_BROKER_TOKEN", "")
 DASHBOARD_KEY_PREFIX = os.getenv("DASHBOARD_KEY_PREFIX", "llmr")
 DEFAULT_ROTATION_GRACE_S = int(os.getenv("DASHBOARD_KEY_ROTATION_GRACE_S", "86400"))
 DASHBOARD_POLICY_CONFIG_PATH = os.getenv("DASHBOARD_POLICY_CONFIG_PATH", "config.live.lua")
@@ -61,6 +81,8 @@ DASHBOARD_POLICY_DIR = os.getenv("DASHBOARD_POLICY_DIR", "policies")
 ROUTER_CONTEXT_LENGTH = int(os.getenv("ROUTER_CONTEXT_LENGTH", "200000"))
 ROUTE_HEALTH_ROUTES = [r.strip() for r in os.getenv("DASHBOARD_ROUTE_HEALTH_ROUTES", "profile:default").split(",") if r.strip()]
 SYNTHETIC_PROBES_ENABLED = os.getenv("DASHBOARD_SYNTHETIC_PROBES_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
+RUN_COST_BACKFILL = os.getenv("RUN_COST_BACKFILL", "1").lower() not in {
+    "0", "false", "no", "off"}
 SYNTHETIC_PROBE_INTERVAL_S = float(os.getenv("DASHBOARD_SYNTHETIC_PROBE_INTERVAL_S", "300"))
 SYNTHETIC_PROBE_INITIAL_DELAY_S = float(os.getenv("DASHBOARD_SYNTHETIC_PROBE_INITIAL_DELAY_S", "45"))
 SYNTHETIC_PROBE_TIMEOUT_S = float(os.getenv("DASHBOARD_SYNTHETIC_PROBE_TIMEOUT_S", "45"))
@@ -84,8 +106,21 @@ def _load_caller_map(raw: str, name: str) -> Dict[str, str]:
         raise RuntimeError(f"invalid {name}: {exc}") from exc
 
 
-CALLER_KEYS: Dict[str, str] = _load_caller_map(CALLER_KEYS_JSON, "CALLER_KEYS_JSON")
-CALLER_KEY_HASHES: Dict[str, str] = _load_caller_map(CALLER_KEYS_SHA256_JSON, "CALLER_KEYS_SHA256_JSON")
+def _bootstrap_caller_key_hashes(raw: str) -> Dict[str, str]:
+    """Load GitOps keys as hashes so the dashboard can never reveal them."""
+    return {
+        hashlib.sha256(token.encode()).hexdigest(): owner
+        for token, owner in _load_caller_map(
+            raw, "CALLER_KEYS_BOOTSTRAP_JSON").items()
+    }
+
+
+CALLER_KEYS: Dict[str, str] = _load_caller_map(
+    CALLER_KEYS_JSON, "CALLER_KEYS_JSON")
+CALLER_KEY_HASHES: Dict[str, str] = _bootstrap_caller_key_hashes(
+    CALLER_KEYS_BOOTSTRAP_JSON)
+CALLER_KEY_HASHES.update(_load_caller_map(
+    CALLER_KEYS_SHA256_JSON, "CALLER_KEYS_SHA256_JSON"))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
 log = logging.getLogger("llm-router-auth-proxy")
@@ -96,9 +131,27 @@ app = FastAPI(title="llm-router auth proxy", docs_url=None, redoc_url=None)
 app.include_router(internal_api.router)
 _client: httpx.AsyncClient | None = None
 _probe_task: asyncio.Task[None] | None = None
-_windows: dict[str, deque[float]] = defaultdict(deque)
 _started_wall = time.time()
 _stats_lock = RLock()
+
+# Event-loop-owned capacity state.  No thread lock is needed: every mutation is
+# made by an auth-proxy coroutine, and the synchronous metrics renderer only
+# snapshots it on that same loop.
+_capacity: asyncio.Semaphore | None = None
+_active_requests = 0
+_pending_requests = 0
+
+# Low-cardinality Prometheus state. Caller/model/provider labels are
+# deliberately absent: the durable ledger owns those dimensions and putting
+# them here would make autoscaling telemetry attacker-controlled.
+_metrics_lock = Lock()
+_metric_requests: dict[str, int] = defaultdict(int)
+_metric_rejects: dict[str, int] = defaultdict(int)
+_metric_store_errors: dict[str, int] = defaultdict(int)
+_duration_buckets = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 50.0, 60.0, 120.0)
+_metric_duration_bucket: dict[float, int] = defaultdict(int)
+_metric_duration_count = 0
+_metric_duration_sum = 0.0
 
 
 def _counter() -> dict[str, Any]:
@@ -108,6 +161,7 @@ def _counter() -> dict[str, Any]:
         "tokens_in": 0,
         "tokens_out": 0,
         "tokens_total": 0,
+        "tokens_cached": 0,
         "latency_ms_total": 0.0,
         "latency_ms_max": 0.0,
         "last_seen": None,
@@ -145,6 +199,130 @@ def _new_stats() -> dict[str, Any]:
     }
 
 
+async def _capacity_acquire() -> bool:
+    """Enter the bounded upstream section, queueing only a small burst.
+
+    HPA/KEDA cannot create a pod before the first burst arrives.  The short
+    bounded queue absorbs that reaction window; once both active and pending
+    budgets are full we shed immediately instead of letting arbitrary numbers
+    of 50-second requests consume sockets and kill the health loop.
+    """
+    global _active_requests, _pending_requests
+    if _capacity is None:
+        _active_requests += 1
+        return True
+
+    queued = _capacity.locked()
+    if queued:
+        if _pending_requests >= MAX_PENDING_REQUESTS:
+            return False
+        _pending_requests += 1
+    try:
+        if queued:
+            await asyncio.wait_for(
+                _capacity.acquire(), timeout=CAPACITY_QUEUE_TIMEOUT_S)
+        else:
+            await _capacity.acquire()
+    except (asyncio.TimeoutError, TimeoutError):
+        return False
+    finally:
+        if queued:
+            _pending_requests = max(0, _pending_requests - 1)
+    _active_requests += 1
+    return True
+
+
+def _capacity_release() -> None:
+    global _active_requests
+    _active_requests = max(0, _active_requests - 1)
+    if _capacity is not None:
+        _capacity.release()
+
+
+def _metric_request(status: int, latency_ms: float) -> None:
+    global _metric_duration_count, _metric_duration_sum
+    seconds = max(0.0, float(latency_ms) / 1000.0)
+    with _metrics_lock:
+        _metric_requests[str(int(status))] += 1
+        _metric_duration_count += 1
+        _metric_duration_sum += seconds
+        for bound in _duration_buckets:
+            if seconds <= bound:
+                _metric_duration_bucket[bound] += 1
+
+
+def _metric_reject(reason: str) -> None:
+    with _metrics_lock:
+        _metric_rejects[str(reason or "unknown")] += 1
+
+
+def _metric_store_error(kind: str) -> None:
+    with _metrics_lock:
+        _metric_store_errors[str(kind or "unknown")] += 1
+
+
+def _prometheus_metrics() -> str:
+    """Render the small autoscaling/availability surface without a dependency.
+
+    The endpoint is scraped directly on the pod's auth-proxy port. nginx blocks
+    it on the public listener in the Kubernetes manifest.
+    """
+    with _metrics_lock:
+        requests = dict(_metric_requests)
+        rejects = dict(_metric_rejects)
+        store_errors = dict(_metric_store_errors)
+        duration_buckets = dict(_metric_duration_bucket)
+        duration_count = _metric_duration_count
+        duration_sum = _metric_duration_sum
+    lines = [
+        "# HELP llm_router_inflight_requests Requests currently executing upstream.",
+        "# TYPE llm_router_inflight_requests gauge",
+        f"llm_router_inflight_requests {_active_requests}",
+        "# HELP llm_router_pending_requests Requests waiting for per-pod capacity.",
+        "# TYPE llm_router_pending_requests gauge",
+        f"llm_router_pending_requests {_pending_requests}",
+        "# HELP llm_router_capacity_requests Configured per-pod active request capacity.",
+        "# TYPE llm_router_capacity_requests gauge",
+        f"llm_router_capacity_requests {MAX_INFLIGHT_REQUESTS}",
+        "# HELP llm_router_requests_total Completed authenticated upstream requests.",
+        "# TYPE llm_router_requests_total counter",
+    ]
+    for status, count in sorted(requests.items()):
+        lines.append(f'llm_router_requests_total{{status="{status}"}} {count}')
+    lines.extend([
+        "# HELP llm_router_rejections_total Requests rejected before upstream.",
+        "# TYPE llm_router_rejections_total counter",
+    ])
+    for reason, count in sorted(rejects.items()):
+        safe = re.sub(r"[^A-Za-z0-9_.:-]", "_", reason)
+        lines.append(f'llm_router_rejections_total{{reason="{safe}"}} {count}')
+    lines.extend([
+        "# HELP llm_router_store_errors_total Admission-store failures.",
+        "# TYPE llm_router_store_errors_total counter",
+    ])
+    for kind, count in sorted(store_errors.items()):
+        safe = re.sub(r"[^A-Za-z0-9_.:-]", "_", kind)
+        lines.append(f'llm_router_store_errors_total{{kind="{safe}"}} {count}')
+    lines.extend([
+        "# HELP llm_router_request_duration_seconds End-to-end upstream request latency.",
+        "# TYPE llm_router_request_duration_seconds histogram",
+    ])
+    for bound in _duration_buckets:
+        lines.append(
+            f'llm_router_request_duration_seconds_bucket{{le="{bound:g}"}} '
+            f'{duration_buckets.get(bound, 0)}')
+    lines.extend([
+        f'llm_router_request_duration_seconds_bucket{{le="+Inf"}} {duration_count}',
+        f"llm_router_request_duration_seconds_sum {duration_sum:.6f}",
+        f"llm_router_request_duration_seconds_count {duration_count}",
+        "# HELP llm_router_process_uptime_seconds Auth-proxy process uptime.",
+        "# TYPE llm_router_process_uptime_seconds gauge",
+        f"llm_router_process_uptime_seconds {max(0.0, time.time() - _started_wall):.3f}",
+        "",
+    ])
+    return "\n".join(lines)
+
+
 _stats: dict[str, Any] = _new_stats()
 
 # Short TTL cache over the SQL-derived dashboard snapshots (stats bundle, the
@@ -156,6 +334,7 @@ _stats: dict[str, Any] = _new_stats()
 _SNAPSHOT_TTL_S = float(os.getenv("DASHBOARD_STATS_TTL_S", "12"))
 _snapshot_cache: dict[tuple, tuple[float, Any]] = {}
 _snapshot_cache_lock = RLock()
+_snapshot_compute_locks: dict[tuple, Lock] = {}
 
 
 def _snapshot_cache_get(key: tuple) -> Any:
@@ -175,6 +354,21 @@ def _snapshot_cache_put(key: tuple, value: Any) -> None:
         if len(_snapshot_cache) > 256:  # bound the key space (bad params etc.)
             _snapshot_cache.clear()
         _snapshot_cache[key] = (time.monotonic(), value)
+
+
+def _snapshot_cached_compute(key: tuple, compute: Any) -> Any:
+    """Compute a missing snapshot once, even with concurrent dashboard loads."""
+    value = _snapshot_cache_get(key)
+    if value is not None:
+        return value
+    with _snapshot_cache_lock:
+        lock = _snapshot_compute_locks.setdefault(key, Lock())
+    with lock:
+        value = _snapshot_cache_get(key)
+        if value is None:
+            value = compute()
+            _snapshot_cache_put(key, value)
+        return value
 
 
 def _snapshot_cache_clear() -> None:
@@ -291,6 +485,19 @@ def _optional_int(value: Any, *, min_value: int = 0, max_value: int | None = 1_0
     return max(min_value, ivalue)
 
 
+def _optional_float(value: Any, *, min_value: float = 0.0,
+                    max_value: float = 1_000_000.0) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (min_value <= number <= max_value):
+        return None
+    return round(number, 6)
+
+
 def _normalize_key_record(record: Any) -> dict[str, Any] | None:
     if not isinstance(record, dict):
         return None
@@ -349,6 +556,9 @@ def _normalize_consumer_record(consumer: str, record: Any) -> dict[str, Any]:
         "allowed_routes": _clean_route_list(record.get("allowed_routes")),
         "rate_per_min": rate_per_min,
         "burst": burst,
+        "batch": str(record.get("batch") or "").strip()[:80] or None,
+        "member_id": str(record.get("member_id") or "").strip()[:16] or None,
+        "budget_usd": _optional_float(record.get("budget_usd"), min_value=0.01),
         "keys": keys,
         "updated_at": _optional_int(record.get("updated_at")) or now,
     }
@@ -360,7 +570,10 @@ def _issued_consumer_records() -> dict[str, dict[str, Any]]:
     return {name: _normalize_consumer_record(name, issued.get(name)) for name in consumers}
 
 
-def _write_issued_consumer_records(records: dict[str, dict[str, Any]]) -> bool:
+def _write_issued_consumer_records(
+        records: dict[str, dict[str, Any]], *,
+        key_digests: dict[str, str] | None = None,
+        delete_key_digests: list[tuple[str, str]] | None = None) -> bool:
     """Persist the consumer records; returns True on success, False on a
     persistence failure — a swallowed failure would let a key rotation/revocation
     be reported as saved while still working after a restart (a security hole)."""
@@ -370,7 +583,36 @@ def _write_issued_consumer_records(records: dict[str, dict[str, Any]]) -> bool:
         if normalized["status"] == "active" and not normalized["allowed_routes"] and normalized["rate_per_min"] is None and normalized["burst"] is None and not normalized["keys"]:
             continue
         compact[consumer] = normalized
-    return host_store.set_consumer_keys(compact)
+    return host_store.set_consumer_keys(
+        compact, key_digests=key_digests,
+        delete_key_digests=delete_key_digests)
+
+
+def _exact_consumer_key_digests(
+        *, hashes: dict[str, str] | None = None,
+        plaintext: dict[str, str] | None = None) -> dict[str, str]:
+    """Build the complete shared resolver map without retaining plaintext."""
+    out = dict(CALLER_KEY_HASHES if hashes is None else hashes)
+    for token, owner in (CALLER_KEYS if plaintext is None else plaintext).items():
+        out[hashlib.sha256(token.encode()).hexdigest()] = owner
+    return out
+
+
+def _publish_local_consumer_map(name: str, mapping: dict[str, str],
+                                target: dict[str, str]) -> None:
+    """Refresh this process and best-effort PVC mirror after a DB commit.
+
+    PostgreSQL is the cross-replica authority.  A PVC write failure must not
+    hide an already-issued credential from the operator; the database copy is
+    sufficient for current and future stateless replicas.
+    """
+    target.clear()
+    target.update(mapping)
+    try:
+        _upsert_env_json(Path(DASHBOARD_KEY_ENV_PATH), name, mapping)
+    except Exception as exc:  # noqa: BLE001
+        _metric_store_error("consumer_key_pvc_mirror")
+        log.warning("consumer key PVC mirror failed for %s: %s", name, exc)
 
 
 def _consumer_meta(consumer: str) -> dict[str, Any]:
@@ -411,6 +653,9 @@ def _consumer_key_rows(by_caller_stats: dict[str, dict[str, Any]] | None = None)
             "allowed_routes": meta.get("allowed_routes") or [],
             "rate_per_min": meta.get("rate_per_min"),
             "burst": meta.get("burst"),
+            "batch": meta.get("batch"),
+            "member_id": meta.get("member_id"),
+            "budget_usd": meta.get("budget_usd"),
             "effective_rate_per_min": meta.get("rate_per_min") or RATE_PER_MIN,
             "effective_burst": meta.get("burst") or BURST,
             "issued_metadata": name in records,
@@ -477,8 +722,20 @@ def _caller_auth(token: str | None) -> dict[str, Any]:
         caller = CALLER_KEY_HASHES.get(digest)
         storage = "CALLER_KEYS_SHA256_JSON" if caller else None
     if not caller:
+        caller, store_ok = host_store.consumer_for_digest(digest)
+        if not store_ok:
+            return {"ok": False, "digest": digest,
+                    "error_code": "caller_auth_unavailable"}
+        storage = "host_store" if caller else None
+    if not caller:
         return {"ok": False, "error_code": "caller_auth"}
-    meta = _consumer_meta(caller)
+    # Authentication is an admission decision. Read only this caller's row;
+    # dashboard aggregation still uses the full-table helper separately.
+    issued, metadata_ok = host_store.get_consumer_key(caller)
+    if not metadata_ok:
+        return {"ok": False, "caller": caller, "digest": digest,
+                "storage": storage, "error_code": "caller_auth_unavailable"}
+    meta = _normalize_consumer_record(caller, issued)
     if meta.get("status") != "active":
         return {"ok": False, "caller": caller, "digest": digest, "storage": storage, "error_code": "caller_inactive"}
     allowed, key_error = _key_record_allows(digest, meta)
@@ -497,7 +754,7 @@ async def _caller_auth_async(token: str | None) -> dict[str, Any]:
     control-plane consumer name (tenant slug) and the plan's rate limits ride
     the returned meta; an explicit local record for that same name keeps
     precedence (operator kill-switch: mark the slug inactive locally)."""
-    auth = _caller_auth(token)
+    auth = await asyncio.to_thread(_caller_auth, token)
     if auth.get("ok") or auth.get("caller") or not token or not control_plane_client.enabled():
         return auth
     digest = hashlib.sha256(token.encode()).hexdigest()
@@ -505,7 +762,7 @@ async def _caller_auth_async(token: str | None) -> dict[str, Any]:
     if resolved is None or not resolved.active or not resolved.consumer:
         return auth
     caller = f"{CONTROL_PLANE_CALLER_PREFIX}{resolved.consumer}"
-    meta = _consumer_meta(caller)
+    meta = await asyncio.to_thread(_consumer_meta, caller)
     if meta.get("keys"):
         # A local consumer already answers to this name — attribution merges.
         control_plane_client.log_collision_once(caller)
@@ -523,20 +780,12 @@ async def _caller_auth_async(token: str | None) -> dict[str, Any]:
     return out
 
 
-def _rate_ok(caller: str, meta: dict[str, Any] | None = None) -> bool:
-    meta = meta if meta is not None else _consumer_meta(caller)
+def _rate_ok(caller: str, meta: dict[str, Any] | None = None) \
+        -> tuple[bool, bool, float]:
+    meta = meta or _consumer_meta(caller)
     rate_per_min = int(meta.get("rate_per_min") or RATE_PER_MIN)
     burst = int(meta.get("burst") or BURST)
-    now = time.monotonic()
-    q = _windows[caller]
-    cutoff = now - 60.0
-    while q and q[0] < cutoff:
-        q.popleft()
-    allowed = max(rate_per_min, burst)
-    if len(q) >= allowed:
-        return False
-    q.append(now)
-    return True
+    return host_store.consume_rate_token(caller, rate_per_min, burst)
 
 
 def _requested_route_from(path: str, body: bytes | None) -> str | None:
@@ -551,6 +800,11 @@ def _requested_route_from(path: str, body: bytes | None) -> str | None:
     parts = [p for p in path.strip("/").split("/") if p]
     if len(parts) >= 3 and parts[1:] == ["v1", "chat", "completions"] and parts[0] != "v1":
         route = route or f"profile:{parts[0]}"
+    # The router already treats a missing/empty OpenAI model as its current
+    # default policy. Normalize admission to that same identity so a consumer
+    # restricted to profile:default is not rejected before reaching the router.
+    if not route and parts in (["v1", "chat", "completions"], ["v1", "responses"]):
+        route = "profile:default"
     return str(route).strip() if route else None
 
 
@@ -776,7 +1030,11 @@ def _provider_credentials_snapshot(*, timeframe: str = "all", viewer_role: str =
     counters: dict[str, dict[str, Any]] = defaultdict(_counter)
     last_event: dict[str, dict[str, Any]] = {}
     cost_by_provider: dict[str, float] = defaultdict(float)
-    if timeframe != "runtime":
+    if timeframe == "recent":
+        overlay = _snapshot_cached_compute(
+            ("provider_recent",),
+            lambda: host_store.usage_rows_page(limit=DASHBOARD_STATS_RECENT_LIMIT))
+    elif timeframe != "runtime":
         # SQL per-provider rollup over the window (was: load every retained row
         # and fold in Python), TTL-cached; only the not-yet-landed runtime rows
         # get folded on top — the old merge deduped landed rows anyway.
@@ -829,7 +1087,7 @@ def _provider_credentials_snapshot(*, timeframe: str = "all", viewer_role: str =
         elif auth_kind:
             status = "configured"
         counter = _counter_snapshot(counters.get(name, _counter()))
-        if timeframe == "runtime" and not counter.get("requests"):
+        if timeframe in {"runtime", "recent"} and not counter.get("requests"):
             counter = runtime_by_provider.get(name, counter)
         latest = last_event.get(name, {})
         rows.append({
@@ -919,7 +1177,12 @@ def _login_connections_snapshot(*, timeframe: str = "all", consumer: str | None 
         dashboard_rows = [r for r in dashboard_rows if r.get("consumer") == consumer or r.get("viewer") == f"consumer:{consumer}"]
 
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
-    if timeframe != "runtime":
+    if timeframe == "recent":
+        usage_rows = _snapshot_cached_compute(
+            ("connections_recent", consumer),
+            lambda: host_store.usage_rows_page(
+                caller=consumer, limit=DASHBOARD_STATS_RECENT_LIMIT))
+    elif timeframe != "runtime":
         # SQL per-(caller, key-prefix) rollup over the window (was: load every
         # retained row), TTL-cached; the not-yet-landed runtime rows fold on top.
         cached = _snapshot_cache_get(("connections", timeframe, consumer))
@@ -1000,15 +1263,29 @@ _backfill_task: "asyncio.Task | None" = None
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _client, _probe_task, _backfill_task
+    global _client, _probe_task, _backfill_task, _capacity
     # The ingress is the owner of the operational store (consumer keys, the ledger,
     # operator-config writes); all operator state lives in Postgres now (the legacy
     # JSON backfill was retired once prod confirmed the tables were populated).
-    _client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0))
+    _capacity = (asyncio.Semaphore(MAX_INFLIGHT_REQUESTS)
+                 if MAX_INFLIGHT_REQUESTS else None)
+    _client = httpx.AsyncClient(
+        timeout=httpx.Timeout(90.0, connect=10.0),
+        limits=httpx.Limits(
+            max_connections=UPSTREAM_MAX_CONNECTIONS,
+            max_keepalive_connections=UPSTREAM_MAX_KEEPALIVE_CONNECTIONS))
+    digests_ok = await asyncio.to_thread(
+        host_store.upsert_consumer_key_digests,
+        _exact_consumer_key_digests())
+    if not digests_ok:
+        _metric_store_error("consumer_digest_startup")
+        log.warning("consumer digest startup backfill failed; shared auth will fail closed")
     if SYNTHETIC_PROBES_ENABLED and ROUTE_HEALTH_ROUTES:
         _probe_task = asyncio.create_task(_synthetic_probe_loop())
     # Off the event loop: batched UPDATEs, potentially many rows on first deploy.
-    _backfill_task = asyncio.create_task(asyncio.to_thread(_run_cost_backfill))
+    if RUN_COST_BACKFILL:
+        _backfill_task = asyncio.create_task(
+            asyncio.to_thread(_run_cost_backfill))
 
 
 @app.on_event("shutdown")
@@ -1032,6 +1309,13 @@ async def healthz() -> Response:
         return JSONResponse(status_code=r.status_code, content=r.json())
     except Exception as exc:
         return JSONResponse(status_code=502, content={"ok": False, "error": str(exc)})
+
+
+@app.get("/metrics")
+async def metrics() -> Response:
+    return Response(
+        content=_prometheus_metrics(),
+        media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.get("/favicon.ico")
@@ -1515,9 +1799,19 @@ async def dashboard_stats(request: Request) -> Response:
     consumer = str(ctx.get("consumer") or "").strip() or requested_consumer
     key_sha256 = str(ctx.get("key_sha256") or "").strip() or None
     role = str(ctx.get("role") or "admin")
-    snap = _stats_snapshot(viewer=caller, upstream_status=upstream_status, upstream_health=upstream_health, consumer=consumer, timeframe=_dashboard_timeframe(request.query_params.get("timeframe") or request.query_params.get("window")), key_sha256=key_sha256, viewer_role=role, provider=request.query_params.get("provider"), model=request.query_params.get("model"))
+    # _stats_snapshot performs synchronous PostgreSQL aggregation. Keep it off
+    # Uvicorn's event loop so a slow query cannot stall health checks and all
+    # proxied traffic handled by this worker.
+    snap = await asyncio.to_thread(
+        _stats_snapshot, viewer=caller, upstream_status=upstream_status,
+        upstream_health=upstream_health, consumer=consumer,
+        timeframe=_dashboard_timeframe(request.query_params.get("timeframe") or request.query_params.get("window")),
+        key_sha256=key_sha256, viewer_role=role,
+        provider=request.query_params.get("provider"),
+        model=request.query_params.get("model"))
     await _attach_antseed_wallet(snap.get("provider_keys"))
-    return JSONResponse(content=snap)
+    payload = await asyncio.to_thread(json.dumps, snap, separators=(",", ":"))
+    return Response(content=payload, media_type="application/json")
 
 
 async def _dashboard_full_snapshot(request: Request) -> Response:
@@ -1544,7 +1838,11 @@ async def _dashboard_full_snapshot(request: Request) -> Response:
     consumer = str(ctx.get("consumer") or "").strip() or requested_consumer
     key_sha256 = str(ctx.get("key_sha256") or "").strip() or None
     role = str(ctx.get("role") or "admin")
-    stats = _stats_snapshot(viewer=caller, upstream_status=upstream_status, upstream_health=upstream_health, consumer=consumer, timeframe=_dashboard_timeframe(request.query_params.get("timeframe") or request.query_params.get("window")), key_sha256=key_sha256, viewer_role=role)
+    stats = await asyncio.to_thread(
+        _stats_snapshot, viewer=caller, upstream_status=upstream_status,
+        upstream_health=upstream_health, consumer=consumer,
+        timeframe=_dashboard_timeframe(request.query_params.get("timeframe") or request.query_params.get("window")),
+        key_sha256=key_sha256, viewer_role=role)
     try:
         policies = _policy_catalog_snapshot() if role == "admin" else {"providers": [], "models": [], "profiles": [], "retry_policies": {}, "consumer_visible": False, "generated_at": int(time.time())}
         policy_error = None
@@ -2193,6 +2491,20 @@ async def dashboard_policy_build(request: Request) -> Response:
     return await _router_post_json("/x/policy/build", await request.json())
 
 
+@app.post("/dashboard/api/policy/templates/{template_id}")
+async def dashboard_policy_template(
+    template_id: str,
+    request: Request,
+) -> Response:
+    ctx, error = _require_admin_dashboard_auth(request)
+    if error:
+        return error
+    return await _router_post_json(
+        f"/x/policy/templates/{template_id}",
+        await request.json(),
+    )
+
+
 @app.post("/dashboard/api/policy/preview")
 async def dashboard_policy_preview(request: Request) -> Response:
     ctx, error = _require_admin_dashboard_auth(request)
@@ -2539,23 +2851,26 @@ async def dashboard_revoke_key(request: Request) -> Response:
     new_hashes = {digest: owner for digest, owner in CALLER_KEY_HASHES.items() if not (owner == consumer and digest.startswith(prefix))}
     removed = len(CALLER_KEY_HASHES) - len(new_hashes)
     if removed:
-        CALLER_KEY_HASHES.clear()
-        CALLER_KEY_HASHES.update(new_hashes)
-        _upsert_env_json(Path(DASHBOARD_KEY_ENV_PATH), "CALLER_KEYS_SHA256_JSON", new_hashes)
         found = True
     new_plaintext = {token: owner for token, owner in CALLER_KEYS.items() if not (owner == consumer and hashlib.sha256(token.encode()).hexdigest().startswith(prefix))}
     removed_plaintext = len(CALLER_KEYS) - len(new_plaintext)
     if removed_plaintext:
-        CALLER_KEYS.clear()
-        CALLER_KEYS.update(new_plaintext)
-        _upsert_env_json(Path(DASHBOARD_KEY_ENV_PATH), "CALLER_KEYS_JSON", new_plaintext)
         found = True
     if not found:
         return JSONResponse(status_code=404, content={"error": {"message": "key prefix not found for consumer", "type": "not_found", "code": "key_not_found"}})
     meta["updated_at"] = now
     records[consumer] = meta
-    if not _write_issued_consumer_records(records):
+    if not _write_issued_consumer_records(
+            records, delete_key_digests=[(consumer, prefix)]):
         return JSONResponse(status_code=500, content={"ok": False, "error": "failed to persist key revocation"})
+    # Publish the local/PVC mirror only after the shared authority commits.  A
+    # failed SQL write must never revoke on one replica while others accept it.
+    if removed:
+        _publish_local_consumer_map(
+            "CALLER_KEYS_SHA256_JSON", new_hashes, CALLER_KEY_HASHES)
+    if removed_plaintext:
+        _publish_local_consumer_map(
+            "CALLER_KEYS_JSON", new_plaintext, CALLER_KEYS)
     _log({"event": "dashboard_key_revoked", "consumer": consumer, "viewer": caller, "sha256_prefix": prefix, "removed_hashes": removed, "removed_plaintext": removed_plaintext})
     return JSONResponse(content={"ok": True, "consumer": consumer, "sha256_prefix": prefix, "removed_hashes": removed, "removed_plaintext": removed_plaintext})
 
@@ -2676,10 +2991,12 @@ async def dashboard_update_provider_key(request: Request) -> Response:
         f"saved, but live apply failed ({apply_error}); the key will load on the next router restart"})
 
 
-async def _wallet_proxy(request: Request, op: str, *, body: dict | None = None) -> Response:
+async def _wallet_proxy(request: Request, op: str, *, body: dict | None = None,
+                        timeout: float = 135.0) -> Response:
     """Admin-only proxy to the router's /x/wallet/* — which runs the AntSeed buyer
-    deposit/withdraw/refresh on the sidecar and returns the refreshed wallet. Lets
-    the operator fund the hot-wallet from the catalog instead of `kubectl exec`."""
+    deposit/withdraw/refresh/reclaim on the sidecar and returns the refreshed
+    wallet. Lets the operator fund and reclaim the hot-wallet from the catalog
+    instead of `kubectl exec`."""
     caller, error = _require_admin_dashboard_caller(request)
     if error:
         return error
@@ -2687,7 +3004,7 @@ async def _wallet_proxy(request: Request, op: str, *, body: dict | None = None) 
         return JSONResponse(status_code=502, content={"error": {
             "message": "router client unavailable", "type": "wallet_error", "code": "wallet"}})
     try:
-        r = await _client.post(f"{UPSTREAM}/x/wallet/{op}", json=(body or {}), timeout=135.0)
+        r = await _client.post(f"{UPSTREAM}/x/wallet/{op}", json=(body or {}), timeout=timeout)
     except Exception as exc:
         return JSONResponse(status_code=502, content={"error": {
             "message": f"router /x/wallet/{op} unreachable: {exc}",
@@ -2722,6 +3039,49 @@ async def dashboard_wallet_withdraw(request: Request) -> Response:
 @app.post("/dashboard/api/wallet/refresh")
 async def dashboard_wallet_refresh(request: Request) -> Response:
     return await _wallet_proxy(request, "refresh")
+
+
+@app.post("/dashboard/api/wallet/reclaim/scan")
+async def dashboard_wallet_reclaim_scan(request: Request) -> Response:
+    # Read-only: enumerate channels + on-chain reclaimable USDC + operator status.
+    return await _wallet_proxy(request, "reclaim/scan", timeout=100.0)
+
+
+@app.post("/dashboard/api/wallet/reclaim/set-operator")
+async def dashboard_wallet_reclaim_set_operator(request: Request) -> Response:
+    # On-chain one-time: assign the buyer wallet as its own deposits operator
+    # (unblocks requestClose/withdraw). Moves no funds.
+    return await _wallet_proxy(request, "reclaim/set-operator", timeout=260.0)
+
+
+@app.post("/dashboard/api/wallet/reclaim/request-close")
+async def dashboard_wallet_reclaim_request_close(request: Request) -> Response:
+    # On-chain: start the ~15-min close challenge on idle channels.
+    return await _wallet_proxy(request, "reclaim/request-close", timeout=260.0)
+
+
+@app.post("/dashboard/api/wallet/reclaim/withdraw")
+async def dashboard_wallet_reclaim_withdraw(request: Request) -> Response:
+    # On-chain: pull funds from channels whose challenge window has elapsed.
+    return await _wallet_proxy(request, "reclaim/withdraw", timeout=260.0)
+
+
+@app.get("/dashboard/api/wallet")
+async def dashboard_wallet_get(request: Request) -> Response:
+    """Read-only wallet balance for the config panel — no on-chain tx."""
+    caller, error = _require_admin_dashboard_caller(request)
+    if error:
+        return error
+    if _client is None:
+        return JSONResponse(status_code=502, content={"error": {
+            "message": "router client unavailable", "type": "wallet_error", "code": "wallet"}})
+    try:
+        r = await _client.get(f"{UPSTREAM}/x/wallet", timeout=10.0)
+        return JSONResponse(status_code=r.status_code, content=r.json())
+    except Exception as exc:
+        return JSONResponse(status_code=502, content={"error": {
+            "message": f"router /x/wallet unreachable: {exc}",
+            "type": "wallet_error", "code": "wallet"}})
 
 
 @app.get("/dashboard/api/provider-keys/reveal")
@@ -2795,10 +3155,18 @@ async def _reload_codex_router() -> tuple[bool, str | None]:
     goes live. On failure the change still loads at the next router restart."""
     try:
         if _client is not None:
-            r = await _client.post(f"{UPSTREAM}/x/codex/reload", timeout=10.0)
+            if CODEX_BROKER_URL:
+                if not CODEX_BROKER_TOKEN:
+                    return False, "CODEX_BROKER_TOKEN is not configured"
+                url = f"{CODEX_BROKER_URL}/v1/reload"
+                headers = {"authorization": f"Bearer {CODEX_BROKER_TOKEN}"}
+            else:
+                url = f"{UPSTREAM}/x/codex/reload"
+                headers = None
+            r = await _client.post(url, headers=headers, timeout=10.0)
             if r.status_code == 200:
                 return True, None
-            return False, f"router /x/codex/reload returned {r.status_code}"
+            return False, f"Codex reload returned {r.status_code}"
     except Exception as exc:
         return False, str(exc)
     return False, "router client unavailable"
@@ -2904,6 +3272,205 @@ async def dashboard_delete_codex_account(request: Request, name: str) -> Respons
     applied_live, apply_error = await _reload_codex_router()
     _log({"event": "dashboard_codex_account_deleted", "account": name, "viewer": caller, "applied_live": applied_live})
     return JSONResponse(content={"ok": True, "account": name, "applied_live": applied_live})
+
+
+# ---- Codex onboarding invites (server-side OAuth device flow) --------------
+# Spec: docs/superpowers/specs/2026-07-22-codex-oauth-invite-design.md
+
+def _invite_store():
+    from codex_invites import CodexInviteStore
+    return CodexInviteStore(CODEX_ACCOUNTS_DIR)
+
+
+def _request_origin(request: Request) -> str:
+    """Public origin for links we hand out, honoring the ingress's
+    X-Forwarded-* headers; falls back to the request's own scheme/host."""
+    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http")
+    host = (request.headers.get("x-forwarded-host") or request.headers.get("host")
+            or request.url.netloc)
+    return f"{proto.split(',')[0].strip()}://{host.split(',')[0].strip()}"
+
+
+def _invite_view(inv: dict, origin: str) -> dict:
+    return {"name": inv["name"], "status": inv.get("status"),
+            "url": f"{origin}/codex/onboard/{inv['token']}",
+            "created_at": inv.get("created_at"), "expires_at": inv.get("expires_at"),
+            "used_at": inv.get("used_at")}
+
+
+@app.post("/dashboard/api/codex/invites")
+async def dashboard_create_codex_invite(request: Request) -> Response:
+    """Mint a single-use onboarding link that lets a teammate OAuth their
+    ChatGPT account into the named Codex slot. Admin-only."""
+    caller, error = _require_admin_dashboard_caller(request)
+    if error:
+        return error
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {"message": "invalid JSON body", "type": "invalid_request", "code": "codex_invite"}})
+    try:
+        inv = _invite_store().create(str(body.get("name") or ""))
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": {"message": str(exc), "type": "invalid_request", "code": "codex_invite"}})
+    _log({"event": "dashboard_codex_invite_created", "account": inv["name"], "viewer": caller})
+    return JSONResponse(content={"ok": True, **_invite_view({**inv, "status": "pending"}, _request_origin(request))})
+
+
+@app.get("/dashboard/api/codex/invites")
+async def dashboard_list_codex_invites(request: Request) -> Response:
+    caller, error = _require_admin_dashboard_caller(request)
+    if error:
+        return error
+    origin = _request_origin(request)
+    return JSONResponse(content={"invites": [_invite_view(i, origin) for i in _invite_store().list()]})
+
+
+@app.delete("/dashboard/api/codex/invites/{token}")
+async def dashboard_revoke_codex_invite(request: Request, token: str) -> Response:
+    caller, error = _require_admin_dashboard_caller(request)
+    if error:
+        return error
+    if not _invite_store().revoke(token):
+        return JSONResponse(status_code=404, content={"error": {"message": "invite not found", "type": "not_found", "code": "codex_invite_not_found"}})
+    _log({"event": "dashboard_codex_invite_revoked", "viewer": caller})
+    return JSONResponse(content={"ok": True})
+
+
+def _live_invite(token: str):
+    """(store, invite, status). Unknown and expired links both present to the
+    visitor as a dead link (no oracle distinguishing them)."""
+    store = _invite_store()
+    inv = store.get(token)
+    if inv is None:
+        return store, None, "missing"
+    return store, inv, store.status_of(inv)
+
+
+@app.get("/codex/onboard/{token}")
+async def codex_onboard_page(token: str) -> Response:
+    store, inv, status = _live_invite(token)
+    if inv is None or status == "expired":
+        return HTMLResponse(_onboard_dead_html(), status_code=404)
+    return HTMLResponse(_onboard_html(inv["name"], connected=(status == "used")))
+
+
+@app.post("/codex/onboard/{token}/start")
+async def codex_onboard_start(token: str) -> Response:
+    import codex_auth
+    store, inv, status = _live_invite(token)
+    if inv is None or status == "expired":
+        return JSONResponse(status_code=404, content={"error": {"message": "invite link expired", "type": "not_found", "code": "codex_onboard"}})
+    if status == "used":
+        return JSONResponse(status_code=409, content={"error": {"message": "invite already used", "type": "invalid_request", "code": "codex_onboard_used"}})
+    try:
+        device = await asyncio.to_thread(codex_auth.device_usercode_request)
+    except codex_auth.DeviceAuthError as exc:
+        return JSONResponse(status_code=502, content={"error": {"message": str(exc), "type": "device_auth_error", "code": "codex_onboard_start"}})
+    store.set_device(token, device)
+    _log({"event": "codex_invite_signin_started", "account": inv["name"]})
+    return JSONResponse(content={"user_code": device["user_code"],
+                                 "verification_url": codex_auth.DEVICE_VERIFY_URL,
+                                 "interval": device["interval"]})
+
+
+@app.get("/codex/onboard/{token}/status")
+async def codex_onboard_status(token: str) -> Response:
+    import codex_auth
+    store, inv, status = _live_invite(token)
+    if inv is None or status == "expired":
+        # Same shape as an unknown token: no oracle distinguishing the two.
+        return JSONResponse(status_code=404, content={"error": {"message": "invite link expired", "type": "not_found", "code": "codex_onboard"}})
+    if status == "used":
+        return JSONResponse(content={"status": "connected", "name": inv["name"]})
+    if status == "pending":
+        if inv.get("device_auth_id"):
+            store.clear_device(token)   # device code timed out; allow a fresh start
+        return JSONResponse(content={"status": "pending"})
+    # status == "awaiting": at most one upstream poll per interval
+    if not store.due_for_poll(token):
+        return JSONResponse(content={"status": "awaiting"})
+    try:
+        result = await asyncio.to_thread(
+            codex_auth.device_token_poll, inv["device_auth_id"], inv["user_code"])
+        if result is None:
+            return JSONResponse(content={"status": "awaiting"})
+        auth_json = await asyncio.to_thread(
+            codex_auth.device_code_exchange,
+            result["authorization_code"], result["code_verifier"])
+    except codex_auth.DeviceAuthError as exc:
+        store.clear_device(token)
+        _log({"event": "codex_invite_device_error", "account": inv["name"], "error": str(exc)})
+        return JSONResponse(content={"status": "error", "message": str(exc)})
+    slug = _codex_store().add_account(inv["name"], auth_json)
+    applied_live, _ = await _reload_codex_router()
+    store.mark_used(token)
+    _log({"event": "codex_invite_connected", "account": slug, "applied_live": applied_live})
+    return JSONResponse(content={"status": "connected", "name": slug, "applied_live": applied_live})
+
+
+def _onboard_dead_html() -> str:
+    return """<!doctype html><html lang='en'><head><meta charset='utf-8'/>
+<meta name='viewport' content='width=device-width,initial-scale=1'/>
+<meta name='robots' content='noindex,nofollow,noarchive'/><title>Link expired</title>
+<style>body{margin:0;background:#08090a;color:#f7f8f8;font:15px/1.5 Inter,ui-sans-serif,system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}main{max-width:420px;padding:32px;text-align:center}h1{font-size:22px}p{color:#8a8f98}</style>
+</head><body><main><h1>This link is no longer valid</h1>
+<p>The invite has expired or was already used. Ask the person who sent it for a new link.</p>
+</main></body></html>"""
+
+
+def _onboard_html(name: str, connected: bool = False) -> str:
+    import html as _html
+    safe = _html.escape(name)
+    idle_cls = "hidden" if connected else ""
+    done_cls = "" if connected else "hidden"
+    return f"""<!doctype html><html lang='en'><head><meta charset='utf-8'/>
+<meta name='viewport' content='width=device-width,initial-scale=1'/>
+<meta name='robots' content='noindex,nofollow,noarchive'/><title>Connect ChatGPT — {safe}</title>
+<style>
+body{{margin:0;background:radial-gradient(circle at 20% -10%,rgba(113,112,255,.18),transparent 34%),#08090a;color:#f7f8f8;font:15px/1.55 Inter,ui-sans-serif,system-ui,sans-serif;display:grid;place-items:center;min-height:100vh}}
+main{{max-width:460px;padding:34px;border:1px solid rgba(255,255,255,.075);border-radius:18px;background:rgba(15,16,17,.92);box-shadow:0 24px 80px rgba(0,0,0,.42)}}
+h1{{font-size:21px;letter-spacing:-.3px;margin:0 0 6px}}p{{color:#8a8f98;margin:10px 0}}
+.btn{{display:inline-block;border:0;border-radius:10px;background:linear-gradient(180deg,#7170ff,#5e6ad2);color:#fff;font:inherit;font-weight:590;padding:11px 18px;cursor:pointer;text-decoration:none}}
+.code{{font:600 30px/1 'JetBrains Mono',ui-monospace,monospace;letter-spacing:.14em;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:14px 18px;text-align:center;margin:14px 0;user-select:all}}
+.muted{{font-size:13px;color:#62666d}}.ok{{color:#27a644}}.err{{color:#ff5c7a}}
+.hidden{{display:none}}.copy{{margin-left:10px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);color:#f7f8f8;border-radius:8px;padding:6px 10px;cursor:pointer}}
+</style></head><body><main>
+<h1>Connect your ChatGPT account</h1>
+<p>This links your ChatGPT subscription to the <b>unhardcoded</b> router as account <b>{safe}</b>. Only continue if a person you trust sent you this link.</p>
+<div id='idle' class='{idle_cls}'>
+  <button class='btn' id='startBtn'>Sign in with ChatGPT</button>
+  <p class='muted'>You'll sign in on openai.com and enter a one-time code. OpenAI's page warns about codes given to you by websites — that warning refers to this flow; continue only because your operator sent you this link, otherwise cancel.</p>
+</div>
+<div id='steps' class='hidden'>
+  <p>1 · Open <a id='verifyLink' class='btn' target='_blank' rel='noopener'>openai.com sign-in</a></p>
+  <p>2 · Enter this one-time code <button class='copy' id='copyBtn'>copy</button></p>
+  <div class='code' id='userCode'></div>
+  <p class='muted' id='waitMsg'>Waiting for you to finish signing in… this page updates automatically.</p>
+</div>
+<div id='done' class='{done_cls}'>
+  <p class='ok'>✓ Connected as <b>{safe}</b>. You can close this page.</p>
+</div>
+<p class='err hidden' id='errMsg'></p>
+</main><script>
+const S={{start:location.pathname+'/start',status:location.pathname+'/status'}};
+const $=id=>document.getElementById(id);let timer=null;
+function show(err){{$('errMsg').textContent=err||'';$('errMsg').classList.toggle('hidden',!err)}}
+async function start(){{show('');try{{const r=await fetch(S.start,{{method:'POST'}});const d=await r.json();
+if(!r.ok)throw new Error(d.error&&d.error.message||('start failed ('+r.status+')'));
+$('verifyLink').href=d.verification_url;$('userCode').textContent=d.user_code;
+$('idle').classList.add('hidden');$('steps').classList.remove('hidden');poll()}}
+catch(e){{show(e.message)}}}}
+async function poll(){{clearTimeout(timer);try{{const r=await fetch(S.status);
+if(r.status===404){{$('steps').classList.add('hidden');$('idle').classList.add('hidden');show('This link is no longer valid — ask for a new one.');return}}
+const d=await r.json();
+if(d.status==='connected'){{$('steps').classList.add('hidden');$('done').classList.remove('hidden');return}}
+if(d.status==='error'){{$('steps').classList.add('hidden');$('idle').classList.remove('hidden');show(d.message||'sign-in failed — try again');return}}
+if(d.status==='pending'&&!$('steps').classList.contains('hidden')){{$('steps').classList.add('hidden');$('idle').classList.remove('hidden');show('The sign-in expired — start again.');return}}
+}}catch(e){{}}timer=setTimeout(poll,5000)}}
+$('startBtn').onclick=start;
+$('copyBtn').onclick=()=>navigator.clipboard.writeText($('userCode').textContent);
+</script></body></html>"""
 
 
 def _cost_accuracy_rows(routes, ema, _mult_of, *, min_calls=20, threshold=0.15):
@@ -3094,6 +3661,9 @@ async def dashboard_list_keys(request: Request) -> Response:
         "allowed_routes": meta.get("allowed_routes") or [],
         "rate_per_min": meta.get("rate_per_min"),
         "burst": meta.get("burst"),
+        "batch": meta.get("batch"),
+        "member_id": meta.get("member_id"),
+        "budget_usd": meta.get("budget_usd"),
         "keys": keys,
     })
 
@@ -3141,18 +3711,97 @@ async def dashboard_create_key(request: Request) -> Response:
             return JSONResponse(status_code=404, content={"error": {"message": "sha256_prefix does not match an active key for this consumer", "type": "not_found", "code": "key_not_found"}})
     new_hashes = dict(CALLER_KEY_HASHES)
     new_hashes[token_hash] = consumer
-    _upsert_env_json(Path(DASHBOARD_KEY_ENV_PATH), "CALLER_KEYS_SHA256_JSON", new_hashes)
-    CALLER_KEY_HASHES.clear()
-    CALLER_KEY_HASHES.update(new_hashes)
     meta.setdefault("keys", [])
     meta["keys"].append({"sha256_prefix": token_hash[:12], "status": "active", "created_at": now, "viewer": caller})
     meta["status"] = meta.get("status") or "active"
     meta["updated_at"] = now
     records[consumer] = meta
-    if not _write_issued_consumer_records(records):
+    if not _write_issued_consumer_records(
+            records, key_digests={token_hash: consumer}):
         return JSONResponse(status_code=500, content={"ok": False, "error": "failed to persist the issued key"})
+    _publish_local_consumer_map(
+        "CALLER_KEYS_SHA256_JSON", new_hashes, CALLER_KEY_HASHES)
     _log({"event": "dashboard_key_created", "consumer": consumer, "viewer": caller, "rotate": rotate, "rotated_prefix": rotate_prefix or None})
     return JSONResponse(content={"ok": True, "consumer": consumer, "api_key": token, "sha256_prefix": token_hash[:12], "rotate": rotate, "grace_period_s": None if not rotate else (DEFAULT_ROTATION_GRACE_S if grace_period_s is None else grace_period_s), "warning": "Copy now. The raw key is shown once and only hashed key metadata is persisted."})
+
+
+@app.post("/dashboard/api/keys/batch")
+async def dashboard_create_key_batch(request: Request) -> Response:
+    ctx, error = _require_admin_dashboard_auth(request)
+    if error:
+        return error
+    try:
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise ValueError("JSON body must be an object")
+        batch = _safe_consumer_name(str(data.get("batch", "")))
+        try:
+            count = int(data.get("count"))
+        except (TypeError, ValueError):
+            count = 0
+        budget_usd = _optional_float(data.get("budget_usd"), min_value=0.01)
+        rate_per_min = _optional_int(data.get("rate_per_min"), min_value=1)
+        burst = _optional_int(data.get("burst"), min_value=1)
+        allowed_routes = _clean_route_list(data.get("allowed_routes"))
+        if not 1 <= count <= 50:
+            raise ValueError("count must be between 1 and 50")
+        if budget_usd is None:
+            raise ValueError("budget_usd must be a positive number")
+        members = [(f"{idx:03d}", _safe_consumer_name(f"{batch}-{idx:03d}"))
+                   for idx in range(1, count + 1)]
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": str(exc), "type": "invalid_request_error",
+            "code": "invalid_key_batch"}})
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "invalid JSON body", "type": "invalid_request_error",
+            "code": "invalid_json"}})
+
+    records = _issued_consumer_records()
+    collisions = [consumer for _, consumer in members if consumer in records]
+    if collisions:
+        return JSONResponse(status_code=409, content={"error": {
+            "message": "batch consumers already exist", "type": "conflict",
+            "code": "consumer_batch_exists", "consumers": collisions[:10]}})
+
+    now = int(time.time())
+    viewer = str(ctx.get("viewer"))
+    old_hashes = dict(CALLER_KEY_HASHES)
+    new_hashes = dict(old_hashes)
+    issued = []
+    for member_id, consumer in members:
+        token = f"{DASHBOARD_KEY_PREFIX}_{secrets.token_urlsafe(32)}"
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        new_hashes[digest] = consumer
+        meta = _normalize_consumer_record(consumer, {
+            "status": "active", "batch": batch, "member_id": member_id,
+            "budget_usd": budget_usd, "rate_per_min": rate_per_min,
+            "burst": burst, "allowed_routes": allowed_routes,
+            "keys": [{"sha256_prefix": digest[:12], "status": "active",
+                      "created_at": now, "viewer": viewer}],
+            "updated_at": now})
+        records[consumer] = meta
+        issued.append({"batch": batch, "member_id": member_id,
+                       "consumer": consumer, "api_key": token,
+                       "sha256_prefix": digest[:12], "budget_usd": budget_usd})
+
+    created_hashes = {
+        digest: owner for digest, owner in new_hashes.items()
+        if digest not in old_hashes
+    }
+    if not _write_issued_consumer_records(
+            records, key_digests=created_hashes):
+        return JSONResponse(status_code=500, content={"error": {
+            "message": "failed to persist key batch", "type": "server_error",
+            "code": "key_batch_persistence"}})
+    _publish_local_consumer_map(
+        "CALLER_KEYS_SHA256_JSON", new_hashes, CALLER_KEY_HASHES)
+    _log({"event": "dashboard_key_batch_created", "batch": batch,
+          "count": count, "budget_usd": budget_usd, "viewer": viewer})
+    return JSONResponse(content={"ok": True, "batch": batch, "count": count,
+                                 "keys": issued,
+                                 "warning": "Copy or download now. Raw keys are shown only once."})
 
 
 
@@ -3260,7 +3909,11 @@ async def proxy(path: str, request: Request) -> Response:
     caller = auth.get("caller")
     if not auth.get("ok"):
         code = auth.get("error_code") or "caller_auth"
-        status_code = 403 if code in {"caller_inactive", "caller_key_revoked", "caller_key_expired"} else 401
+        if code == "caller_auth_unavailable":
+            status_code = 503
+            _metric_store_error("consumer_auth")
+        else:
+            status_code = 403 if code in {"caller_inactive", "caller_key_revoked", "caller_key_expired"} else 401
         _record_reject(reason=code, path="/" + path, caller=caller, status=status_code, remote=request.client.host if request.client else None)
         _log({"event": "reject", "reason": code, "path": "/" + path, "caller": caller, "remote": request.client.host if request.client else None})
         messages = {
@@ -3268,21 +3921,39 @@ async def proxy(path: str, request: Request) -> Response:
             "caller_inactive": "caller is inactive",
             "caller_key_revoked": "caller key is revoked",
             "caller_key_expired": "caller key is expired",
+            "caller_auth_unavailable": "caller authentication is temporarily unavailable",
         }
-        return JSONResponse(status_code=status_code, content={"error": {"message": messages.get(code, "caller not authorized"), "type": "auth_error", "code": code}})
+        error_type = "server_error" if status_code == 503 else "auth_error"
+        return JSONResponse(status_code=status_code, content={"error": {"message": messages.get(code, "caller not authorized"), "type": error_type, "code": code}})
 
     caller = str(caller)
-    auth_meta = auth.get("meta")
+    consumer_meta = auth.get("meta") or {}
     body = await request.body()
     requested_route = _requested_route_from(path, body)
-    if not _route_allowed(caller, requested_route, meta=auth_meta):
+    if not _route_allowed(caller, requested_route, consumer_meta):
         _record_reject(reason="route_not_allowed", path="/" + path, caller=caller, status=403, route=requested_route)
         _log({"event": "reject", "reason": "route_not_allowed", "caller": caller, "path": "/" + path, "route": requested_route})
         return JSONResponse(status_code=403, content={"error": {"message": "caller is not allowed to use this route", "type": "auth_error", "code": "caller_route_not_allowed"}})
-    if not _rate_ok(caller, meta=auth_meta):
+    rate_result = await asyncio.to_thread(_rate_ok, caller, consumer_meta)
+    # Compatibility for embedders/tests that supplied the pre-HA boolean hook.
+    if isinstance(rate_result, tuple):
+        rate_allowed, rate_store_ok, retry_after_s = rate_result
+    else:
+        rate_allowed, rate_store_ok, retry_after_s = bool(rate_result), True, 0.0
+    if not rate_store_ok:
+        _metric_store_error("rate_limit")
+        _record_reject(reason="rate_limit_unavailable", path="/" + path,
+                       caller=caller, status=503)
+        return JSONResponse(status_code=503, content={"error": {
+            "message": "caller rate-limit state is temporarily unavailable",
+            "type": "server_error", "code": "caller_rate_limit_unavailable"}})
+    if not rate_allowed:
         _record_reject(reason="rate_limit", path="/" + path, caller=caller, status=429)
         _log({"event": "reject", "reason": "rate_limit", "caller": caller, "path": "/" + path})
-        return JSONResponse(status_code=429, content={"error": {"message": "caller rate limit exceeded", "type": "rate_limit_error", "code": "caller_rate_limit"}})
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(max(1, math.ceil(retry_after_s)))},
+            content={"error": {"message": "caller rate limit exceeded", "type": "rate_limit_error", "code": "caller_rate_limit"}})
 
     if path == "api/show" and request.method.upper() == "POST":
         requested_model = None
@@ -3298,7 +3969,32 @@ async def proxy(path: str, request: Request) -> Response:
         _log({"event": "metadata_probe", "caller": caller, "method": request.method, "path": "/" + path, "status": 200, "latency_ms": latency_ms, "requested_model": requested_model})
         return JSONResponse(content=_ollama_show_response(requested_model))
 
+    budget_usd = _optional_float(consumer_meta.get("budget_usd"), min_value=0.01)
+    if budget_usd is not None:
+        spent_usd, spend_ok = await asyncio.to_thread(host_store.consumer_spend_usd, caller)
+        if not spend_ok:
+            return JSONResponse(status_code=503, content={"error": {
+                "message": "consumer budget state is temporarily unavailable",
+                "type": "server_error", "code": "consumer_budget_unavailable"}})
+        if spent_usd >= budget_usd:
+            _record_reject(reason="budget_exhausted", path="/" + path,
+                           caller=caller, status=402, route=requested_route)
+            return JSONResponse(status_code=402, content={"error": {
+                "message": "consumer budget exhausted", "type": "budget_error",
+                "code": "consumer_budget_exhausted",
+                "budget_usd": budget_usd, "spent_usd": spent_usd}})
+
     assert _client is not None
+    if not await _capacity_acquire():
+        _record_reject(reason="router_overloaded", path="/" + path,
+                       caller=caller, status=503, route=requested_route)
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": str(max(1, math.ceil(CAPACITY_QUEUE_TIMEOUT_S)))},
+            content={"error": {
+                "message": "router capacity is temporarily exhausted; retry shortly",
+                "type": "server_error", "code": "router_overloaded"}})
+
     upstream_url = f"{UPSTREAM}/{path}"
     if request.url.query:
         upstream_url += f"?{request.url.query}"
@@ -3328,11 +4024,26 @@ async def proxy(path: str, request: Request) -> Response:
     decision_trace = None
     error_type = error_code = error_message = None
     record_in_finally = True
+    capacity_released = False
+    # The per-session meter DERIVES from this ledger (host_store.calls.session):
+    # without the sid recorded here, /v1/session/{sid} answers 404 for everyone
+    # even though the shim pinned the session fine. Same precedence as the shim:
+    # an explicit body `session` wins (szc sends it there); the
+    # X-Unhardcoded-Session header covers header-only clients (opencode plugin).
+    session_id = request.headers.get("x-unhardcoded-session")
 
     def _finish():
+        nonlocal capacity_released
+        if capacity_released:
+            return
+        capacity_released = True
         latency_ms = round((time.perf_counter() - started) * 1000, 1)
-        _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
-        _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
+        try:
+            _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
+            _metric_request(status, latency_ms)
+            _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
+        finally:
+            _capacity_release()
 
     try:
         if body:
@@ -3340,6 +4051,8 @@ async def proxy(path: str, request: Request) -> Response:
                 parsed_body = json.loads(body.decode("utf-8"))
                 if isinstance(parsed_body, dict):
                     requested_model = parsed_body.get("model")
+                    if parsed_body.get("session"):
+                        session_id = str(parsed_body.get("session"))
             except Exception:
                 pass
         upstream_req = _client.build_request(request.method, upstream_url, content=body, headers=headers)
@@ -3353,6 +4066,14 @@ async def proxy(path: str, request: Request) -> Response:
             # recorded AFTER the stream ends — with tokens, cost, provider and
             # full-stream latency — instead of in the outer finally.
             record_in_finally = False
+            upstream_closed = False
+
+            async def _close_upstream_stream() -> None:
+                nonlocal upstream_closed
+                if upstream_closed:
+                    return
+                upstream_closed = True
+                await r.aclose()
 
             async def _passthrough():
                 nonlocal provider, model_family, served_model_id, served_by, \
@@ -3365,7 +4086,7 @@ async def proxy(path: str, request: Request) -> Response:
                         _trim_sse_tail(tail)
                         yield chunk
                 finally:
-                    await r.aclose()
+                    await _close_upstream_stream()
                     try:
                         meta = _parse_stream_tail(bytes(tail))
                         xr = meta.get("x_router") or {}
@@ -3393,7 +4114,18 @@ async def proxy(path: str, request: Request) -> Response:
                     except Exception:
                         pass
                     _finish()
-            return StreamingResponse(_passthrough(), status_code=status, media_type=content_type)
+
+            async def _stream_background() -> None:
+                # Starlette normally closes the async generator on disconnect.
+                # The background fallback also covers a client that disconnects
+                # before the first iteration, so neither the upstream socket nor
+                # the admission permit can leak indefinitely.
+                await _close_upstream_stream()
+                _finish()
+
+            return StreamingResponse(
+                _passthrough(), status_code=status, media_type=content_type,
+                background=BackgroundTask(_stream_background))
         content = await r.aread()
         await r.aclose()
         if content_type.startswith("application/json"):
@@ -3441,6 +4173,7 @@ def _record_reject(**event: Any) -> None:
     # rejects were dual-written to usage-history; with that file retired, the
     # persistent stats are per-LLM-call and rejects are a runtime view.)
     stored = {"ts": int(time.time()), "event": "reject", **event}
+    _metric_reject(str(event.get("reason") or "unknown"))
     with _stats_lock:
         _stats["total_rejects"] += 1
         _stats["recent"].appendleft(stored)
@@ -3556,7 +4289,11 @@ def _record_request(**event: Any) -> None:
         _stats["by_status"][str(status)] += 1
         route_key = event.get("requested_model") or event.get("route") or "unknown"
         served_key = event.get("served_model_id") or "unknown"
-        for group_name, key in (("by_caller", event.get("caller")), ("by_provider", event.get("provider") or "unknown"), ("by_model_family", event.get("model_family") or "unknown"), ("by_route", route_key), ("by_served_model", served_key)):
+        # Error/aux rows lack a served model_family — attribute to the requested
+        # model instead of a single opaque "unknown" bucket (mirrors host_store
+        # usage_aggregate's family_k fallback for the persistent view).
+        family_key = event.get("model_family") or route_key
+        for group_name, key in (("by_caller", event.get("caller")), ("by_provider", event.get("provider") or "unknown"), ("by_model_family", family_key), ("by_route", route_key), ("by_served_model", served_key)):
             c = _stats[group_name][str(key or "unknown")]
             c["requests"] += 1
             if is_error:
@@ -3570,7 +4307,7 @@ def _record_request(**event: Any) -> None:
             if cost_usd is not None:
                 c["cost_usd"] = round(float(c.get("cost_usd") or 0.0) + cost_usd, 6)
         caller = str(event.get("caller") or "unknown")
-        for group_name, key in (("by_caller_provider", event.get("provider") or "unknown"), ("by_caller_model_family", event.get("model_family") or "unknown"), ("by_caller_route", route_key), ("by_caller_served_model", served_key)):
+        for group_name, key in (("by_caller_provider", event.get("provider") or "unknown"), ("by_caller_model_family", family_key), ("by_caller_route", route_key), ("by_caller_served_model", served_key)):
             c = _stats[group_name][caller][str(key or "unknown")]
             c["requests"] += 1
             if is_error:
@@ -3598,7 +4335,7 @@ def _record_request(**event: Any) -> None:
             c["last_seen"] = now
             if cost_usd is not None:
                 c["cost_usd"] = round(float(c.get("cost_usd") or 0.0) + cost_usd, 6)
-            for group_name, key in (("by_key_provider", event.get("provider") or "unknown"), ("by_key_model_family", event.get("model_family") or "unknown"), ("by_key_route", route_key), ("by_key_served_model", served_key)):
+            for group_name, key in (("by_key_provider", event.get("provider") or "unknown"), ("by_key_model_family", family_key), ("by_key_route", route_key), ("by_key_served_model", served_key)):
                 kc = _stats[group_name][key_sha256][str(key or "unknown")]
                 kc["requests"] += 1
                 if is_error:
@@ -3749,6 +4486,13 @@ def _counter_snapshot(d: dict[str, Any]) -> dict[str, Any]:
     out["latency_ms_avg"] = round(float(out.pop("latency_ms_total", 0.0)) / req, 1) if req else 0.0
     out["latency_ms_max"] = round(float(out.get("latency_ms_max") or 0), 1)
     out["error_rate"] = round((int(out.get("errors") or 0) / req), 4) if req else 0.0
+    tokens = int(out.get("tokens_total") or 0)
+    tokens_in = int(out.get("tokens_in") or 0)
+    cached = int(out.get("tokens_cached") or 0)
+    cost = float(out.get("cost_usd") or 0.0)
+    out["cost_per_mtok"] = round(cost * 1_000_000 / tokens, 4) if tokens else None
+    out["cost_per_request"] = round(cost / req, 6) if req else None
+    out["cache_hit_rate"] = round(cached / tokens_in, 4) if tokens_in else None
     return out
 
 
@@ -3897,6 +4641,7 @@ def _add_counter(counter: dict[str, Any], row: dict[str, Any], cost: float | Non
     tokens_in = int(row.get("tokens_in") or 0)
     tokens_out = int(row.get("tokens_out") or 0)
     tokens_total = int(row.get("tokens_total") or (tokens_in + tokens_out))
+    tokens_cached = int(row.get("tokens_cached") or 0)
     latency_ms = float(row.get("latency_ms") or 0)
     ts = int(row.get("ts") or 0)
     counter["requests"] += 1
@@ -3905,6 +4650,7 @@ def _add_counter(counter: dict[str, Any], row: dict[str, Any], cost: float | Non
     counter["tokens_in"] += tokens_in
     counter["tokens_out"] += tokens_out
     counter["tokens_total"] += tokens_total
+    counter["tokens_cached"] += tokens_cached
     counter["latency_ms_total"] += latency_ms
     counter["latency_ms_max"] = max(float(counter.get("latency_ms_max") or 0), latency_ms)
     counter["last_seen"] = max(int(counter.get("last_seen") or 0), ts) or None
@@ -4070,24 +4816,24 @@ def _key_usage_snapshot(*, viewer: str, key_sha256: str, caller: str | None = No
 
 
 
-DASHBOARD_TIMEFRAMES = {"runtime", "1h", "24h", "7d", "30d", "all"}
+DASHBOARD_TIMEFRAMES = {"recent", "runtime", "1h", "24h", "7d", "30d"}
 
 
 def _dashboard_timeframe(value: Any) -> str:
-    text = str(value or "all").strip().lower()
-    if text in {"", "history"}:
-        return "all"
+    text = str(value or "recent").strip().lower()
+    if text in {"", "history", "all"}:
+        return "recent"
     if text not in DASHBOARD_TIMEFRAMES:
-        return "all"
+        return "recent"
     return text
 
 
 def _dashboard_timeframe_options(timeframe: str) -> dict[str, Any]:
     timeframe = _dashboard_timeframe(timeframe)
-    if timeframe == "runtime" or timeframe == "all":
-        return {"since": None, "until": None, "window": None, "limit": RECENT_LIMIT, "offset": 0, "timeframe": timeframe}
+    if timeframe in {"recent", "runtime"}:
+        return {"since": None, "until": None, "window": None, "limit": DASHBOARD_STATS_RECENT_LIMIT, "offset": 0, "timeframe": timeframe}
     since, window_label = _parse_usage_window(timeframe)
-    return {"since": since, "until": None, "window": window_label, "limit": RECENT_LIMIT, "offset": 0, "timeframe": timeframe}
+    return {"since": since, "until": None, "window": window_label, "limit": DASHBOARD_STATS_RECENT_LIMIT, "offset": 0, "timeframe": timeframe}
 
 
 def _counter_from_sql(c: dict[str, Any]) -> dict[str, Any]:
@@ -4099,6 +4845,7 @@ def _counter_from_sql(c: dict[str, Any]) -> dict[str, Any]:
     out = {"requests": int(c.get("requests") or 0), "errors": int(c.get("errors") or 0),
            "tokens_in": int(c.get("tokens_in") or 0), "tokens_out": int(c.get("tokens_out") or 0),
            "tokens_total": int(c.get("tokens_total") or 0),
+           "tokens_cached": int(c.get("tokens_cached") or 0),
            "latency_ms_total": 0.0, "latency_ms_max": 0.0,
            "last_seen": c.get("last_seen") or None}
     if int(c.get("priced") or 0):
@@ -4117,6 +4864,7 @@ def _agg_from_sql(sql_agg: dict[str, Any], recent_rows: list[dict[str, Any]], *,
     totals = {"requests": int(t["requests"]), "rejects": 0, "errors": int(t["errors"]),
               "tokens_in": int(t["tokens_in"]), "tokens_out": int(t["tokens_out"]),
               "tokens_total": int(t["tokens_total"]),
+              "tokens_cached": int(t.get("tokens_cached") or 0),
               "cost_usd": round(float(t["cost_usd"] or 0.0), 6)}
 
     def snap(bucket: dict[str, Any]) -> dict[str, Any]:
@@ -4149,7 +4897,7 @@ def _daily_totals_from_sql(by_day: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _stats_history_bundle(*, since: int | None, selected: str | None,
                           key_filter: str | None, provider: str | None,
-                          model: str | None) -> dict[str, Any]:
+                          model: str | None, recent_only: bool = False) -> dict[str, Any]:
     """Everything the persistent-timeframe stats snapshot derives from the store,
     via SQL aggregation (was: load every retained row and fold in Python, TWICE).
 
@@ -4164,6 +4912,20 @@ def _stats_history_bundle(*, since: int | None, selected: str | None,
     otherwise — never narrowed by provider/model."""
     caller = selected
     caller_is_null = bool(key_filter) and selected is None
+    if recent_only:
+        rows = host_store.usage_rows_page(
+            caller=caller, caller_is_null=caller_is_null,
+            consumer_sha=key_filter, provider=provider, model_family=model,
+            limit=DASHBOARD_STATS_RECENT_LIMIT)
+        agg = _aggregate_usage_rows(rows, selected=selected)
+        return {
+            "agg": agg,
+            "keys_by_caller": agg["by_caller_all"],
+            "filter_options": {"providers": sorted(agg["by_provider"]),
+                               "models": sorted(agg["by_model_family"])},
+            "daily_totals": _period_totals(rows, monthly=False),
+            "history_events": len(rows), "history_events_all": len(rows),
+        }
     filtered = host_store.usage_aggregate(
         since_ts=since, caller=caller, caller_is_null=caller_is_null,
         consumer_sha=key_filter, provider=provider, model_family=model)
@@ -4195,6 +4957,30 @@ def _stats_history_bundle(*, since: int | None, selected: str | None,
     }
 
 
+def _analytics_history_bundle(*, since: int, selected: str | None,
+                              provider: str | None, model: str | None,
+                              key_filter: str | None = None) -> dict[str, Any]:
+    sql_agg, state, ok = host_store.analytics_aggregate(
+        since_ts=since, caller=selected, provider=provider, model_family=model,
+        consumer_sha=key_filter)
+    recent = host_store.usage_rows_page(caller=selected, provider=provider,
+                                        model_family=model,
+                                        consumer_sha=key_filter,
+                                        limit=DASHBOARD_STATS_RECENT_LIMIT)
+    agg = _agg_from_sql(sql_agg, recent, selected=selected)
+    return {
+        "agg": agg,
+        "keys_by_caller": {k: _counter_snapshot(_counter_from_sql(v))
+                           for k, v in sorted(sql_agg["by_caller"].items())},
+        "filter_options": {"providers": sorted(sql_agg["by_provider"]),
+                           "models": sorted(sql_agg["by_model_family"])},
+        "daily_totals": _daily_totals_from_sql(sql_agg["by_day"]),
+        "history_events": int(sql_agg["totals"]["requests"]),
+        "history_events_all": int(sql_agg["totals"]["requests"]),
+        "analytics": {"available": ok, **state},
+    }
+
+
 def _unlanded_recent_requests(since: int | None) -> list[dict[str, Any]]:
     """Runtime `recent` request rows whose async ledger write has NOT landed yet.
     The old code merged the whole history read with the runtime deque and
@@ -4219,7 +5005,9 @@ def _aggregate_usage_rows(rows: list[dict[str, Any]], *, selected: str | None = 
     # same shape in SQL (_stats_history_bundle / host_store.usage_aggregate) —
     # tests/test_dashboard_stats_sql.py asserts the two stay identical. Keep the
     # semantics here and there in lockstep.
-    totals = {"requests": 0, "rejects": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0, "tokens_total": 0, "cost_usd": 0.0}
+    totals = {"requests": 0, "rejects": 0, "errors": 0, "tokens_in": 0,
+              "tokens_out": 0, "tokens_total": 0, "tokens_cached": 0,
+              "cost_usd": 0.0}
     prices = _price_table()
     by_caller: dict[str, dict[str, Any]] = defaultdict(_counter)
     by_provider: dict[str, dict[str, Any]] = defaultdict(_counter)
@@ -4243,13 +5031,16 @@ def _aggregate_usage_rows(rows: list[dict[str, Any]], *, selected: str | None = 
         totals["tokens_in"] += int(row.get("tokens_in") or 0)
         totals["tokens_out"] += int(row.get("tokens_out") or 0)
         totals["tokens_total"] += int(row.get("tokens_total") or (int(row.get("tokens_in") or 0) + int(row.get("tokens_out") or 0)))
+        totals["tokens_cached"] += int(row.get("tokens_cached") or 0)
         if cost is not None:
             totals["cost_usd"] = round(totals["cost_usd"] + cost, 6)
         by_status[str(status)] += 1
         for bucket, key in (
             (by_caller, row.get("caller") or "unknown"),
             (by_provider, row.get("provider") or "unknown"),
-            (by_model_family, row.get("model_family") or "unknown"),
+            # error/aux rows lack a served family — fall back to the requested
+            # model (matches host_store usage_aggregate + the live _stats fold)
+            (by_model_family, row.get("model_family") or row.get("requested_model") or row.get("route") or "unknown"),
             (by_route, row.get("requested_model") or row.get("route") or "unknown"),
             (by_served_model, row.get("served_model_id") or "unknown"),
         ):
@@ -4268,7 +5059,7 @@ def _aggregate_usage_rows(rows: list[dict[str, Any]], *, selected: str | None = 
     }
 
 
-def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[str, Any], consumer: str | None = None, timeframe: str = "all", key_sha256: str | None = None, viewer_role: str = "admin", provider: str | None = None, model: str | None = None) -> dict[str, Any]:
+def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[str, Any], consumer: str | None = None, timeframe: str = "recent", key_sha256: str | None = None, viewer_role: str = "admin", provider: str | None = None, model: str | None = None) -> dict[str, Any]:
     selected = consumer if consumer in _consumers() else None
     provider = (provider or "").strip() or None
     model = (model or "").strip() or None
@@ -4282,12 +5073,15 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
         # re-scanning the window per request.
         since = _dashboard_timeframe_options(timeframe).get("since")
         cache_key = ("stats", timeframe, selected, key_filter, provider, model)
-        bundle = _snapshot_cache_get(cache_key)
-        if bundle is None:
-            bundle = _stats_history_bundle(since=since, selected=selected,
-                                           key_filter=key_filter,
-                                           provider=provider, model=model)
-            _snapshot_cache_put(cache_key, bundle)
+        if timeframe == "recent":
+            compute = lambda: _stats_history_bundle(
+                since=since, selected=selected, key_filter=key_filter,
+                provider=provider, model=model, recent_only=True)
+        else:
+            compute = lambda: _analytics_history_bundle(
+                since=int(since or 0), selected=selected,
+                provider=provider, model=model, key_filter=key_filter)
+        bundle = _snapshot_cached_compute(cache_key, compute)
         agg = bundle["agg"]
         # Surface live in-memory events (dashboard test calls, probes, just-served
         # requests) that are not persisted to billing history, so Activity always
@@ -4299,7 +5093,8 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
                     if (not selected or r.get("caller") == selected)
                     and (not key_filter or r.get("key_sha256_prefix") == (key_filter[:12] if key_filter else None))]
         seen_ids = {r.get("usage_event_id") for r in agg["recent"] if r.get("usage_event_id")}
-        merged_recent = [r for r in live if r.get("usage_event_id") not in seen_ids] + agg["recent"]
+        merged_recent = ([r for r in live if r.get("usage_event_id") not in seen_ids] + agg["recent"])
+        merged_recent = merged_recent[:DASHBOARD_STATS_RECENT_LIMIT]
         route_health = _route_health_snapshot(agg["recent"], synthetic)
         health_summary = _health_summary(agg["recent"], route_health)
         return {
@@ -4309,7 +5104,7 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
             "viewer_role": viewer_role,
             "selected_consumer": selected,
             "selected_key_sha256_prefix": key_filter[:12] if key_filter else None,
-            "timeframe": {"selected": timeframe, "source": "persistent_history", "history_path_configured": True, "history_events": bundle["history_events"], "history_events_all": bundle["history_events_all"]},
+            "timeframe": {"selected": timeframe, "source": "recent_events" if timeframe == "recent" else "analytics_hourly", "history_path_configured": True, "history_events": bundle["history_events"], "history_events_all": bundle["history_events_all"], "analytics": bundle.get("analytics")},
             "rate_limit": {"rate_per_min": RATE_PER_MIN, "burst": BURST, "effective_per_min": max(RATE_PER_MIN, BURST)},
             "upstream": {"status": upstream_status, "health": upstream_health},
             "consumers": [{"name": name, "configured": True} for name in _consumers()],
@@ -4326,8 +5121,8 @@ def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[
             "daily_totals": bundle["daily_totals"],
             "route_health": route_health,
             "health_summary": health_summary,
-            "logins": _login_connections_snapshot(timeframe=timeframe, consumer=selected, viewer_role=viewer_role),
-            "provider_keys": _provider_credentials_snapshot(timeframe=timeframe, viewer_role=viewer_role),
+            "logins": _login_connections_snapshot(timeframe="recent" if timeframe != "recent" else timeframe, consumer=selected, viewer_role=viewer_role),
+            "provider_keys": _provider_credentials_snapshot(timeframe="recent" if timeframe != "recent" else timeframe, viewer_role=viewer_role),
         }
     with _stats_lock:
         by_caller_all = {k: _counter_snapshot(v) for k, v in sorted(_stats["by_caller"].items())}
@@ -4451,28 +5246,34 @@ def _dashboard_html() -> str:
   <main class='content'>
     <div class='topbar'>
       <div class='pageTitle'><h1 id='pageTitle'>Analytics</h1><div class='sub' id='pageSub'>Spend, traffic and errors — filter by timeframe, consumer, provider and model.</div></div>
-      <div class='topActions'><select class='select' id='consumer'><option value=''>All consumers</option></select><select class='select' id='timeframe' title='Usage timeframe'><option value='all' selected>All history</option><option value='runtime'>Since restart</option><option value='1h'>Last hour</option><option value='24h'>Last 24h</option><option value='7d'>Last 7d</option><option value='30d'>Last 30d</option></select><button class='btn' id='refresh'>Refresh</button><button class='btn' id='logout'>Log out</button></div>
+      <div class='topActions'><select class='select' id='consumer'><option value=''>All consumers</option></select><select class='select' id='timeframe' title='Usage scope'><option value='recent'>Latest 100 events</option><option value='24h'>Last 24 hours</option><option value='7d'>Last 7 days</option><option value='30d' selected>Last 30 days</option></select><button class='btn' id='refresh'>Refresh</button><button class='btn' id='logout'>Log out</button></div>
     </div>
     <div id='err' class='errorbox'></div>
+    <div id='dashboardLoading' class='card cardPad' style='display:flex;align-items:center;gap:12px;margin-bottom:14px'><span aria-hidden='true' style='font-size:24px'>◌</span><div><b>Loading recent activity…</b><div class='muted small'>Applying the selected filters.</div></div></div>
     <section id='login' class='card login hidden'><div class='label'>Dashboard login</div><h2>Welcome back</h2><p class='muted'>Admins can use the dashboard password. Consumers can paste their router API key to see only their own usage.</p><div class='formGrid' style='margin-top:14px'><label>Admin password<input id='password' type='password' placeholder='Dashboard password' autocomplete='current-password' /></label><button class='btn primary' id='loginBtn'>Admin log in</button><label>Consumer API key<input id='apiKeyLogin' type='password' placeholder='Router API key' autocomplete='off' /></label><button class='btn' id='apiKeyLoginBtn'>View my usage</button></div></section>
 
     <section class='grid hidden page' id='app'>
-      <div class='card cardPad span12'><div class='toolbar'><div class='label'>Filters</div><div style='margin-left:auto;display:flex;gap:8px;align-items:center'><span class='muted small'>timeframe &amp; consumer: top right</span><select id='anProvider'><option value=''>All providers</option></select><select id='anModel'><option value=''>All models</option></select></div></div></div>
+      <div class='card cardPad span12'><div class='toolbar'><div class='label'>Filters</div><span id='analyticsFreshness' class='muted small'></span><div style='margin-left:auto;display:flex;gap:8px;align-items:center'><span class='muted small'>timeframe &amp; consumer: top right</span><select id='anProvider'><option value=''>All providers</option></select><select id='anModel'><option value=''>All models</option></select></div></div></div>
       <div class='card cardPad span3'><div class='label'>Requests</div><div id='anRequests' class='metric'>0</div><div id='anReqSub' class='statSub'>—</div></div>
       <div class='card cardPad span3'><div class='label'>Spend</div><div id='anSpend' class='metric'>$0</div><div id='anSpendSub' class='statSub'>—</div></div>
       <div class='card cardPad span3'><div class='label'>Tokens</div><div id='anTokens' class='metric'>0</div><div id='anTokSub' class='statSub'>—</div></div>
       <div class='card cardPad span3'><div class='label'>Success rate</div><div id='anSuccess' class='metric'>—</div><div id='anSuccessSub' class='statSub'>—</div></div>
+      <div class='card cardPad span4'><div class='label'>Blended $ / Mtok</div><div id='anCostPerMtok' class='metric'>—</div><div class='statSub'>effective cost efficiency</div></div>
+      <div class='card cardPad span4'><div class='label'>Cache hit rate</div><div id='anCacheRate' class='metric'>—</div><div id='anCacheSub' class='statSub'>cached input tokens</div></div>
+      <div class='card cardPad span4'><div class='label'>$ / request</div><div id='anCostPerRequest' class='metric'>—</div><div class='statSub'>blended average</div></div>
       <div class='card span12'><div class='toolbar'><div class='label'>Requests &amp; spend over time</div></div><div id='anSeries' class='cardPad'></div></div>
-      <div class='card span6'><div class='toolbar'><div class='label'>By provider</div></div><div id='anByProvider'></div></div>
-      <div class='card span6'><div class='toolbar'><div class='label'>By model family</div></div><div id='anByModel'></div></div>
+      <div class='card span6'><div class='toolbar'><div class='label'>By provider</div><span class='muted small' style='margin-left:auto'>actual traffic efficiency</span></div><div id='anByProvider'></div></div>
+      <div class='card span6'><div class='toolbar'><div class='label'>By model family</div><span class='muted small' style='margin-left:auto'>actual destination family</span></div><div id='anByModel'></div></div>
+      <div class='card span12'><div class='toolbar'><div class='label'>Destination model</div><span class='muted small' style='margin-left:auto'>where policies sent traffic</span></div><div id='anByDestination'></div></div>
       <div class='card span6'><div class='toolbar'><div class='label'>By consumer</div></div><div id='anByConsumer'></div></div>
-      <div class='card span6'><div class='toolbar'><div class='label'>By status</div></div><div id='anByStatus'></div></div>
+      <div class='card span6'><div class='toolbar'><div class='label'>Cost by policy / route</div></div><div id='anByRoute'></div></div>
+      <div class='card span12'><div class='toolbar'><div class='label'>By status</div></div><div id='anByStatus'></div></div>
       <div class='card span12'><div class='toolbar'><div class='label'>Cost accuracy</div><span class='muted small' style='margin-left:auto'>measured spend vs advertised list · drift flags only where the provider reports its own cost (≥ 20 calls)</span></div><div id='anCostAccuracy'></div></div>
     </section>
 
     <section class='grid hidden page' id='consumersPage'>
       <div class='card span12'>
-        <div class='toolbar'><div class='toolbarLeft'><div class='label'>Consumers</div><input id='consumerSearch' class='input search' placeholder='Search consumers…' /><div class='seg' id='consumerStatusSeg'><button data-status='' class='active'>All</button><button data-status='active'>Active</button><button data-status='inactive'>Inactive</button></div></div><div class='toolbarRight'><button class='btn primary' id='newConsumerKey'>Generate key</button></div></div>
+        <div class='toolbar'><div class='toolbarLeft'><div class='label'>Consumers</div><input id='consumerSearch' class='input search' placeholder='Search consumers…' /><div class='seg' id='consumerStatusSeg'><button data-status='' class='active'>All</button><button data-status='active'>Active</button><button data-status='inactive'>Inactive</button></div></div><div class='toolbarRight'><button class='btn' id='newKeyBatch'>Generate batch</button><button class='btn primary' id='newConsumerKey'>Generate key</button></div></div>
         <div id='keys'></div>
       </div>
       <div class='card span12'><div id='consumerDetail'></div></div>
@@ -4481,7 +5282,8 @@ def _dashboard_html() -> str:
     <section class='grid hidden page' id='providerKeysPage'>
       <div class='card span12'><div class='toolbar'><div><div class='label'>LLM provider credentials</div><div class='muted small'>Privatized view: env names and 12-char key fingerprints only. No raw provider keys or full hashes.</div></div><div class='toolbarRight'><button class='btn primary' id='toggleAddProvider'>Add provider</button></div></div><div id='providerKeys'></div></div>
       <div class='card span12' id='addProviderCard' style='display:none'><div class='toolbar'><div><div class='label'>Add provider</div><div class='muted small'>OpenAI-compatible endpoints only. The key is stored in .env.secrets under the env var; the provider definition persists in the host store and goes live immediately.</div></div></div><div class='cardPad'><div class='formGrid'><label>Provider id<input id='addProvId' placeholder='groq' /></label><label>Base URL<input id='addProvBaseUrl' placeholder='https://api.groq.com/openai/v1' /></label><label>Tier<select id='addProvTier' class='select'><option value='partner'>partner</option><option value='fallback'>fallback</option></select></label><label>Key env var<input id='addProvEnv' placeholder='GROQ_API_KEY' /></label><label>API key<input id='addProvKey' type='password' placeholder='sk-…' autocomplete='off' /></label><label>Served models (one per line: family or family=provider_model_id)<textarea id='addProvModels' rows='3' placeholder='llama-3.3-70b=llama-3.3-70b-versatile'></textarea></label></div><div class='actions' style='margin-top:10px'><button class='btn primary' id='addProvSubmit'>Add provider</button><button class='btn' id='addProvCancel'>Cancel</button></div><div id='addProvResult' class='muted small' style='margin-top:8px'></div></div></div>
-      <div class='card span12'><div class='toolbar'><div><div class='label'>Codex accounts</div><div class='muted small'>ChatGPT-subscription auth.json accounts (paste the output of `codex login`). Stored on the PVC, applied live. Token fingerprints only — never the raw token.</div></div><div class='toolbarRight'><button class='btn primary' id='toggleAddCodex'>Add codex account</button></div></div><div id='codexAccounts'></div></div>
+      <div class='card span12'><div class='toolbar'><div><div class='label'>Codex accounts</div><div class='muted small'>ChatGPT-subscription auth.json accounts (paste the output of `codex login`). Stored on the PVC, applied live. Token fingerprints only — never the raw token.</div></div><div class='toolbarRight'><button class='btn' id='toggleInviteCodex'>Invite via link</button><button class='btn primary' id='toggleAddCodex'>Add codex account</button></div></div><div id='codexAccounts'></div><div id='codexInvites'></div></div>
+      <div class='card span12' id='inviteCodexCard' style='display:none'><div class='cardPad'><div class='formGrid'><label>Account name<input id='inviteCodexName' placeholder='team-1' /></label></div><div class='actions' style='margin-top:10px'><button class='btn primary' id='inviteCodexSubmit'>Generate invite link</button><button class='btn' id='inviteCodexCancel'>Cancel</button></div><div id='inviteCodexResult' class='muted small' style='margin-top:8px'></div></div></div>
       <div class='card span12' id='addCodexCard' style='display:none'><div class='cardPad'><div class='formGrid'><label>Account name<input id='addCodexName' placeholder='team-1' /></label><label>auth.json<textarea id='addCodexJson' rows='6' placeholder='{&quot;tokens&quot;:{&quot;access_token&quot;:&quot;...&quot;,&quot;refresh_token&quot;:&quot;...&quot;,&quot;account_id&quot;:&quot;...&quot;}}'></textarea></label></div><div class='actions' style='margin-top:10px'><button class='btn primary' id='addCodexSubmit'>Save account</button><button class='btn' id='addCodexCancel'>Cancel</button></div><div id='addCodexResult' class='muted small' style='margin-top:8px'></div></div></div>
     </section>
 
@@ -4494,7 +5296,23 @@ def _dashboard_html() -> str:
       <div class='toolbar' style='margin-bottom:4px'><div class='seg' id='builderKindSeg'><button data-kind='policy' class='active' type='button'>Policy</button><button data-kind='flow' type='button'>Flow</button></div><span class='muted small' style='margin-left:auto'>debug a Σ_pol policy · or a Σ_flow DAG of policies</span></div>
       <div id='policyBuilder'>
       <div class='toolbar'><div class='label'>Policy debugger</div><div class='seg' id='bModeSeg' style='margin-left:auto;display:none'><button data-mode='structured' type='button'>Structured</button><button data-mode='raw' class='active' type='button'>Raw term</button></div></div>
-      <div class='muted small' style='margin:2px 0 10px'><b>Paste your Σ_pol term</b> (or compose one with the structured form) and <b>Review ranking</b> to see what it does over the live catalog: which candidates it <b>admits and how it ranks them</b>, and which it <b>filters out and why</b>. Author terms with the SKILL.md (Catalog → ↓ SKILL.md) and paste them here to debug. <b>Test call</b> runs the policy live for real.</div>
+      <div class='muted small' style='margin:2px 0 10px'><b>Start from a safe template below</b>, or paste your own Σ_pol term, then <b>Review ranking</b> to see what it does over the live catalog: which candidates it <b>admits and how it ranks them</b>, and which it <b>filters out and why</b>. Author custom terms with the SKILL.md (Catalog → ↓ SKILL.md). <b>Test call</b> runs the policy live for real.</div>
+      <div class='toolbar' id='bTemplateBar' style='margin-bottom:12px;align-items:center;flex-wrap:wrap'>
+        <span class='label small'>Start from a safe template</span>
+        <select id='bTemplate' class='select' style='width:auto'>
+          <option value='cheapest-family'>Cheapest in one family</option>
+          <option value='smart-value'>Smart value</option>
+          <option value='agent'>Stable tool agent</option>
+          <option value='default'>Default for vanilla clients</option>
+        </select>
+        <input id='bTemplateFamily' class='input' list='familyOptions' placeholder='model family, e.g. glm-5.2' style='min-width:220px'>
+        <select id='bTemplateStrategy' class='select' style='width:auto'>
+          <option value='cost'>Lowest cost</option>
+          <option value='ordered'>Codex → AntSeed → Bedrock → OpenRouter</option>
+        </select>
+        <button class='btn primary' id='bLoadTemplate' type='button'>Create policy</button>
+        <span class='muted small' id='bTemplateHelp'>Stays inside the exact family; unavailable providers are skipped.</span>
+      </div>
       <div class='toolbar' style='margin-bottom:12px;display:none'><span class='muted small'>Load an example →</span><button class='btn' id='bEx1' type='button'>Cheapest in the top-5 (intelligence ∩ coding)</button><button class='btn' id='bEx2' type='button'>Top 3 by combined benchmarks</button></div>
       <div id='bStructured' style='display:none'>
         <div class='label small' style='margin-top:4px'>Filter</div>
@@ -4553,6 +5371,11 @@ def _dashboard_html() -> str:
   <div id='newKeyStep2' style='display:none'><div class='sub' id='newKeyStep2Title'>Key ready</div><div class='keyWarn'>Shown once — copy it now</div><textarea id='newKeyValue' class='mono' readonly></textarea><div class='drawerActions'><button class='btn' id='copyKey'>Copy key</button><button class='btn primary' id='copyKeyHandoff'>Copy setup blurb</button></div><textarea id='newKeyHandoffValue' readonly style='display:none'></textarea><div class='drawerActions' style='margin-top:12px'><button class='btn' id='newKeyDone'>Done</button></div></div>
 </div></div><div id='toast' class='toast'></div>
 
+<div id='batchKeyShade' class='drawerShade'><div class='dialog' role='dialog' aria-modal='true' aria-labelledby='batchKeyTitle'><div class='drawerHead'><div><div class='label'>Key batch</div><h2 id='batchKeyTitle'>Generate consumer keys</h2></div><button class='btn iconBtn ghost' id='closeKeyBatch'>×</button></div>
+  <div id='batchKeyForm' class='formGrid'><label>Batch name<input id='batchKeyName' placeholder='validators-mainnet' /></label><label>Number of validators<input id='batchKeyCount' type='number' min='1' max='50' value='50' /></label><label>Budget per validator (USD)<input id='batchKeyBudget' type='number' min='0.01' step='0.01' placeholder='25' /></label><label>Allowed routes (optional)<input id='batchKeyRoutes' placeholder='profile:default' /></label><label>Requests per minute (optional)<input id='batchKeyRate' type='number' min='1' placeholder='default' /></label><label>Burst (optional)<input id='batchKeyBurst' type='number' min='1' placeholder='default' /></label><div class='muted small'>Creates batch-001 through batch-NNN. Each consumer has an independent key and budget.</div><button class='btn primary' id='createKeyBatch'>Generate batch</button></div>
+  <div id='batchKeyResult' style='display:none'><div class='keyWarn'>Shown once — download now</div><textarea id='batchKeyCsv' class='mono' readonly style='width:100%;min-height:240px'></textarea><div class='drawerActions'><button class='btn primary' id='downloadKeyBatchCsv'>Download CSV</button><button class='btn' id='downloadKeyBatchJson'>Download JSON</button><button class='btn' id='batchKeyDone'>Done</button></div></div>
+</div></div>
+
 <script>
 const $=(id)=>document.getElementById(id);const fmt=(n)=>Number(n||0).toLocaleString();const ts=(s)=>s?new Date(s*1000).toLocaleString():'—';const esc=(s)=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 function jsarg(s){return JSON.stringify(String(s??'')).replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])).replace(/\"/g,'&quot;')}function toast(msg){$('toast').textContent=msg;$('toast').style.display='block';setTimeout(()=>$('toast').style.display='none',2200)}function showErr(msg){$('err').style.display='block';$('err').textContent=msg}function clearErr(){$('err').style.display='none';$('err').textContent=''}function pct(v){return v==null?'—':Math.round(Number(v||0)*100)+'%'}
@@ -4577,7 +5400,8 @@ function renderKeysList(d){const keys=d.keys||[];$('keysList').innerHTML=keys.le
 async function loadDrawerKeys(){try{const r=await fetch('/dashboard/api/keys/list?consumer='+encodeURIComponent(drawerConsumer),{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`keys ${r.status}`);const d=await r.json();renderKeysList(d);$('settingsStatus').value=d.status==='active'?'active':(d.status||'inactive');$('settingsAllowedRoutes').value=(d.allowed_routes||[]).filter(x=>x!=='all').join(', ');$('settingsRate').value=d.rate_per_min||'';$('settingsBurst').value=d.burst||''}catch(e){$('keysList').innerHTML=`<div class="bad small">${esc(e.message)}</div>`}}
 function openDrawer(c,mode){drawerConsumer=c||'';const row=(lastStats.keys||[]).find(k=>k.consumer===c)||{};const status=row.status||'inactive';const routes=row.allowed_routes&&row.allowed_routes!=='all'?row.allowed_routes:'all routes';$('drawerTitle').textContent=c||'Consumer';$('drawerMeta').innerHTML=`<span class="pill"><span class="dot ${status==='active'?'ok':'warn'}"></span>${esc(status)}</span><span class="pill">${esc(routes)}</span>${row.rate_per_min?`<span class="pill">${esc(row.rate_per_min)}/min</span>`:''}`;$('keyReady').style.display='none';$('keyReady').innerHTML='';$('keysList').innerHTML='<div class="muted small">Loading…</div>';$('settingsFold').open=(mode==='settings');$('drawerShade').classList.add('open');loadDrawerKeys();if(mode==='settings')setTimeout(()=>$('settingsStatus').focus(),0)}
 function closeDrawer(){$('drawerShade').classList.remove('open')}
-async function load(){try{clearErr();const c=$('consumer').value;const tf=$('timeframe').value||'all';const qs=new URLSearchParams();if(c)qs.set('consumer',c);qs.set('timeframe',tf);const pv=$('anProvider')?$('anProvider').value:'';const md=$('anModel')?$('anModel').value:'';if(pv)qs.set('provider',pv);if(md)qs.set('model',md);const r=await fetch('/dashboard/api/stats?'+qs.toString(),{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`stats ${r.status}`);const d=await r.json();lastStats=d;render(d);loadCostAccuracy()}catch(e){showErr(e.message)}}
+let statsAbort=null;
+async function load(){if(statsAbort)statsAbort.abort();statsAbort=new AbortController();const mine=statsAbort;$('dashboardLoading').style.display='flex';$('refresh').disabled=true;try{clearErr();const c=$('consumer').value;const tf=$('timeframe').value||'recent';const qs=new URLSearchParams();if(c)qs.set('consumer',c);qs.set('timeframe',tf);const pv=$('anProvider')?$('anProvider').value:'';const md=$('anModel')?$('anModel').value:'';if(pv)qs.set('provider',pv);if(md)qs.set('model',md);const r=await fetch('/dashboard/api/stats?'+qs.toString(),{credentials:'same-origin',signal:mine.signal});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`stats ${r.status}`);const d=await r.json();lastStats=d;render(d);loadCostAccuracy()}catch(e){if(e.name!=='AbortError')showErr(e.message)}finally{if(statsAbort===mine){$('dashboardLoading').style.display='none';$('refresh').disabled=false;statsAbort=null}}}
 function applyViewerMode(d){const consumerMode=d.viewer_role==='consumer';$('consumer').classList.toggle('hidden',consumerMode);$('newConsumerKey').classList.toggle('hidden',consumerMode);$('tabMarket').classList.toggle('hidden',consumerMode);$('tabProviderKeys').classList.toggle('hidden',consumerMode);$('tabKeyUsage').classList.add('hidden');if(consumerMode&&(activeTab==='policies'||activeTab==='market'||activeTab==='providerKeys'))activeTab='consumers';if(consumerMode)$('pageSub').textContent='Your API-key-scoped usage and activity.'}
 function renderProviderKeys(d){const pk=d.provider_keys||{};const rows=(pk.rows||[]).map(r=>({...r,last_seen_text:ts(r.last_seen),requests:r.usage?.requests||0,errors:r.usage?.errors||0,tokens:r.usage?.tokens_total||0,latency:r.usage?.latency_ms_avg||0,cost:r.estimated_cost_usd||0}));$('providerKeys').innerHTML=table(rows,[{label:'Provider',f:r=>`<div class="rowTitle">${esc(r.provider)}</div><div class="rowMeta">${esc(r.api_kind||'—')} · ${esc(r.tier||'—')}</div>`},{label:'Credential / wallet',f:r=>r.wallet?walletCell(r.wallet):`<span class="pill ${r.credential_status==='missing'?'bad':'ok'}">${esc(r.credential_status)}</span><div class="rowMeta">${esc(r.auth_env||r.auth_kind||'none')}${r.key_fingerprint?' · '+esc(r.key_fingerprint):''}</div>${(r.key_present||r.credential_status==='oauth_configured'||r.auth_env)?`<div class="actions" style="margin-top:4px">${(r.key_present||r.credential_status==='oauth_configured')?`<button class="btn iconBtn ghost" title="Reveal key" onclick="revealProviderKey(${jsarg(r.provider)},this)">👁</button><button class="btn iconBtn ghost" title="Copy key to clipboard" onclick="copyProviderKey(${jsarg(r.provider)})">⧉</button>`:''}${r.auth_env?`<button class="btn iconBtn ghost" title="Set/replace key" onclick="editProviderKey(${jsarg(r.provider)})">✎</button>`:''}</div>`:''}`},{label:'Requests',cls:'right',f:r=>fmt(r.requests)},{label:'Errors',cls:'right',f:r=>fmt(r.errors)},{label:'Tokens',cls:'right',f:r=>fmt(r.tokens)},{label:'Est. cost',cls:'right',f:r=>r.cost?('$'+Number(r.cost).toFixed(4)):'—'},{label:'Last seen',f:r=>esc(r.last_seen_text)},{label:'Last route/model',f:r=>`${esc(r.last_route||'—')}<div class="rowMeta">${esc(r.last_model_family||'')}</div>`}])}
 function actStep(e,n){const skip=e.event==='skipped';const ok=!skip&&!e.error_kind;const err=`${esc(e.error_kind||'')}${e.http_status?` (${esc(e.http_status)})`:''}${e.error_message?': '+esc(String(e.error_message).slice(0,200)):''}`;const dot=skip?'<span class="dot"></span>':`<span class="dot ${ok?'ok':'bad'}"></span>`;const tag=skip?'<span class="muted small">skipped</span>':ok?'<span class="ok small">ok ✓</span>':`<span class="bad small">${err}</span>`;return `<div class="actStep"><span class="stepN">${n}</span>${dot}<code>${esc(e.provider_id||e.provider||'—')}</code>${e.model_family?`<span class="muted small">${esc(e.model_family)}</span>`:''}${tag}</div>`}
@@ -4586,13 +5410,13 @@ function actFlowCard(n){const itr=n.decision_trace||{};const raw=(Array.isArray(
 function actFlowDag(nodes){const byId={};nodes.forEach(n=>{byId[n.node]=n});const lvl={};const level=n=>{if(lvl[n.node]!=null)return lvl[n.node];lvl[n.node]=1;let m=1;(n.inputs||[]).forEach(p=>{if(byId[p])m=Math.max(m,level(byId[p])+1)});return lvl[n.node]=m};nodes.forEach(level);const maxL=Math.max(1,...nodes.map(n=>lvl[n.node]));let rows='';for(let L=1;L<=maxL;L++){const at=nodes.filter(n=>lvl[n.node]===L);if(!at.length)continue;rows+=`<div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:center">${at.map(actFlowCard).join('')}</div>`;if(L<maxL)rows+=`<div style="text-align:center;color:var(--muted);margin:1px 0">↓</div>`}return `<div style="display:flex;flex-direction:column;gap:2px">${rows}</div>`}
 function actDetail(r){const tr=r.decision_trace||{};const rawPath=Array.isArray(tr.decision_path)?tr.decision_path:(Array.isArray(tr.attempts)?tr.attempts:[]);const path=rawPath.filter(e=>e&&(e.provider_id||e.provider));const steps=path.length?path.map((e,i)=>actStep(e,i+1)).join(''):'<div class="muted small">No fallback trace recorded for this event.</div>';const fnodes=Array.isArray(tr.flow_nodes)?tr.flow_nodes:null;const fp=tr.flow_fingerprint?('flow '+tr.flow_fingerprint):(tr.policy_fingerprint||r.policy_fingerprint||r.requested_model);const cost=r.cost_usd==null?'—':'$'+Number(r.cost_usd).toFixed(6);const termStr=tr.policy_term?JSON.stringify(tr.policy_term):null;const policyBlock=termStr?`<div class="label small" style="margin-top:10px;display:flex;align-items:center;gap:8px">Policy term<button class="btn" data-copyterm="${esc(termStr)}" style="height:22px;padding:0 8px;font-size:11px">Copy</button></div><pre class="mono small" style="white-space:pre-wrap;max-height:160px;overflow:auto;background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:8px;padding:8px;margin-top:4px">${esc(termStr)}</pre>`:`<div class="muted small" style="margin-top:10px">No Σ_pol term — legacy closure profile (no copyable policy object).</div>`;return `<div class="actDetailBox"><div class="actMeta"><span class="pill">policy ${fp?esc(fp):'—'}</span><span class="pill">cost ${cost}</span><span class="pill">tokens ${fmt(r.tokens_total)} · in ${fmt(r.tokens_in)} · out ${fmt(r.tokens_out)}</span><span class="pill">${fmt(Math.round(r.latency_ms||0))} ms</span>${r.served_model_id?`<span class="pill">served <code>${esc(r.served_model_id)}</code></span>`:''}</div>${fnodes?('<div class="label small" style="margin-bottom:4px">Σ_flow — node DAG ('+fnodes.length+' node'+(fnodes.length===1?'':'s')+')</div>'+(fnodes.some(n=>Array.isArray(n.inputs))?actFlowDag(fnodes):fnodes.map(actFlowNode).join(''))):('<div class="label small" style="margin-bottom:4px">Attempts — fallback order</div>'+steps)}${policyBlock}</div>`}
 function renderActivity(rows){if(!rows.length){$('recent').innerHTML='<div class="empty">No activity yet.</div>';return}const head=`<tr><th></th><th>Time</th><th>Event</th><th>Caller</th><th class="right">Status</th><th>Route</th><th>Provider</th><th class="right">Cost</th><th>Error</th></tr>`;const body=rows.map((r,i)=>{const errK=r.error_kind||r.error_code||r.error_type||'';const st=Number(r.status||0);const sCls=(st>=200&&st<300)?'ok':(st>=400||errK)?'bad':'warn';const summary=`<tr class="actRow" data-i="${i}"><td class="actToggle" data-t="${i}">▸</td><td>${ts(r.ts)}</td><td><span class="pill">${esc(r.event)}</span></td><td>${esc(r.caller||'—')}</td><td class="right"><span class="${sCls}">${esc(r.status||'—')}</span></td><td>${esc(r.requested_model||r.route||'—')}</td><td>${esc(r.provider||'—')}</td><td class="right">${r.cost_usd==null?'—':'$'+Number(r.cost_usd).toFixed(6)}</td><td>${errK?`<span class="bad">${esc(errK)}</span>`:'—'}</td></tr>`;const detail=`<tr class="actDetail hidden" data-d="${i}"><td></td><td colspan="8">${actDetail(r)}</td></tr>`;return summary+detail}).join('');$('recent').innerHTML=`<table class="dataTable">${head}${body}</table>`}
-function anCols(){return [{label:'Name',f:r=>`<span class="pill">${esc(r.name)}</span>`},{label:'Requests',cls:'right',f:r=>fmt(r.requests)},{label:'Errors',cls:'right',f:r=>fmt(r.errors)},{label:'Tokens',cls:'right',f:r=>fmt(r.tokens_total)},{label:'Spend',cls:'right',f:r=>r.cost_usd==null?'—':'$'+Number(r.cost_usd).toFixed(4)}]}
+function anCols(){return [{label:'Name',f:r=>`<span class="pill">${esc(r.name)}</span>`},{label:'Requests',cls:'right',f:r=>fmt(r.requests)},{label:'Errors',cls:'right',f:r=>fmt(r.errors)},{label:'Tokens',cls:'right',f:r=>fmt(r.tokens_total)},{label:'Spend',cls:'right',f:r=>r.cost_usd==null?'—':'$'+Number(r.cost_usd).toFixed(4)},{label:'$/Mtok',cls:'right',f:r=>r.cost_per_mtok==null?'—':'$'+Number(r.cost_per_mtok).toFixed(2)},{label:'Cache',cls:'right',f:r=>r.cache_hit_rate==null?'—':Math.round(Number(r.cache_hit_rate)*100)+'%'}]}
 function fillFilter(id,opts,allLabel){const sel=$(id);if(!sel)return;const cur=sel.value;sel.innerHTML=`<option value="">${esc(allLabel)}</option>`+(opts||[]).map(o=>`<option value="${esc(o)}"${o===cur?' selected':''}>${esc(o)}</option>`).join('');if([...sel.options].some(o=>o.value===cur))sel.value=cur}
-function renderSeries(days){if(!days||!days.length){$('anSeries').innerHTML='<div class="muted small">No data in this window.</div>';return}const rows=days.slice(0,30);const max=Math.max(1,...rows.map(d=>Number(d.requests||0)));$('anSeries').innerHTML=rows.map(d=>{const r=Number(d.requests||0),w=Math.round(r/max*100);return `<div style="display:flex;align-items:center;gap:10px;margin:3px 0;font-size:12px"><span class="muted" style="width:88px;flex:none">${esc(d.date||d.month||'—')}</span><div style="flex:1;background:rgba(255,255,255,.04);border-radius:4px;height:14px;overflow:hidden"><div style="width:${w}%;height:100%;background:linear-gradient(90deg,#7170ff,#5e6ad2)"></div></div><span style="width:54px;text-align:right;flex:none">${fmt(r)}</span><span class="muted" style="width:78px;text-align:right;flex:none">$${Number(d.cost_usd||0).toFixed(4)}</span></div>`}).join('')}
-function renderAnalytics(d){const t=d.totals||{};const req=Number(t.requests||0),err=Number(t.errors||0);$('anRequests').textContent=fmt(req);$('anReqSub').textContent=`${fmt(err)} errors · ${fmt(t.rejects||0)} rejects`;$('anSpend').textContent='$'+Number(t.cost_usd||0).toFixed(4);$('anSpendSub').textContent=`over ${fmt(req)} requests`;$('anTokens').textContent=fmt(t.tokens_total);$('anTokSub').textContent=`in ${fmt(t.tokens_in)} · out ${fmt(t.tokens_out)}`;const sr=req?(req-err)/req:null;$('anSuccess').textContent=sr==null?'—':Math.round(sr*100)+'%';$('anSuccess').className='metric '+(sr==null?'':sr>=0.95?'ok':sr>=0.8?'warn':'bad');$('anSuccessSub').textContent=`${fmt(req-err)} ok / ${fmt(req)}`;$('anByProvider').innerHTML=table(counterRows(d.by_provider),anCols());$('anByModel').innerHTML=table(counterRows(d.by_model_family),anCols());$('anByConsumer').innerHTML=table(counterRows(d.by_caller),anCols());$('anByStatus').innerHTML=table(Object.entries(d.by_status||{}).map(([name,count])=>({name,requests:count})),[{label:'Status',f:r=>`<span class="pill">${esc(r.name)}</span>`},{label:'Count',cls:'right',f:r=>fmt(r.requests)}]);renderSeries(d.daily_totals||[]);const fo=d.filter_options||{};fillFilter('anProvider',fo.providers,'All providers');fillFilter('anModel',fo.models,'All models')}
+function renderSeries(days){if(!days||!days.length){$('anSeries').innerHTML='<div class="muted small">No data in this window.</div>';return}const rows=days.slice(0,30).reverse();const max=Math.max(1,...rows.map(d=>Number(d.requests||0)));$('anSeries').innerHTML=`<div style="display:flex;align-items:flex-end;gap:8px;height:220px;overflow-x:auto;padding:12px 4px 0">${rows.map(d=>{const r=Number(d.requests||0),h=Math.max(3,Math.round(r/max*150)),label=String(d.date||d.month||'—'),short=label.slice(5),mt=d.cost_per_mtok==null?'—':'$'+Number(d.cost_per_mtok).toFixed(2),cache=d.cache_hit_rate==null?'—':Math.round(Number(d.cache_hit_rate)*100)+'%';return `<div title="${esc(label)} · ${fmt(r)} requests · $${Number(d.cost_usd||0).toFixed(4)} · ${mt}/Mtok · cache ${cache}" style="height:190px;min-width:34px;flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:5px"><span class="muted small">${fmt(r)}</span><div style="width:min(28px,80%);height:${h}px;border-radius:5px 5px 2px 2px;background:linear-gradient(180deg,#8584ff,#5e6ad2)"></div><span class="muted small" style="font-size:10px;white-space:nowrap">${esc(short)}</span></div>`}).join('')}</div>`}
+function renderAnalytics(d){const t=d.totals||{};const req=Number(t.requests||0),err=Number(t.errors||0),tok=Number(t.tokens_total||0),tin=Number(t.tokens_in||0),cached=Number(t.tokens_cached||0),cost=Number(t.cost_usd||0);$('anRequests').textContent=fmt(req);$('anReqSub').textContent=`${fmt(err)} errors · ${fmt(t.rejects||0)} rejects`;$('anSpend').textContent='$'+cost.toFixed(4);$('anSpendSub').textContent=`over ${fmt(req)} requests`;$('anTokens').textContent=fmt(tok);$('anTokSub').textContent=`in ${fmt(tin)} · out ${fmt(t.tokens_out)}`;const sr=req?(req-err)/req:null;$('anSuccess').textContent=sr==null?'—':Math.round(sr*100)+'%';$('anSuccess').className='metric '+(sr==null?'':sr>=0.95?'ok':sr>=0.8?'warn':'bad');$('anSuccessSub').textContent=`${fmt(req-err)} ok / ${fmt(req)}`;$('anCostPerMtok').textContent=tok?'$'+(cost*1e6/tok).toFixed(2):'—';$('anCacheRate').textContent=tin?Math.round(cached/tin*100)+'%':'—';$('anCacheSub').textContent=tin?`${fmt(cached)} / ${fmt(tin)} input tokens`:'no input tokens';$('anCostPerRequest').textContent=req?'$'+(cost/req).toFixed(4):'—';$('anByProvider').innerHTML=table(counterRows(d.by_provider),anCols());$('anByModel').innerHTML=table(counterRows(d.by_model_family),anCols());$('anByDestination').innerHTML=table(counterRows(d.by_served_model),anCols());$('anByConsumer').innerHTML=table(counterRows(d.by_caller),anCols());$('anByRoute').innerHTML=table(counterRows(d.by_route),anCols());$('anByStatus').innerHTML=table(Object.entries(d.by_status||{}).map(([name,count])=>({name,requests:count})),[{label:'Status',f:r=>`<span class="pill">${esc(r.name)}</span>`},{label:'Count',cls:'right',f:r=>fmt(r.requests)}]);renderSeries(d.daily_totals||[]);const fo=d.filter_options||{};fillFilter('anProvider',fo.providers,'All providers');fillFilter('anModel',fo.models,'All models')}
 function renderCostAccuracy(rows){const el=$('anCostAccuracy');if(!el)return;if(!rows||!rows.length){el.innerHTML='<div class="empty">No priced traffic in the window yet.</div>';return}const drift=r=>{const pct=Math.round((r.deviation-1)*100);const cls=r.warn?(pct>0?'bad':'warn'):'muted';const sign=pct>0?'+':'';return `<span class="${cls}">${sign}${pct}%</span>${r.warn?' <span class="pill warn">drift</span>':''}`};const sig=r=>r.signal==='reported'?'<span class="pill" title="provider reports its own cost — drift is real signal">reported</span>':'<span class="muted small" title="cost derived from the list price — drift is reprice noise, not a discount">derived</span>';el.innerHTML=table(rows,[{label:'Provider',f:r=>`<b>${esc(r.provider)}</b> ${sig(r)}`},{label:'Effective $/Mtok',cls:'right',f:r=>'$'+Number(r.measured_usd_per_mtok).toFixed(3)},{label:'List $/Mtok',cls:'right',f:r=>'$'+Number(r.expected_usd_per_mtok).toFixed(3)},{label:'Drift',cls:'right',f:drift},{label:'Calls',cls:'right',f:r=>fmt(r.calls)}])}
 async function loadCostAccuracy(){try{const r=await fetch('/dashboard/api/cost-accuracy',{credentials:'same-origin'});if(!r.ok)return;const d=await r.json();renderCostAccuracy(d.rows||[])}catch(e){}}
-function render(d){$('login').classList.add('hidden');applyViewerMode(d);document.querySelectorAll('.page').forEach(el=>el.classList.add('hidden'));$(({overview:'app',consumers:'consumersPage',providerKeys:'providerKeysPage',keyUsage:'keyUsagePage',market:'marketPage',builder:'builderPage',activity:'activityPage',config:'configPage'})[activeTab]||'app').classList.remove('hidden');syncConsumers(d.consumers||[],d.selected_consumer||'');renderAnalytics(d);renderConsumers(d.keys||[]);renderConsumerDetail(d);renderProviderKeys(d);let recent=(d.recent||[]);if(activityKind)recent=recent.filter(r=>r.event===activityKind);renderActivity(recent.slice(0,60))}
+function render(d){$('login').classList.add('hidden');applyViewerMode(d);document.querySelectorAll('.page').forEach(el=>el.classList.add('hidden'));$(({overview:'app',consumers:'consumersPage',providerKeys:'providerKeysPage',keyUsage:'keyUsagePage',market:'marketPage',builder:'builderPage',activity:'activityPage',config:'configPage'})[activeTab]||'app').classList.remove('hidden');syncConsumers(d.consumers||[],d.selected_consumer||'');const am=(d.timeframe||{}).analytics||null;$('analyticsFreshness').textContent=am?(am.available?'Hourly analytics · updated '+ts(am.updated_at):'Hourly analytics unavailable'):'Live recent events';renderAnalytics(d);renderConsumers(d.keys||[]);renderConsumerDetail(d);renderProviderKeys(d);let recent=(d.recent||[]);if(activityKind)recent=recent.filter(r=>r.event===activityKind);renderActivity(recent.slice(0,60))}
 async function login(){try{clearErr();const r=await fetch('/dashboard/login',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({password:$('password').value})});if(!r.ok)throw new Error('login failed');$('password').value='';toast('Logged in');load()}catch(e){showErr(e.message)}}async function apiKeyLogin(){try{clearErr();const r=await fetch('/dashboard/login',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({api_key:$('apiKeyLogin').value})});if(!r.ok)throw new Error('API key login failed');$('apiKeyLogin').value='';activeTab='consumers';toast('Logged in');load()}catch(e){showErr(e.message)}}async function logout(){await fetch('/dashboard/logout',{method:'POST',credentials:'same-origin'});showLogin()}async function revealKey(prefix){try{const r=await fetch('/dashboard/api/keys/reveal?consumer='+encodeURIComponent(drawerConsumer),{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`reveal ${r.status}`);const d=await r.json();const match=(d.keys||[]).find(k=>String(k.sha256_prefix||'').startsWith(String(prefix))||String(prefix).startsWith(String(k.sha256_prefix||'')))||(d.keys||[])[0];if(!match||!match.api_key){toast(d.message||'No recoverable raw key for this key');return}showKeyReady(match.api_key,drawerConsumer,'Recovered key for '+drawerConsumer)}catch(e){showErr(e.message)}}
 function buildKeyHandoff(apiKey,consumer){
   const key=String(apiKey||'').trim();
@@ -4670,6 +5494,12 @@ function showKeyReady(apiKey,consumer,title){const box=$('keyReady');box.innerHT
 function openNewKey(){$('newKeyConsumer').value='';$('newKeyStep1').style.display='';$('newKeyStep2').style.display='none';$('newKeyValue').value='';$('newKeyHandoffValue').value='';$('newKeyShade').classList.add('open');setTimeout(()=>$('newKeyConsumer').focus(),0)}
 function closeNewKey(){$('newKeyShade').classList.remove('open')}
 async function createKey(){try{const consumer=$('newKeyConsumer').value.trim();if(!consumer){showErr('Enter who this key is for');return}const r=await fetch('/dashboard/api/keys',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({consumer})});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`create ${r.status}`);const d=await r.json();const name=d.consumer||consumer;$('newKeyStep2Title').textContent='Key for '+name;$('newKeyValue').value=d.api_key||'';$('newKeyHandoffValue').value=buildKeyHandoff(d.api_key||'',name);$('newKeyStep1').style.display='none';$('newKeyStep2').style.display='';toast('Key generated — copy it now');load()}catch(e){showErr(e.message)}}
+let lastKeyBatch=null;
+function openKeyBatch(){$('batchKeyName').value='';$('batchKeyCount').value='50';$('batchKeyBudget').value='';$('batchKeyRoutes').value='profile:default';$('batchKeyRate').value='';$('batchKeyBurst').value='';$('batchKeyForm').style.display='grid';$('batchKeyResult').style.display='none';$('batchKeyShade').classList.add('open');setTimeout(()=>$('batchKeyName').focus(),0)}
+function closeKeyBatch(){$('batchKeyShade').classList.remove('open');lastKeyBatch=null;$('batchKeyCsv').value=''}
+function keyBatchCsv(keys){const q=v=>'"'+String(v??'').replaceAll('"','""')+'"';return ['batch,member_id,consumer,api_key,budget_usd'].concat((keys||[]).map(k=>[k.batch,k.member_id,k.consumer,k.api_key,k.budget_usd].map(q).join(','))).join('\\n')+'\\n'}
+function downloadKeyBatch(kind){if(!lastKeyBatch)return;const csv=keyBatchCsv(lastKeyBatch.keys);const text=kind==='json'?JSON.stringify(lastKeyBatch,null,2):csv;const blob=new Blob([text],{type:kind==='json'?'application/json':'text/csv'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=lastKeyBatch.batch+'-consumer-keys.'+kind;a.click();URL.revokeObjectURL(a.href)}
+async function createKeyBatch(){try{clearErr();const body={batch:$('batchKeyName').value.trim(),count:Number($('batchKeyCount').value),budget_usd:Number($('batchKeyBudget').value),allowed_routes:$('batchKeyRoutes').value.split(',').map(x=>x.trim()).filter(Boolean)};if($('batchKeyRate').value)body.rate_per_min=Number($('batchKeyRate').value);if($('batchKeyBurst').value)body.burst=Number($('batchKeyBurst').value);if(!body.batch||!body.budget_usd)throw new Error('Batch name and budget are required');$('createKeyBatch').disabled=true;const r=await fetch('/dashboard/api/keys/batch',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify(body)});const d=await r.json();if(r.status===401){showLogin();return}if(!r.ok)throw new Error(d.error?.message||`batch ${r.status}`);lastKeyBatch=d;$('batchKeyCsv').value=keyBatchCsv(d.keys);$('batchKeyForm').style.display='none';$('batchKeyResult').style.display='';toast(d.count+' keys generated — download now');load()}catch(e){showErr(e.message)}finally{$('createKeyBatch').disabled=false}}
 async function rotateKey(prefix){try{const grace=Number($('rotationGrace').value);const r=await fetch('/dashboard/api/keys',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({consumer:drawerConsumer,rotate:true,sha256_prefix:prefix,grace_period_s:grace})});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`rotate ${r.status}`);const d=await r.json();showKeyReady(d.api_key||'',drawerConsumer,'New key for '+drawerConsumer);toast('Key rotated — copy the new key now');loadDrawerKeys();load()}catch(e){showErr(e.message)}}
 async function revokeKey(prefix){try{const r=await fetch('/dashboard/api/keys/revoke',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({consumer:drawerConsumer,sha256_prefix:prefix})});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`revoke ${r.status}`);toast('Key revoked');loadDrawerKeys();load()}catch(e){showErr(e.message)}}
 async function saveConsumerSettings(){try{const c=drawerConsumer;const routes=$('settingsAllowedRoutes').value.trim();const body={status:$('settingsStatus').value};if(routes)body.allowed_routes=routes.split(',').map(s=>s.trim()).filter(Boolean);else body.allowed_routes=[];const rate=$('settingsRate').value.trim();const burst=$('settingsBurst').value.trim();if(rate)body.rate_per_min=Number(rate);if(burst)body.burst=Number(burst);const r=await fetch('/dashboard/api/consumers/'+encodeURIComponent(c),{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify(body)});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`settings ${r.status}`);toast('Settings saved');load()}catch(e){showErr(e.message)}}
@@ -4682,10 +5512,10 @@ function marketStatus(r){if(r.source!=='antseed')return r.tradable?'<span class=
 function metaBadges(m){if(!m)return '';const b=[];if(m.bench_intelligence!=null)b.push(`<span class="pill" title="OpenRouter intelligence index">IQ ${pct(m.bench_intelligence)}</span>`);if(m.bench_coding!=null)b.push(`<span class="pill" title="OpenRouter coding index">code ${pct(m.bench_coding)}</span>`);if(m.bench_agentic!=null)b.push(`<span class="pill" title="OpenRouter agentic index">agent ${pct(m.bench_agentic)}</span>`);if(m.bench_arena!=null)b.push(`<span class="pill" title="Design Arena win rate">arena ${pct(m.bench_arena)}</span>`);const mods=['image','audio','file','video'].filter(k=>m['in_'+k]);if(mods.length)b.push(`<span class="muted small" title="input modalities">${mods.join('/')}</span>`);return b.length?`<span style="display:inline-flex;gap:4px;align-items:center">${b.join('')}</span>`:''}
 function copyAddr(a){navigator.clipboard.writeText(a).then(()=>toast('Address copied')).catch(e=>showErr(e.message))}
 function walletCell(w){const rw=w.runway||'';const pill=rw==='empty'?'<span class="pill bad">empty · top up</span>':rw==='low'?'<span class="pill warn">low · top up</span>':rw==='ok'?'<span class="pill ok">funded</span>':'';const dep=w.deposits_available==null?'—':Number(w.deposits_available).toFixed(2);const res=w.deposits_reserved==null||Number(w.deposits_reserved)===0?'':' · '+Number(w.deposits_reserved).toFixed(2)+' in channels';const addr=w.address||'';const wu=w.wallet_usdc==null?null:Number(w.wallet_usdc);const we=w.wallet_eth==null?null:Number(w.wallet_eth);const walletLine=(wu==null&&we==null)?'':`<div class="rowMeta" style="display:flex;gap:8px;align-items:center;margin-top:3px"><span class="muted small">in wallet</span><b style="font-variant-numeric:tabular-nums">${wu==null?'—':wu.toFixed(2)+' USDC'}</b><span class="muted small">+</span><b style="font-variant-numeric:tabular-nums">${we==null?'—':we.toFixed(5)+' ETH'}</b>${we!=null&&we===0?' <span class="pill bad">no gas</span>':''}<span class="muted small">— deposit USDC into escrow to spend</span></div>`;return `<div style="display:flex;gap:6px;align-items:center"><b style="font-variant-numeric:tabular-nums">${dep} USDC</b><span class="muted small">in escrow${res}</span>${pill}</div>${addr?`<div class="rowMeta" style="display:flex;gap:6px;align-items:center;margin-top:3px"><code style="font-size:11px;word-break:break-all">${esc(addr)}</code><button class="btn iconBtn ghost" title="Copy wallet address" onclick="copyAddr(${jsarg(addr)})">⧉</button></div>`:'<div class="rowMeta">no address yet</div>'}${walletLine}${addr?`<div class="rowMeta" style="display:flex;gap:6px;margin-top:4px"><button class="btn ghost small" onclick="walletDeposit()">Deposit</button><button class="btn ghost small" onclick="walletWithdraw()">Withdraw</button><button class="btn iconBtn ghost" title="Refresh balance" onclick="walletRefresh()">↻</button></div>`:''}<div class="rowMeta">hot-wallet · top up on Base mainnet (USDC + ETH gas)${w.connection?' · '+esc(w.connection):''}</div>`}
-function walletOp(op,promptMsg){return (async()=>{try{const a=prompt(promptMsg);if(a===null)return;const amount=String(a).trim();if(!/^\\d+(\\.\\d{1,6})?$/.test(amount)||Number(amount)<=0){showErr('amount must be a positive USDC value (≤6 decimals)');return}toast(op+' '+amount+' USDC…');const r=await fetch('/dashboard/api/wallet/'+op,{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({amount})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||(op+' '+r.status));toast(op+' ok · '+amount+' USDC');loadMarket()}catch(e){showErr(e.message)}})()}
+function walletOp(op,promptMsg){return (async()=>{try{const a=prompt(promptMsg);if(a===null)return;const amount=String(a).trim();if(!/^\\d+(\\.\\d{1,6})?$/.test(amount)||Number(amount)<=0){showErr('amount must be a positive USDC value (≤6 decimals)');return}toast(op+' '+amount+' USDC…');const r=await fetch('/dashboard/api/wallet/'+op,{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({amount})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||(op+' '+r.status));toast(op+' ok · '+amount+' USDC');loadMarket();loadConfig()}catch(e){showErr(e.message)}})()}
 function walletDeposit(){return walletOp('deposit','Deposit how much USDC into the AntSeed deposits contract?\\n(moves wallet → escrow; needs a little ETH on Base for gas)')}
 function walletWithdraw(){return walletOp('withdraw','Withdraw how much USDC from the deposits contract back to the wallet?')}
-async function walletRefresh(){try{toast('Refreshing wallet…');const r=await fetch('/dashboard/api/wallet/refresh',{method:'POST',credentials:'same-origin'});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||('refresh '+r.status));toast('Wallet refreshed');loadMarket()}catch(e){showErr(e.message)}}
+async function walletRefresh(){try{toast('Refreshing wallet…');const r=await fetch('/dashboard/api/wallet/refresh',{method:'POST',credentials:'same-origin'});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||('refresh '+r.status));lastWallet=d.wallet||lastWallet;toast('Wallet refreshed');loadMarket();loadConfig()}catch(e){showErr(e.message)}}
 function renderMarket(d){lastMarket=d;const q=($('marketSearch')?.value||'').toLowerCase();const tradableOnly=$('tradableOnly').checked;const fams=(d.families||[]).map(f=>({...f,rows:(f.rows||[]).filter(r=>!tradableOnly||r.tradable)})).filter(f=>f.rows.length&&(!q||f.family.toLowerCase().includes(q)));$('market').innerHTML=fams.map(f=>{const best=f.rows[0];const open=marketOpen.has(f.family);const head=`<div class="marketHead" data-fam="${esc(f.family)}" style="cursor:pointer;display:flex;gap:12px;align-items:center;padding:10px 4px;border-bottom:1px solid rgba(128,128,128,.25)"><span style="width:14px">${open?'▾':'▸'}</span><code style="min-width:200px">${esc(f.family)}</code><span class="muted small">q ${esc(f.quality??'—')}</span>${metaBadges(f.meta)}<span style="min-width:150px">from ${priceText(best?.price_in)} / ${priceText(best?.price_out)}</span><span class="muted small">${fmt(f.sellers_total)} seller${f.sellers_total===1?'':'s'}</span></div>`;const body=open?`<div style="padding:4px 0 14px 26px">${table(f.rows,[{label:'Seller',f:r=>`${esc(r.seller)}${r.source==='antseed'?`<div class="rowMeta">antseed${r.last_seen?' · seen '+ts(Math.round(r.last_seen/1000)):''}</div>`:''}`},{label:'Wire model',f:r=>esc(r.wire_model_id||'—')},{label:'$ in/Mtok',cls:'right',f:r=>priceText(r.price_in)},{label:'$ out/Mtok',cls:'right',f:r=>priceText(r.price_out)},{label:'Status',f:r=>marketStatus(r)},{label:'Performance',f:r=>perfText(r.perf)},{label:'Refreshed',f:r=>r.price_refreshed_at?ts(r.price_refreshed_at):'—'}])}</div>`:'';return head+body}).join('')||'<div class="empty">No market data yet.</div>'}
 async function loadMarket(){try{clearErr();const r=await fetch('/dashboard/api/market',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error(`market ${r.status}`);renderMarket(await r.json())}catch(e){showErr(e.message)}}
 let lastBuiltPolicy=null;
@@ -4748,6 +5578,8 @@ async function bDownload(){$('bError').style.display='none';try{const term=bCurr
 async function bTest(){$('bError').style.display='none';$('bTestResult').innerHTML='<div class="muted small" style="margin-top:8px">Running…</div>';try{const term=bCurrentTerm();const prompt=$('bTestPrompt').value.trim()||'Reply exactly: pong';const r=await fetch('/dashboard/api/policy/test',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({policy_ir:term,prompt})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||(typeof d.error==='string'?d.error:'test '+r.status));const okc=d.ok?'':'bad';const out=d.text?`<pre class="mono small" style="white-space:pre-wrap;margin-top:8px;background:rgba(255,255,255,.02);border:1px solid var(--line);border-radius:8px;padding:8px">${esc(d.text)}</pre>`:`<div class="bad small" style="margin-top:8px">${esc(d.error||'no output')}</div>`;$('bTestResult').innerHTML=`<div class="actMeta" style="margin-top:8px"><span class="pill ${okc}">status ${esc(d.status)}</span><span class="pill">${esc(d.provider||'—')}${d.served_model_id?' · '+esc(d.served_model_id):''}</span></div><div class="label small" style="margin-top:12px">How it routed — executed live, real spend</div>${actDetail(d)}<div class="label small" style="margin-top:12px">Answer</div>${out}<div class="muted small" style="margin-top:6px">Also recorded in <b>Activity</b>.</div>`;toast('Test call done')}catch(e){bFail(e.message)}}
 async function loadBuilderFamilies(){try{const r=await fetch('/dashboard/api/policies',{credentials:'same-origin'});if(!r.ok)return;const d=await r.json();const fams=new Set();(d.profiles||[]).forEach(p=>(p.models||[]).forEach(m=>{if(m.name)fams.add(m.name)}));$('familyOptions').innerHTML=[...fams].sort().map(f=>`<option value="${esc(f)}">`).join('')}catch(e){}}
 async function loadBuilderFields(){try{const r=await fetch('/dashboard/api/fields',{credentials:'same-origin'});if(!r.ok)return;const d=await r.json();const num=[],bool=[];(d.fields||[]).forEach(f=>{const e={name:f.name,group:f.group||'model'};if(f.sort==='Bool')bool.push(e);else if(f.sort==='Num')num.push(e)});if(num.length)bFields.num=num;bFields.bool=bool;if(activeTab==='builder'&&!bRawMode)bRender()}catch(e){}}
+function bTemplateChanged(){const id=$('bTemplate').value,family=id==='cheapest-family';$('bTemplateFamily').style.display=family?'':'none';$('bTemplateStrategy').style.display=family?'':'none';$('bTemplateHelp').textContent=family?'Stays inside the exact family; unavailable providers are skipped.':id==='agent'?'Quality-first tool routing with trusted peers and attempt budgets that leave room for failover.':id==='default'?'The actual no-policy default: top-five first, then Codex → AntSeed → Bedrock → OpenRouter.':'Chooses the cheapest reliable route inside the top-five intelligence shortlist.'}
+async function bCreateTemplate(){$('bError').style.display='none';const id=$('bTemplate').value,opts={};if(id==='cheapest-family'){const family=$('bTemplateFamily').value.trim();if(!family){bFail('Choose a model family first.');$('bTemplateFamily').focus();return}opts.family=family;opts.provider_strategy=$('bTemplateStrategy').value}const btn=$('bLoadTemplate'),old=btn.textContent;btn.disabled=true;btn.textContent='Creating…';try{const r=await fetch('/dashboard/api/policy/templates/'+encodeURIComponent(id),{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(opts)});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`template ${r.status}`);bSetMode('raw');$('bRawTerm').value=JSON.stringify(d.policy_ir,null,2);lastBuiltPolicy=d;await bReview();toast('Template created and previewed')}catch(e){bFail(e.message)}finally{btn.disabled=false;btn.textContent=old}}
 // One-click teaching policies, authored as structured state (filters/scores/pick).
 const B_EXAMPLES={ex1:{filters:[{field:'in_top_k',k:'5',by:'bench_intelligence'},{field:'in_top_k',k:'5',by:'bench_coding'}],scores:[{field:'field:price_in',w:'1',norm:true,inv:true}],gate:false,selector:'argmax',topn:''},ex2:{filters:[],scores:[{field:'field:bench_intelligence',w:'1',norm:true,inv:false},{field:'field:bench_coding',w:'1',norm:true,inv:false},{field:'field:bench_agentic',w:'1',norm:true,inv:false}],gate:false,selector:'argmax',topn:'3'}};
 function bLoadExample(name){const e=B_EXAMPLES[name];if(!e)return;bSetMode('structured');bFilters=JSON.parse(JSON.stringify(e.filters));bScores=JSON.parse(JSON.stringify(e.scores));$('bGateBreaker').checked=!!e.gate;$('b_selector').value=e.selector||'argmax';$('b_topn').value=e.topn||'';$('bTempWrap').style.display=$('b_selector').value==='sample'?'':'none';bRender();bReview()}
@@ -4757,16 +5589,29 @@ async function copyProviderKey(p){try{await navigator.clipboard.writeText(await 
 async function editProviderKey(p){try{const key=prompt('New API key for '+p+' (replaces the current one, takes effect live):');if(key===null)return;const k=key.trim();if(!k){showErr('key is empty');return}const r=await fetch('/dashboard/api/provider-keys/update',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({provider:p,key:k})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`update ${r.status}`);toast(d.applied_live?'Key updated (live)':'Key saved');load()}catch(e){showErr(e.message)}}
 function parseServedModels(text){return text.split('\\n').map(s=>s.trim()).filter(Boolean).map(line=>{const i=line.indexOf('=');if(i<0)return {family:line};return {family:line.slice(0,i).trim(),provider_model_id:line.slice(i+1).trim()}})}
 async function addProvider(){try{const payload={id:$('addProvId').value.trim().toLowerCase(),base_url:$('addProvBaseUrl').value.trim(),tier:$('addProvTier').value,auth_env:$('addProvEnv').value.trim(),key:$('addProvKey').value.trim(),served_models:parseServedModels($('addProvModels').value)};const r=await fetch('/dashboard/api/provider-keys/add',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify(payload)});if(r.status===401){$('addProvResult').textContent='Session expired — log in and submit again (your form values are kept).';showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`add ${r.status}`);$('addProvResult').textContent=d.applied_live?`${d.provider} added and live.`:(d.note||'saved');$('addProvKey').value='';toast(d.applied_live?'Provider live':'Provider saved');load()}catch(e){$('addProvResult').textContent=e.message;showErr(e.message)}}
-async function loadCodexAccounts(){try{const r=await fetch('/dashboard/api/codex/accounts',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(r.status===403){$('codexAccounts').innerHTML='<div class="muted small">Admin session required to manage codex accounts.</div>';return}if(!r.ok)throw new Error('codex '+r.status);renderCodexAccounts(await r.json())}catch(e){showErr(e.message)}}
+async function loadCodexAccounts(){try{const r=await fetch('/dashboard/api/codex/accounts',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(r.status===403){$('codexAccounts').innerHTML='<div class="muted small">Admin session required to manage codex accounts.</div>';return}if(!r.ok)throw new Error('codex '+r.status);renderCodexAccounts(await r.json());loadCodexInvites()}catch(e){showErr(e.message)}}
+async function loadCodexInvites(){try{const r=await fetch('/dashboard/api/codex/invites',{credentials:'same-origin'});if(!r.ok){$('codexInvites').innerHTML='';return}renderCodexInvites((await r.json()).invites||[])}catch(e){}}
+function renderCodexInvites(list){if(!list.length){$('codexInvites').innerHTML='';return}const pill=s=>s==='used'?'<span class="pill ok">used</span>':s==='expired'?'<span class="pill bad">expired</span>':s==='awaiting'?'<span class="pill warn">awaiting sign-in</span>':'<span class="pill">pending</span>';$('codexInvites').innerHTML='<div class="label" style="padding:12px 14px 4px">Onboarding invites</div>'+table(list,[{label:'Account',f:r=>`<div class="rowTitle">${esc(r.name)}</div>`},{label:'Status',f:r=>pill(r.status)},{label:'Expires',f:r=>r.expires_at?new Date(r.expires_at*1000).toLocaleString():'—'},{label:'',cls:'right',f:r=>`<button class="btn ghost small" onclick="navigator.clipboard.writeText(${jsarg(r.url)}).then(()=>toast('Invite link copied'))">Copy link</button> <button class="btn iconBtn ghost" title="Revoke invite" onclick="revokeCodexInvite(${jsarg(r.url.split('/').pop())})">🗑</button>`}])}
+async function generateCodexInvite(){try{const name=$('inviteCodexName').value.trim();if(!name){$('inviteCodexResult').textContent='account name required';return}const r=await fetch('/dashboard/api/codex/invites',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({name})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`invite ${r.status}`);await navigator.clipboard.writeText(d.url).catch(()=>{});$('inviteCodexResult').innerHTML='Invite for <b>'+esc(d.name)+'</b> copied to clipboard — send it to the teammate. Valid 24h, single use.<br><code>'+esc(d.url)+'</code>';toast('Invite link copied');loadCodexInvites()}catch(e){$('inviteCodexResult').textContent=e.message;showErr(e.message)}}
+async function revokeCodexInvite(token){if(!confirm('Revoke this invite link?'))return;try{const r=await fetch('/dashboard/api/codex/invites/'+encodeURIComponent(token),{method:'DELETE',credentials:'same-origin'});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`revoke ${r.status}`);toast('Invite revoked');loadCodexInvites()}catch(e){showErr(e.message)}}
 function renderCodexAccounts(d){const accts=(d&&d.accounts)||[];const a=(d&&d.activity)||{};const pr=a.scarcity_price_in;const summary=`<div class="rowMeta" style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px"><span>requests <b>${a.requests??0}</b></span><span>errors <b>${a.errors??0}</b>${a.error_rate?` · ${(a.error_rate*100).toFixed(1)}%`:''}</span><span>quota used <b>${a.used_percent==null?'—':a.used_percent+'%'}</b></span><span>recent 429 <b>${a.recent_429==null?'—':a.recent_429}</b></span><span>scarcity price <b>${pr==null?'—':'$'+Number(pr).toFixed(2)+'/Mtok'}</b></span></div>`;if(!accts.length){$('codexAccounts').innerHTML=summary+'<div class="muted small">No codex accounts yet — add one to enable the ChatGPT-subscription provider.</div>';return}const sel=(d&&d.selection)||{mode:'auto',account:null};const cur=sel.mode==='account'?('account:'+(sel.account||'')):sel.mode;const selOpts=['<option value="auto"'+(cur==='auto'?' selected':'')+'>Auto · first account</option>','<option value="balanced"'+(cur==='balanced'?' selected':'')+'>Balanced · round-robin across all</option>'].concat(accts.map(r=>{const v='account:'+r.name;return '<option value="'+esc(v)+'"'+(cur===v?' selected':'')+'>'+esc(r.name)+'</option>'})).join('');const selector='<div class="rowMeta" style="display:flex;gap:8px;align-items:center;margin-bottom:10px"><span class="muted small">Serving account</span><select id="codexSelect" onchange="selectCodexAccount(this.value)">'+selOpts+'</select><span class="muted small">balanced spreads calls across all accounts</span></div>';$('codexAccounts').innerHTML=summary+selector+table(accts,[{label:'Account',f:r=>`<div class="rowTitle">${esc(r.name)} ${r.active?'<span class="pill ok">active</span>':''}</div>`},{label:'account_id',f:r=>esc(r.account_id||'—')},{label:'Token',f:r=>r.fingerprint?esc(r.fingerprint):'<span class="pill bad">no token</span>'},{label:'',cls:'right',f:r=>`<button class="btn iconBtn ghost" title="Delete account" onclick="deleteCodexAccount(${jsarg(r.name)})">🗑</button>`}])}
 async function addCodexAccount(){try{const name=$('addCodexName').value.trim();const auth_json=$('addCodexJson').value.trim();if(!name){$('addCodexResult').textContent='account name required';return}if(!auth_json){$('addCodexResult').textContent='paste the auth.json';return}const r=await fetch('/dashboard/api/codex/accounts',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({name,auth_json})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`add ${r.status}`);$('addCodexResult').textContent=d.applied_live?`${d.account} added and live.`:(d.note||'saved');$('addCodexJson').value='';toast(d.applied_live?'Codex account live':'Codex account saved');loadCodexAccounts()}catch(e){$('addCodexResult').textContent=e.message;showErr(e.message)}}
-async function loadConfig(){try{clearErr();const r=await fetch('/dashboard/api/config',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(r.status===403){$('config').innerHTML='<div class="muted small">Admin session required to edit config.</div>';return}if(!r.ok)throw new Error('config '+r.status);renderConfig((await r.json()).knobs||[])}catch(e){showErr(e.message)}}
-function renderConfig(knobs){const groups={};knobs.forEach(k=>{(groups[k.provider]=groups[k.provider]||[]).push(k)});const order=['antseed','codex','openrouter','compaction'];const provs=order.filter(p=>groups[p]).concat(Object.keys(groups).filter(p=>!order.includes(p)));const inp=k=>k.type==='list'?`<input id="cfg_${esc(k.key)}" data-kind="list" type="text" value="${esc((k.value||[]).join(', '))}" placeholder="peer-id, peer-id…">`:`<input id="cfg_${esc(k.key)}" data-kind="num" type="number" step="any" value="${k.value}">`;const hint=k=>k.type==='list'?`up to ${k.max} items`:`default ${k.default} · [${k.min}, ${k.max}]`;$('config').innerHTML=provs.map(p=>`<div class="card span6"><div class="toolbar"><div class="label">${esc(p)}</div><span class="muted small" style="margin-left:auto">${groups[p].length} knob${groups[p].length===1?'':'s'}</span></div>${groups[p].map(k=>`<div class="cfgRow"><div class="cfgDesc"><b>${esc(k.label)}</b>${k.overridden?' <span class="pill warn">override</span>':''}<div class="muted small">${esc(k.help)}</div></div><div class="cfgCtl">${inp(k)}<div class="muted small" style="margin-top:5px">${hint(k)}</div></div><div class="cfgAct"><button class="btn ghost small" onclick="saveConfigKnob(${jsarg(k.key)})">Save</button>${k.overridden?`<button class="btn ghost small" title="Reset to default" onclick="postConfig({[${jsarg(k.key)}]:null})">Reset</button>`:''}</div></div>`).join('')}</div>`).join('')||'<div class="empty">No tunable knobs.</div>'}
+async function loadConfig(){try{clearErr();const r=await fetch('/dashboard/api/config',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(r.status===403){$('config').innerHTML='<div class="muted small">Admin session required to edit config.</div>';return}if(!r.ok)throw new Error('config '+r.status);try{const wr=await fetch('/dashboard/api/wallet',{credentials:'same-origin'});lastWallet=wr.ok?((await wr.json()).wallet||null):lastWallet}catch(_){}renderConfig((await r.json()).knobs||[])}catch(e){showErr(e.message)}}
+let lastWallet=null;
+function walletQuick(v){const el=$('walletAmt');if(!el)return;el.value=(v==='max')?((lastWallet&&lastWallet.wallet_usdc!=null)?Number(lastWallet.wallet_usdc):''):v;el.focus()}
+function walletDo(op){const el=$('walletAmt');const amount=el?String(el.value).trim():'';if(!/^\\d+(\\.\\d{1,6})?$/.test(amount)||Number(amount)<=0){showErr('Enter a valid USDC amount (>0, ≤6 decimals)');return}if(op==='withdraw'&&lastWallet&&lastWallet.deposits_available!=null&&Number(amount)>Number(lastWallet.deposits_available)){showErr('You can only withdraw what is available in escrow ('+Number(lastWallet.deposits_available).toFixed(6)+' USDC). USDC reserved in channels frees up when they settle.');return}if(!confirm((op==='deposit'?'Top up':'Withdraw')+' '+amount+' USDC?\\nOn-chain tx on Base, irreversible.'))return;walletOpAmount(op,amount)}
+async function walletOpAmount(op,amount){try{toast(op+' '+amount+' USDC…');const r=await fetch('/dashboard/api/wallet/'+op,{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({amount})});if(r.status===401){showLogin();return}const t=await r.text();let d={};try{d=JSON.parse(t)}catch(_){}if(!r.ok){const raw=d.error?.message||(t&&t.trim()[0]!=='<'?t:('server error '+r.status));throw new Error(String(raw).split('\\n')[0].slice(0,240))}toast(op+' ok · '+amount+' USDC');const el=$('walletAmt');if(el)el.value='';loadMarket();loadConfig()}catch(e){showErr(e.message)}}
+async function walletReclaimScan(){const v=$('walletReclaimView');if(v)v.innerHTML='<span class="muted">Scanning channels on-chain…</span>';try{const r=await fetch('/dashboard/api/wallet/reclaim/scan',{method:'POST',credentials:'same-origin'});if(r.status===401){showLogin();return}const t=await r.text();let d={};try{d=JSON.parse(t)}catch(_){}if(!r.ok){const raw=d.error?.message||(t&&t.trim()[0]!=='<'?t:('scan '+r.status));throw new Error(String(raw).split('\\n')[0].slice(0,240))}renderReclaim(d)}catch(e){if(v)v.innerHTML='';showErr(e.message)}}
+function renderReclaim(d){const v=$('walletReclaimView');if(!v)return;const ch=(d&&d.channels)||[];const isSelf=!!d.operatorIsSelf;let banner='';if(!isSelf){banner='<div style="padding:8px 10px;border:1px solid rgba(230,160,30,.5);border-radius:8px;margin-bottom:8px"><div class="small"><b>One-time setup needed.</b> To reclaim channels the buyer wallet must be assigned as its own on-chain operator — requestClose is operator-gated. Single tx, moves no funds.</div><div style="margin-top:6px"><button class="btn" onclick="walletReclaimAct(\\'set-operator\\')">Enable reclaim</button></div></div>';}const pend=ch.filter(c=>Number(c.reclaimable||0)>0&&!c.closeRequested);const ready=ch.filter(c=>c.closeRequested);const rows=ch.map(c=>{const id=String(c.id||'').slice(0,10)+'…';const st=c.error?'<span class="pill bad" title="'+esc(c.error)+'">error</span>':c.closeRequested?'<span class="pill warn">closing · withdraw in ~15 min</span>':'<span class="pill">idle</span>';return '<div style="display:flex;gap:8px;align-items:center;padding:3px 0;border-top:1px solid rgba(128,128,128,.12)"><code style="font-size:11px">'+esc(id)+'</code><span class="muted" style="font-size:11px">→ '+esc(String(c.seller||'').slice(0,10))+'…</span><span style="margin-left:auto;font-variant-numeric:tabular-nums">'+Number(c.reclaimable||0).toFixed(4)+' USDC</span>'+st+'</div>';}).join('');const sk=d.skipped||{};const skN=(sk.settled||0)+(sk.timeout||0)+(sk.other||0);const skTxt=skN?' · '+skN+' already settled (not reclaimable)':'';const summary='<div class="muted" style="margin-bottom:4px">'+(ch.length?ch.length+' active channel(s) · up to '+esc(d.reclaimableTotal||'0')+' USDC reclaimable':'No active channels holding reclaimable USDC')+skTxt+'</div>';let actions='';if(isSelf){const a=[];if(pend.length)a.push('<button class="btn" onclick="walletReclaimAct(\\'request-close\\')">Request close ('+pend.length+')</button>');if(ready.length)a.push('<button class="btn" onclick="walletReclaimAct(\\'withdraw\\')">Withdraw closed ('+ready.length+')</button>');actions='<div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">'+(a.join('')||'<span class="muted">Nothing to close right now.</span>')+'</div>';}v.innerHTML=banner+summary+rows+actions;}
+async function walletReclaimAct(phase){const label=phase==='set-operator'?'Enable reclaim — assign your wallet as its own channel operator':phase==='request-close'?'Request close on idle channels':'Withdraw closed channels';const note=phase==='set-operator'?'\\nOne-time on-chain tx on Base. Moves no funds.':'\\nOn-chain tx(s) on Base — one per channel, irreversible.'+(phase==='request-close'?'\\nWithdraw becomes possible ~15 min after.':'');if(!confirm(label+'?'+note))return;const v=$('walletReclaimView');if(v)v.innerHTML='<span class="muted">Sending on-chain tx…</span>';try{const r=await fetch('/dashboard/api/wallet/reclaim/'+phase,{method:'POST',credentials:'same-origin'});if(r.status===401){showLogin();return}const t=await r.text();let d={};try{d=JSON.parse(t)}catch(_){}if(!r.ok){const raw=d.error?.message||(t&&t.trim()[0]!=='<'?t:(phase+' '+r.status));throw new Error(String(raw).split('\\n')[0].slice(0,240))}if(phase==='set-operator'){toast('Reclaim enabled · operator set')}else{const done=((d.channels)||[]).filter(c=>c.tx).length;toast(phase==='request-close'?('Close requested · '+done+' channel(s) · withdraw in ~15 min'):('Withdrew '+done+' channel(s)'))}walletReclaimScan();loadConfig()}catch(e){showErr(e.message)}}
+function walletPanel(w){if(!w)return '<div class="muted small" style="padding:6px 2px">Loading wallet balance…</div>';const num=(v,d=2)=>v==null?'—':Number(v).toFixed(d);const rw=w.runway||'';const pill=rw==='empty'?'<span class="pill bad">empty · top up</span>':rw==='low'?'<span class="pill warn">low · top up</span>':rw==='ok'?'<span class="pill ok">funded</span>':'';const noGas=w.wallet_eth!=null&&Number(w.wallet_eth)===0;const box=(l,v,u,s)=>`<div style="min-width:150px;padding:10px 14px;border:1px solid rgba(128,128,128,.22);border-radius:10px"><div class="muted small">${l}</div><div style="font-size:24px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.15">${v}<span class="muted" style="font-size:13px;font-weight:400"> ${u}</span></div><div class="muted small" style="margin-top:3px">${s||'&nbsp;'}</div></div>`;return `<div style="display:flex;gap:12px;flex-wrap:wrap;padding:6px 2px 2px">`+box('In wallet',num(w.wallet_usdc),'USDC','not in escrow yet')+box('Gas',num(w.wallet_eth,5),'ETH',noGas?'<span class="pill bad">no gas</span>':'for Base txs')+box('In escrow · spendable',num(w.deposits_available),'USDC',pill)+box('Reserved in channels',num(w.deposits_reserved),'USDC','frees on settle → reclaimable')+`</div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 2px 12px;margin-bottom:12px;border-bottom:1px solid rgba(128,128,128,.25)"><input id="walletAmt" type="number" step="0.000001" min="0" placeholder="USDC" style="width:120px;padding:7px 9px;border:1px solid rgba(128,128,128,.35);border-radius:8px;font-variant-numeric:tabular-nums"><button class="btn" onclick="walletDo('deposit')">Top up</button><button class="btn ghost" onclick="walletDo('withdraw')">Withdraw</button><span class="muted small" style="margin-left:4px">quick:</span><button class="btn ghost small" onclick="walletQuick(5)">5</button><button class="btn ghost small" onclick="walletQuick(20)">20</button><button class="btn ghost small" onclick="walletQuick(80)">80</button><button class="btn ghost small" onclick="walletQuick('max')" title="All wallet USDC">Max</button><button class="btn iconBtn ghost" title="Refresh balance" onclick="walletRefresh()">↻</button>${w.address?`<code class="muted small" style="margin-left:auto;font-size:11px;word-break:break-all">${esc(w.address)}</code><button class="btn iconBtn ghost" title="Copy address" onclick="copyAddr(${jsarg(w.address)})">⧉</button>`:''}</div><div style="padding:0 2px 4px"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="muted small" style="flex:1">Reclaim USDC locked in idle payment channels (${num(w.deposits_reserved)} USDC reserved). Request close → wait ~15 min → withdraw.</span><button class="btn ghost small" onclick="walletReclaimScan()">Scan idle channels</button></div><div id="walletReclaimView" class="small" style="margin-top:8px"></div></div>`;}
+function renderConfig(knobs){const groups={};knobs.forEach(k=>{(groups[k.provider]=groups[k.provider]||[]).push(k)});const order=['antseed','codex','openrouter','compaction'];const provs=order.filter(p=>groups[p]).concat(Object.keys(groups).filter(p=>!order.includes(p)));const inp=k=>k.type==='list'?`<input id="cfg_${esc(k.key)}" data-kind="list" type="text" value="${esc((k.value||[]).join(', '))}" placeholder="peer-id, peer-id…">`:`<input id="cfg_${esc(k.key)}" data-kind="num" type="number" step="any" value="${k.value}">`;const hint=k=>k.type==='list'?`up to ${k.max} items`:`default ${k.default} · [${k.min}, ${k.max}]`;$('config').innerHTML=provs.map(p=>`<div class="card span6"><div class="toolbar"><div class="label">${esc(p)}</div><span class="muted small" style="margin-left:auto">${groups[p].length} knob${groups[p].length===1?'':'s'}</span></div>${p==='antseed'?walletPanel(lastWallet):''}${groups[p].map(k=>`<div class="cfgRow"><div class="cfgDesc"><b>${esc(k.label)}</b>${k.overridden?' <span class="pill warn">override</span>':''}<div class="muted small">${esc(k.help)}</div></div><div class="cfgCtl">${inp(k)}<div class="muted small" style="margin-top:5px">${hint(k)}</div></div><div class="cfgAct"><button class="btn ghost small" onclick="saveConfigKnob(${jsarg(k.key)})">Save</button>${k.overridden?`<button class="btn ghost small" title="Reset to default" onclick="postConfig({[${jsarg(k.key)}]:null})">Reset</button>`:''}</div></div>`).join('')}</div>`).join('')||'<div class="empty">No tunable knobs.</div>'}
 async function saveConfigKnob(key){const el=$('cfg_'+key);if(!el)return;const v=el.value.trim();if(el.dataset.kind==='list'){await postConfig({[key]:v?v.split(',').map(s=>s.trim()).filter(Boolean):[]});return}await postConfig({[key]:v===''?null:Number(v)})}
 async function postConfig(updates){try{const r=await fetch('/dashboard/api/config',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({updates})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||('config '+r.status));toast(d.applied_live?'Saved · live':(d.note?'Saved · '+d.note:'Saved'));renderConfig(d.knobs||[])}catch(e){showErr(e.message)}}
 async function selectCodexAccount(value){try{let mode=value,account=null;if(value.indexOf('account:')===0){mode='account';account=value.slice('account:'.length)}const r=await fetch('/dashboard/api/codex/select',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({mode,account})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`select ${r.status}`);toast(mode==='balanced'?'Codex: balanced across accounts':(mode==='account'?('Codex: serving '+account):'Codex: auto'));loadCodexAccounts()}catch(e){showErr(e.message)}}
 async function deleteCodexAccount(name){if(!confirm('Delete codex account '+name+'?'))return;try{const r=await fetch('/dashboard/api/codex/accounts/'+encodeURIComponent(name),{method:'DELETE',credentials:'same-origin'});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`delete ${r.status}`);toast('Codex account deleted');loadCodexAccounts()}catch(e){showErr(e.message)}}
-$('loginBtn').onclick=login;$('apiKeyLoginBtn').onclick=apiKeyLogin;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});$('apiKeyLogin').addEventListener('keydown',e=>{if(e.key==='Enter')apiKeyLogin()});$('logout').onclick=logout;$('tabOverview').onclick=()=>setTab('overview');$('tabConsumers').onclick=()=>setTab('consumers');$('tabProviderKeys').onclick=()=>setTab('providerKeys');$('tabKeyUsage').onclick=()=>setTab('keyUsage');$('tabMarket').onclick=()=>setTab('market');$('tabBuilder').onclick=()=>setTab('builder');$('tabActivity').onclick=()=>setTab('activity');$('recent').addEventListener('click',e=>{const cp=e.target.closest('[data-copyterm]');if(cp){navigator.clipboard.writeText(cp.dataset.copyterm).then(()=>toast('Policy term copied'));return}const row=e.target.closest('.actRow');if(!row)return;const det=$('recent').querySelector('.actDetail[data-d="'+row.dataset.i+'"]');if(!det)return;det.classList.toggle('hidden');const tog=row.querySelector('.actToggle');if(tog)tog.textContent=det.classList.contains('hidden')?'▸':'▾'});$('bReview').onclick=bReview;$('bBacktest').onclick=bBacktest;$('bDownload').onclick=bDownload;$('bTestBtn').onclick=bTest;$('bEx1').onclick=()=>bLoadExample('ex1');$('bEx2').onclick=()=>bLoadExample('ex2');$('bAddCond').onclick=()=>{bSync();bFilters.push({field:'latency_ms',rel:'le',val:''});bRender()};$('bAddOr').onclick=()=>{bSync();bFilters.push({kind:'or',subs:[{field:'latency_ms',rel:'le',val:''}]});bRender()};$('bAddScore').onclick=()=>{bSync();bScores.push({field:'field:price_in',w:'0.5',norm:true,inv:true});bRender()};$('b_selector').onchange=()=>{$('bTempWrap').style.display=$('b_selector').value==='sample'?'':'none'};document.querySelectorAll('#bModeSeg button').forEach(b=>b.onclick=()=>bSetMode(b.dataset.mode));$('bStructured').addEventListener('change',e=>{if(e.target.classList.contains('bF-field'))bSyncRender()});$('bStructured').addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b)return;bSync();const i=+b.dataset.i,j=+b.dataset.j,act=b.dataset.act;if(act==='del')bFilters.splice(i,1);else if(act==='addsub')bFilters[i].subs.push({field:'latency_ms',rel:'le',val:''});else if(act==='delsub')bFilters[i].subs.splice(j,1);else if(act==='delscore')bScores.splice(i,1);bRender()});bRender();document.querySelector('.nav').addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b){e.preventDefault();setTab(b.dataset.tab)}});$('refresh').onclick=()=>{if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else if(activeTab==='keyUsage')loadKeyUsage();else load()};$('market').addEventListener('click',e=>{const h=e.target.closest('[data-fam]');if(!h)return;const fam=h.dataset.fam;if(marketOpen.has(fam))marketOpen.delete(fam);else marketOpen.add(fam);if(lastMarket)renderMarket(lastMarket)});$('marketSearch').oninput=()=>{if(lastMarket)renderMarket(lastMarket)};$('tradableOnly').checked=localStorage.getItem('tradableOnly')==='1';$('tradableOnly').onchange=()=>{localStorage.setItem('tradableOnly',$('tradableOnly').checked?'1':'0');if(lastMarket)renderMarket(lastMarket)};$('marketCopy').onclick=()=>{if(!lastMarket){showErr('No catalog data loaded yet');return}navigator.clipboard.writeText(JSON.stringify(lastMarket,null,2)).then(()=>toast('Catalog copied to clipboard')).catch(e=>showErr(e.message))};let skillText='';async function loadSkill(){try{$('skillContent').textContent='Loading…';const r=await fetch('/dashboard/api/skill',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error('skill '+r.status);skillText=await r.text();$('skillContent').textContent=skillText}catch(e){$('skillContent').textContent='';showErr(e.message)}}function downloadSkill(){if(!skillText){toast('Still loading…');return}const blob=new Blob([skillText],{type:'text/markdown'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='SKILL.md';a.click();URL.revokeObjectURL(a.href);toast('SKILL.md downloaded')}$('skillDownload').onclick=downloadSkill;$('tabSkill').onclick=()=>setTab('skill');$('toggleAddProvider').onclick=()=>{const c=$('addProviderCard');c.style.display=c.style.display==='none'?'':'none'};$('addProvCancel').onclick=()=>{$('addProviderCard').style.display='none'};$('addProvSubmit').onclick=addProvider;$('toggleAddCodex').onclick=()=>{const c=$('addCodexCard');c.style.display=c.style.display==='none'?'':'none'};$('addCodexCancel').onclick=()=>{$('addCodexCard').style.display='none'};$('addCodexSubmit').onclick=addCodexAccount;$('addProvId').addEventListener('blur',()=>{if(!$('addProvEnv').value.trim()&&$('addProvId').value.trim())$('addProvEnv').value=$('addProvId').value.trim().toUpperCase().replace(/[^A-Z0-9]+/g,'_')+'_API_KEY'});$('loadKeyUsage').onclick=loadKeyUsage;$('consumer').onchange=load;$('timeframe').onchange=load;$('consumerSearch').oninput=()=>renderConsumers(lastStats.keys||[]);document.querySelectorAll('#consumerStatusSeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#consumerStatusSeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');consumerFilterStatus=b.dataset.status;renderConsumers(lastStats.keys||[])});document.querySelectorAll('#activitySeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#activitySeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');activityKind=b.dataset.kind;render(lastStats)});$('newConsumerKey').onclick=openNewKey;$('closeDrawer').onclick=closeDrawer;$('drawerShade').addEventListener('click',e=>{if(e.target===$('drawerShade'))closeDrawer()});$('drawerGenerateKey').onclick=()=>{closeDrawer();openNewKey();if(drawerConsumer)$('newKeyConsumer').value=drawerConsumer};$('saveConsumerSettings').onclick=saveConsumerSettings;$('closeNewKey').onclick=closeNewKey;$('newKeyShade').addEventListener('click',e=>{if(e.target===$('newKeyShade'))closeNewKey()});$('newKeyDone').onclick=closeNewKey;$('createKey').onclick=createKey;$('newKeyConsumer').addEventListener('keydown',e=>{if(e.key==='Enter')createKey()});$('copyKey').onclick=()=>navigator.clipboard.writeText($('newKeyValue').value).then(()=>toast('Key copied'));$('copyKeyHandoff').onclick=()=>navigator.clipboard.writeText($('newKeyHandoffValue').value).then(()=>toast('Setup blurb copied'));$('anProvider').onchange=load;$('anModel').onchange=load;setTab(tabFromLocation(),{silent:true});setInterval(()=>{const ds=$('drawerShade');if(ds&&ds.classList.contains('open'))return;const nk=$('newKeyShade');if(nk&&nk.classList.contains('open'))return;const ap=$('addProviderCard'),ac=$('addCodexCard');if((ap&&ap.style.display&&ap.style.display!=='none')||(ac&&ac.style.display&&ac.style.display!=='none'))return;if(document.querySelector('#recent .actDetail:not(.hidden)'))return;if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else load()},15000);
+$('bTemplate').onchange=bTemplateChanged;$('bLoadTemplate').onclick=bCreateTemplate;bTemplateChanged();
+$('loginBtn').onclick=login;$('apiKeyLoginBtn').onclick=apiKeyLogin;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});$('apiKeyLogin').addEventListener('keydown',e=>{if(e.key==='Enter')apiKeyLogin()});$('logout').onclick=logout;$('tabOverview').onclick=()=>setTab('overview');$('tabConsumers').onclick=()=>setTab('consumers');$('tabProviderKeys').onclick=()=>setTab('providerKeys');$('tabKeyUsage').onclick=()=>setTab('keyUsage');$('tabMarket').onclick=()=>setTab('market');$('tabBuilder').onclick=()=>setTab('builder');$('tabActivity').onclick=()=>setTab('activity');$('recent').addEventListener('click',e=>{const cp=e.target.closest('[data-copyterm]');if(cp){navigator.clipboard.writeText(cp.dataset.copyterm).then(()=>toast('Policy term copied'));return}const row=e.target.closest('.actRow');if(!row)return;const det=$('recent').querySelector('.actDetail[data-d="'+row.dataset.i+'"]');if(!det)return;det.classList.toggle('hidden');const tog=row.querySelector('.actToggle');if(tog)tog.textContent=det.classList.contains('hidden')?'▸':'▾'});$('bReview').onclick=bReview;$('bBacktest').onclick=bBacktest;$('bDownload').onclick=bDownload;$('bTestBtn').onclick=bTest;$('bEx1').onclick=()=>bLoadExample('ex1');$('bEx2').onclick=()=>bLoadExample('ex2');$('bAddCond').onclick=()=>{bSync();bFilters.push({field:'latency_ms',rel:'le',val:''});bRender()};$('bAddOr').onclick=()=>{bSync();bFilters.push({kind:'or',subs:[{field:'latency_ms',rel:'le',val:''}]});bRender()};$('bAddScore').onclick=()=>{bSync();bScores.push({field:'field:price_in',w:'0.5',norm:true,inv:true});bRender()};$('b_selector').onchange=()=>{$('bTempWrap').style.display=$('b_selector').value==='sample'?'':'none'};document.querySelectorAll('#bModeSeg button').forEach(b=>b.onclick=()=>bSetMode(b.dataset.mode));$('bStructured').addEventListener('change',e=>{if(e.target.classList.contains('bF-field'))bSyncRender()});$('bStructured').addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b)return;bSync();const i=+b.dataset.i,j=+b.dataset.j,act=b.dataset.act;if(act==='del')bFilters.splice(i,1);else if(act==='addsub')bFilters[i].subs.push({field:'latency_ms',rel:'le',val:''});else if(act==='delsub')bFilters[i].subs.splice(j,1);else if(act==='delscore')bScores.splice(i,1);bRender()});bRender();document.querySelector('.nav').addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b){e.preventDefault();setTab(b.dataset.tab)}});$('refresh').onclick=()=>{if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else if(activeTab==='keyUsage')loadKeyUsage();else load()};$('market').addEventListener('click',e=>{const h=e.target.closest('[data-fam]');if(!h)return;const fam=h.dataset.fam;if(marketOpen.has(fam))marketOpen.delete(fam);else marketOpen.add(fam);if(lastMarket)renderMarket(lastMarket)});$('marketSearch').oninput=()=>{if(lastMarket)renderMarket(lastMarket)};$('tradableOnly').checked=localStorage.getItem('tradableOnly')==='1';$('tradableOnly').onchange=()=>{localStorage.setItem('tradableOnly',$('tradableOnly').checked?'1':'0');if(lastMarket)renderMarket(lastMarket)};$('marketCopy').onclick=()=>{if(!lastMarket){showErr('No catalog data loaded yet');return}navigator.clipboard.writeText(JSON.stringify(lastMarket,null,2)).then(()=>toast('Catalog copied to clipboard')).catch(e=>showErr(e.message))};let skillText='';async function loadSkill(){try{$('skillContent').textContent='Loading…';const r=await fetch('/dashboard/api/skill',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error('skill '+r.status);skillText=await r.text();$('skillContent').textContent=skillText}catch(e){$('skillContent').textContent='';showErr(e.message)}}function downloadSkill(){if(!skillText){toast('Still loading…');return}const blob=new Blob([skillText],{type:'text/markdown'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='SKILL.md';a.click();URL.revokeObjectURL(a.href);toast('SKILL.md downloaded')}$('skillDownload').onclick=downloadSkill;$('tabSkill').onclick=()=>setTab('skill');$('toggleAddProvider').onclick=()=>{const c=$('addProviderCard');c.style.display=c.style.display==='none'?'':'none'};$('addProvCancel').onclick=()=>{$('addProviderCard').style.display='none'};$('addProvSubmit').onclick=addProvider;$('toggleAddCodex').onclick=()=>{const c=$('addCodexCard');c.style.display=c.style.display==='none'?'':'none'};$('addCodexCancel').onclick=()=>{$('addCodexCard').style.display='none'};$('addCodexSubmit').onclick=addCodexAccount;$('toggleInviteCodex').onclick=()=>{const c=$('inviteCodexCard');c.style.display=c.style.display==='none'?'':'none'};$('inviteCodexCancel').onclick=()=>{$('inviteCodexCard').style.display='none'};$('inviteCodexSubmit').onclick=generateCodexInvite;$('addProvId').addEventListener('blur',()=>{if(!$('addProvEnv').value.trim()&&$('addProvId').value.trim())$('addProvEnv').value=$('addProvId').value.trim().toUpperCase().replace(/[^A-Z0-9]+/g,'_')+'_API_KEY'});$('loadKeyUsage').onclick=loadKeyUsage;$('consumer').onchange=load;$('timeframe').onchange=load;$('consumerSearch').oninput=()=>renderConsumers(lastStats.keys||[]);document.querySelectorAll('#consumerStatusSeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#consumerStatusSeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');consumerFilterStatus=b.dataset.status;renderConsumers(lastStats.keys||[])});document.querySelectorAll('#activitySeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#activitySeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');activityKind=b.dataset.kind;render(lastStats)});$('newConsumerKey').onclick=openNewKey;$('closeDrawer').onclick=closeDrawer;$('drawerShade').addEventListener('click',e=>{if(e.target===$('drawerShade'))closeDrawer()});$('drawerGenerateKey').onclick=()=>{closeDrawer();openNewKey();if(drawerConsumer)$('newKeyConsumer').value=drawerConsumer};$('saveConsumerSettings').onclick=saveConsumerSettings;$('closeNewKey').onclick=closeNewKey;$('newKeyShade').addEventListener('click',e=>{if(e.target===$('newKeyShade'))closeNewKey()});$('newKeyDone').onclick=closeNewKey;$('createKey').onclick=createKey;$('newKeyConsumer').addEventListener('keydown',e=>{if(e.key==='Enter')createKey()});$('copyKey').onclick=()=>navigator.clipboard.writeText($('newKeyValue').value).then(()=>toast('Key copied'));$('copyKeyHandoff').onclick=()=>navigator.clipboard.writeText($('newKeyHandoffValue').value).then(()=>toast('Setup blurb copied'));$('anProvider').onchange=load;$('anModel').onchange=load;setTab(tabFromLocation(),{silent:true});setInterval(()=>{const ds=$('drawerShade');if(ds&&ds.classList.contains('open'))return;const nk=$('newKeyShade');if(nk&&nk.classList.contains('open'))return;const ap=$('addProviderCard'),ac=$('addCodexCard'),ic=$('inviteCodexCard');if((ap&&ap.style.display&&ap.style.display!=='none')||(ac&&ac.style.display&&ac.style.display!=='none')||(ic&&ic.style.display&&ic.style.display!=='none'))return;if(document.querySelector('#recent .actDetail:not(.hidden)'))return;if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else load()},15000);
 /* ---- Flow builder: a DAG of nodes, each reusing the policy builder ---- */
 let fNodes=[];let fSeq=0;let fOutput=null;
 const F_DEFAULT_POLICY=()=>['policy',['and',['meets_req'],['not',['is','disabled']]],['add',['scale',0.5,['field','bench_intelligence']],['scale',0.5,['neg',['normalize',['field','price_in']]]]],['argmax'],['id'],['always',{action:'next_candidate'}]];
@@ -4787,6 +5632,7 @@ function setBuilderKind(k){const flow=k==='flow';$('policyBuilder').style.displa
 $('builderKindSeg').addEventListener('click',e=>{const b=e.target.closest('[data-kind]');if(b)setBuilderKind(b.dataset.kind)});
 $('fAddNode').onclick=fAddNode;$('fReview').onclick=fReview;$('fDownload').onclick=fDownload;$('fTestBtn').onclick=fTest;$('fEx1').onclick=fLoadExample;$('fOutput').onchange=()=>{fOutput=$('fOutput').value};
 $('flowBuilder').addEventListener('click',e=>{const b=e.target.closest('[data-fact]');if(!b)return;fSync();const id=b.dataset.id,act=b.dataset.fact,n=fNodes.find(x=>x.id===id);if(act==='del'){fNodes=fNodes.filter(x=>x.id!==id);if(fOutput===id)fOutput=fNodes.length?fNodes[fNodes.length-1].id:null;fRender()}else if(act==='usepol'){if(n){try{n.policy=bCurrentTerm();n.custom=true;toast('Captured the Policy-builder term into '+id)}catch(err){fFail(err.message)}fRender()}}else if(act==='editpol'){const ta=$('flowBuilder').querySelector('.fN-pol[data-id="'+id+'"]');if(ta)ta.style.display=ta.style.display==='none'?'':'none'}});
+$('newKeyBatch').onclick=openKeyBatch;$('closeKeyBatch').onclick=closeKeyBatch;$('batchKeyDone').onclick=closeKeyBatch;$('createKeyBatch').onclick=createKeyBatch;$('downloadKeyBatchCsv').onclick=()=>downloadKeyBatch('csv');$('downloadKeyBatchJson').onclick=()=>downloadKeyBatch('json');$('batchKeyShade').addEventListener('click',e=>{if(e.target===$('batchKeyShade'))closeKeyBatch()});
 </script>
 </body></html>"""
     return html.replace("__PUBLIC_BASE_URL__", _public_base_url())

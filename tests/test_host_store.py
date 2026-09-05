@@ -45,6 +45,46 @@ def test_insert_and_recent_roundtrip(store):
     assert r["session_id"] == "sess-A"
 
 
+def test_consumer_spend_usd_sums_only_that_consumer(store):
+    store.insert_call(_row(usage_event_id="budget-1", caller="validator-001", cost_usd=1.25))
+    store.insert_call(_row(usage_event_id="budget-2", caller="validator-001", cost_usd=0.75))
+    store.insert_call(_row(usage_event_id="other", caller="validator-002", cost_usd=99))
+    assert store.consumer_spend_usd("validator-001") == (2.0, True)
+
+
+def test_hourly_analytics_rollup_is_idempotent_and_filterable(store):
+    base = 1_800_000_000
+    store.insert_call(_row(ts=base + 10, usage_event_id="a1", caller="a",
+                           provider="p1", model_family="m1", status=200,
+                           tokens_in=10, tokens_out=5, tokens_total=15,
+                           tokens_cached=5, cost_usd=1.0))
+    store.insert_call(_row(ts=base + 20, usage_event_id="a2", caller="a",
+                           provider="p2", model_family="m2", status=500,
+                           tokens_in=20, tokens_out=10, tokens_total=30,
+                           tokens_cached=10, cost_usd=2.0))
+    store.insert_call(_row(ts=base + 30, usage_event_id="b1", caller="b",
+                           provider="p1", model_family="m1", status=200,
+                           tokens_in=30, tokens_out=15, tokens_total=45,
+                           tokens_cached=0, cost_usd=3.0))
+    first = store.rollup_analytics(base, base + 3600)
+    assert first["rows"] == 3
+    agg, state, ok = store.analytics_aggregate(base, caller="a")
+    assert ok is True
+    assert agg["totals"]["requests"] == 2
+    assert agg["totals"]["errors"] == 1
+    assert agg["totals"]["cost_usd"] == 3.0
+    assert agg["totals"]["tokens_cached"] == 15
+    assert agg["totals"]["cache_hit_rate"] == 0.5
+    assert agg["totals"]["cost_per_request"] == 1.5
+    assert set(agg["by_provider"]) == {"p1", "p2"}
+    assert state["covered_until"] >= base + 3600
+    # Replacing the same buckets must not double count.
+    store.rollup_analytics(base, base + 3600)
+    agg2, _, _ = store.analytics_aggregate(base)
+    assert agg2["totals"]["requests"] == 3
+    assert agg2["totals"]["cost_usd"] == 6.0
+
+
 def test_usage_rows_since_ts_filters_in_query(store):
     # The timeframe window lives in SQL now (idx_calls_ts), not Python: a windowed
     # dashboard view reads only its window, never the whole retention table to then
@@ -123,6 +163,12 @@ def test_set_returns_bool_contract(store):
     assert hs.set_provider_overlays({"groq": {"auth_env": "G", "added_at": 1}}) is True
 
 
+def test_pool_sizes_are_bounded_and_min_never_exceeds_max(monkeypatch):
+    monkeypatch.setenv("HOST_STORE_POOL_MIN_SIZE", "20")
+    monkeypatch.setenv("HOST_STORE_POOL_MAX_SIZE", "2")
+    assert hs._pool_sizes() == (2, 2)
+
+
 def test_set_is_atomic_and_returns_false_on_failure(store, monkeypatch):
     # A set_* is ONE transaction: a failure mid-write rolls back (existing data
     # intact, no half-applied DELETE) and returns False. With the pool model each
@@ -157,33 +203,149 @@ def test_set_is_atomic_and_returns_false_on_failure(store, monkeypatch):
     assert hs.get_consumer_keys()[0] == {"crm": {"status": "active"}}  # rolled back, intact
 
 
+def test_consumer_key_digest_roundtrip_upsert_and_targeted_revoke(store):
+    first = "a" * 64
+    second = "b" * 64
+    assert store.set_consumer_keys(
+        {"crm": {"status": "active"}},
+        key_digests={first: "crm"}) is True
+    assert store.consumer_for_digest(first) == ("crm", True)
+
+    # A startup backfill is additive: a stateless replica does not know the
+    # dashboard-created hashes already stored by the stateful owner.
+    assert store.upsert_consumer_key_digests({second: "bootstrap"}) is True
+    assert store.consumer_for_digest(first) == ("crm", True)
+    assert store.consumer_for_digest(second) == ("bootstrap", True)
+
+    # Metadata-only writes preserve the resolver, while a targeted revoke
+    # removes only the selected owner's matching digest.
+    assert store.set_consumer_keys(
+        {"crm": {"status": "inactive"}},
+        delete_key_digests=[("crm", first[:12])]) is True
+    assert store.consumer_for_digest(first) == (None, True)
+    assert store.consumer_for_digest(second) == ("bootstrap", True)
+
+
+def test_get_one_consumer_key_does_not_load_other_records(store):
+    assert store.set_consumer_keys({
+        "first": {"status": "active"},
+        "second": {"status": "inactive"},
+    })
+    assert store.get_consumer_key("second") == ({"status": "inactive"}, True)
+    assert store.get_consumer_key("missing") == (None, True)
+
+
+def test_consumer_digest_validation_fails_as_one_write(store):
+    assert store.set_consumer_keys(
+        {"crm": {"status": "active"}},
+        key_digests={"not-a-sha256": "crm"}) is False
+    assert store.get_consumer_keys() == ({}, True)
+
+
+def test_global_token_bucket_enforces_burst_and_refills(store):
+    decisions = [
+        store.consume_rate_token("crm", rate_per_min=5, burst=2, now=1000.0)
+        for _ in range(3)
+    ]
+    assert [allowed for allowed, ok, _ in decisions] == [True, True, False]
+    assert all(ok for _, ok, _ in decisions)
+    assert decisions[-1][2] == pytest.approx(12.0)
+    assert store.consume_rate_token(
+        "crm", rate_per_min=5, burst=2, now=1012.0)[0] is True
+    # Buckets are isolated by consumer.
+    assert store.consume_rate_token(
+        "other", rate_per_min=5, burst=1, now=1000.0)[0] is True
+
+
+def test_global_token_bucket_serializes_concurrent_replicas(store):
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = [
+            pool.submit(
+                store.consume_rate_token, "shared", 60, 5, now=2000.0)
+            for _ in range(20)
+        ]
+    decisions = [future.result() for future in futures]
+    assert sum(1 for allowed, ok, _ in decisions if allowed and ok) == 5
+    assert all(ok for _, ok, _ in decisions)
+
+
+def test_peer_concurrency_leases_are_global_and_released(store):
+    first = "1" * 32
+    second = "2" * 32
+    third = "3" * 32
+    assert store.try_acquire_peer_lease(
+        "peer-a", first, 1) == (True, True)
+    assert store.try_acquire_peer_lease(
+        "peer-a", second, 1) == (False, True)
+    # Another seller has an independent budget.
+    assert store.try_acquire_peer_lease(
+        "peer-b", third, 1) == (True, True)
+    assert store.renew_peer_lease("peer-a", first) is True
+    assert store.release_peer_lease("peer-a", first) is True
+    assert store.try_acquire_peer_lease(
+        "peer-a", second, 1) == (True, True)
+
+
+def test_peer_concurrency_lease_acquisition_serializes_replicas(store):
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = [
+            pool.submit(
+                store.try_acquire_peer_lease,
+                "shared-peer", f"{idx:032x}", 3)
+            for idx in range(12)
+        ]
+    decisions = [future.result() for future in futures]
+    assert sum(1 for acquired, ok in decisions if acquired and ok) == 3
+    assert all(ok for _, ok in decisions)
+
+
+def test_expired_peer_lease_is_reclaimed(store):
+    assert store.try_acquire_peer_lease(
+        "peer-expired", "a" * 32, 1) == (True, True)
+    with store._get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE peer_concurrency_leases SET expires_at=0"
+            " WHERE peer_id='peer-expired'")
+    assert store.try_acquire_peer_lease(
+        "peer-expired", "b" * 32, 1) == (True, True)
+    assert store.renew_peer_lease("peer-expired", "a" * 32) is False
+
+
 # ---- peer_offers (antseed market book; sidecar writes, host reads) -------------
 
 def _insert_peer_offer(store, peer_id, service, observed_at, **over):
     row = {"price_in": 0.5, "price_out": 1.0, "price_cached_in": None,
            "max_concurrency": 5, "reputation": None, "last_seen": 1,
+           "last_reached_at": None,
            "first_seen": observed_at, "fetched_at": observed_at}
     row.update(over)
     with store._get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO peer_offers (peer_id, service, price_in, price_out,"
             " price_cached_in, max_concurrency, reputation, last_seen,"
-            " observed_at, first_seen, fetched_at)"
-            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            " last_reached_at, observed_at, first_seen, fetched_at)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (peer_id, service, row["price_in"], row["price_out"],
              row["price_cached_in"], row["max_concurrency"], row["reputation"],
-             row["last_seen"], observed_at, row["first_seen"], row["fetched_at"]))
+             row["last_seen"], row["last_reached_at"], observed_at,
+             row["first_seen"], row["fetched_at"]))
 
 
 def test_peer_offers_returns_rows_in_reader_shape(store):
     now = int(time.time() * 1000)
-    _insert_peer_offer(store, "peerA", "gpt-5", now, reputation=80.0)
+    _insert_peer_offer(store, "peerA", "gpt-5", now, reputation=80.0,
+                       last_reached_at=now - 500)
     rows = store.peer_offers()
     assert len(rows) == 1
     r = rows[0]
     assert r == {"peer_id": "peerA", "service": "gpt-5", "price_in": 0.5,
                  "price_out": 1.0, "price_cached_in": None, "max_concurrency": 5,
-                 "reputation": 80.0, "last_seen": 1}
+                 "reputation": 80.0, "last_seen": 1,
+                 "last_reached_at": now - 500}
 
 
 def test_peer_offers_window_filters_stale_rows(store):
@@ -206,9 +368,15 @@ def test_buyer_status_roundtrip_and_absent(store):
             " VALUES (%s,%s,%s,%s,%s,%s,%s)",
             ("antseed", "peerX", "1.5", "0.2", "0xabc", "connected", 1))
     row = store.buyer_status("antseed")
+    # `fetched_at` (epoch MS) is part of the row on purpose. It was in the table
+    # but NOT in _BUYER_STATUS_FIELDS, so no consumer could bound the row's age —
+    # and all three funding gates (the offer tourniquet, the envelope's credits
+    # clause, the wallet keeper) decide from this one signal. A dead sidecar plus
+    # a drained escrow left every one of them reading a stale "funded".
     assert row == {"pid": "antseed", "pinned_peer_id": "peerX",
                    "deposits_available": "1.5", "deposits_reserved": "0.2",
-                   "wallet_address": "0xabc", "connection_state": "connected"}
+                   "wallet_address": "0xabc", "connection_state": "connected",
+                   "fetched_at": 1}
 
 
 def test_served_by_and_tokens_cached_recorded(store):
@@ -291,3 +459,157 @@ def test_recent_calls_caller_filter(store):
     rows = store.recent_calls(caller="acme")
     assert [r["usage_event_id"] for r in rows] == ["c", "a"]   # newest first
     assert [r["usage_event_id"] for r in store.recent_calls()][0] == "c"
+def test_marketplace_health_tracks_route_and_peer_fault_scope(store):
+    from conftest import seed_route_obs
+    now = int(time.time() * 1000)
+    # A model 404 is route-specific.
+    seed_route_obs("antseed", "m404", "peerA", ok=False, ts=now - 30,
+                   error_kind="model_unavailable", http_status=404)
+    # A newer timeout is both route- and peer-attributable.
+    seed_route_obs("antseed", "mtimeout", "peerA", ok=False, ts=now - 20,
+                   error_kind="timeout", http_status=504)
+    health = store.marketplace_route_health("antseed")
+    assert health["routes"]["antseed|m404|peerA"]["consecutive_failures"] == 1
+    timeout = health["routes"]["antseed|mtimeout|peerA"]
+    assert timeout["latest_error_kind"] == "timeout"
+    assert timeout["latest_http_status"] == 504
+    # The 404 is neutral at peer scope; only the timeout contributes.
+    assert health["peers"]["peerA"]["consecutive_failures"] == 1
+
+
+def test_marketplace_health_success_resets_failure_streak(store):
+    from conftest import seed_route_obs
+    now = int(time.time() * 1000)
+    seed_route_obs("antseed", "m", "peerA", ok=False, ts=now - 30,
+                   error_kind="timeout", http_status=504)
+    seed_route_obs("antseed", "m", "peerA", ok=True, ts=now - 20)
+    state = store.marketplace_route_health("antseed")["routes"]["antseed|m|peerA"]
+    assert state["consecutive_failures"] == 0
+    assert state["last_success_at"] == now - 20
+
+
+@pytest.mark.parametrize("error_kind,http_status", [
+    ("bad_request", 400),
+    ("payment_required", 402),
+])
+def test_marketplace_health_ignores_non_route_faults(
+        store, error_kind, http_status):
+    from conftest import seed_route_obs
+    seed_route_obs("antseed", "m", "peerA", ok=False,
+                   error_kind=error_kind, http_status=http_status)
+    assert store.marketplace_route_health("antseed") == {"routes": {}, "peers": {}}
+
+
+def test_marketplace_health_keeps_stream_break_route_scoped(store):
+    from conftest import seed_route_obs
+    seed_route_obs("antseed", "m", "peerA", ok=False,
+                   error_kind="stream_interrupted", http_status=200)
+    health = store.marketplace_route_health("antseed")
+    assert health["routes"]["antseed|m|peerA"]["consecutive_failures"] == 1
+    assert health["peers"] == {}
+
+
+# ---- wallet_ops: the keeper's audit trail + rate-cap ledger -------------------
+# Not best-effort telemetry like `calls`: these rows gate real USDC movement, so
+# the writers report failure and every read fails in the SAFE direction.
+
+def test_wallet_op_begin_writes_the_intent_before_the_transaction(store):
+    op_id = store.wallet_op_begin("antseed", "topup", amount_usdc=5.0,
+                                  reason="below trigger", pre_available=0.5)
+    assert op_id is not None
+    (row,) = store.wallet_ops_recent("antseed")
+    assert row["op"] == "topup" and row["outcome"] == "pending"
+    assert row["amount_usdc"] == 5.0 and row["pre_available"] == 0.5
+    assert row["reason"] == "below trigger" and row["post_available"] is None
+    # `pending` means "in flight": open for reconciliation, already counted spent.
+    assert [r["id"] for r in store.wallet_ops_open("antseed", "topup")] == [op_id]
+    assert store.wallet_op_spend_since("antseed", "topup", 0)["spent_usdc"] == 5.0
+
+
+def test_wallet_op_finish_records_the_measured_outcome(store):
+    op_id = store.wallet_op_begin("antseed", "topup", amount_usdc=5.0,
+                                  pre_available=0.5)
+    assert store.wallet_op_finish(op_id, "effective", post_available=5.4,
+                                  detail="landed") is True
+    (row,) = store.wallet_ops_settled("antseed", "topup")
+    assert row["outcome"] == "effective" and row["post_available"] == 5.4
+    assert store.wallet_ops_open("antseed", "topup") == []
+
+
+def test_failed_ops_do_not_consume_the_daily_cap(store):
+    ok_id = store.wallet_op_begin("antseed", "topup", amount_usdc=5.0)
+    store.wallet_op_finish(ok_id, "fired")
+    bad_id = store.wallet_op_begin("antseed", "topup", amount_usdc=5.0)
+    store.wallet_op_finish(bad_id, "failed")
+    spend = store.wallet_op_spend_since("antseed", "topup", 0)
+    assert spend["spent_usdc"] == 5.0 and spend["count"] == 1
+
+
+def test_spend_ledger_is_scoped_per_provider_and_per_op(store):
+    store.wallet_op_begin("antseed_a", "topup", amount_usdc=5.0)
+    store.wallet_op_begin("antseed_b", "topup", amount_usdc=7.0)
+    store.wallet_op_begin("antseed_a", "reclaim_withdraw")
+    assert store.wallet_op_spend_since("antseed_a", "topup", 0)["spent_usdc"] == 5.0
+    assert store.wallet_op_spend_since("antseed_b", "topup", 0)["spent_usdc"] == 7.0
+
+
+def test_spend_ledger_window_excludes_older_ops(store):
+    op_id = store.wallet_op_begin("antseed", "topup", amount_usdc=5.0)
+    store.wallet_op_finish(op_id, "fired")
+    old = int(time.time()) - 90_000                       # ~25h ago
+    with store._get_pool().connection() as conn:
+        conn.execute("UPDATE wallet_ops SET ts=%s WHERE id=%s", (old, op_id))
+    since = int(time.time()) - 86_400
+    assert store.wallet_op_spend_since("antseed", "topup", since)["spent_usdc"] == 0.0
+    assert store.wallet_op_spend_since("antseed", "topup", 0)["spent_usdc"] == 5.0
+
+
+def test_halt_is_durable_scoped_and_operator_cleared(store):
+    assert store.wallet_halted("antseed", "topup") is False
+    assert store.wallet_halt("antseed", "topup", "two ineffective deposits") is True
+    assert store.wallet_halted("antseed", "topup") is True
+    assert store.wallet_halted("antseed", "reclaim") is False   # per-class
+    assert store.wallet_halted("antseed_other", "topup") is False  # per-provider
+    store.wallet_halt("antseed", "topup", "again")              # idempotent
+    assert len([r for r in store.wallet_ops_recent("antseed")
+                if r["outcome"] == "halted"]) == 1
+    assert store.wallet_clear_halt("antseed", "topup") is True
+    assert store.wallet_halted("antseed", "topup") is False
+
+
+def test_wallet_reads_fail_in_the_safe_direction(store, monkeypatch):
+    def _boom(*a, **kw):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(hs, "_get_pool", _boom)
+    # An unreadable ledger must look like "already halted, cap consumed,
+    # cooldown just started" — never like "free to spend".
+    assert hs.wallet_halted("antseed", "topup") is True
+    spend = hs.wallet_op_spend_since("antseed", "topup", 0)
+    assert spend["spent_usdc"] == float("inf") and spend["unreadable"] is True
+    # ...and the intent write reports failure so the caller aborts.
+    assert hs.wallet_op_begin("antseed", "topup", amount_usdc=5.0) is None
+
+
+def test_provider_attempt_counts_distinguishes_wedged_from_idle(store):
+    from conftest import seed_route_obs
+    assert store.provider_attempt_counts("antseed") == {
+        "ok": 0, "failed": 0, "total": 0}, "idle: no attempts at all"
+    seed_route_obs("antseed", "m", "peerA", ok=False, n=5)
+    assert store.provider_attempt_counts("antseed") == {
+        "ok": 0, "failed": 5, "total": 5}, "wedged: attempts, zero successes"
+    seed_route_obs("antseed", "m", "peerA", ok=True, n=1)
+    assert store.provider_attempt_counts("antseed")["ok"] == 1
+    # scoped per provider, and windowed
+    assert store.provider_attempt_counts("openrouter")["total"] == 0
+    old = int(time.time() * 1000) - 7200 * 1000
+    seed_route_obs("stale_p", "m", "peerA", ok=False, n=3, ts=old)
+    assert store.provider_attempt_counts("stale_p", window_ms=3_600_000)["total"] == 0
+
+
+def test_provider_recent_ok_returns_newest_first(store):
+    from conftest import seed_route_obs
+    now = int(time.time() * 1000)
+    seed_route_obs("antseed", "m", "peerA", ok=True, n=1, ts=now - 3000)
+    seed_route_obs("antseed", "m", "peerA", ok=False, n=2, ts=now - 1000)
+    assert store.provider_recent_ok("antseed", limit=3) == [False, False, True]
+    assert store.provider_recent_ok("antseed", limit=1) == [False]

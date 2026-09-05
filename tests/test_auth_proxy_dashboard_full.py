@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -17,10 +22,50 @@ sys.path.insert(0, str(ROOT))
 # operator shell env or .env loader that may contain non-JSON placeholders.
 os.environ["CALLER_KEYS_JSON"] = '{"internal":"default"}'
 os.environ["CALLER_KEYS_SHA256_JSON"] = "{}"
+os.environ["CALLER_KEYS_BOOTSTRAP_JSON"] = "{}"
 os.environ["DASHBOARD_TRUSTED_USER_HEADER"] = ""
 
 import auth_proxy  # noqa: E402
 import host_store  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_dashboard_stats_keeps_event_loop_responsive_during_slow_store_query(monkeypatch):
+    """A slow synchronous stats query must not take down health/proxy traffic."""
+    _install_test_state(monkeypatch)
+    monkeypatch.setattr(
+        auth_proxy, "_require_dashboard_context",
+        lambda _request: {"viewer": "admin", "role": "admin"})
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_snapshot(**_kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        return {}
+
+    monkeypatch.setattr(auth_proxy, "_stats_snapshot", slow_snapshot)
+    request = Request({
+        "type": "http", "method": "GET", "path": "/dashboard/api/stats",
+        "query_string": b"timeframe=all", "headers": [],
+        "client": ("test", 1), "server": ("test", 80), "scheme": "http",
+    })
+
+    # A timer releases the fake DB query even on the broken implementation,
+    # preventing a deadlock while making event-loop blocking measurable.
+    timer = threading.Timer(0.5, release.set)
+    timer.start()
+    before = time.monotonic()
+    task = asyncio.create_task(auth_proxy.dashboard_stats(request))
+    await asyncio.to_thread(started.wait, 1)
+    await asyncio.sleep(0.05)
+    elapsed = time.monotonic() - before
+    release.set()
+    await task
+    timer.cancel()
+
+    assert elapsed < 0.25, "synchronous stats work blocked the event loop"
 
 
 def _use_db(monkeypatch, tmp_path):
@@ -195,6 +240,9 @@ def test_dashboard_key_generation_ui_has_copy_key_and_handoff_blurb(monkeypatch,
     assert "copyKeyHandoff" in html
     assert "Copy setup blurb" in html
     assert "buildKeyHandoff" in html
+    assert "Generate batch" in html
+    assert "batchKeyBudget" in html
+    assert "downloadKeyBatchCsv" in html
     # Two-step new-consumer-key dialog and the scoped keys drawer.
     assert "newKeyConsumer" in html
     assert "Create and generate key" in html
@@ -372,14 +420,14 @@ def test_policy_catalog_uses_policy_files_and_router_rank():
     catalog = auth_proxy._policy_catalog_snapshot()
     profiles = {row["name"]: row for row in catalog["profiles"]}
 
-    # No tiers: the catalog has only the declarative `default` fallback policy
-    # (callers send their own per-call policy_ir). It is declarative, not a
-    # closure file, so there are no policy_files.
-    assert list(profiles) == ["default"]
+    # No tiers: the catalog has the declarative vanilla and tool-agent policies.
+    # Both are IR, not closure files, so there are no policy_files.
+    assert set(profiles) == {"agent", "default"}
     assert catalog["source"].endswith("config.live.lua")
     assert catalog["metrics_source"].endswith("metrics.live.lua")
     assert catalog["policy_files"] == []
     assert profiles["default"]["candidate_count"] > 0
+    assert profiles["agent"]["candidate_count"] > 0
     assert "router.rank" in profiles["default"]["selection_note"]
 
 
@@ -419,7 +467,6 @@ def _with_consumer_auth(monkeypatch, tmp_path, token="crm-token", consumer="crm"
     auth_proxy.CALLER_KEYS.clear()
     auth_proxy.CALLER_KEY_HASHES.clear()
     auth_proxy.CALLER_KEY_HASHES.update({digest: consumer})
-    auth_proxy._windows.clear()
     if issued is not None:
         _set_issued({consumer: issued})
     return token, digest, original_plaintext, original_hashes
@@ -430,7 +477,6 @@ def _restore_auth_maps(original_plaintext, original_hashes):
     auth_proxy.CALLER_KEYS.update(original_plaintext)
     auth_proxy.CALLER_KEY_HASHES.clear()
     auth_proxy.CALLER_KEY_HASHES.update(original_hashes)
-    auth_proxy._windows.clear()
 
 
 class _CannedResp:
@@ -606,6 +652,26 @@ def test_restricted_consumer_fails_closed_when_route_is_missing(monkeypatch, tmp
         _restore_auth_maps(original_plaintext, original_hashes)
 
 
+def test_missing_or_empty_openai_model_maps_to_default_profile(monkeypatch):
+    assert auth_proxy._requested_route_from(
+        "v1/chat/completions", b'{"messages":[]}') == "profile:default"
+    assert auth_proxy._requested_route_from(
+        "/v1/chat/completions", b'{"model":"","messages":[]}') == "profile:default"
+    assert auth_proxy._requested_route_from(
+        "v1/responses", b'{"input":"hello"}') == "profile:default"
+    assert auth_proxy._requested_route_from(
+        "v1/chat/completions", b'{"model":"profile:edge"}') == "profile:edge"
+    monkeypatch.setattr(auth_proxy, "_consumer_meta", lambda caller: {
+        "allowed_routes": ["profile:default"]})
+    assert auth_proxy._route_allowed("validator-001", auth_proxy._requested_route_from(
+        "v1/chat/completions", b'{"messages":[]}'))
+    assert auth_proxy._route_allowed("validator-001", auth_proxy._requested_route_from(
+        "v1/chat/completions", b'{"model":""}'))
+    # Unknown paths remain unidentified and therefore fail closed for a
+    # route-restricted consumer.
+    assert auth_proxy._requested_route_from("v1/embeddings", b'{"input":"x"}') is None
+
+
 def test_dashboard_rotation_with_zero_grace_expires_old_key_not_new_key(monkeypatch, tmp_path):
     digest = hashlib.sha256("crm-token".encode()).hexdigest()
     token, digest, original_plaintext, original_hashes = _with_consumer_auth(
@@ -728,7 +794,6 @@ def test_legacy_plaintext_keys_can_be_rotated_and_revoked(monkeypatch, tmp_path)
     auth_proxy.CALLER_KEYS.clear()
     auth_proxy.CALLER_KEYS[token] = "crm"
     auth_proxy.CALLER_KEY_HASHES.clear()
-    auth_proxy._windows.clear()
     try:
         client = _dashboard_client(monkeypatch)
         rotated = client.post("/dashboard/api/keys", json={"consumer": "crm", "rotate": True, "grace_period_s": 0})
@@ -831,6 +896,7 @@ def test_dashboard_admin_endpoints_reject_unauthenticated_and_consumer_bearer(mo
             ("GET", "/dashboard/api/keys/reveal?consumer=crm", None),
             ("POST", "/dashboard/api/key-usage", {"api_key": token}),
             ("POST", "/dashboard/api/keys", {"consumer": "crm"}),
+            ("POST", "/dashboard/api/keys/batch", {"batch": "validators", "count": 2, "budget_usd": 5}),
             ("POST", "/dashboard/api/keys/revoke", {"consumer": "crm", "sha256_prefix": "01234567"}),
             ("POST", "/dashboard/api/consumers/crm", {"status": "inactive"}),
         ]
@@ -841,6 +907,55 @@ def test_dashboard_admin_endpoints_reject_unauthenticated_and_consumer_bearer(mo
             assert consumer_auth.status_code == 401, path
     finally:
         _restore_auth_maps(original_plaintext, original_hashes)
+
+
+def test_dashboard_generates_bounded_key_batch_with_independent_budgets(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    env_path = tmp_path / ".env.secrets"
+    monkeypatch.setattr(auth_proxy, "DASHBOARD_KEY_ENV_PATH", str(env_path))
+    original = dict(auth_proxy.CALLER_KEY_HASHES)
+    try:
+        client = _dashboard_client(monkeypatch)
+        resp = client.post("/dashboard/api/keys/batch", json={
+            "batch": "validators-mainnet", "count": 3, "budget_usd": 25,
+            "allowed_routes": ["profile:default"], "rate_per_min": 10, "burst": 2})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert [row["consumer"] for row in body["keys"]] == [
+            "validators-mainnet-001", "validators-mainnet-002", "validators-mainnet-003"]
+        assert len({row["api_key"] for row in body["keys"]}) == 3
+        records = _issued_data()
+        for idx in range(1, 4):
+            meta = records[f"validators-mainnet-{idx:03d}"]
+            assert meta["batch"] == "validators-mainnet"
+            assert meta["member_id"] == f"{idx:03d}"
+            assert meta["budget_usd"] == 25
+            assert meta["allowed_routes"] == ["profile:default"]
+        collision = client.post("/dashboard/api/keys/batch", json={
+            "batch": "validators-mainnet", "count": 3, "budget_usd": 25})
+        assert collision.status_code == 409
+        too_many = client.post("/dashboard/api/keys/batch", json={
+            "batch": "other", "count": 51, "budget_usd": 25})
+        assert too_many.status_code == 400
+    finally:
+        auth_proxy.CALLER_KEY_HASHES.clear()
+        auth_proxy.CALLER_KEY_HASHES.update(original)
+
+
+def test_consumer_budget_rejects_before_upstream(monkeypatch):
+    monkeypatch.setattr(auth_proxy, "_caller_auth", lambda token: {
+        "ok": True, "caller": "validators-001", "digest": "a" * 64,
+        "meta": {"status": "active", "budget_usd": 5.0}})
+    monkeypatch.setattr(
+        auth_proxy, "_route_allowed", lambda caller, route, meta=None: True)
+    monkeypatch.setattr(
+        auth_proxy, "_rate_ok", lambda caller, meta=None: True)
+    monkeypatch.setattr(host_store, "consumer_spend_usd", lambda caller: (5.0, True))
+    resp = TestClient(auth_proxy.app).post(
+        "/v1/chat/completions", headers={"Authorization": "Bearer test"},
+        json={"model": "profile:default", "messages": []})
+    assert resp.status_code == 402
+    assert resp.json()["error"]["code"] == "consumer_budget_exhausted"
 
 
 def test_malformed_issued_key_metadata_fails_closed(monkeypatch, tmp_path):
@@ -863,11 +978,13 @@ def test_malformed_issued_key_metadata_fails_closed(monkeypatch, tmp_path):
             assert resp.json()["error"]["code"] in {"caller_inactive", "caller_key_revoked"}
             auth_proxy._issued_keys_load_failed = False
 
-        # A store LOAD FAILURE (the old unparseable file) also fails closed.
-        monkeypatch.setattr(host_store, "get_consumer_keys", lambda: ({}, False))
+        # A store LOAD FAILURE fails closed but remains distinguishable from a
+        # genuinely inactive key, so clients can retry an infrastructure fault.
+        monkeypatch.setattr(host_store, "get_consumer_key",
+                            lambda _consumer: (None, False))
         resp = client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"}, json={"model": "profile:edge", "messages": []})
-        assert resp.status_code == 403
-        assert resp.json()["error"]["code"] in {"caller_inactive", "caller_key_revoked"}
+        assert resp.status_code == 503
+        assert resp.json()["error"]["code"] == "caller_auth_unavailable"
         auth_proxy._issued_keys_load_failed = False
     finally:
         _restore_auth_maps(original_plaintext, original_hashes)
@@ -911,7 +1028,7 @@ def test_usage_history_survives_stats_reset_and_supports_windows_pagination_and_
         auth_proxy._reset_stats_for_tests()
 
 
-def test_dashboard_stats_default_all_history_and_consumer_rows(monkeypatch, tmp_path):
+def test_dashboard_stats_defaults_to_latest_events_and_consumer_rows(monkeypatch, tmp_path):
     history_path = tmp_path / "usage-history.jsonl"
     monkeypatch.setenv("ROUTER_USAGE_HISTORY_PATH", str(history_path))
     token = "dashboard-history-token"
@@ -928,8 +1045,8 @@ def test_dashboard_stats_default_all_history_and_consumer_rows(monkeypatch, tmp_
         resp = dashboard.get("/dashboard/api/stats")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["timeframe"]["selected"] == "all"
-        assert body["timeframe"]["source"] == "persistent_history"
+        assert body["timeframe"]["selected"] == "recent"
+        assert body["timeframe"]["source"] == "recent_events"
         assert body["totals"]["requests"] == 3
         assert body["by_caller"]["crm"]["requests"] == 2
         assert body["by_caller"]["wingston"]["requests"] == 1
@@ -945,9 +1062,13 @@ def test_dashboard_stats_default_all_history_and_consumer_rows(monkeypatch, tmp_
         assert selected_body["selected_consumer"] == "crm"
         assert selected_body["totals"]["requests"] == 2
         selected_crm_row = next(row for row in selected_body["keys"] if row["consumer"] == "crm")
-        selected_wing_row = next(row for row in selected_body["keys"] if row["consumer"] == "wingston")
         assert selected_crm_row["stats"]["requests"] == 2
-        assert selected_wing_row["stats"]["requests"] == 1
+        selected_wing_row = next(row for row in selected_body["keys"] if row["consumer"] == "wingston")
+        assert selected_wing_row["stats"]["requests"] == 0
+
+        legacy_all = dashboard.get("/dashboard/api/stats?timeframe=all")
+        assert legacy_all.status_code == 200
+        assert legacy_all.json()["timeframe"]["selected"] == "recent"
 
         runtime = dashboard.get("/dashboard/api/stats?timeframe=runtime")
         assert runtime.status_code == 200
@@ -956,6 +1077,21 @@ def test_dashboard_stats_default_all_history_and_consumer_rows(monkeypatch, tmp_
     finally:
         _restore_auth_maps(original_plaintext, original_hashes)
         auth_proxy._reset_stats_for_tests()
+
+
+def test_historical_dashboard_reads_rollups_not_raw_aggregation(monkeypatch, tmp_path):
+    _use_db(monkeypatch, tmp_path)
+    _install_test_state(monkeypatch)
+    monkeypatch.setattr(host_store, "usage_aggregate", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("historical dashboard must not aggregate raw calls")))
+    client = _dashboard_client(monkeypatch)
+    response = client.get("/dashboard/api/stats?timeframe=7d")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["timeframe"]["selected"] == "7d"
+    assert body["timeframe"]["source"] == "analytics_hourly"
+    assert body["timeframe"]["analytics"]["available"] is True
+    assert body["totals"]["requests"] == 0
 
 
 def test_dashboard_api_key_login_filters_same_dashboard_to_exact_key(monkeypatch, tmp_path):
@@ -1027,11 +1163,24 @@ def test_dashboard_key_usage_accepts_window_and_pagination_controls(monkeypatch,
 
 def test_openapi_and_dashboard_document_key_usage_controls():
     html = auth_proxy._dashboard_html()
+    assert "anCostPerMtok" in html
+    assert "anCacheRate" in html
+    assert "anCostPerRequest" in html
+    assert "anByRoute" in html
+    assert "align-items:flex-end" in html
     assert "tabKeyUsage" in html
     assert "keyUsageApiKey" in html
     assert "loadKeyUsage" in html
     assert "cost_estimate" in html
     assert "recentOffset" in html
+    assert "Latest 100 events" in html
+    assert "Last 24 hours" in html
+    assert "Last 7 days" in html
+    assert "Last 30 days" in html
+    assert "analyticsFreshness" in html
+    assert "value='all' selected" not in html
+    assert "dashboardLoading" in html
+    assert "AbortController" in html
     spec = TestClient(auth_proxy.app).get("/openapi.json")
     assert spec.status_code == 200
     paths = spec.json()["paths"]
@@ -1140,6 +1289,32 @@ def test_dashboard_html_has_provider_health_ui():
     assert "healthDot" in html              # dot renderer
 
 
+def test_dashboard_builder_exposes_and_wires_safe_policy_templates():
+    html = auth_proxy._dashboard_html()
+    for marker in (
+        "bTemplateBar",
+        "cheapest-family",
+        "smart-value",
+        "Stable tool agent",
+        "Default for vanilla clients",
+        "/dashboard/api/policy/templates/",
+        "$('bLoadTemplate').onclick=bCreateTemplate",
+        "bTemplateChanged();",
+    ):
+        assert marker in html
+
+
+def test_gitops_bootstrap_keys_are_loaded_hash_only():
+    token = "llmr_reconciled"
+    loaded = auth_proxy._bootstrap_caller_key_hashes(
+        f'{{"{token}":"micromarkets-dev"}}')
+
+    assert loaded == {
+        hashlib.sha256(token.encode()).hexdigest(): "micromarkets-dev",
+    }
+    assert token not in loaded
+
+
 def test_policy_snapshot_prefers_live_ranks():
     live = {"default": [
         {"provider": "openai", "model_family": "gpt-5.5-codex",
@@ -1229,6 +1404,7 @@ def test_proxy_passes_sse_through_unbuffered(monkeypatch):
     monkeypatch.setattr(auth_proxy, "_caller_auth",
                         lambda token: {"ok": True, "caller": "tester", "digest": None})
     monkeypatch.setattr(auth_proxy, "_client", FakeClient())
+    active_before = auth_proxy._active_requests
     client = TestClient(auth_proxy.app)  # no context: startup must not replace _client
     r = client.post("/v1/chat/completions", headers={"Authorization": "Bearer k"},
                     json={"model": "profile:edge", "messages": [], "stream": True})
@@ -1236,6 +1412,7 @@ def test_proxy_passes_sse_through_unbuffered(monkeypatch):
     assert r.headers["content-type"].startswith("text/event-stream")
     assert b"data: one" in r.content and b"[DONE]" in r.content
     assert fake_resp.aread_called is False   # streamed, not buffered
+    assert auth_proxy._active_requests == active_before
 
 
 # ---- market tab -------------------------------------------------------------
@@ -1568,7 +1745,9 @@ def test_codex_accounts_admin_add_list_delete(monkeypatch, tmp_path):
 def test_dashboard_html_has_codex_account_ui(monkeypatch):
     html = _dashboard_client(monkeypatch).get("/dashboard").text
     for needle in ("Codex accounts", "/dashboard/api/codex/accounts",
-                   "addCodexAccount", "loadCodexAccounts"):
+                   "addCodexAccount", "loadCodexAccounts",
+                   "/dashboard/api/codex/invites", "generateCodexInvite",
+                   "revokeCodexInvite", "codexInvites", "Invite via link"):
         assert needle in html, needle
 
 
@@ -1661,7 +1840,8 @@ def test_consumer_skill_endpoint_authed_by_consumer_key(monkeypatch):
 
     monkeypatch.setattr(auth_proxy, "_fetch_live_market", _m)
     monkeypatch.setattr(auth_proxy, "_fetch_live_fields", _f)
-    monkeypatch.setattr(auth_proxy, "_consumer_meta", lambda c: {"status": "active"})
+    monkeypatch.setattr(host_store, "get_consumer_key",
+                        lambda _consumer: ({"status": "active"}, True))
     client = TestClient(auth_proxy.app)
 
     # no key / bad key -> 401 (reuses the same key auth as /v1/*)

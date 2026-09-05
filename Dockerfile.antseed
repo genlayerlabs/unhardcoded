@@ -3,7 +3,30 @@
 # registry and freezes the bundled @antseed/node (whose DHT bootstrap nodes
 # rot with the version). socat exposes the localhost-only buyer proxy on the
 # container network. See antseed/entrypoint.sh for the why of each piece.
-FROM node:25-slim
+FROM node:22-slim AS antseed-dependencies
+
+# Native dependencies normally download a prebuilt binary. Keep a compiler
+# fallback in the build stage so a transient prebuild-host failure cannot make
+# releases undeployable; none of this toolchain is copied into the runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 make g++ \
+    && for install_attempt in 1 2 3; do \
+         if npm install -g @antseed/cli@0.1.153 pg@8.16.3; then break; fi; \
+         rm -rf /usr/local/lib/node_modules/@antseed \
+           /usr/local/lib/node_modules/pg /usr/local/bin/antseed; \
+         if [ "${install_attempt}" = 3 ]; then exit 1; fi; \
+       done \
+    && mkdir -p /opt/antseed-plugins \
+    && cd /opt/antseed-plugins \
+    && npm init -y \
+    && for install_attempt in 1 2 3; do \
+         if npm install --ignore-scripts --save-exact @antseed/router-local@0.1.45; then break; fi; \
+         rm -rf node_modules package-lock.json; \
+         if [ "${install_attempt}" = 3 ]; then exit 1; fi; \
+       done \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM node:22-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends socat \
@@ -12,10 +35,24 @@ RUN apt-get update \
 # Pinned, vendored. Bump deliberately (newer CLIs carry fresher bootstrap nodes).
 # `pg` is the market writer's Postgres client (write-market.js upserts peer_offers
 # into the shared host store). NODE_PATH lets the scripts require these globals.
-RUN npm install -g @antseed/cli@0.1.128 pg@8.16.3
-ENV NODE_PATH=/usr/local/lib/node_modules
+COPY --from=antseed-dependencies /usr/local/lib/node_modules /usr/local/lib/node_modules
+# Since CLI 0.1.153 the default buyer router is a separately installed plugin.
+# Vendor the compatible release in the exact directory the CLI loads from so a
+# fresh container never reaches npm before it can join the P2P network.
+COPY --from=antseed-dependencies /opt/antseed-plugins /root/.antseed/plugins
+# Docker COPY dereferences the npm-created bin symlink. Recreate it explicitly
+# so Node resolves package imports from @antseed/cli instead of /usr/local/bin.
+RUN ln -s ../lib/node_modules/@antseed/cli/dist/cli/index.js /usr/local/bin/antseed
+ENV NODE_PATH=/usr/local/lib/node_modules \
+    ANTSEED_SKIP_PLUGIN_UPDATE_CHECK=1
 
-COPY antseed/db.js antseed/store.js antseed/write-market.js antseed/write-status.js antseed/control.js antseed/entrypoint.sh /usr/local/lib/antseed/
+# Every non-test file under antseed/ — an explicit list silently ships a module
+# whose `require('./x.js')` has no target, and the control server then dies at
+# import time with the wallet endpoints 502ing (which is exactly what shipping
+# ids.js/queue.js without updating this line did). tests/test_antseed_node.py
+# pins that every local require resolves inside the image.
+COPY antseed/*.js antseed/*.mjs antseed/entrypoint.sh /usr/local/lib/antseed/
+RUN rm -f /usr/local/lib/antseed/*.test.js
 RUN chmod +x /usr/local/lib/antseed/entrypoint.sh
 
 ENV ANTSEED_DATA_DIR=/data

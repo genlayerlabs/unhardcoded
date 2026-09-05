@@ -142,6 +142,9 @@ def _parse_gemini_response(data: dict, status: int, latency: int) -> dict:
             "tokens_in": usage.get("promptTokenCount"),
             "tokens_out": usage.get("candidatesTokenCount"),
             "tokens_total": usage.get("totalTokenCount"),
+            # Gemini implicit caching reports its hits here — read it or the
+            # meter (and the cost discount) is blind on google routes
+            "tokens_cached": usage.get("cachedContentTokenCount"),
             "raw_model": data.get("modelVersion"),
         },
     }
@@ -257,6 +260,9 @@ async def stream_google(
             "tokens_in": usage.get("promptTokenCount"),
             "tokens_out": usage.get("candidatesTokenCount"),
             "tokens_total": usage.get("totalTokenCount"),
+            # same as the sync path: Gemini implicit-cache hits live in
+            # usageMetadata.cachedContentTokenCount
+            "tokens_cached": usage.get("cachedContentTokenCount"),
             "raw_model": acc.raw_model,
         },
     }

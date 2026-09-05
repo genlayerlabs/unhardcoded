@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import AsyncExitStack
 from typing import Any, Iterable
 
@@ -23,6 +24,21 @@ from provider_adapters.common import (
 )
 
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+
+
+# The quota signal the router can never re-fetch: polling the codex endpoint
+# would burn the very quota it measures, so observation of real traffic is the
+# only safe source. A header dropped here is therefore lost for good — which is
+# why the match covers WHEN the limit lifts (`*-reset-*`, `retry-after`) and not
+# only how much is used. Deliberately still narrow: response headers can carry
+# cookies and tokens, and this map is stored and rendered on the dashboard.
+_QUOTA_HEADER_RE = re.compile(r"ratelimit|usage|quota|percent|reset|^retry-after$", re.I)
+
+
+def quota_headers(headers) -> dict:
+    """The quota-relevant subset of a response's headers, lowercased."""
+    return {k.lower(): v for k, v in dict(headers or {}).items()
+            if _QUOTA_HEADER_RE.search(k)}
 
 
 def _err(kind: str, status: int, latency_ms: int, message: str) -> dict:
@@ -294,6 +310,7 @@ def make_codex_async_call_provider(
     timeout_s: float = 120.0,
     extra_headers: dict[str, str] | None = None,
     observe=None,
+    client=None,
 ):
     """Async call_provider for api_kind="openai_codex". `auth` is a
     codex_auth.CodexAuth (or anything with access_token()/account_id()).
@@ -310,9 +327,8 @@ def make_codex_async_call_provider(
         if observe is None:
             return
         try:
-            hdrs = {k.lower(): v for k, v in dict(headers or {}).items()
-                    if _re.search(r"ratelimit|usage|quota|percent", k, _re.I)}
-            observe({"status": status, "headers": hdrs, "ts": int(time.time())})
+            observe({"status": status, "headers": quota_headers(headers),
+                     "ts": int(time.time())})
         except Exception:
             pass
 
@@ -343,43 +359,55 @@ def make_codex_async_call_provider(
         def _timeout_err() -> dict:
             return first_token_timeout_err(first_timeout_s, _latency())
 
+        owns_client = client is None
         try:
-            async with httpx.AsyncClient(timeout=timeout) as c:
-                async with AsyncExitStack() as stack:
-                    try:
-                        resp = await before_first_output(stack.enter_async_context(
-                            c.stream("POST", url, json=body, headers=headers)),
-                            first_timeout_s, t0, _saw_output)
-                    except (asyncio.TimeoutError, TimeoutError):
-                        if not status_seen:
-                            _notify(0)
-                        return _timeout_err()
+            async with AsyncExitStack() as stack:
+                c = (await stack.enter_async_context(
+                    httpx.AsyncClient(timeout=timeout))
+                     if owns_client else client)
+                stream_kwargs = {
+                    "json": body,
+                    "headers": headers,
+                }
+                # A shared client has no request-specific default; an owned
+                # client was constructed with this timeout above. Keeping the
+                # latter call shape also supports lightweight test transports.
+                if not owns_client:
+                    stream_kwargs["timeout"] = timeout
+                try:
+                    resp = await before_first_output(stack.enter_async_context(
+                        c.stream("POST", url, **stream_kwargs)),
+                        first_timeout_s, t0, _saw_output)
+                except (asyncio.TimeoutError, TimeoutError):
+                    if not status_seen:
+                        _notify(0)
+                    return _timeout_err()
 
-                    _notify(resp.status_code, resp.headers)
-                    status_seen = True
-                    latency = _latency()
-                    if resp.status_code == 401:
-                        return _err("auth_error", 401, latency, "codex token rejected")
-                    if resp.status_code == 429:
-                        return _err("rate_limit", 429, latency, "codex rate limited")
-                    if resp.status_code >= 400:
-                        detail = (await resp.aread()).decode("utf-8", "replace")[:500]
-                        return _err("server_error", resp.status_code, latency, detail)
-                    lines = []
-                    stream_lines = resp.aiter_lines().__aiter__()
-                    while True:
-                        try:
-                            line = await before_first_output(
-                                stream_lines.__anext__(), first_timeout_s, t0, _saw_output)
-                        except StopAsyncIteration:
-                            break
-                        except (asyncio.TimeoutError, TimeoutError):
-                            if not saw_output:
-                                return _timeout_err()
-                            raise
-                        lines.append(line)
-                        if _codex_line_has_output_delta(line):
-                            saw_output = True
+                _notify(resp.status_code, resp.headers)
+                status_seen = True
+                latency = _latency()
+                if resp.status_code == 401:
+                    return _err("auth_error", 401, latency, "codex token rejected")
+                if resp.status_code == 429:
+                    return _err("rate_limit", 429, latency, "codex rate limited")
+                if resp.status_code >= 400:
+                    detail = (await resp.aread()).decode("utf-8", "replace")[:500]
+                    return _err("server_error", resp.status_code, latency, detail)
+                lines = []
+                stream_lines = resp.aiter_lines().__aiter__()
+                while True:
+                    try:
+                        line = await before_first_output(
+                            stream_lines.__anext__(), first_timeout_s, t0, _saw_output)
+                    except StopAsyncIteration:
+                        break
+                    except (asyncio.TimeoutError, TimeoutError):
+                        if not saw_output:
+                            return _timeout_err()
+                        raise
+                    lines.append(line)
+                    if _codex_line_has_output_delta(line):
+                        saw_output = True
             return aggregate_codex_sse(lines, _latency())
         except httpx.TimeoutException:
             _notify(0)

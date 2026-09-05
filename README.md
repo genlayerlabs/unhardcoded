@@ -107,7 +107,7 @@ prefix is sugar for the common cases:
 |---------------------------------|---------------------------------------------------------|
 | `policy_ir` term in the body    | run that Σ_pol policy (the primary path)                |
 | `""` / unprefixed `model`       | the `default` policy                                    |
-| `model = "profile:NAME"`        | a named profile from the catalog (only `default` ships) |
+| `model = "profile:NAME"`        | a named profile from the catalog (`default` and `agent` ship) |
 | `model = "family:FAMILY"`       | default, pinned to a model family                       |
 | `model = "pin:PROVIDER/FAMILY"` | default, pinned to one (provider, family)               |
 
@@ -119,6 +119,48 @@ vocabulary it filters/scores over includes live fields (`price_in`/`price_out`,
 benchmarks/modalities/capabilities (`bench_intelligence`, `in_image`,
 `cap_tools`, …). See the core's `core/docs/SIGMA-POL.md` for the algebra;
 `config.live.lua` declares the host fields and the `default` policy.
+
+### Blessed policy templates
+
+Most callers should not write raw weights. `GET /x/policy/templates` lists the
+supported intent-level templates; `POST /x/policy/templates/{id}` compiles one
+to an identified `policy_ir` that can be previewed with `POST /x/rank`.
+
+```bash
+curl -s http://127.0.0.1:8080/x/policy/templates/cheapest-family \
+  -H "Authorization: Bearer <key>" -H "Content-Type: application/json" \
+  -d '{
+    "family": "glm-5.2",
+    "provider_strategy": "ordered"
+  }'
+```
+
+The four templates are:
+
+- `cheapest-family` — stay in one exact family and minimize expected token
+  cost; `provider_strategy: "ordered"` instead enforces Codex → AntSeed →
+  Bedrock → OpenRouter, skipping unavailable providers and retaining
+  breaker-open routes only as final fallbacks.
+- `smart-value` — minimize cost among the current top five intelligence models
+  (the shortlist size and price/reliability rails are configurable).
+- `agent` — the reusable `profile:agent` policy for autonomous tool users:
+  require tools, 128k context, top-ten measured intelligence and reliable,
+  priced routes; prefer healthy Codex/direct providers before gateways and
+  trusted AntSeed peers; cap the cascade at eight candidates. The policy also
+  sets a 10s first-token and 22s per-attempt timeout and moves immediately to a
+  different candidate on provider failures, so a stalled first route cannot
+  consume the complete request deadline.
+- `default` — the actual policy used by OpenAI-compatible callers that send no
+  policy: prefer a top-five intelligence model, then enforce Codex → AntSeed →
+  Bedrock → OpenRouter and use a 75% cost / 25% intelligence value score inside
+  each provider. Lower-ranked models remain available when request requirements
+  or an explicit `family:` model leave no top-five candidate.
+
+The ordered strategy compiles to nested `prefer(pred, inner)` selectors, not
+large score weights. Cost still orders candidates inside each provider group.
+All templates reject unknown prices and default to explicit $5 input / $25
+output per-million-token ceilings plus a `0.8` reliability floor; callers can
+tighten or deliberately raise those rails on the configurable templates.
 
 ## Dashboard
 

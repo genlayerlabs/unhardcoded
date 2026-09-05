@@ -276,6 +276,14 @@ class OpenRouterSource:
             out.append({**o, "latency_ms": (stats.get(lkey) or {}).get("latency_ms")})
         return out
 
+    def live_offers(self) -> list[dict]:
+        """The discovery offers built by the last pricing() refresh — the live
+        OpenRouter catalog with each model's real context and traits. Exposed
+        read-only so ANOTHER source can join its own raw wire names against real
+        model metadata instead of inventing it (sources/antseed, whose marketplace
+        rows carry none). Empty until the first refresh."""
+        return self._offers
+
     def market_book(self) -> dict:
         """Read-only full list of the live (uncurated) OpenRouter models for the
         dashboard Catalog. Curated families show via their own static rows; this

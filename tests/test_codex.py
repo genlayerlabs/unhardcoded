@@ -386,3 +386,25 @@ def test_content_to_text_coerces_part_arrays():
     assert cb._content_to_text([{"type": "text", "text": "a"},
                                 {"type": "text", "text": "b"}]) == "ab"
     assert cb._content_to_text(7) == "7"
+
+
+def test_quota_headers_keeps_reset_signals_not_just_usage():
+    """The observer is the ONLY quota signal (polling would burn the quota it
+    measures), so a header it drops is a signal nobody can ever recover. The
+    vendor's own naming is `x-codex-primary-*`, and a reset field in that family
+    contains none of ratelimit/usage/quota/percent."""
+    import codex_backend as cb
+
+    kept = cb.quota_headers({
+        "x-codex-primary-used-percent": "98",
+        "x-codex-primary-reset-after-seconds": "3600",
+        "retry-after": "120",
+        "content-type": "application/json",
+        "set-cookie": "session=abc",
+    })
+
+    assert "x-codex-primary-used-percent" in kept   # unchanged
+    assert "x-codex-primary-reset-after-seconds" in kept
+    assert "retry-after" in kept
+    assert "content-type" not in kept               # still narrow
+    assert "set-cookie" not in kept                 # never widen onto secrets

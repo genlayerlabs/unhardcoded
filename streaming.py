@@ -76,7 +76,8 @@ async def stream_codex(
     url = (request.get("base_url") or base_url or CODEX_BASE_URL).rstrip("/") + "/responses"
     timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
 
-    if client is None:
+    owns_client = client is None
+    if owns_client:
         import httpx
         client = httpx.AsyncClient()
 
@@ -138,6 +139,9 @@ async def stream_codex(
             return _err("stream_interrupted", 0, _latency(),
                         f"{type(exc).__name__}: {exc} (partial: {text!r})")
         return _err("network_error", 0, _latency(), f"{type(exc).__name__}: {exc}")
+    finally:
+        if owns_client:
+            await client.aclose()
 
     # the battle-tested aggregator builds the complete response for the core
     return aggregate_codex_sse(lines, _latency())

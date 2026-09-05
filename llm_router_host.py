@@ -805,6 +805,8 @@ def _fold_route_outcome(request: dict, result: dict,
     host_store.observe_route_call_async({
         "ts": int(time.time() * 1000), "provider_id": pid, "model_family": fam,
         "served_by": peer_id or pid, "ok": ok, "latency_ms": result.get("latency_ms"),
+        "error_kind": None if ok else result.get("error_kind"),
+        "http_status": None if ok else result.get("http_status"),
         "tools_requested": bool(request.get("tools")),
         "tool_calls_emitted": bool((result.get("response") or {}).get("tool_calls"))})
     # Cache affinity + the per-session meter are DERIVED on the fly from `calls`

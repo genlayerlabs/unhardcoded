@@ -1,7 +1,6 @@
--- config.live.lua — provider catalog used by `hosts/python_shim/live_smoke.py`.
--- Primary model is minimax-m2.7 served by OpenRouter — fast, current,
--- and inexpensive. Llama-3.3-70b is kept as a secondary candidate so
--- the cascade behaviour can still be demonstrated when needed.
+-- config.live.lua — production provider/model catalog.  Plain
+-- OpenAI-compatible requests use the identified default policy below; callers
+-- can override it with a per-call Σ_pol policy_ir.
 
 -- Tier policies live in their own files under policies/ for clarity; this dir is
 -- resolved relative to the process cwd (run from the repo root) or $LLM_POLICY_DIR.
@@ -28,6 +27,232 @@ local function mfield(name, sort, default)
                  if o ~= nil and o.traits ~= nil and o.traits[name] ~= nil then return o.traits[name] end
                  return nil
              end }
+end
+
+-- The same bounded product defaults exposed by policy_templates.py.  A parity
+-- test compares the normalized terms so the Python template and this
+-- no-policy profile cannot drift silently.
+local DEFAULT_PROVIDER_ORDER = {
+    { "openai_codex" },
+    { "antseed" },
+    { "bedrock", "bedrock_market" },
+    { "openrouter", "openrouter_market" },
+}
+local DEFAULT_EXPECTED_INPUT_SHARE = 0.8
+local DEFAULT_RELIABILITY_FLOOR = 0.8
+local DEFAULT_MAX_PRICE_IN = 5.0
+local DEFAULT_MAX_PRICE_OUT = 25.0
+local DEFAULT_QUALITY_TOP_N = 5
+local DEFAULT_COST_WEIGHT = 0.75
+local DEFAULT_INTELLIGENCE_WEIGHT = 0.25
+
+-- Quality-first defaults for long-running tool agents.  Unlike the vanilla
+-- chat policy, each provider attempt is bounded inside the policy itself so a
+-- slow first route cannot consume the router's complete fallback deadline.
+local AGENT_PROVIDER_ORDER = {
+    { "openai_codex" },
+    { "openai", "anthropic", "gemini", "bedrock", "bedrock_market" },
+    { "openrouter", "openrouter_market" },
+    { "antseed" },
+}
+local AGENT_RELIABILITY_FLOOR = 0.8
+local AGENT_MIN_CONTEXT = 128000
+local AGENT_MAX_PRICE_IN = 15.0
+local AGENT_MAX_PRICE_OUT = 30.0
+local AGENT_QUALITY_TOP_N = 10
+local AGENT_TOP_K = 8
+local AGENT_INTELLIGENCE_WEIGHT = 0.60
+local AGENT_INPUT_COST_WEIGHT = 0.15
+local AGENT_RELIABILITY_WEIGHT = 0.25
+local AGENT_FIRST_TOKEN_TIMEOUT_MS = 10000
+local AGENT_ATTEMPT_TIMEOUT_MS = 22000
+local TRUSTED_ANTSEED_PEERS = {
+    "4668854ba3e8b094e6f48fbeb59cec1cfde162f2", -- Dark Signal
+    "9e8f9aaee684298b7f2af2ae008e3692f0e9f4f7", -- Venice.ai Proxy
+    "1d90f467689d499dc435e5744b4613c3203eb0aa", -- Open Forge
+    "ded67f398fcf7b7884ff7c669d9a4fe820d7657c", -- Chutes
+    "6ec1c8189340370220ea253612f23f6dfe9f5b75", -- The Seeder
+}
+
+local BALANCED_RETRY = {
+    rate_limit        = { action = "next_candidate", open_breaker_ms = 30000 },
+    timeout           = { action = "next_candidate" },
+    server_error      = { action = "retry_same", attempts = 1, backoff_ms = 500,
+                          then_action = "next_candidate" },
+    auth_error        = { action = "disable_provider" },
+    bad_request       = { action = "next_candidate" },
+    content_filter    = { action = "next_candidate" },
+    bad_response      = { action = "next_candidate" },
+    model_unavailable = { action = "next_provider_same_model", mark_unavailable_ms = 300000 },
+    network_error     = { action = "retry_same", attempts = 2, backoff_ms = { 200, 600 },
+                          then_action = "next_candidate" },
+    -- A context overflow on one route says nothing about the others.
+    context_overflow  = { action = "next_candidate" },
+    -- A stream that died after content reached the client cannot fall through.
+    stream_interrupted = { action = "abort" },
+    -- Out of credits will not heal on retry; keep the breaker open for 5 min.
+    payment_required  = { action = "next_candidate", open_breaker_ms = 300000 },
+    unknown           = { action = "next_candidate" },
+}
+
+-- Retry a different route, not the same slow route.  With a 50 s outer request
+-- deadline this is what makes the ranked agent cascade operational rather than
+-- decorative.
+local AGENT_RETRY = {
+    rate_limit        = { action = "next_candidate", open_breaker_ms = 30000 },
+    timeout           = { action = "next_candidate" },
+    server_error      = { action = "next_candidate" },
+    auth_error        = { action = "disable_provider" },
+    bad_request       = { action = "next_candidate" },
+    content_filter    = { action = "next_candidate" },
+    bad_response      = { action = "next_candidate" },
+    model_unavailable = { action = "next_provider_same_model", mark_unavailable_ms = 300000 },
+    network_error     = { action = "next_candidate" },
+    context_overflow  = { action = "next_candidate" },
+    stream_interrupted = { action = "abort" },
+    payment_required  = { action = "next_candidate", open_breaker_ms = 300000 },
+    unknown           = { action = "next_candidate" },
+}
+
+local function fail_plan(actions)
+    local keys = {}
+    for reason, _ in pairs(actions) do
+        if reason ~= "unknown" then keys[#keys + 1] = reason end
+    end
+    table.sort(keys)
+    local out = { "always", actions.unknown }
+    for _, reason in ipairs(keys) do
+        out = { "override", out, reason, actions[reason] }
+    end
+    return out
+end
+
+local function provider_pred(group)
+    if #group == 1 then return { "provider_eq", group[1] } end
+    local out = { "or" }
+    for _, provider in ipairs(group) do
+        out[#out + 1] = { "provider_eq", provider }
+    end
+    return out
+end
+
+local function default_policy_ir()
+    local provider_preds = {}
+    local allowed = { "or" }
+    for _, group in ipairs(DEFAULT_PROVIDER_ORDER) do
+        local pred = provider_pred(group)
+        provider_preds[#provider_preds + 1] = pred
+        allowed[#allowed + 1] = pred
+    end
+
+    -- Cost dominates the value score inside a provider, with intelligence as
+    -- the quality/tie-break component.  The top-five preference is soft: a
+    -- lower-ranked family remains available when requirements (or an explicit
+    -- `family:` model) leave no top-five candidate.
+    local selector = { "argmax" }
+    for i = #provider_preds, 1, -1 do
+        selector = { "prefer", provider_preds[i], selector }
+    end
+    selector = {
+        "prefer",
+        { "cmp", "bench_intelligence_rank", "le", DEFAULT_QUALITY_TOP_N },
+        selector,
+    }
+    selector = {
+        "prefer",
+        { "not", { "is", "breaker_open" } },
+        selector,
+    }
+
+    return {
+        "policy",
+        { "and",
+            { "meets_req" },
+            { "not", { "is", "disabled" } },
+            { "cmp", "success_rate", "ge", DEFAULT_RELIABILITY_FLOOR },
+            { "cmp", "price_in", "le", DEFAULT_MAX_PRICE_IN },
+            { "cmp", "price_out", "le", DEFAULT_MAX_PRICE_OUT },
+            allowed,
+        },
+        { "add",
+            { "scale", DEFAULT_COST_WEIGHT,
+                { "neg", { "normalize",
+                    { "add",
+                        { "scale", DEFAULT_EXPECTED_INPUT_SHARE, { "field", "price_in" } },
+                        { "scale", 1.0 - DEFAULT_EXPECTED_INPUT_SHARE, { "field", "price_out" } },
+                    },
+                } },
+            },
+            { "scale", DEFAULT_INTELLIGENCE_WEIGHT,
+                { "normalize", { "field", "bench_intelligence" } },
+            },
+        },
+        selector,
+        { "id" },
+        fail_plan(BALANCED_RETRY),
+    }
+end
+
+local function trusted_antseed_gate()
+    local gate = {
+        "or",
+        { "not", { "provider_eq", "antseed" } },
+        { "cmp", "reputation_score", "gt", 95 },
+    }
+    for _, peer in ipairs(TRUSTED_ANTSEED_PEERS) do
+        gate[#gate + 1] = { "served_by_eq", peer }
+    end
+    return gate
+end
+
+local function agent_policy_ir()
+    local provider_preds = {}
+    for _, group in ipairs(AGENT_PROVIDER_ORDER) do
+        provider_preds[#provider_preds + 1] = provider_pred(group)
+    end
+
+    local provider_selector = { "argmax" }
+    for i = #provider_preds, 1, -1 do
+        provider_selector = { "prefer", provider_preds[i], provider_selector }
+    end
+    local selector = {
+        "top_k",
+        AGENT_TOP_K,
+        {
+            "prefer",
+            { "not", { "is", "breaker_open" } },
+            provider_selector,
+        },
+    }
+
+    return {
+        "policy",
+        { "and",
+            { "meets_req" },
+            { "not", { "is", "disabled" } },
+            { "is", "cap_tools" },
+            { "cmp", "context", "ge", AGENT_MIN_CONTEXT },
+            { "cmp", "success_rate", "ge", AGENT_RELIABILITY_FLOOR },
+            { "cmp", "bench_intelligence_rank", "le", AGENT_QUALITY_TOP_N },
+            { "cmp", "price_in", "le", AGENT_MAX_PRICE_IN },
+            { "cmp", "price_out", "le", AGENT_MAX_PRICE_OUT },
+            trusted_antseed_gate(),
+        },
+        { "add",
+            { "scale", AGENT_INTELLIGENCE_WEIGHT,
+                { "normalize", { "field", "bench_intelligence" } } },
+            { "scale", AGENT_INPUT_COST_WEIGHT,
+                { "neg", { "normalize", { "field", "price_in" } } } },
+            { "scale", AGENT_RELIABILITY_WEIGHT,
+                { "field", "success_rate" } },
+        },
+        selector,
+        { "seq",
+            { "set_param", "first_token_timeout_ms", AGENT_FIRST_TOKEN_TIMEOUT_MS },
+            { "set_param", "timeout_ms", AGENT_ATTEMPT_TIMEOUT_MS },
+        },
+        fail_plan(AGENT_RETRY),
+    }
 end
 
 return {
@@ -164,6 +389,12 @@ return {
             -- wide outer ceiling; the real per-call price gate is the caller's
             -- Σ_pol policy. Must stay <= the buyer's ANTSEED_MAX_* spend rails.
             market_price_cap = { input = 1000, output = 1000 },
+            -- Exact wire-name -> curated family, and the ONLY way a peer's name
+            -- reaches a family the canonicalizer refuses to guess at. It folds
+            -- vendor prefixes and separators (`opus-4.8`, `anthropic/claude-opus-4.8`)
+            -- and gives serving-mode variants their own `<family>@<variant>`, but it
+            -- never bridges a letter/digit boundary (`gemma4-31b` vs `gemma-4-31b`)
+            -- and never crosses vendors — that judgement is the operator's, here.
             service_aliases  = { ["qwen3-235b-instruct"] = "qwen3-235b-a22b" },
             error_map = {
                 ["insufficient_deposits"]             = "payment_required",
@@ -193,8 +424,24 @@ return {
         },
     },
 
+    -- `vendor` (optional): who actually makes the weights. Only the AntSeed
+    -- marketplace canonicalizer reads it (sources/antseed.py `_family_vendor`).
+    --
+    -- A peer's wire name may claim a vendor (`z-ai-glm-5.1`), and that claim is
+    -- refused unless this family's vendor is KNOWN and agrees — so `x-ai-glm-5.1`
+    -- and `deepseek-llama-3.3-70b` (the naming shape of a real distill with
+    -- DIFFERENT weights) never reach these families. Unknown vendor + a vendor
+    -- claim = refused, and the offer stays routable under its raw wire name.
+    --
+    -- So annotate ONLY a family whose own name does not already carry its vendor
+    -- token: `claude-*`, `gemini-*`, `deepseek-*` and `minimax-*` are read off
+    -- the name and need no line. Annotating is what re-opens the legitimate
+    -- `<vendor>-<family>` spellings peers really advertise (they mirror the
+    -- OpenRouter slugs in `served_by` below) — and only those. Write the vendor
+    -- as the wire token (`mistralai`) or its canonical id (`mistral`); anything
+    -- else is dead config and warns.
     models = {
-        ["minimax-m2.7"] = {
+        ["minimax-m2.7"] = {  -- vendor read off the name: `minimax-`
             served_by = {
                 { provider = "openrouter", provider_model_id = "minimax/minimax-m2.7" },
             },
@@ -206,6 +453,7 @@ return {
             static_quality_hint = 0.80,
         },
         ["llama-3.3-70b"] = {
+            vendor = "meta",
             served_by = {
                 { provider = "heurist",    provider_model_id = "meta-llama/llama-3.3-70b-instruct" },
                 { provider = "io_net",     provider_model_id = "meta-llama/Llama-3.3-70B-Instruct" },
@@ -229,6 +477,7 @@ return {
         -- over before the 429 wall. Claude/Gemini have no codex path, so they
         -- cascade through their other configured providers.
         ["gpt-5.5"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.5" },
                 { provider = "openai",       provider_model_id = "gpt-5.5" },
@@ -238,6 +487,7 @@ return {
             static_quality_hint = 0.95,
         },
         ["gpt-5.4"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.4" },
                 { provider = "openai",       provider_model_id = "gpt-5.4" },
@@ -247,6 +497,7 @@ return {
             static_quality_hint = 0.90,
         },
         ["gpt-5.4-mini"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.4-mini" },
                 { provider = "openai",       provider_model_id = "gpt-5.4-mini" },
@@ -262,6 +513,27 @@ return {
             },
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.93,
+        },
+        -- The two Opus releases before 4.8. Both are sold live by several AntSeed
+        -- peers, and until they were curated every one of those peers' spellings
+        -- was its own unreachable family (`family_eq` is an exact compare). Same id
+        -- scheme as 4.8 at both providers, so the direct routes are a rename of a
+        -- route we already call — not a guess about a model that might not exist.
+        ["claude-opus-4-7"] = {
+            served_by = {
+                { provider = "anthropic",    provider_model_id = "claude-opus-4-7" },
+                { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4-7" },
+            },
+            capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.92,
+        },
+        ["claude-opus-4-6"] = {
+            served_by = {
+                { provider = "anthropic",    provider_model_id = "claude-opus-4-6" },
+                { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4-6" },
+            },
+            capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.91,
         },
         -- Curated so it has a DIRECT (non-marketplace) fallback: until now
         -- claude-fable-5 lived only as raw marketplace offers (2 thin/failing
@@ -284,11 +556,24 @@ return {
             capabilities = { context = 1000000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.92,
         },
+        -- The Flash tier of the same Gemini 3 line as the Pro preview above: same
+        -- id at the gemini API, same `google/<id>` slug at OpenRouter, and the
+        -- official-pricing scraper anchors on the family verbatim
+        -- (sources/official_pricing's gemini_html parser), so it prices itself.
+        ["gemini-3-flash-preview"] = {
+            served_by = {
+                { provider = "gemini",       provider_model_id = "gemini-3-flash-preview" },
+                { provider = "openrouter",   provider_model_id = "google/gemini-3-flash-preview" },
+            },
+            capabilities = { context = 1000000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.85,
+        },
         -- Emergency affordable edge fallback for low OpenRouter credit states.
         -- Verified 2026-06-04 with a ~20k-token Hermes/t4pebot prompt + tools:
         -- expensive frontier models were rejected by OpenRouter credit ceilings,
         -- while this Qwen route returned valid content/tool-call responses.
         ["qwen3-235b-a22b"] = {
+            vendor = "qwen",
             served_by = {
                 { provider = "bedrock", provider_model_id = "qwen.qwen3-vl-235b-a22b" },
                 { provider = "openrouter", provider_model_id = "qwen/qwen3-235b-a22b-2507" },
@@ -300,6 +585,7 @@ return {
         -- Free codex safety net for `edge`: spark (subscription, ~0 marginal)
         -- ranks just below gpt-5.5-codex and above every paid candidate.
         ["gpt-5.3-codex-spark"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "openai_codex", provider_model_id = "gpt-5.3-codex-spark" },
             },
@@ -321,6 +607,28 @@ return {
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.88,
         },
+        -- The Sonnet/Haiku releases before 4.6, curated for the same reason as the
+        -- older Opus pair: live on AntSeed under several spellings, each of which
+        -- was its own unreachable family until the curated name existed to fold
+        -- them onto. Bedrock is left off deliberately — sources/bedrock only maps
+        -- the families in its `_FAMILY_PATTERNS`, and claiming a bedrock route it
+        -- cannot price would be a route that 404s on first call.
+        ["claude-sonnet-4-5"] = {
+            served_by = {
+                { provider = "anthropic",     provider_model_id = "claude-sonnet-4-5" },
+                { provider = "openrouter",    provider_model_id = "anthropic/claude-sonnet-4-5" },
+            },
+            capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.86,
+        },
+        ["claude-haiku-4-5"] = {
+            served_by = {
+                { provider = "anthropic",     provider_model_id = "claude-haiku-4-5" },
+                { provider = "openrouter",    provider_model_id = "anthropic/claude-haiku-4-5" },
+            },
+            capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.80,
+        },
         ["deepseek-v4-pro"] = {
             served_by = {
                 { provider = "openrouter",    provider_model_id = "deepseek/deepseek-v4-pro" },
@@ -328,7 +636,19 @@ return {
             capabilities = { context = 128000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.85,
         },
+        -- Already reachable on TWO routes the repo names itself — sources/bedrock's
+        -- `_FAMILY_PATTERNS` maps AWS's ids onto this exact family, and the
+        -- OpenRouter slug is `deepseek/deepseek-v3.2`. Curating it is what lets
+        -- bedrock stamp a context on its offers (_capabilities_for reads it here).
+        ["deepseek-v3.2"] = {
+            served_by = {
+                { provider = "openrouter",    provider_model_id = "deepseek/deepseek-v3.2" },
+            },
+            capabilities = { context = 128000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.82,
+        },
         ["glm-5.1"] = {
+            vendor = "z-ai",
             served_by = {
                 { provider = "openrouter",    provider_model_id = "z-ai/glm-5.1" },
             },
@@ -336,11 +656,28 @@ return {
             static_quality_hint = 0.84,
         },
         ["kimi-k2.6"] = {
+            vendor = "moonshot",
             served_by = {
                 { provider = "openrouter",    provider_model_id = "moonshotai/kimi-k2.6" },
             },
             capabilities = { context = 256000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.83,
+        },
+        ["qwen3-coder"] = {
+            vendor = "qwen",
+            served_by = {
+                { provider = "openrouter",    provider_model_id = "qwen/qwen3-coder" },
+            },
+            capabilities = { context = 262000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.82,
+        },
+        ["mistral-large"] = {
+            vendor = "mistral",
+            served_by = {
+                { provider = "openrouter",    provider_model_id = "mistralai/mistral-large" },
+            },
+            capabilities = { context = 128000, supports_tools = true, supports_json_mode = true },
+            static_quality_hint = 0.80,
         },
 
         -- ── `dummy` tier: quality < 0.78. Free AntSeed → cheap → OR ────────────
@@ -352,6 +689,7 @@ return {
             static_quality_hint = 0.76,
         },
         ["gpt-oss-120b"] = {
+            vendor = "openai",
             served_by = {
                 { provider = "bedrock",       provider_model_id = "openai.gpt-oss-120b-1:0" },
                 { provider = "openrouter",    provider_model_id = "openai/gpt-oss-120b" },
@@ -360,6 +698,7 @@ return {
             static_quality_hint = 0.70,
         },
         ["gemma-3-27b"] = {
+            vendor = "google",
             served_by = {
                 { provider = "bedrock",       provider_model_id = "google.gemma-3-27b-it" },
                 { provider = "openrouter",    provider_model_id = "google/gemma-3-27b-it" },
@@ -367,73 +706,42 @@ return {
             capabilities = { context = 96000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.65,
         },
+        -- NOT curated, on purpose: `grok-4.3`, `minimax-m3`, `kimi-k2.7-code`,
+        -- `qwen3.6-27b`, `gemma-4-31b-it` and `gemma-4-26b-a4b-it` are named by
+        -- live policies, but no provider here has a route we can name for them —
+        -- each would need a `served_by` extrapolated FORWARD from a different
+        -- model's id, and `validate_model` (core/llm_policy/candidate.lua) would
+        -- happily accept the invention. They stay reachable through the AntSeed
+        -- market under their raw wire names; the AntSeed source now ranks them by
+        -- distinct-seller count in `_stats.unbound_top` (with a `near_miss` when
+        -- one alias would bind them, e.g. `gemma4-31b-it` -> `gemma-4-31b-it`), so
+        -- curating each is a one-entry job the moment a real route is confirmed.
     },
 
     profiles = {
-        -- No tiers. Each caller sends its own policy as a Σ_pol term (policy_ir,
-        -- e.g. from the dashboard builder). `default` is only the fallback when a
-        -- caller sends no policy at all: a balanced, DECLARATIVE policy — so it
-        -- lowers to a Σ_pol term with an identity (copyable, testable in the
-        -- builder), unlike the old closure-based tier profiles.
+        -- Reusable default for autonomous/tool agents.  The profile owns its
+        -- attempt budgets and fast-fallback plan, so callers only need to send
+        -- model="profile:agent" instead of copying a policy term and timeout
+        -- knobs into every deployment.
+        agent = {
+            policy_ir    = agent_policy_ir(),
+            selector     = "top_k",
+            retry_policy = "agent",
+        },
+        -- Callers may send their own policy_ir.  Plain OpenAI-compatible
+        -- requests use this identified policy: healthy Codex -> AntSeed ->
+        -- Bedrock -> OpenRouter, with safe price/reliability rails and the best
+        -- intelligence-ranked families preferred inside each provider.
         default = {
-            -- (sigma-pol/v2) the composite scorer atoms AND quality/quality_hint
-            -- were removed; score on real fields. Balanced = benchmark (per
-            -- model, identical whoever serves it) vs price (cheaper wins — this
-            -- is where AntSeed, serving the same families, competes and often
-            -- wins) vs learned reliability. success_rate is the live EMA of
-            -- observed success per (provider, family) — the only signal that is
-            -- genuinely per-provider for the same model (OpenRouter's benchmark
-            -- can't tell you a peer's reliability). Its cold-start default is 1,
-            -- so it's neutral until real traffic differentiates: a peer that
-            -- starts failing has its EMA fall and is PROGRESSIVELY demoted as the
-            -- failures accumulate. Weighted 0.30 (was 0.10): at 0.10 the demotion
-            -- was too weak to overcome a failing peer's price edge, so dead peers
-            -- (e.g. a marketplace seller timing out every request) kept being
-            -- re-chosen. At 0.30 a peer whose EMA collapses falls below a reliable
-            -- alternative — self-healing, and it climbs back if it recovers.
-            -- (Raw latency_ms is deliberately NOT scored here: its cold-start
-            -- default is +inf, which would freeze out every never-tried peer.)
-            scorer       = { "add",
-                { "scale", 0.35, { "field", "bench_intelligence" } },
-                { "scale", 0.35, { "neg", { "normalize", { "field", "price_in" } } } },
-                { "scale", 0.30, { "field", "success_rate" } },
-            },
-            filter       = { "requirements", "not_disabled" },
+            policy_ir    = default_policy_ir(),
             selector     = "argmax",
             retry_policy = "balanced",
         },
     },
 
     retry_policies = {
-        balanced = {
-            rate_limit        = { action = "next_candidate", open_breaker_ms = 30000 },
-            timeout           = { action = "next_candidate" },
-            server_error      = { action = "retry_same", attempts = 1, backoff_ms = 500,
-                                  then_action = "next_candidate" },
-            auth_error        = { action = "disable_provider" },
-            bad_request       = { action = "next_candidate" },
-            content_filter    = { action = "next_candidate" },
-            bad_response      = { action = "next_candidate" },
-            model_unavailable = { action = "next_provider_same_model", mark_unavailable_ms = 300000 },
-            network_error     = { action = "retry_same", attempts = 2, backoff_ms = { 200, 600 },
-                                  then_action = "next_candidate" },
-            -- A context overflow on ONE route says nothing about the others:
-            -- a provider-neutral family (e.g. family:gpt-5.4) spans candidates
-            -- with heterogeneous context windows, so the next one may well fit.
-            -- retry_same would be futile (same model, same window) but
-            -- next_candidate is not — fall through. If every candidate overflows
-            -- the request still ends cleanly in `exhausted: context_overflow`.
-            context_overflow  = { action = "next_candidate" },
-            -- A stream that died AFTER content reached the client cannot
-            -- fall through (the next candidate would append a second answer
-            -- to a half-delivered one): abort, the shim reports in-stream.
-            stream_interrupted = { action = "abort" },
-            -- Out of credits (OpenRouter 402, AntSeed insufficient_deposits).
-            -- Won't heal on retry: fall through, and keep the breaker open
-            -- long (5 min) so dead-broke providers stop eating latency.
-            payment_required  = { action = "next_candidate", open_breaker_ms = 300000 },
-            unknown           = { action = "next_candidate" },
-        },
+        balanced = BALANCED_RETRY,
+        agent    = AGENT_RETRY,
     },
 
     -- Model-level observation fields (registered traits from OpenRouter, read
@@ -482,5 +790,45 @@ return {
     -- so callers can only NARROW what this host allows, never widen it.
     -- Floor: the contract's requirements must hold, and auth-disabled
     -- providers stay out no matter what the caller's term says.
-    policy_envelope = { "and", { "meets_req" }, { "not", { "is", "disabled" } } },
+    --
+    -- Third clause — ANTSEED FUNDING ADMISSION. AntSeed pays every call out of an
+    -- on-chain USDC escrow, and opening a payment channel reserves ~1 USDC; below
+    -- that, every routed call 402s `insufficient_deposits`. `credits` carries the
+    -- buyer's live `deposits_available` (pushed by sources.push_credits on each
+    -- balances refresh), so this keeps an unfundable buyer out of ranking.
+    --
+    -- Deliberately SCOPED to antseed by the `or`: every other provider bills
+    -- against its own quota/credit mechanics with no on-chain escrow, and the
+    -- engine's `credits` field defaults to 0 — an unscoped clause would reject
+    -- the entire catalog. The scoped form needs no core change precisely because
+    -- the `not provider_eq` branch is true for them.
+    --
+    -- SCOPING IS BY EXACT PROVIDER ID, and `provider_eq` is the only identity
+    -- predicate the algebra has — there is no prefix match. Every OTHER antseed
+    -- predicate in the host (sources/antseed.py, providers.py, wallet_keeper.py)
+    -- selects on `discovery_id` STARTSWITH "antseed", so a second buyer proxy
+    -- would be an antseed buyer everywhere except here — and because of the
+    -- `or` shape it would escape this clause by failing the `provider_eq`, i.e.
+    -- fail OPEN, the one direction this gate must never fail. Adding a proxy
+    -- therefore means or-composing its id into the `not` below. That is not left
+    -- to memory: tests/test_live_wiring.py asserts every marketplace antseed
+    -- provider in this file is named here, and fails the build if one is not.
+    --
+    -- The 1.0 floor is ONE CHANNEL RESERVE, the same quantity the offer
+    -- tourniquet uses. It is a literal because the envelope is static Lua and
+    -- cannot read an operator knob, so the knob is constrained instead:
+    -- `antseed.min_available_usdc` has a schema minimum of 1.0 (providers.py).
+    -- Without that, lowering the knob below 1.0 was a SILENT no-op — offers
+    -- would rank and the envelope would reject every one of them, with nothing
+    -- anywhere explaining why.
+    --
+    -- This fails CLOSED (default 0 < 1.0 => rejected) where the offer-side
+    -- tourniquet in sources/antseed.py fails OPEN. That asymmetry is intended —
+    -- envelope = belt, offers_sync = braces — and the cold-start hole it opens is
+    -- closed by sources.seed_credits, which publishes the last known escrow from
+    -- the durable buyer_status row before the app serves its first request
+    -- (skipping any row too stale to prove anything).
+    policy_envelope = { "and", { "meets_req" }, { "not", { "is", "disabled" } },
+        { "or", { "not", { "provider_eq", "antseed" } },
+                { "cmp", "credits", "ge", 1.0 } } },
 }

@@ -68,6 +68,14 @@ def test_peer_offers_column_contract():
         f"\n  schema-only: {sorted(schema - mimic)}\n  mimic-only: {sorted(mimic - schema)}")
 
 
+def test_peer_offer_reachability_upsert_preserves_known_value():
+    clause = ("last_reached_at=COALESCE(EXCLUDED.last_reached_at, "
+              "peer_offers.last_reached_at)")
+    assert clause in _WRITE_MARKET, "Node writer can erase known peer reachability"
+    # Keep the functional test fixture faithful to the cross-language writer.
+    assert clause in _CONFTEST, "Python peer-offer mimic drifted from the Node upsert"
+
+
 def test_buyer_status_column_contract():
     schema = _create_columns(_HOST_STORE, "buyer_status")
     node = _insert_columns(_STORE_JS, "buyer_status")

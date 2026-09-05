@@ -76,6 +76,33 @@ def test_healthz(client):
     assert r.json() == {"ok": True, "initialized": True}
 
 
+def test_request_deadline_returns_504_and_cancels_host(host, monkeypatch):
+    import asyncio
+
+    cancelled = []
+
+    async def _never_finishes(contract, call_override=None):
+        try:
+            await asyncio.sleep(60)
+        finally:
+            cancelled.append(True)
+
+    monkeypatch.setattr(host, "execute_async", _never_finishes)
+    deadline_client = TestClient(create_app(
+        host, default_profile="default", request_deadline_ms=10))
+
+    r = deadline_client.post("/v1/chat/completions", json={
+        "model": "", "messages": [{"role": "user", "content": "hi"}]})
+
+    assert r.status_code == 504
+    body = r.json()
+    assert body["error"]["code"] == "timeout"
+    trace = body["x_router"]["decision_trace"]
+    assert trace["request_deadline_exceeded"] is True
+    assert trace["request_deadline_ms"] == 10
+    assert cancelled == [True]
+
+
 # ---- wallet control endpoints ------------------------------------------
 
 def test_wallet_deposit_503_without_control(client, monkeypatch):
