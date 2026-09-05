@@ -94,8 +94,50 @@ def test_resolve_fetches_then_serves_from_cache(monkeypatch):
     assert len(fake.calls) == 1
     call = fake.calls[0]
     assert call["url"].endswith("/internal/keys/resolve")
-    assert call["params"] == {"sha256": DIGEST}
+    assert call["params"] == {"sha256": DIGEST, "scope_version": "2"}
     assert call["headers"] == {"x-internal-secret": "s3cret"}
+
+
+@pytest.mark.parametrize('extra', [
+    {'scope_version': 2, 'project_id': 4},
+    {'scope_version': 2, 'project_id': 4, 'environment_id': 0},
+    {'scope_version': 2, 'project_id': True, 'environment_id': 9},
+    {'scope_version': 2, 'project_id': '4', 'environment_id': 9},
+    {'scope_version': 3, 'project_id': 4, 'environment_id': 9},
+    {'project_id': 4, 'environment_id': 9},
+])
+def test_partial_unknown_or_malformed_scopes_never_downgrade(extra):
+    assert not cpc._parse_resolved({**_active(), **extra}).active
+
+
+def test_scoped_identity_survives_cache(monkeypatch):
+    _install(monkeypatch, [_FakeResp(200, {**_active(), 'scope_version': 2, 'project_id': 4, 'environment_id': 9})])
+    first = asyncio.run(cpc.resolve_key(DIGEST))
+    assert first.active and first.scope_version == 2
+    assert first.project_id == 4 and first.environment_id == 9
+    assert asyncio.run(cpc.resolve_key(DIGEST)) is first
+
+
+def test_scoped_credentials_require_echoed_matching_scope(monkeypatch):
+    identity = {'scope_version': 2, 'tenant_id': 7, 'project_id': 4, 'environment_id': 9}
+    fake = _install(monkeypatch, [_FakeResp(200, {**identity, 'env': {'OPENAI_API_KEY': 'private'}, 'connections': {}})])
+    assert asyncio.run(cpc.tenant_connections(7, {'OPENAI_API_KEY'}, project_id=4, environment_id=9))[0] == {'OPENAI_API_KEY': 'private'}
+    assert '/projects/4/environments/9/provider-env' in fake.calls[0]['url']
+    for extra in ({'environment_id': 10}, {'scope_version': 1}, {'project_id': '4'}):
+        _install(monkeypatch, [_FakeResp(200, {**identity, **extra, 'env': {}, 'connections': {}})])
+        with pytest.raises(cpc.RouteUnavailable):
+            asyncio.run(cpc.tenant_connections(7, set(), project_id=4, environment_id=9))
+
+
+def test_scoped_route_rechecks_key_on_every_request(monkeypatch):
+    identity = {'scope_version': 2, 'tenant_id': 7, 'project_id': 4, 'environment_id': 9}
+    contract = {**identity, 'policy_ir': ['policy'], 'policy_id': 'a'*64, 'revision': 1, 'execution': {}}
+    fake = _install(monkeypatch, [_FakeResp(200, contract), _FakeResp(403, {})])
+    assert asyncio.run(cpc.resolve_route(7, 'assistant', project_id=4, environment_id=9, key_digest=DIGEST))['revision'] == 1
+    with pytest.raises(cpc.RouteUnavailable):
+        asyncio.run(cpc.resolve_route(7, 'assistant', project_id=4, environment_id=9, key_digest=DIGEST))
+    assert len(fake.calls) == 2
+    assert all(call['params'] == {'key_sha256': DIGEST} for call in fake.calls)
 
 
 def test_negative_answer_is_cached(monkeypatch):
@@ -248,3 +290,27 @@ def test_internal_secret_ok(monkeypatch):
     assert cpc.internal_secret_ok({}) is False
     monkeypatch.setattr(cpc, "CONTROL_PLANE_INTERNAL_SECRET", "")
     assert cpc.internal_secret_ok({"x-internal-secret": ""}) is False
+
+
+def test_trusted_transport_requires_tls_without_explicit_local_opt_in(monkeypatch):
+    monkeypatch.setattr(cpc, 'ALLOW_INSECURE_HTTP', False)
+    assert cpc.trusted_transport_ok('https://router.internal:18080')
+    for url in ('http://router:18080', 'ftp://router', 'https://user:secret@router', 'https:///path', 'https://router?secret=x'):
+        assert not cpc.trusted_transport_ok(url)
+    monkeypatch.setattr(cpc, 'ALLOW_INSECURE_HTTP', True)
+    assert cpc.trusted_transport_ok('http://router:18080')
+    assert not cpc.trusted_transport_ok('ftp://router')
+
+
+def test_plaintext_control_plane_sends_no_secret(monkeypatch):
+    monkeypatch.setattr(cpc, 'CONTROL_PLANE_URL', 'http://cp.test')
+    monkeypatch.setattr(cpc, 'ALLOW_INSECURE_HTTP', False)
+    class NoNetwork:
+        async def get(self, *args, **kwargs):
+            pytest.fail('plaintext bridge must fail before sending headers')
+    monkeypatch.setattr(cpc, '_client', NoNetwork())
+    assert asyncio.run(cpc._fetch_resolve('a' * 64)) is None
+    with pytest.raises(cpc.RouteUnavailable):
+        asyncio.run(cpc.tenant_connections(1, set(), project_id=2, environment_id=3))
+    with pytest.raises(cpc.RouteUnavailable):
+        asyncio.run(cpc.resolve_route(1, 'assistant', project_id=2, environment_id=3, key_digest='a' * 64))

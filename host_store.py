@@ -386,7 +386,7 @@ def routing_summary(trace) -> dict | None:
     or the full candidate catalog in the tenant activity ledger."""
     if not isinstance(trace, dict):
         return None
-    summary = {key: str(trace[key])[:100] for key in ('route', 'route_revision', 'policy_id', 'routing_preference')
+    summary = {key: str(trace[key])[:100] for key in ('route', 'route_revision', 'policy_id', 'routing_preference', 'project_id', 'environment_id')
                if trace.get(key) is not None}
     summary['attempts'] = [
         {key: str(step[key])[:160] for key in ('provider_id', 'model_family', 'error_kind')
@@ -529,18 +529,24 @@ def observe_route_call_async(row: dict[str, Any]) -> None:
     _enqueue(lambda: _insert_route_observation(snap))
 
 
-def recent_calls(limit: int = 100, caller: "str | None" = None) -> list[dict[str, Any]]:
+def recent_calls(limit: int = 100, caller: "str | None" = None, *, project_id=None, environment_id=None, strict=False) -> list[dict[str, Any]]:
     """The most recent calls, newest first (operator view / verification).
     Optionally scoped to one caller (control-plane activity feed)."""
     try:
         where, params = ("", []) if caller is None else (" WHERE caller = %s", [caller])
+        if project_id is not None or environment_id is not None:
+            where, params = _usage_where(caller=caller, project_id=project_id, environment_id=environment_id)
         with _get_pool().connection() as conn:
+            if strict:
+                _set_dashboard_statement_timeout(conn)
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(f"SELECT * FROM calls{where} ORDER BY id DESC LIMIT %s",
                             params + [int(limit)])
                 return cur.fetchall()
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store recent_calls failed: %s", exc)
+        if strict:
+            raise
         return []
 
 
@@ -1267,7 +1273,7 @@ _USAGE_COLS = ("ts", "caller", "provider_id", "model_family", "served_model_id",
 def _usage_where(since_ts: "int | None" = None, caller: "str | None" = None,
                  caller_is_null: bool = False, consumer_sha: "str | None" = None,
                  provider: "str | None" = None,
-                 model_family: "str | None" = None) -> "tuple[str, list[Any]]":
+                 model_family: "str | None" = None, project_id=None, environment_id=None) -> "tuple[str, list[Any]]":
     """The shared WHERE for every calls-derived usage read. "all" (since_ts=None)
     is still bounded to the retention horizon so the read is ALWAYS time-bounded
     (never a bare table scan): rows older than retention are pruned anyway, so the
@@ -1290,6 +1296,11 @@ def _usage_where(since_ts: "int | None" = None, caller: "str | None" = None,
         clauses.append("provider_id = %s"); params.append(provider)
     if model_family is not None:
         clauses.append("model_family = %s"); params.append(model_family)
+    if project_id is not None or environment_id is not None:
+        if not caller or any(type(v) is not int or v <= 0 for v in (project_id, environment_id)):
+            raise ValueError("A caller and complete positive project/environment scope are required")
+        clauses.extend(["routing_summary->>'project_id' = %s", "routing_summary->>'environment_id' = %s"])
+        params.extend([str(project_id), str(environment_id)])
     return " WHERE " + " AND ".join(clauses), params
 
 
@@ -1425,7 +1436,7 @@ def _empty_usage_aggregate() -> dict[str, Any]:
 def usage_aggregate(since_ts: "int | None" = None, caller: "str | None" = None,
                     caller_is_null: bool = False, consumer_sha: "str | None" = None,
                     provider: "str | None" = None,
-                    model_family: "str | None" = None) -> dict[str, Any]:
+                    model_family: "str | None" = None, *, project_id=None, environment_id=None, strict=False) -> dict[str, Any]:
     """Every dashboard stats aggregate in ONE window scan: overall totals plus
     the by_caller / by_provider / by_model_family / by_route / by_served_model /
     by_status / by_day breakdowns, as raw counters (see _agg_counter). Fail-soft
@@ -1434,7 +1445,7 @@ def usage_aggregate(since_ts: "int | None" = None, caller: "str | None" = None,
         where, params = _usage_where(since_ts=since_ts, caller=caller,
                                      caller_is_null=caller_is_null,
                                      consumer_sha=consumer_sha, provider=provider,
-                                     model_family=model_family)
+                                     model_family=model_family, project_id=project_id, environment_id=environment_id)
         sql = ("SELECT grouping(caller_k, provider_k, family_k, route_k,"
                " served_k, status_k, day_k) AS gset,"
                " caller_k, provider_k, family_k, route_k, served_k, status_k,"
@@ -1463,18 +1474,20 @@ def usage_aggregate(since_ts: "int | None" = None, caller: "str | None" = None,
         return out
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store usage_aggregate failed: %s", exc)
+        if strict:
+            raise
         return _empty_usage_aggregate()
 
 
 def usage_totals(since_ts: "int | None" = None,
-                 caller: "str | None" = None) -> dict[str, Any]:
+                 caller: "str | None" = None, *, project_id=None, environment_id=None, strict=False) -> dict[str, Any]:
     """One-row window totals over `calls`, including cached tokens (which the
     dashboard aggregate doesn't sum) — the control-plane metering read.
     Fail-soft -> zeros (same keys)."""
     zeros = {"requests": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0,
              "tokens_cached": 0, "tokens_total": 0, "cost_usd": 0.0, "priced": 0}
     try:
-        where, params = _usage_where(since_ts=since_ts, caller=caller)
+        where, params = _usage_where(since_ts=since_ts, caller=caller, project_id=project_id, environment_id=environment_id)
         sql = (
             "SELECT count(*),"
             " count(*) FILTER (WHERE COALESCE(status,0) >= 400),"
@@ -1487,6 +1500,7 @@ def usage_totals(since_ts: "int | None" = None,
             " count(cost_usd)"
             f" FROM calls{where}")
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             row = conn.execute(sql, params).fetchone()
         requests, errors, tin, tout, tcached, ttotal, cost, priced = row
         return {"requests": int(requests), "errors": int(errors),
@@ -1495,6 +1509,8 @@ def usage_totals(since_ts: "int | None" = None,
                 "cost_usd": float(cost), "priced": int(priced)}
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store usage_totals failed: %s", exc)
+        if strict:
+            raise
         return zeros
 
 

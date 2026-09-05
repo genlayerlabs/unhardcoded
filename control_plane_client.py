@@ -29,6 +29,7 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -36,6 +37,7 @@ log = logging.getLogger("llm-router-control-plane")
 
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "").rstrip("/")
 CONTROL_PLANE_INTERNAL_SECRET = os.getenv("CONTROL_PLANE_INTERNAL_SECRET", "")
+ALLOW_INSECURE_HTTP = os.getenv("CP_ALLOW_INSECURE_HTTP", "0").lower() in {"1", "true", "yes"}
 RESOLVE_TTL_S = float(os.getenv("CP_RESOLVE_TTL_S", "60"))
 NEGATIVE_TTL_S = float(os.getenv("CP_NEGATIVE_TTL_S", "15"))
 RESOLVE_STALE_GRACE_S = float(os.getenv("CP_RESOLVE_STALE_GRACE_S", "300"))
@@ -75,6 +77,9 @@ class ResolvedKey:
     rate_per_min: int | None
     burst: int | None
     fetched_at: float  # time.monotonic()
+    scope_version: int = 1
+    project_id: int | None = None
+    environment_id: int | None = None
 
 
 _resolve_cache: dict[str, ResolvedKey] = {}  # sha256 hex -> entry (positive AND negative)
@@ -87,8 +92,21 @@ _client: httpx.AsyncClient | None = None
 _collision_logged: set[str] = set()
 
 
+def trusted_transport_ok(url: str) -> bool:
+    """Bridge secrets require TLS; local HTTP requires explicit operator opt-in."""
+    try:
+        parsed = urlsplit(url)
+        return bool(parsed.hostname and not parsed.username and not parsed.password
+                    and not parsed.query and not parsed.fragment
+                    and (parsed.scheme == "https" or (parsed.scheme == "http" and ALLOW_INSECURE_HTTP)))
+    except ValueError:
+        return False
+
+
 def _get_client() -> httpx.AsyncClient:
     global _client
+    if not trusted_transport_ok(CONTROL_PLANE_URL):
+        raise httpx.UnsupportedProtocol("Control-plane bridge requires HTTPS")
     if _client is None:
         _client = httpx.AsyncClient(timeout=_TIMEOUT)
     return _client
@@ -126,6 +144,15 @@ def _parse_resolved(data: Any) -> ResolvedKey:
 
     consumer = str(data.get("consumer") or "").strip() or None
     active = bool(data.get("active")) and consumer is not None and _opt_int(data.get("tenant_id")) is not None
+    version = data.get("scope_version", 1)
+    project_id, environment_id = data.get("project_id"), data.get("environment_id")
+    if type(version) is not int or version not in (1, 2):
+        active = False
+    elif version == 2:
+        if any(type(value) is not int or value <= 0 for value in (project_id, environment_id)):
+            active = False
+    elif project_id is not None or environment_id is not None:
+        active = False  # Never downgrade a partial scoped identity to tenant-wide.
     return ResolvedKey(
         active=active,
         consumer=consumer if active else None,
@@ -133,6 +160,9 @@ def _parse_resolved(data: Any) -> ResolvedKey:
         rate_per_min=_opt_int(data.get("rate_per_min")) if active else None,
         burst=_opt_int(data.get("burst")) if active else None,
         fetched_at=time.monotonic(),
+        scope_version=version if active else 1,
+        project_id=project_id if active and version == 2 else None,
+        environment_id=environment_id if active and version == 2 else None,
     )
 
 
@@ -142,7 +172,7 @@ async def _fetch_resolve(digest: str) -> ResolvedKey | None:
     try:
         resp = await _get_client().get(
             f"{CONTROL_PLANE_URL}/internal/keys/resolve",
-            params={"sha256": digest},
+            params={"sha256": digest, "scope_version": "2"},
             headers={"x-internal-secret": CONTROL_PLANE_INTERNAL_SECRET},
         )
     except httpx.HTTPError as exc:
@@ -244,24 +274,35 @@ async def tenant_env(tenant_id: int) -> dict[str, str]:
     return env
 
 
-async def tenant_connections(tenant_id: int, allowed_env: set[str]) -> tuple[dict, dict]:
+async def tenant_connections(tenant_id: int, allowed_env: set[str], *, project_id=None, environment_id=None) -> tuple[dict, dict]:
     """Fresh closed credential scope and encrypted structured BYO connections.
     The loaded catalog, not a second hardcoded list, declares credential names.
     An unavailable control plane grants nothing; no stale authorization."""
     if not enabled():
+        if project_id is not None or environment_id is not None:
+            raise RouteUnavailable("Scoped credentials unavailable.")
         return {}, {}
+    scoped = project_id is not None or environment_id is not None
+    if scoped and any(type(value) is not int or value <= 0 for value in (project_id, environment_id)):
+        raise RouteUnavailable("Invalid credential scope.")
+    path = (f"/internal/tenants/{tenant_id}/projects/{project_id}/environments/{environment_id}/provider-env"
+            if scoped else f"/internal/tenants/{int(tenant_id)}/provider-env")
     try:
         response = await _get_client().get(
-            f"{CONTROL_PLANE_URL}/internal/tenants/{int(tenant_id)}/provider-env",
+            f"{CONTROL_PLANE_URL}{path}",
             headers={"x-internal-secret": CONTROL_PLANE_INTERNAL_SECRET})
         response.raise_for_status()
         data = response.json()
+        if scoped:
+            _validate_scope(data, tenant_id, project_id, environment_id)
         raw, connections = data.get('env'), data.get('connections', {})
         if not isinstance(raw, dict) or not isinstance(connections, dict):
             raise ValueError('invalid connection scope')
         return ({k: v for k, v in raw.items() if k in allowed_env and isinstance(v, str) and v},
                 {p: c for p, c in connections.items() if p in {'bedrock', 'antseed'} and isinstance(c, dict)})
-    except (httpx.HTTPError, ValueError, AttributeError):
+    except (httpx.HTTPError, ValueError, AttributeError) as exc:
+        if scoped:
+            raise RouteUnavailable("Scoped credentials unavailable.") from exc
         return {}, {}
 
 
@@ -285,15 +326,33 @@ class RouteUnavailable(RuntimeError):
     pass
 
 
-async def resolve_route(tenant_id: int, name: str) -> dict:
+def _validate_scope(data, tenant_id, project_id, environment_id):
+    expected = {"scope_version": 2, "tenant_id": tenant_id,
+                "project_id": project_id, "environment_id": environment_id}
+    if not isinstance(data, dict) or any(type(data.get(k)) is not int or data[k] != v for k, v in expected.items()):
+        raise ValueError("Mismatched project/environment scope")
+
+
+async def resolve_route(tenant_id: int, name: str, *, project_id=None, environment_id=None, key_digest=None) -> dict:
     """Resolve the published revision on every call, so publish/pause is immediate."""
     try:
+        scoped = project_id is not None or environment_id is not None
+        if scoped:
+            if (any(type(value) is not int or value <= 0 for value in (project_id, environment_id))
+                    or not isinstance(key_digest, str) or len(key_digest) != 64):
+                raise ValueError("Invalid route scope")
+            path = f"/internal/tenants/{tenant_id}/projects/{project_id}/environments/{environment_id}/routes/{name}"
+        else:
+            path = f"/internal/tenants/{tenant_id}/routes/{name}"
         response = await _get_client().get(
-            f"{CONTROL_PLANE_URL}/internal/tenants/{tenant_id}/routes/{name}",
+            f"{CONTROL_PLANE_URL}{path}",
+            params={"key_sha256": key_digest} if scoped else None,
             headers={"x-internal-secret": CONTROL_PLANE_INTERNAL_SECRET},
         )
         response.raise_for_status()
         data = response.json()
+        if scoped:
+            _validate_scope(data, tenant_id, project_id, environment_id)
         if (not isinstance(data.get("policy_ir"), list)
                 or not isinstance(data.get("policy_id"), str) or len(data["policy_id"]) != 64
                 or not isinstance(data.get("revision"), int) or data["revision"] <= 0

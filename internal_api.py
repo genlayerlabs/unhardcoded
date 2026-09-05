@@ -14,6 +14,7 @@ the router — ingress-level rejects (401/429) are not counted here.
 from __future__ import annotations
 
 import time
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -38,16 +39,27 @@ def _gate(request: Request) -> JSONResponse | None:
 @router.get("/internal/usage")
 async def internal_usage(request: Request, caller: str = "",
                          since_ts: int | None = None,
-                         bucket: str | None = None) -> JSONResponse:
+                         bucket: str | None = None,
+                         project_id: int | None = None, environment_id: int | None = None) -> JSONResponse:
     denied = _gate(request)
     if denied is not None:
         return denied
+    scope = {}
+    if project_id is not None or environment_id is not None:
+        if project_id is None or environment_id is None or min(project_id, environment_id) <= 0:
+            return JSONResponse({"error": "invalid_scope"}, status_code=400)
+        scope = {"project_id": project_id, "environment_id": environment_id}
     caller = caller.strip()
     if not caller:
         return JSONResponse({"error": "caller_required"}, status_code=400)
-    totals = host_store.usage_totals(since_ts=since_ts, caller=caller)
+    try:
+        totals = await asyncio.to_thread(host_store.usage_totals, since_ts=since_ts, caller=caller, strict=True, **scope)
+        by_day = (await asyncio.to_thread(host_store.usage_aggregate, since_ts=since_ts, caller=caller, strict=True, **scope))["by_day"] if bucket == "day" else {}
+    except Exception:
+        return JSONResponse({"error": "ledger_unavailable"}, status_code=503)
     out: dict[str, Any] = {
         "caller": caller,
+        **({"scope_version": 2, **scope} if scope else {}),
         "window": {"since_ts": since_ts, "until_ts": int(time.time())},
         "runs": totals["requests"],
         "errors": totals["errors"],
@@ -58,7 +70,6 @@ async def internal_usage(request: Request, caller: str = "",
         "cost_usd": totals["cost_usd"],
     }
     if bucket == "day":
-        by_day = host_store.usage_aggregate(since_ts=since_ts, caller=caller)["by_day"]
         out["buckets"] = [
             {"date": day, "runs": counter["requests"], "cost_usd": counter["cost_usd"]}
             for day, counter in sorted(by_day.items())
@@ -68,16 +79,26 @@ async def internal_usage(request: Request, caller: str = "",
 
 @router.get("/internal/usage/recent")
 async def internal_usage_recent(request: Request, caller: str = "",
-                                limit: int = 50) -> JSONResponse:
+                                limit: int = 50, project_id: int | None = None,
+                                environment_id: int | None = None) -> JSONResponse:
     denied = _gate(request)
     if denied is not None:
         return denied
+    scope = {}
+    if project_id is not None or environment_id is not None:
+        if project_id is None or environment_id is None or min(project_id, environment_id) <= 0:
+            return JSONResponse({"error": "invalid_scope"}, status_code=400)
+        scope = {"project_id": project_id, "environment_id": environment_id}
     caller = caller.strip()
     if not caller:
         return JSONResponse({"error": "caller_required"}, status_code=400)
     limit = max(1, min(int(limit), _RECENT_LIMIT_MAX))
     calls = []
-    for row in host_store.recent_calls(limit=limit, caller=caller):
+    try:
+        rows = await asyncio.to_thread(host_store.recent_calls, limit=limit, caller=caller, strict=True, **scope)
+    except Exception:
+        return JSONResponse({"error": "ledger_unavailable"}, status_code=503)
+    for row in rows:
         calls.append({
             "ts": row.get("ts"),
             "status": row.get("status"),
@@ -95,4 +116,4 @@ async def internal_usage_recent(request: Request, caller: str = "",
             "routing_summary": row.get("routing_summary"),
             "key_sha256_prefix": (row.get("consumer_sha") or "")[:12] or None,
         })
-    return JSONResponse({"caller": caller, "calls": calls})
+    return JSONResponse({"caller": caller, "calls": calls, **({"scope_version": 2, **scope} if scope else {})})

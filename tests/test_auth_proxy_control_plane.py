@@ -276,7 +276,8 @@ def test_route_resolution_failure_does_not_call_router(monkeypatch):
 
 
 @pytest.mark.parametrize('path', ['/v1/chat/completions', '/v1/responses'])
-def test_full_ingress_to_engine_alias_and_failover(monkeypatch, path):
+@pytest.mark.parametrize('scoped', [False, True])
+def test_full_ingress_to_engine_alias_and_failover(monkeypatch, path, scoped):
     """Actual ingress + shim + Lua, with only CP HTTP and providers faked."""
     require_host_store()
     import asyncio
@@ -293,7 +294,12 @@ def test_full_ingress_to_engine_alias_and_failover(monkeypatch, path):
             return {'ok':False, 'error_kind':'server_error'}
         return {'ok':True, 'latency_ms':10, 'response':{'text':'Fallback works', 'tokens_in':2, 'tokens_out':3}}
     host.set_async_call_hook(call)
+    scope = {'scope_version': 2, 'tenant_id': 7, 'project_id': 8, 'environment_id': 9} if scoped else {}
     def cp_http(request):
+        if scoped and ('/provider-env' in request.url.path or '/routes/' in request.url.path):
+            assert '/projects/8/environments/9/' in request.url.path
+        if scoped and '/routes/' in request.url.path:
+            assert request.url.params['key_sha256'] == hashlib.sha256(b'full-chain').hexdigest()
         if request.url.path.endswith('/provider-env'):
             data = {'env':{'OPENAI_API_KEY':'sk-tenant', 'ANTHROPIC_API_KEY':'sk-backup'}}
         elif '/routes/' in request.url.path:
@@ -301,18 +307,24 @@ def test_full_ingress_to_engine_alias_and_failover(monkeypatch, path):
                     'revision':3, 'execution':{'timeout_ms':8000}, 'route':'route:production'}
         else:
             data = {'active':True, 'consumer':'acme', 'tenant_id':7}
-        return httpx.Response(200, json=data)
+        return httpx.Response(200, json={**data, **scope})
     cp_client = httpx.AsyncClient(transport=httpx.MockTransport(cp_http))
     shim_client = httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(host)), base_url='http://router.test')
     monkeypatch.setattr(cpc, '_client', cp_client)
     monkeypatch.setattr(auth_proxy, '_client', shim_client)
     body = {'model':'route:production', 'messages':[{'role':'user','content':'hi'}]} if 'chat' in path else {'model':'route:production','input':'hi'}
     try:
-        r = TestClient(auth_proxy.app).post(path, headers={'Authorization':'Bearer full-chain'}, json=body)
+        r = TestClient(auth_proxy.app).post(path, headers={'Authorization':'Bearer full-chain',
+            'x-unhardcoded-scope-version': '2', 'x-unhardcoded-project': '999',
+            'x-unhardcoded-environment': '999'}, json=body)
         assert r.status_code == 200, r.text
         trace = r.json()['x_router']['decision_trace']
         assert trace['route_revision'] == '3'
         assert trace['route'] == 'route:production'
+        if scoped:
+            assert trace['project_id'] == 8 and trace['environment_id'] == 9
+        else:
+            assert 'project_id' not in trace and 'environment_id' not in trace
         assert [s['provider_id'] for s in trace['decision_path'] if s['event'] == 'attempted'] == ['openai', 'anthropic']
         assert seen == [('openai','sk-tenant'), ('anthropic','sk-tenant')]
         host_store._write_q.join()
@@ -399,3 +411,61 @@ def test_internal_usage_is_not_proxied_upstream(monkeypatch):
                                        headers={"x-internal-secret": "s3cret"})
     assert r.status_code == 400          # caller_required, answered locally
     assert upstream.requests == []
+
+
+def test_scoped_usage_filters_before_aggregate_and_recent_limit():
+    require_host_store()
+    now = int(time.time())
+    for caller, project, env, tokens in [('acme', 1, 10, 7), ('acme', 1, 11, 90),
+                                        ('acme', 2, 10, 800), ('other', 1, 10, 900),
+                                        ('acme', None, None, 1000)]:
+        trace = {'project_id': project, 'environment_id': env} if project else None
+        host_store.insert_call({'ts': now, 'caller': caller, 'status': 200, 'tokens_in': tokens,
+                                'decision_trace': trace, 'cost_usd': tokens / 1000})
+    client = TestClient(auth_proxy.app)
+    headers = {'x-internal-secret': 's3cret'}
+    scope = {'caller': 'acme', 'project_id': 1, 'environment_id': 10}
+    response = client.get('/internal/usage', params={**scope, 'bucket': 'day'}, headers=headers)
+    assert response.status_code == 200
+    data = response.json()
+    assert data['runs'] == 1 and data['tokens_in'] == 7
+    assert data['cost_usd'] == pytest.approx(.007)
+    assert sum(b['runs'] for b in data['buckets']) == 1
+    assert {k: data[k] for k in scope} == scope
+    assert data['scope_version'] == 2
+    response = client.get('/internal/usage/recent', params={**scope, 'limit': 1}, headers=headers)
+    assert response.status_code == 200
+    assert response.json()['calls'][0]['tokens_in'] == 7
+    for path in ('/internal/usage', '/internal/usage/recent'):
+        for invalid in ({'project_id': 1}, {'environment_id': 10}, {'project_id': 0, 'environment_id': 10}):
+            assert client.get(path, params={'caller': 'acme', **invalid}, headers=headers).status_code == 400
+
+
+def test_scoped_metering_outage_is_unavailable_not_successful_zero(monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise RuntimeError('database unavailable')
+    monkeypatch.setattr(host_store, '_get_pool', unavailable)
+    client = TestClient(auth_proxy.app)
+    for path in ('/internal/usage', '/internal/usage/recent'):
+        result = client.get(path, params={'caller': 'acme', 'project_id': 1, 'environment_id': 2},
+                            headers={'x-internal-secret': 's3cret'})
+        assert result.status_code == 503
+        assert result.json() == {'error': 'ledger_unavailable'}
+
+
+def test_plaintext_upstream_never_receives_trusted_scope_secret(monkeypatch):
+    _upstream(monkeypatch)
+    monkeypatch.setattr(cpc, 'ALLOW_INSECURE_HTTP', False)
+    monkeypatch.setattr(auth_proxy, 'UPSTREAM', 'http://router.test')
+    async def auth(token):
+        return {'ok': True, 'caller': 'transport-fixture', 'tenant_id': 1, 'digest': 'a' * 64, 'meta': {}}
+    async def route(*args, **kwargs):
+        return {'route': 'route:production', 'revision': 1, 'policy_id': 'a' * 64,
+                'policy_ir': ['policy'], 'execution': {}}
+    monkeypatch.setattr(auth_proxy, '_caller_auth_async', auth)
+    monkeypatch.setattr(cpc, 'resolve_route', route)
+    monkeypatch.setattr(auth_proxy, '_rate_ok', lambda *args: True)
+    result = _post_chat(TestClient(auth_proxy.app), 'fixture')
+    assert result.status_code == 503
+    assert result.json()['error']['code'] == 'bridge_transport_unavailable'
+    assert auth_proxy._client.requests == []

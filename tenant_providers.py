@@ -109,7 +109,7 @@ async def prepare(host):
         # operator source after timeout, malformed data or revoked credentials.
         host._tenant_offers.update({pid: [] for pid in ids})
         digest = hashlib.sha256(json.dumps(configs[name], sort_keys=True).encode()).hexdigest()
-        key = (host._tenant_id, name, digest)
+        key = (host._tenant_id, getattr(host, '_environment_id', None), name, digest)
         cached = _cache.get(key)
         try:
             if cached and time.monotonic() - cached[0] < (15 if name == 'antseed' else 300):
