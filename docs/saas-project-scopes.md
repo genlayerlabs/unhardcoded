@@ -18,7 +18,7 @@ serve a scoped key.
 
 On every inference request the ingress resolves:
 
-```
+```text
 GET /internal/tenants/{tenant}/projects/{project}/environments/{environment}/routes/{name}
     ?key_sha256={authenticated_key_digest}
 ```
@@ -69,3 +69,18 @@ an opt-in two-process test using the actual Django bridge and this dataplane,
 with concurrent Chat Completions/Responses, streaming/fallback, scope forgery,
 revoked cached keys and removed connection assignments. Provider calls are fake;
 this verifies isolation/recovery rather than a production throughput target.
+
+## Bridge transport
+
+HTTPS is required by default for all control-plane HTTP requests and the ingress
+hop that carries trusted tenant headers to the shim. TLS certificate verification
+remains enabled. Configure trusted internal certificates (including a CA bundle
+where needed); do not expose the shim or internal control-plane endpoints publicly.
+
+`CP_ALLOW_INSECURE_HTTP=1` is an explicit exception for isolated local development
+or an operator-managed transport boundary. It does not add encryption. The local
+Compose/test fixtures set it deliberately; SaaS production must leave it disabled.
+Cloud's production settings also reject plaintext router/ingress URLs. Existing
+operator-only deployments are unaffected because their control-plane integration
+is disabled. Existing HTTP control-plane deployments must configure HTTPS or
+explicitly opt into their existing insecure transport before adopting this release.

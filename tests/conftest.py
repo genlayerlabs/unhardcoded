@@ -42,6 +42,9 @@ os.environ.setdefault("ROUTER_SKIP_SETTINGS_IMPORT_RELOAD", "1")
 # waiting on psycopg_pool's 30s default connection checkout timeout.
 os.environ.setdefault("HOST_STORE_POOL_TIMEOUT", "1")
 
+# Test HTTP endpoints are local/fake; production requires TLS by default.
+os.environ["CP_ALLOW_INSECURE_HTTP"] = "1"
+
 import host_store  # noqa: E402
 
 _HOST_STORE_UNAVAILABLE: str | None = None

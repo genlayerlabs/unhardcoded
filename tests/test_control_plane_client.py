@@ -290,3 +290,27 @@ def test_internal_secret_ok(monkeypatch):
     assert cpc.internal_secret_ok({}) is False
     monkeypatch.setattr(cpc, "CONTROL_PLANE_INTERNAL_SECRET", "")
     assert cpc.internal_secret_ok({"x-internal-secret": ""}) is False
+
+
+def test_trusted_transport_requires_tls_without_explicit_local_opt_in(monkeypatch):
+    monkeypatch.setattr(cpc, 'ALLOW_INSECURE_HTTP', False)
+    assert cpc.trusted_transport_ok('https://router.internal:18080')
+    for url in ('http://router:18080', 'ftp://router', 'https://user:secret@router', 'https:///path', 'https://router?secret=x'):
+        assert not cpc.trusted_transport_ok(url)
+    monkeypatch.setattr(cpc, 'ALLOW_INSECURE_HTTP', True)
+    assert cpc.trusted_transport_ok('http://router:18080')
+    assert not cpc.trusted_transport_ok('ftp://router')
+
+
+def test_plaintext_control_plane_sends_no_secret(monkeypatch):
+    monkeypatch.setattr(cpc, 'CONTROL_PLANE_URL', 'http://cp.test')
+    monkeypatch.setattr(cpc, 'ALLOW_INSECURE_HTTP', False)
+    class NoNetwork:
+        async def get(self, *args, **kwargs):
+            pytest.fail('plaintext bridge must fail before sending headers')
+    monkeypatch.setattr(cpc, '_client', NoNetwork())
+    assert asyncio.run(cpc._fetch_resolve('a' * 64)) is None
+    with pytest.raises(cpc.RouteUnavailable):
+        asyncio.run(cpc.tenant_connections(1, set(), project_id=2, environment_id=3))
+    with pytest.raises(cpc.RouteUnavailable):
+        asyncio.run(cpc.resolve_route(1, 'assistant', project_id=2, environment_id=3, key_digest='a' * 64))

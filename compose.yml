@@ -30,6 +30,7 @@ services:
       # Optional external control plane: per-tenant BYO provider credentials
       # (fetched by tenant id from the trusted x-llm-router-tenant header the
       # ingress stamps). Both unset -> feature off, platform keys only.
+      CP_ALLOW_INSECURE_HTTP: ${CP_ALLOW_INSECURE_HTTP:-0}
       CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-}
       CONTROL_PLANE_INTERNAL_SECRET: ${CONTROL_PLANE_INTERNAL_SECRET:-}
       SAAS_SHARED_PROVIDERS: ${SAAS_SHARED_PROVIDERS:-}
@@ -93,6 +94,7 @@ services:
       # Optional external control plane: consumer-key resolve fallback plus the
       # /internal/usage metering surface. Both unset -> feature off (/internal/*
       # answers 404, unknown keys just 401).
+      CP_ALLOW_INSECURE_HTTP: ${CP_ALLOW_INSECURE_HTTP:-0}
       CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-}
       CONTROL_PLANE_INTERNAL_SECRET: ${CONTROL_PLANE_INTERNAL_SECRET:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}

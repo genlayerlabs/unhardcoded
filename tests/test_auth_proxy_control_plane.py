@@ -451,3 +451,21 @@ def test_scoped_metering_outage_is_unavailable_not_successful_zero(monkeypatch):
                             headers={'x-internal-secret': 's3cret'})
         assert result.status_code == 503
         assert result.json() == {'error': 'ledger_unavailable'}
+
+
+def test_plaintext_upstream_never_receives_trusted_scope_secret(monkeypatch):
+    _upstream(monkeypatch)
+    monkeypatch.setattr(cpc, 'ALLOW_INSECURE_HTTP', False)
+    monkeypatch.setattr(auth_proxy, 'UPSTREAM', 'http://router.test')
+    async def auth(token):
+        return {'ok': True, 'caller': 'transport-fixture', 'tenant_id': 1, 'digest': 'a' * 64, 'meta': {}}
+    async def route(*args, **kwargs):
+        return {'route': 'route:production', 'revision': 1, 'policy_id': 'a' * 64,
+                'policy_ir': ['policy'], 'execution': {}}
+    monkeypatch.setattr(auth_proxy, '_caller_auth_async', auth)
+    monkeypatch.setattr(cpc, 'resolve_route', route)
+    monkeypatch.setattr(auth_proxy, '_rate_ok', lambda *args: True)
+    result = _post_chat(TestClient(auth_proxy.app), 'fixture')
+    assert result.status_code == 503
+    assert result.json()['error']['code'] == 'bridge_transport_unavailable'
+    assert auth_proxy._client.requests == []

@@ -29,6 +29,7 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -36,6 +37,7 @@ log = logging.getLogger("llm-router-control-plane")
 
 CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "").rstrip("/")
 CONTROL_PLANE_INTERNAL_SECRET = os.getenv("CONTROL_PLANE_INTERNAL_SECRET", "")
+ALLOW_INSECURE_HTTP = os.getenv("CP_ALLOW_INSECURE_HTTP", "0").lower() in {"1", "true", "yes"}
 RESOLVE_TTL_S = float(os.getenv("CP_RESOLVE_TTL_S", "60"))
 NEGATIVE_TTL_S = float(os.getenv("CP_NEGATIVE_TTL_S", "15"))
 RESOLVE_STALE_GRACE_S = float(os.getenv("CP_RESOLVE_STALE_GRACE_S", "300"))
@@ -90,8 +92,21 @@ _client: httpx.AsyncClient | None = None
 _collision_logged: set[str] = set()
 
 
+def trusted_transport_ok(url: str) -> bool:
+    """Bridge secrets require TLS; local HTTP requires explicit operator opt-in."""
+    try:
+        parsed = urlsplit(url)
+        return bool(parsed.hostname and not parsed.username and not parsed.password
+                    and not parsed.query and not parsed.fragment
+                    and (parsed.scheme == "https" or (parsed.scheme == "http" and ALLOW_INSECURE_HTTP)))
+    except ValueError:
+        return False
+
+
 def _get_client() -> httpx.AsyncClient:
     global _client
+    if not trusted_transport_ok(CONTROL_PLANE_URL):
+        raise httpx.UnsupportedProtocol("Control-plane bridge requires HTTPS")
     if _client is None:
         _client = httpx.AsyncClient(timeout=_TIMEOUT)
     return _client

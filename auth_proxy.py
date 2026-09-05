@@ -4010,6 +4010,10 @@ async def proxy(path: str, request: Request) -> Response:
                 "code": "consumer_budget_exhausted",
                 "budget_usd": budget_usd, "spent_usd": spent_usd}})
 
+    if auth.get("tenant_id") is not None and not control_plane_client.trusted_transport_ok(UPSTREAM):
+        return JSONResponse(status_code=503, content={"error": {
+            "message": "Trusted router bridge requires HTTPS", "type": "server_error",
+            "code": "bridge_transport_unavailable"}})
     assert _client is not None
     if not await _capacity_acquire():
         _record_reject(reason="router_overloaded", path="/" + path,
