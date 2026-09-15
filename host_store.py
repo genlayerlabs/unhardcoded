@@ -80,6 +80,14 @@ def _retention_days() -> int:
 _RETENTION_DAYS = _retention_days()
 
 _SCHEMA_STATEMENTS = [
+    'CREATE TABLE IF NOT EXISTS cloud_quota_periods (\n       tenant_id BIGINT NOT NULL, period_start BIGINT NOT NULL, period_end BIGINT NOT NULL,\n       used BIGINT NOT NULL DEFAULT 0 CHECK (used >= 0),\n       PRIMARY KEY (tenant_id, period_start))',
+    "CREATE TABLE IF NOT EXISTS cloud_quota_reservations (\n       id TEXT PRIMARY KEY, tenant_id BIGINT NOT NULL, period_start BIGINT NOT NULL,\n       state TEXT NOT NULL DEFAULT 'pending', created_at BIGINT NOT NULL,\n       FOREIGN KEY (tenant_id, period_start) REFERENCES cloud_quota_periods(tenant_id, period_start))",
+    'ALTER TABLE cloud_quota_reservations ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT',
+    'ALTER TABLE cloud_quota_reservations ADD COLUMN IF NOT EXISTS meter_event_name TEXT',
+    'ALTER TABLE cloud_quota_reservations ADD COLUMN IF NOT EXISTS usage_batch_id TEXT',
+    'CREATE TABLE IF NOT EXISTS cloud_usage_batches (\n        id TEXT PRIMARY KEY, stripe_customer_id TEXT NOT NULL, meter_event_name TEXT NOT NULL,\n        value BIGINT NOT NULL CHECK (value > 0), event_timestamp BIGINT NOT NULL,\n        first_attempt_at BIGINT, reported_at BIGINT)',
+    "CREATE INDEX IF NOT EXISTS cloud_usage_unbatched ON cloud_quota_reservations(created_at)\n        WHERE state='success' AND stripe_customer_id IS NOT NULL AND usage_batch_id IS NULL",
+
     """CREATE TABLE IF NOT EXISTS calls (
         id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         ts              BIGINT NOT NULL,

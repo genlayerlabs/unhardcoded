@@ -4025,6 +4025,19 @@ async def proxy(path: str, request: Request) -> Response:
                 "message": "router capacity is temporarily exhausted; retry shortly",
                 "type": "server_error", "code": "router_overloaded"}})
 
+    quota_ticket = None
+    if auth.get("tenant_id") is not None and os.getenv("CLOUD_MONTHLY_QUOTAS_REQUIRED", "0") == "1":
+        import billing_quota
+        try:
+            quota_ticket = await asyncio.to_thread(billing_quota.reserve, auth["tenant_id"],
+                                                   (published_route or {}).get("billing_quota"))
+        except Exception:
+            _capacity_release()
+            return JSONResponse(status_code=503, content={"error": {"message": "Quota accounting is temporarily unavailable", "code": "quota_unavailable"}})
+        if quota_ticket is None:
+            _capacity_release()
+            return JSONResponse(status_code=429, content={"error": {"message": "Your organization has reached its monthly request allowance", "code": "monthly_quota_exceeded"}})
+
     upstream_url = f"{UPSTREAM}/{path}"
     if request.url.query:
         upstream_url += f"?{request.url.query}"
@@ -4065,6 +4078,7 @@ async def proxy(path: str, request: Request) -> Response:
     decision_trace = None
     error_type = error_code = error_message = None
     record_in_finally = True
+    response_complete = False
     capacity_released = False
     # The per-session meter DERIVES from this ledger (host_store.calls.session):
     # without the sid recorded here, /v1/session/{sid} answers 404 for everyone
@@ -4087,7 +4101,12 @@ async def proxy(path: str, request: Request) -> Response:
             if auth.get('scope_version') == 2:
                 decision_trace.update(project_id=auth['project_id'], environment_id=auth['environment_id'])
         try:
-            _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
+            if quota_ticket:
+                try:
+                    billing_quota.settle(quota_ticket, response_complete and 200 <= status < 300 and not error_type)
+                except Exception:
+                    _metric_store_error("billing_quota_settlement")
+            _record_request(usage_event_id=quota_ticket, caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
             _metric_request(status, latency_ms)
             _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
         finally:
@@ -4126,13 +4145,14 @@ async def proxy(path: str, request: Request) -> Response:
             async def _passthrough():
                 nonlocal provider, model_family, served_model_id, served_by, \
                     tokens_in, tokens_out, tokens_total, tokens_cached, cost_usd, \
-                    cost_basis, decision_trace, error_type, error_code, error_message
+                    cost_basis, decision_trace, error_type, error_code, error_message, response_complete
                 tail = bytearray()
                 try:
                     async for chunk in r.aiter_raw():
                         tail.extend(chunk)
                         _trim_sse_tail(tail)
                         yield chunk
+                    response_complete = True
                 finally:
                     await _close_upstream_stream()
                     try:
@@ -4204,6 +4224,7 @@ async def proxy(path: str, request: Request) -> Response:
                     tokens_total = int(usage.get("total_tokens") or (tokens_in + tokens_out))
             except Exception:
                 pass
+        response_complete = True
         return Response(status_code=status, content=content, media_type=content_type)
     except Exception as exc:
         error_type = "proxy_error"
