@@ -291,6 +291,7 @@ end
         child.config.providers = _to_lua(child.lua, catalog.get('providers') or {})
         child.config.models = _to_lua(child.lua, catalog.get('models') or {})
         child._tenant_id = tenant_id
+        child._tenant_byo_auth = frozenset(key for key, value in env.items() if value)
         child._project_id = project_id
         child._environment_id = environment_id
         child._tenant_allowed = allowed

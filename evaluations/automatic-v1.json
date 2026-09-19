@@ -1,0 +1,194 @@
+[
+  {
+    "id": "general-1",
+    "task": "Help me with something.",
+    "acceptable_policies": [
+      "general"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "general-2",
+    "task": "I have a question but I am not sure where to start.",
+    "acceptable_policies": [
+      "general"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "conversation-1",
+    "task": "Write a short polite reply to a customer asking when support opens.",
+    "acceptable_policies": [
+      "conversation"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "conversation-2",
+    "task": "Thank the customer and ask for their order number.",
+    "acceptable_policies": [
+      "conversation"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "classification-1",
+    "task": "Label this review positive or negative: the delivery was excellent.",
+    "acceptable_policies": [
+      "classification"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "classification-2",
+    "task": "Classify this ticket as billing, support or sales: I need a copy of my invoice.",
+    "acceptable_policies": [
+      "classification"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "extraction-1",
+    "task": "Extract name and date as JSON: Alex attended on 2026-01-02.",
+    "acceptable_policies": [
+      "extraction"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "extraction-2",
+    "task": "Return invoice total as JSON: invoice 17, total EUR 42.",
+    "acceptable_policies": [
+      "extraction"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "translation-1",
+    "task": "Translate to French: The meeting starts at nine.",
+    "acceptable_policies": [
+      "translation"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "translation-2",
+    "task": "Localize this Spanish sentence into English: Gracias por su compra.",
+    "acceptable_policies": [
+      "translation"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "summarization-1",
+    "task": "Summarize: Alice proposed a launch on Monday. Bob agreed. They will review on Friday.",
+    "acceptable_policies": [
+      "summarization"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "summarization-2",
+    "task": "Condense this note: the server failed at noon and recovered at one after a restart.",
+    "acceptable_policies": [
+      "summarization"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "long-document-1",
+    "task": "Compare the conclusions across three supplied 100,000-token annual reports.",
+    "acceptable_policies": [
+      "long-document"
+    ],
+    "fixture_requirements": "long_documents"
+  },
+  {
+    "id": "long-document-2",
+    "task": "Synthesize the attached 150,000-token corpus, preserving conflicting evidence.",
+    "acceptable_policies": [
+      "long-document"
+    ],
+    "fixture_requirements": "long_documents"
+  },
+  {
+    "id": "coding-1",
+    "task": "Explain the off-by-one error in for i in range(len(items)+1): print(items[i]).",
+    "acceptable_policies": [
+      "coding"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "coding-2",
+    "task": "Write a Python function that merges two sorted lists. Do not use tools.",
+    "acceptable_policies": [
+      "coding"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "coding-agent-1",
+    "task": "Use repository tools to locate the failing test, fix the code and run tests.",
+    "acceptable_policies": [
+      "coding-agent"
+    ],
+    "fixture_requirements": "tools"
+  },
+  {
+    "id": "coding-agent-2",
+    "task": "Inspect the checkout with tools, implement the requested endpoint and verify it.",
+    "acceptable_policies": [
+      "coding-agent"
+    ],
+    "fixture_requirements": "tools"
+  },
+  {
+    "id": "reasoning-1",
+    "task": "Prove by induction that the sum of the first n odd integers is n squared.",
+    "acceptable_policies": [
+      "reasoning"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "reasoning-2",
+    "task": "Analyze the assumptions behind a three-stage scheduling optimization and derive the optimum.",
+    "acceptable_policies": [
+      "reasoning"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "creative-writing-1",
+    "task": "Write an original opening scene for a mystery set on Mars.",
+    "acceptable_policies": [
+      "creative-writing"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "creative-writing-2",
+    "task": "Invent five playful slogans for a fictional bicycle shop.",
+    "acceptable_policies": [
+      "creative-writing"
+    ],
+    "fixture_requirements": "text"
+  },
+  {
+    "id": "vision-1",
+    "task": "Describe the chart in the supplied image.",
+    "acceptable_policies": [
+      "vision"
+    ],
+    "fixture_requirements": "image"
+  },
+  {
+    "id": "vision-2",
+    "task": "Read the road sign visible in the attached image.",
+    "acceptable_policies": [
+      "vision"
+    ],
+    "fixture_requirements": "image"
+  }
+]

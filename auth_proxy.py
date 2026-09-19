@@ -4687,6 +4687,10 @@ def _cost_for_event(row: dict[str, Any], prices: dict[tuple[str, str], dict[str,
         # at the source carry negative spend (a negative chosen price); never let
         # them subtract from a consumer's / the analytics total.
         return max(0.0, float(stamped)), None
+    # List-price inference estimates cannot fill a missing decision component.
+    summary = row.get("routing_summary") or row.get("decision_trace") or {}
+    if row.get("cost_basis") == "unknown_total" or (isinstance(summary, dict) and "automatic" in summary):
+        return None, None
     family = str(row.get("model_family") or "")
     provider = str(row.get("provider") or "")
     price = prices.get((family, provider))
