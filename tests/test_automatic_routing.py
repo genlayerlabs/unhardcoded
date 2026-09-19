@@ -161,3 +161,52 @@ async def test_both_api_surfaces_use_the_same_authorized_selection(automatic_hos
     assert r.status_code == 200, r.text
     assert len(provider.calls) == 1 and len(calls) == 1
     assert 'coding-agent' in r.text and '0.011' in r.text
+
+
+@pytest.mark.asyncio
+async def test_cancellation_does_not_start_inference_or_become_fallback(automatic_host):
+    started, cancelled = asyncio.Event(), asyncio.Event()
+    class Slow:
+        async def decide(self, request, *, deadline):
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            finally:
+                cancelled.set()
+    execution = {**compile_automatic(automatic_host, intent())["execution"], "automatic_mode": "active"}
+    task = asyncio.create_task(select_policy(automatic_host, {}, execution, provider=Slow()))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_missing_connection_never_uses_operator_credential_and_flag_disables_calls(automatic_host, monkeypatch):
+    execution = {**compile_automatic(automatic_host, intent())["execution"], "automatic_mode": "active"}
+    automatic_host._env.pop("OPENROUTER_API_KEY")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "operator-must-not-be-used")
+    _, trace = await select_policy(automatic_host, {}, execution)
+    assert trace["selected_id"] == "general" and trace["fallback_used"]
+    monkeypatch.setenv("AUTOMATIC_ROUTING_ENABLED", "0")
+    provider = Choose()
+    _, trace = await select_policy(automatic_host, {}, execution, provider=provider)
+    assert not provider.calls and trace["mode"] == "off"
+
+
+@pytest.mark.asyncio
+async def test_interleaved_decisions_do_not_share_selected_policy_or_projection(automatic_host):
+    execution = {**compile_automatic(automatic_host, intent())["execution"], "automatic_mode": "active"}
+    class Interleaved(Choose):
+        async def decide(self, request, *, deadline):
+            await asyncio.sleep(.01)
+            return await super().decide(request, deadline=deadline)
+    coding, extraction = Interleaved(), Interleaved("extraction")
+    results = await asyncio.gather(*[select_policy(automatic_host,
+        {"messages": [{"role": "user", "content": text}]}, execution, provider=provider)
+        for text, provider in (("code-only", coding), ("extract-only", extraction))])
+    assert [r[1]["selected_id"] for r in results] == ["coding-agent", "extraction"]
+    assert coding.calls[0].state["task"] == "code-only"
+    assert extraction.calls[0].state["task"] == "extract-only"
+    assert results[0][1]["decision_id"] != results[1][1]["decision_id"]
