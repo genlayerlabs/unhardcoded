@@ -172,7 +172,7 @@ async def _fetch_resolve(digest: str) -> ResolvedKey | None:
     try:
         resp = await _get_client().get(
             f"{CONTROL_PLANE_URL}/internal/keys/resolve",
-            params={"sha256": digest, "scope_version": "2"},
+            params={"sha256": digest, "scope_version": "2", "automatic_version": "1"},
             headers={"x-internal-secret": CONTROL_PLANE_INTERNAL_SECRET},
         )
     except httpx.HTTPError as exc:
@@ -346,7 +346,7 @@ async def resolve_route(tenant_id: int, name: str, *, project_id=None, environme
             path = f"/internal/tenants/{tenant_id}/routes/{name}"
         response = await _get_client().get(
             f"{CONTROL_PLANE_URL}{path}",
-            params={"key_sha256": key_digest} if scoped else None,
+            params={"key_sha256": key_digest, "automatic_version": "1"} if scoped else None,
             headers={"x-internal-secret": CONTROL_PLANE_INTERNAL_SECRET},
         )
         response.raise_for_status()

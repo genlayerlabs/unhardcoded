@@ -94,7 +94,7 @@ def test_resolve_fetches_then_serves_from_cache(monkeypatch):
     assert len(fake.calls) == 1
     call = fake.calls[0]
     assert call["url"].endswith("/internal/keys/resolve")
-    assert call["params"] == {"sha256": DIGEST, "scope_version": "2"}
+    assert call["params"] == {"sha256": DIGEST, "scope_version": "2", "automatic_version": "1"}
     assert call["headers"] == {"x-internal-secret": "s3cret"}
 
 
@@ -137,7 +137,7 @@ def test_scoped_route_rechecks_key_on_every_request(monkeypatch):
     with pytest.raises(cpc.RouteUnavailable):
         asyncio.run(cpc.resolve_route(7, 'assistant', project_id=4, environment_id=9, key_digest=DIGEST))
     assert len(fake.calls) == 2
-    assert all(call['params'] == {'key_sha256': DIGEST} for call in fake.calls)
+    assert all(call['params'] == {'key_sha256': DIGEST, 'automatic_version': '1'} for call in fake.calls)
 
 
 def test_negative_answer_is_cached(monkeypatch):

@@ -31,6 +31,7 @@ crashloop).
 from __future__ import annotations
 
 import json
+import math
 import logging
 import os
 import queue
@@ -395,6 +396,22 @@ def routing_summary(trace) -> dict | None:
         if isinstance(step, dict) and step.get('event') == 'attempted'
     ]
     summary['deadline_exceeded'] = trace.get('request_deadline_exceeded') is True
+    decision = trace.get('automatic')
+    if isinstance(decision, dict):
+        # A closed allowlist excludes payloads, instructions and arbitrary provider bodies.
+        summary['automatic'] = {key: str(decision[key])[:160] for key in (
+            'decision_id', 'mode', 'catalog_version', 'instruction_version', 'configuration_id',
+            'selected_id', 'proposed_id', 'policy_id', 'provider', 'model', 'fallback_reason')
+            if decision.get(key) is not None}
+        for key in ('latency_ms', 'cost_usd', 'confidence', 'normalized_entropy', 'attempts'):
+            value = decision.get(key)
+            if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                summary['automatic'][key] = value
+        summary['automatic']['cost_known'] = decision.get('cost_usd') is not None
+        summary['automatic']['fallback_used'] = decision.get('fallback_used') is True
+        summary['automatic']['disagrees_with_default'] = decision.get('disagrees_with_default') is True
+        summary['automatic']['legal_choice_ids'] = [str(v)[:64] for v in
+            (decision.get('legal_choice_ids') or [])[:32]]
     return summary
 
 def insert_call(row: dict[str, Any]) -> None:
