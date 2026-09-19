@@ -1804,6 +1804,12 @@ def _build_x_router(result: dict, subscription_providers=frozenset(),
     if isinstance(automatic, dict):
         inference_cost = x_router["cost_usd"]
         decision_cost = automatic.get("cost_usd")
+        # Failed attempts may still be charged; their usage is not reported by
+        # the engine. Do not present only the winning attempt as a full total.
+        if any(step.get("event") == "attempted" and step.get("error_kind")
+               for step in (result.get("trace") or {}).get("decision_path", []) if isinstance(step, dict)):
+            x_router["winning_inference_cost_usd"] = inference_cost
+            inference_cost = None
         x_router.update(inference_cost_usd=inference_cost, decision_cost_usd=decision_cost,
                         cost_usd=(inference_cost + decision_cost
                                   if inference_cost is not None and decision_cost is not None else None))
@@ -1933,8 +1939,8 @@ def _openai_error_from_router(result: dict) -> JSONResponse:
                 "served_model_id": None,
                 "decision_trace": trace or None,
                 **({"decision_cost_usd": trace["automatic"].get("cost_usd"),
-                    "cost_usd": trace["automatic"].get("cost_usd"),
-                    "cost_basis": "decision_only_inference_unknown"} if isinstance(trace.get("automatic"), dict) else {}),
+                    "cost_usd": None,
+                    "cost_basis": "unknown_total"} if isinstance(trace.get("automatic"), dict) else {}),
             },
         },
     )

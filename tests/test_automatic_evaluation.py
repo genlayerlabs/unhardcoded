@@ -38,3 +38,19 @@ def test_unknown_cost_never_becomes_savings_and_missing_cases_fail():
     measurement['decision_cost_usd'] = -1
     with pytest.raises(ValueError):
         evaluate(cases, [measurement])
+
+
+def test_activity_does_not_infer_missing_decision_cost_from_model_prices():
+    from auth_proxy import _cost_for_event
+    row = {'model_family': 'm', 'provider': 'p', 'tokens_in': 1000,
+           'routing_summary': {'automatic': {'cost_known': False}}}
+    assert _cost_for_event(row, {('m', 'p'): {'input': 1, 'output': 2}}) == (None, None)
+
+
+def test_failed_attempts_leave_total_unknown_even_when_winner_and_decision_are_priced():
+    from shim import _build_x_router
+    result = {'response': {'cost_reported': .01}, 'trace': {'automatic': {'cost_usd': .001},
+        'decision_path': [{'event': 'attempted', 'error_kind': 'timeout'}]}}
+    report = _build_x_router(result)
+    assert report['cost_usd'] is None and report['cost_basis'] == 'unknown_total'
+    assert report['decision_cost_usd'] == .001 and report['winning_inference_cost_usd'] == .01

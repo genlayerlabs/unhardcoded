@@ -252,6 +252,7 @@ def test_cost_backfill_is_idempotent_and_scoped_to_null_rows(host_store_clean):
     mk(1)                                        # NULL + priceable
     mk(2, provider="prov-z", family="fam-c")     # NULL + no price entry
     mk(3, cost=0.5, basis="reported")            # already stamped — untouched
+    mk(4, basis="unknown_total")           # missing decision cost cannot be inferred
     assert host_store.backfill_call_costs(prices) == 2
     assert host_store.backfill_call_costs(prices) == 0  # idempotent
     with host_store._get_pool().connection() as conn:
@@ -260,6 +261,7 @@ def test_cost_backfill_is_idempotent_and_scoped_to_null_rows(host_store_clean):
     assert rows["bf-0"] == (3.0, "computed")     # $2/M in + $10/M out
     assert rows["bf-1"] == (3.0, "computed")
     assert rows["bf-2"] == (None, None)          # unpriceable stays NULL (sums as 0)
+    assert rows["bf-4"] == (None, "unknown_total")
     assert rows["bf-3"] == (0.5, "reported")     # provider-reported stamp preserved
 
 

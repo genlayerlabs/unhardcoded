@@ -1888,6 +1888,8 @@ def backfill_call_costs(prices: "dict[tuple[str, str], dict[str, float]]",
                 rows = conn.execute(
                     "SELECT id, provider_id, model_family, tokens_in, tokens_out"
                     " FROM calls WHERE cost_usd IS NULL AND id > %s"
+                    " AND NOT (COALESCE(routing_summary, '{}'::jsonb) ? 'automatic')"
+                    " AND cost_basis IS DISTINCT FROM 'unknown_total'"
                     " ORDER BY id LIMIT %s", (last_id, int(batch_size))).fetchall()
                 if not rows:
                     return stamped
