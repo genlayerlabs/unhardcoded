@@ -16,11 +16,13 @@ RUN apt-get update \
            /usr/local/lib/node_modules/pg /usr/local/bin/antseed; \
          if [ "${install_attempt}" = 3 ]; then exit 1; fi; \
        done \
+    # router-core accepts any node >=0.1.0, but newer releases remove exports.
+    # Match the CLI's pinned node so offline plugin loading is reproducible.
     && mkdir -p /opt/antseed-plugins \
     && cd /opt/antseed-plugins \
     && npm init -y \
     && for install_attempt in 1 2 3; do \
-         if npm install --ignore-scripts --save-exact @antseed/router-local@0.1.45; then break; fi; \
+         if npm install --ignore-scripts --save-exact @antseed/router-local@0.1.45 @antseed/node@0.2.114; then break; fi; \
          rm -rf node_modules package-lock.json; \
          if [ "${install_attempt}" = 3 ]; then exit 1; fi; \
        done \
