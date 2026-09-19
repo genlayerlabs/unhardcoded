@@ -68,7 +68,7 @@ def compile_policy(policy_id, constraints=None):
     spec = next((s for s in _SPECS if s[0] == policy_id), None)
     if spec is None:
         raise ValueError("Unknown automatic policy")
-    limits = validate_constraints(constraints or {})
+    limits = validate_constraints({} if constraints is None else constraints)
     _, _, _, quality, context, capability = spec
     gates = ["and", ["meets_req"], ["not", ["is", "disabled"]],
              ["cmp", "success_rate", "ge", limits["reliability_floor"]],
@@ -108,5 +108,6 @@ def build_bundle(host, policy_ids, constraints=None):
     for policy_id in policy_ids:
         term = host.normalize_policy(compile_policy(policy_id, constraints), admit=True)
         bundle[policy_id] = {**descriptions[policy_id], "policy_ir": term["policy_ir"],
-                             "policy_id": term["policy_id"]}
+                             "policy_id": term["policy_id"], "engine_version": term["version"],
+                             "fingerprint": term["fingerprint"]}
     return bundle
