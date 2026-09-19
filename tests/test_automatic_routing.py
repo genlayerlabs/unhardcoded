@@ -210,3 +210,16 @@ async def test_interleaved_decisions_do_not_share_selected_policy_or_projection(
     assert coding.calls[0].state["task"] == "code-only"
     assert extraction.calls[0].state["task"] == "extract-only"
     assert results[0][1]["decision_id"] != results[1][1]["decision_id"]
+
+
+@pytest.mark.asyncio
+async def test_shared_inference_key_does_not_authorize_decision_billing(automatic_host, monkeypatch):
+    from policy_selection import decision_credential
+    monkeypatch.setenv("SAAS_SHARED_PROVIDERS", "openrouter")
+    child = automatic_host.for_tenant(8, {"OPENAI_API_KEY": "another-tenant"}, managed_providers=["openrouter"], project_id=4, environment_id=5)
+    assert child._env["OPENROUTER_API_KEY"] == "tenant-openrouter"  # shared inference is explicitly enabled
+    assert decision_credential(child) == ""
+    compiled = compile_automatic(child, intent())
+    assert compiled["decision_connection_available"] is False
+    _, trace = await select_policy(child, {}, {**compiled["execution"], "automatic_mode": "active"})
+    assert trace["fallback_reason"] == "missing_credentials"

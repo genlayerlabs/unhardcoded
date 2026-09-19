@@ -25,6 +25,13 @@ def enabled():
     return os.environ.get("AUTOMATIC_ROUTING_ENABLED", "0") == "1"
 
 
+def decision_credential(host):
+    # Managed/shared inference credentials do not authorize decision content or
+    # charges. Require a key supplied by this environment, even with sharing on.
+    return (host._env.get("OPENROUTER_API_KEY", "")
+            if "OPENROUTER_API_KEY" in getattr(host, "_tenant_byo_auth", ()) else "")
+
+
 def compile_automatic(host, intent):
     if not enabled():
         raise ValueError("Automatic routing is not enabled")
@@ -59,7 +66,7 @@ def compile_automatic(host, intent):
         "warnings": ["Automatic selection sends bounded task text to your OpenRouter decision connection.",
                      "Price limits are per million tokens, not a monthly spending cap."],
         "automatic_policies": [{"id": p, "description": v["description"]} for p, v in policies.items()],
-        "decision_connection_available": bool(host._env.get("OPENROUTER_API_KEY")),
+        "decision_connection_available": bool(decision_credential(host)),
         "execution": {"timeout_ms": constraints["timeout_seconds"] * 1000,
                       "first_token_timeout_ms": constraints["timeout_seconds"] * 1000,
                       "automatic": config}}
@@ -172,7 +179,7 @@ async def select_policy(host, contract, execution, *, provider=None, trace=None)
         trace["cost_usd"] = None  # a timeout/cancellation may still be billable
         try:
             if provider is None:
-                provider = JevDecisionProvider(host._env.get("OPENROUTER_API_KEY", ""), model=config["model"])
+                provider = JevDecisionProvider(decision_credential(host), model=config["model"])
             request = DecisionRequest(decision_id, INSTRUCTION, project_task(contract, config["use_case"]),
                 tuple(DecisionChoice(name, policies[name]["description"]) for name in legal))
             # Wrap even injected providers so the application, not a provider,
