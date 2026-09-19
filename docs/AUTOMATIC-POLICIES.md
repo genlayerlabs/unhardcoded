@@ -23,5 +23,10 @@ policy by an unversioned mutable name. General is a mandatory fallback; if it
 has no eligible candidate at execution time the request fails, never widens.
 
 Token-price ceilings and the output-token cap are not a monthly spending quota.
+The output-token cap lives in the frozen host constraints, not the policy term:
+the host clamps the caller's limit before execution so a lower caller limit is
+preserved. A constant Lua set_param would replace that lower limit. The bundle's
+engine_version identifies the IR format; its fingerprint is a diagnostic cache
+key, while policy_id is the canonical SHA-256 identity.
 Accounting, admission controls and request requirements remain host concerns.
 No production behavior changes merely by importing this catalog.

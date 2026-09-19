@@ -45,7 +45,7 @@ def test_new_candidates_can_qualify_without_changing_policy(template_host):
 
 @pytest.mark.parametrize("limits", [{"max_price_in": float("nan")}, {"max_price_out": -1},
     {"timeout_seconds": True}, {"priority": "ignore"}, {"required_capabilities": ["shell"]},
-    {"allowed_models": ["invalid"]}, {"unknown": 1}])
+    {"allowed_models": ["invalid"]}, {"unknown": 1}, [], False, 0, ""])
 def test_invalid_limits_rejected(limits):
     with pytest.raises(ValueError):
         compile_policy("general", limits)
