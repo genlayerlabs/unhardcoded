@@ -15,6 +15,14 @@ from provider_connections import connections, credential_names, label
 
 _active = contextvars.ContextVar("saas_host", default=None)
 _revision = contextvars.ContextVar("saas_revision", default=None)
+_automatic = contextvars.ContextVar("saas_automatic", default=None)
+_decision_trace = contextvars.ContextVar("saas_decision_trace", default=None)
+
+
+def automatic_trace():
+    decision = _decision_trace.get()
+    return ({**(_revision.get() or {}), "automatic": dict(decision),
+             "policy_id": decision.get("policy_id")} if decision else {})
 
 
 class ScopedHost:
@@ -29,9 +37,18 @@ class ScopedHost:
         if host._tenant_id is not None and contract.get("session"):
             scope_id = host._env.get('SAAS_TENANT_SCOPE', str(host._tenant_id))
             contract = {**contract, "session": f"tenant:{scope_id}:{contract['session']}"}
+        if execution := _automatic.get():
+            from decision_providers import DecisionError
+            from policy_selection import select_policy
+            try:
+                contract, _ = await select_policy(host, contract, execution, trace=_decision_trace.get())
+            except (ValueError, DecisionError):
+                return {"ok": False, "error": "no_candidates", "trace": automatic_trace()}
         result = await host.execute_async(contract, **kwargs)
         if revision := _revision.get():
             result.setdefault("trace", {}).update(revision)
+        if _automatic.get():
+            result.setdefault("trace", {}).update(automatic_trace())
         return result
 
 
@@ -119,6 +136,9 @@ def compile_intent(intent):
 
 
 def preview(host, intent):
+    if isinstance(intent, dict) and intent.get("kind") == "automatic":
+        from policy_selection import compile_automatic
+        return compile_automatic(host, intent)
     term = compile_intent(intent)
     normalized = host.normalize_policy(term, admit=True)
     ranked, rejected = host.rank({"policy_ir": normalized["policy_ir"]})
@@ -210,6 +230,15 @@ def install(app, scoped, handle_chat, chat_request):
         env_token = cp.activate_tenant_env(child._env)
         try:
             host_token = _active.set(child)
+            auto_payload = None
+            if request.url.path in ("/v1/chat/completions", "/v1/responses"):
+                try:
+                    payload = await request.json()
+                    auto_payload = payload.get("_auto_contract") if isinstance(payload, dict) else None
+                except ValueError:
+                    pass  # request validation returns the normal bad-body error
+            auto_token = _automatic.set(auto_payload)
+            decision_token = _decision_trace.set({})
             rev_token = _revision.set({
                 "route": request.headers.get("x-unhardcoded-route"),
                 "route_revision": request.headers.get("x-unhardcoded-revision"),
@@ -221,6 +250,8 @@ def install(app, scoped, handle_chat, chat_request):
                 return await call_next(request)
             finally:
                 _revision.reset(rev_token)
+                _automatic.reset(auto_token)
+                _decision_trace.reset(decision_token)
                 _active.reset(host_token)
         finally:
             cp.reset_tenant_env(env_token)
@@ -232,7 +263,10 @@ def install(app, scoped, handle_chat, chat_request):
     def catalog(request: Request):
         if not gate(request):
             return JSONResponse({"error": "forbidden"}, status_code=403)
-        return {"models": choices(scoped), "connection_errors": getattr(scoped, '_connection_errors', {})}
+        from auto_policies import catalog as automatic_catalog
+        from policy_selection import enabled
+        return {"models": choices(scoped), "connection_errors": getattr(scoped, '_connection_errors', {}),
+                "automatic_policies": automatic_catalog() if enabled() else []}
 
     @app.get("/x/saas/connections")
     def connection_catalog(request: Request):
@@ -261,7 +295,12 @@ def install(app, scoped, handle_chat, chat_request):
             built = await asyncio.to_thread(preview, scoped, body.get("intent"))
             req = chat_request(model="", policy_ir=built["policy_ir"], max_tokens=512,
                                messages=[{"role": "user", "content": prompt}],
-                               **{k: v for k, v in built['execution'].items() if k != 'task_policies'})
-            return await handle_chat(req)
+                               **{k: v for k, v in built['execution'].items() if k not in ('task_policies', 'automatic')})
+            token = _automatic.set({**built['execution'], 'automatic_mode': 'active'}
+                                  if 'automatic' in built['execution'] else None)
+            try:
+                return await handle_chat(req)
+            finally:
+                _automatic.reset(token)
         except (ValueError, TypeError, KeyError) as exc:
             return JSONResponse({"error": {"message": str(exc)}}, status_code=400)

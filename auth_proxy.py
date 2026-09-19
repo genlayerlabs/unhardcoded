@@ -3937,8 +3937,17 @@ async def proxy(path: str, request: Request) -> Response:
         # SaaS keys address published routes only. Raw policies, profiles and
         # pins cannot replace the workspace's published restrictions.
         import re
+        try:
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError()
+        except ValueError:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "Provide a JSON request object.", "type": "invalid_request_error"}})
+        raw_model = payload.get("model") or payload.get("name")
+        use_key_default = raw_model in (None, "", "auto")
         if (request.method != "POST" or path not in {"v1/chat/completions", "v1/responses"}
-                or not re.fullmatch(r"route:[a-z0-9][a-z0-9-]{0,79}", requested_route or "")):
+                or not (use_key_default or re.fullmatch(r"route:[a-z0-9][a-z0-9-]{0,79}", requested_route or ""))):
             return JSONResponse(status_code=400, content={"error": {
                 "message": "Use a published route, for example model='route:production'.",
                 "type": "invalid_request_error", "code": "route_required"}})
@@ -3947,10 +3956,15 @@ async def proxy(path: str, request: Request) -> Response:
             scope = ({"project_id": auth["project_id"], "environment_id": auth["environment_id"],
                       "key_digest": auth["digest"]} if auth.get("scope_version") == 2 else {})
             published_route = await control_plane_client.resolve_route(
-                auth["tenant_id"], requested_route[6:], **scope)
-            payload, published_route = apply_contract(json.loads(body), published_route)
+                auth["tenant_id"], "__key_default__" if use_key_default else requested_route[6:], **scope)
+            if use_key_default:
+                requested_route = published_route.get("route")
+                if not isinstance(requested_route, str) or not re.fullmatch(r"route:[a-z0-9][a-z0-9-]{0,79}", requested_route):
+                    raise control_plane_client.RouteUnavailable("The default route is unavailable.")
+                payload["model"] = requested_route
+            payload, published_route = apply_contract(payload, published_route)
             body = json.dumps(payload, separators=(",", ":")).encode()
-        except PreferenceNotAllowed as exc:
+        except (PreferenceNotAllowed, ValueError) as exc:
             return JSONResponse(status_code=400, content={'error': {
                 'message': str(exc), 'type': 'invalid_request_error', 'code': 'preference_not_allowed'}})
         except control_plane_client.RouteUnavailable as exc:
@@ -4082,7 +4096,7 @@ async def proxy(path: str, request: Request) -> Response:
         if published_route:
             decision_trace = {**(decision_trace or {}), 'route': requested_route,
                               'route_revision': published_route['revision'],
-                              'policy_id': published_route['policy_id'],
+                              'policy_id': (decision_trace or {}).get('policy_id') or published_route['policy_id'],
                               'routing_preference': published_route.get('routing_preference', 'default')}
             if auth.get('scope_version') == 2:
                 decision_trace.update(project_id=auth['project_id'], environment_id=auth['environment_id'])

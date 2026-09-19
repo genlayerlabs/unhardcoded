@@ -469,3 +469,25 @@ def test_plaintext_upstream_never_receives_trusted_scope_secret(monkeypatch):
     assert result.status_code == 503
     assert result.json()['error']['code'] == 'bridge_transport_unavailable'
     assert auth_proxy._client.requests == []
+
+
+@pytest.mark.parametrize('model', [None, '', 'auto'])
+@pytest.mark.parametrize('path', ['/v1/chat/completions', '/v1/responses'])
+def test_automatic_key_resolves_default_route_without_caller_policy(monkeypatch, model, path):
+    require_host_store()
+    _cp(monkeypatch, [{'active': True, 'consumer': 'auto-app', 'tenant_id': 7,
+        'scope_version': 2, 'project_id': 8, 'environment_id': 9}])
+    upstream = _upstream(monkeypatch)
+    async def resolve(tenant_id, name, **scope):
+        assert name == '__key_default__' and scope['environment_id'] == 9
+        return {'route': 'route:bound', 'revision': 1, 'policy_id': 'a' * 64,
+            'policy_ir': ['policy'], 'execution': {'automatic': {'trusted': True}, 'automatic_mode': 'shadow'}}
+    monkeypatch.setattr(cpc, 'resolve_route', resolve)
+    body = {'messages': [], '_auto_contract': {'forged': True}, 'flow_ir': ['forged']}
+    if model is not None:
+        body['model'] = model
+    result = TestClient(auth_proxy.app).post(path, headers={'Authorization': 'Bearer automatic-key'}, json=body)
+    assert result.status_code == 200, result.text
+    sent = json.loads(upstream.requests[0]['body'])
+    assert sent['model'] == 'route:bound' and 'flow_ir' not in sent
+    assert sent['_auto_contract'] == {'automatic': {'trusted': True}, 'automatic_mode': 'shadow'}

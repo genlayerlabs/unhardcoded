@@ -295,10 +295,11 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                     "request_deadline_exceeded": True,
                     "request_deadline_ms": request_deadline_ms,
                     "total_latency_ms": request_deadline_ms,
+                    **automatic_trace(),
                 },
             }
 
-    from saas_routes import ScopedHost, install as install_saas
+    from saas_routes import ScopedHost, automatic_trace, install as install_saas
     host = ScopedHost(host)
     app = FastAPI(title="llm-router shim", docs_url=None, redoc_url=None)
 
@@ -1799,6 +1800,15 @@ def _build_x_router(result: dict, subscription_providers=frozenset(),
         "decision_trace": _trim_trace(result.get("trace")),
         "compact": _compact_suggested(resp),
     }
+    automatic = (result.get("trace") or {}).get("automatic")
+    if isinstance(automatic, dict):
+        inference_cost = x_router["cost_usd"]
+        decision_cost = automatic.get("cost_usd")
+        x_router.update(inference_cost_usd=inference_cost, decision_cost_usd=decision_cost,
+                        cost_usd=(inference_cost + decision_cost
+                                  if inference_cost is not None and decision_cost is not None else None))
+        if x_router["cost_usd"] is None:
+            x_router["cost_basis"] = "unknown_total"
     if session:
         # #4b: derive the running total from the committed `calls` and add THIS
         # in-flight call (not yet in the ledger). Owner is derived from the
@@ -1922,6 +1932,9 @@ def _openai_error_from_router(result: dict) -> JSONResponse:
                 "model_family": None,
                 "served_model_id": None,
                 "decision_trace": trace or None,
+                **({"decision_cost_usd": trace["automatic"].get("cost_usd"),
+                    "cost_usd": trace["automatic"].get("cost_usd"),
+                    "cost_basis": "decision_only_inference_unknown"} if isinstance(trace.get("automatic"), dict) else {}),
             },
         },
     )
