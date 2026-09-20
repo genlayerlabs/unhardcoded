@@ -617,14 +617,14 @@
     },
     {
       "id": "catalog-view", "order": 46, "phase": "6-dashboard-ops",
-      "name": "Catalog (Market) -- price book + per-seller perf, + SKILL.md download",
+      "name": "Catalog and Skills -- price book, per-seller performance and agent guides",
       "actor": "operator", "category": "dashboard",
-      "entry_point": "Catalog tab -> GET /dashboard/api/market (-> /x/market); /dashboard/api/skill",
+      "entry_point": "Catalog tab -> GET /dashboard/api/market (-> /x/market); Skills tab -> /dashboard/api/skill?name=policy-authoring|policy-optimization; consumer download /skill with the same name selector",
       "preconditions": ["admin session"],
       "steps": [
         {"action": "open Catalog", "expected": "per-family rows: quality, benchmark badges, modalities, cheapest $in/$out, seller count"},
         {"action": "expand a family", "expected": "seller table: wire model, $in/$out, status (live/disabled/pinned/over-cap), perf (success%/ms/calls), refreshed time"},
-        {"action": "filter / Tradable-only / Copy / download SKILL.md", "expected": "filtered list; catalog JSON to clipboard; SKILL.md with live catalog + field vocab baked in"}
+        {"action": "filter / Tradable-only / Copy; choose authoring or optimization in Skills and download SKILL.md", "expected": "filtered list; catalog JSON to clipboard; selected SKILL.md with live catalog + field vocabulary; old /skill still defaults to authoring"}
       ],
       "notes": "Wallet cell appears on the AntSeed provider. 502 if router /x/market unavailable.",
       "test_flags": {"real_money": false, "real_credentials": false, "tos_risk": false, "mockable": true, "priority": "P1"}

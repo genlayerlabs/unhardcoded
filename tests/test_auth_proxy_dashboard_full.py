@@ -534,6 +534,20 @@ def test_consumer_validation_endpoints_proxy_to_router(monkeypatch, tmp_path):
         # GET /x/fields is forwarded
         assert client.get("/x/fields", headers=h).status_code == 200
         assert any(c[0] == "GET" and c[1].endswith("/x/fields") for c in rec.calls)
+        # Templates promised by the agent guide also work with a consumer key.
+        before = len(rec.calls)
+        assert client.get("/x/policy/templates").status_code == 401
+        assert client.post("/x/policy/templates/default", json={}).status_code == 401
+        assert len(rec.calls) == before
+        assert client.get("/x/policy/templates", headers=h).status_code == 200
+        assert rec.calls[-1][:2] == ("GET", auth_proxy.UPSTREAM + "/x/policy/templates")
+        options = {"family": "jev-1.13", "max_price_in": 0.1}
+        assert client.post("/x/policy/templates/cheapest-family", headers=h,
+                           json=options).status_code == 200
+        assert rec.calls[-1][:3] == ("POST", auth_proxy.UPSTREAM + "/x/policy/templates/cheapest-family", options)
+        before = len(rec.calls)
+        assert client.post("/x/policy/templates/unknown", headers=h, json={}).status_code == 404
+        assert len(rec.calls) == before
         # GET /x/rank carries the query through
         client.get("/x/rank?profile=default", headers=h)
         assert any(c[1].endswith("/x/rank") and c[3].get("profile") == "default"
@@ -1763,7 +1777,7 @@ _SKILL_MARKET = {"families": [{
 # Shape of /x/fields → host.field_schema(): the authoritative live vocabulary.
 _SKILL_FIELDS = [
     {"name": "price_in", "sort": "Num", "group": "provider", "core": True},
-    {"name": "quality", "sort": "Num", "group": "model", "core": True},
+    {"name": "success_rate", "sort": "Num", "group": "provider", "core": True},
     {"name": "bench_coding", "sort": "Num", "group": "model", "core": False},
     {"name": "cap_tools", "sort": "Bool", "group": "model", "core": False},
 ]
@@ -1800,7 +1814,8 @@ def test_field_vocabulary_derived_from_live_schema():
     assert "unavailable" in auth_proxy._field_vocabulary_markdown(None)
 
 
-def test_dashboard_skill_endpoint_downloads_markdown(monkeypatch):
+@pytest.mark.parametrize("name", ["policy-authoring", "policy-optimization"])
+def test_dashboard_skill_endpoint_downloads_markdown(monkeypatch, name):
     async def _fake_market():
         return _SKILL_MARKET
 
@@ -1808,7 +1823,7 @@ def test_dashboard_skill_endpoint_downloads_markdown(monkeypatch):
         return _SKILL_FIELDS
     monkeypatch.setattr(auth_proxy, "_fetch_live_market", _fake_market)
     monkeypatch.setattr(auth_proxy, "_fetch_live_fields", _fake_fields)
-    r = _dashboard_client(monkeypatch).get("/dashboard/api/skill")
+    r = _dashboard_client(monkeypatch).get("/dashboard/api/skill", params={"name": name})
     assert r.status_code == 200
     assert "text/markdown" in r.headers["content-type"]
     assert "filename=SKILL.md" in r.headers["content-disposition"]
@@ -1816,8 +1831,9 @@ def test_dashboard_skill_endpoint_downloads_markdown(monkeypatch):
     assert "`bench_coding`" in r.text   # live field vocabulary baked in too
 
 
-def test_dashboard_skill_endpoint_requires_auth():
-    assert TestClient(auth_proxy.app).get("/dashboard/api/skill").status_code == 401
+@pytest.mark.parametrize("name", ["policy-authoring", "policy-optimization"])
+def test_dashboard_skill_endpoint_requires_auth(name):
+    assert TestClient(auth_proxy.app).get("/dashboard/api/skill", params={"name": name}).status_code == 401
 
 
 def test_catalog_tab_renamed_and_skill_is_its_own_tab(monkeypatch):
@@ -1828,7 +1844,8 @@ def test_catalog_tab_renamed_and_skill_is_its_own_tab(monkeypatch):
     assert "/dashboard/api/skill" in html      # the tab loads + downloads the live SKILL.md
 
 
-def test_consumer_skill_endpoint_authed_by_consumer_key(monkeypatch):
+@pytest.mark.parametrize("name", ["policy-authoring", "policy-optimization"])
+def test_consumer_skill_endpoint_authed_by_consumer_key(monkeypatch, name):
     # /skill serves the SAME SKILL.md as /dashboard/api/skill (same renderer),
     # but authenticated by a CONSUMER KEY (Bearer) instead of a dashboard session,
     # so an agent can fetch it with the credential it already calls /v1/* with.
@@ -1845,14 +1862,36 @@ def test_consumer_skill_endpoint_authed_by_consumer_key(monkeypatch):
     client = TestClient(auth_proxy.app)
 
     # no key / bad key -> 401 (reuses the same key auth as /v1/*)
-    assert client.get("/skill").status_code == 401
-    assert client.get("/skill", headers={"Authorization": "Bearer nope"}).status_code == 401
+    assert client.get("/skill", params={"name": name}).status_code == 401
+    assert client.get("/skill", params={"name": name}, headers={"Authorization": "Bearer nope"}).status_code == 401
 
     # a valid consumer key -> 200, the markdown download
-    r = client.get("/skill", headers={"Authorization": "Bearer internal"})
+    r = client.get("/skill", params={"name": name}, headers={"Authorization": "Bearer internal"})
     assert r.status_code == 200
     assert "text/markdown" in r.headers["content-type"]
     assert "filename=SKILL.md" in r.headers["content-disposition"]
+
+    assert r.text == auth_proxy._render_skill({}, [], path=(
+        auth_proxy.OPTIMIZATION_SKILL_PATH if name == "policy-optimization" else auth_proxy.SKILL_PATH))
+
+
+@pytest.mark.parametrize("path", ["/skill", "/dashboard/api/skill"])
+def test_skill_download_rejects_unknown_names_and_missing_files(monkeypatch, tmp_path, path):
+    async def empty():
+        return None
+    monkeypatch.setattr(auth_proxy, "_fetch_live_market", empty)
+    monkeypatch.setattr(auth_proxy, "_fetch_live_fields", empty)
+    monkeypatch.setattr(host_store, "get_consumer_key", lambda _: ({"status": "active"}, True))
+    client = _dashboard_client(monkeypatch)
+    headers = {"Authorization": "Bearer internal"}
+    for name in ("../SKILL.md", "", "missing"):
+        response = client.get(path, params={"name": name}, headers=headers)
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "skill_not_found"
+    monkeypatch.setattr(auth_proxy, "OPTIMIZATION_SKILL_PATH", tmp_path / "missing.md")
+    response = client.get(path, params={"name": "policy-optimization"}, headers=headers)
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "skill_unavailable"
 
 
 def test_cost_accuracy_rows_flags_drift_against_raw_metrics():

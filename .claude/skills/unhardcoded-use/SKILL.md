@@ -15,8 +15,9 @@ description: >-
 
 The router is an **OpenAI-compatible endpoint**. You do not pick a model name —
 you send a **policy** (data) and the host filters/ranks/picks a `(provider,
-model)` over the *operator's* keys, falling back on provider errors. When a
-policy is present the request's `model` field is ignored for selection.
+model)` over the *operator's* keys, falling back on provider errors. Use an
+empty `model` when the custom policy owns selection; family/pin request
+constraints can still restrict a supplied policy.
 
 There are two roles: **caller** (hits `/v1/*` with a bearer key) and **operator**
 (the dashboard + the internal `/x/*` endpoints). This skill orients both; the
@@ -37,8 +38,8 @@ standard OpenAI + one of:
   path-address a profile: `POST /{profile}/v1/chat/completions`.
 
 **Session pinning.** Set `X-Unhardcoded-Session: <conversation-id>` (or a
-`session` body field — body wins). The router keeps the conversation on its
-cache-hot peer (warm prompt-cache across turns) and meters spend per session.
+`session` body field — body wins). The router prefers session affinity where eligible and meters spend per session.
+This is not a guaranteed pin or a security boundary.
 
 **Streaming.** `stream: true`. Errors *before the first token* return a normal
 JSON error (no partial SSE commit), so client-side fallback still works.
@@ -47,23 +48,31 @@ JSON error (no partial SSE commit), so client-side fallback still works.
 (stateless context sealing — hand it your turns, get a sealed summary back).
 
 **Dry-run before you spend** (these cost nothing):
-- `POST /x/policy/normalize` — admit a `policy_ir` + get its `fingerprint`/version.
+- `POST /x/policy/normalize` — normalize/identify a `policy_ir`; admission happens at rank/use.
 - `POST /x/rank` — the ordered candidates this host *would* try for a term.
 - `POST /x/policy/build` — elaborate a declarative spec → a `policy_ir`.
 - `POST /x/flow/normalize` — admit + identify a `flow_ir`.
 - `GET /x/fields` — the live field schema a policy may reference.
 
+- `GET /x/policy/templates` and `POST /x/policy/templates/{id}` — list/compile intent templates.
+
 **Authoring the policy itself is a separate skill.** The root `SKILL.md`
 (`sigma-policy-author`) is the canonical authoring guide: it embeds this host's
 **live** model/provider catalog and field vocabulary and is test-gated so it can
 only teach ops the core actually admits. Load it to write terms; the normative
-grammar is `core/docs/SIGMA-POL.md`.
+grammar is `core/docs/SIGMA-POL.md`. Fetch `/skill` with a consumer key for the
+live guide, or `/skill?name=policy-optimization` for bounded baseline/candidate
+experiments. Both are available in the dashboard Skills tab.
+
+**Decision models:** discover `/v1/models?type=decisions`, preview `/x/rank`
+with `protocol: "decisions"`, then call `/v1/decisions` with `state` and typed
+`questions`. See `docs/DECISION-MODELS.md`; these are normal-router endpoints.
 
 ## As an operator
 
-The `/x/*` endpoints are **operator-only** — the ingress proxy hides them from
-consumers. The **dashboard** (Analytics · Debugger · Activity · Catalog · SKILL.md · Config · Settings)
-wraps most of them:
+The no-spend authoring endpoints listed above accept consumer keys. Other
+`/x/*` operations remain internal/operator-only. The **dashboard** (Analytics ·
+Debugger · Activity · Catalog · Skills · Config · Settings) wraps most of them:
 - **Keys:** mint/list consumer keys.
 - **Providers:** hot-add or re-key a provider at runtime — `POST /x/providers`,
   `POST /x/provider-key` (persisted as overlays; no redeploy).
@@ -76,12 +85,14 @@ wraps most of them:
 
 ## Gotchas
 
-- **`model` is ignored when a policy is present** — the policy drives selection.
+- **Match preview to execution** — include protocol and actual family, capability
+  and context requirements. Host envelopes can change effective fingerprints.
 - **The host envelope only narrows.** `config.policy_envelope` is `∧`-composed
   onto every caller policy: a caller can tighten the host's invariants, never
   widen them. A term that passes your local check can still be narrowed by the host.
 - **Seed prices are a placeholder.** `metrics.live.lua` is intentionally fake
-  (see `docs/METRICS.md`); real EMA prices/latency accrue from live calls. Don't
+  (see `docs/METRICS.md`); live prices come from discovery; route success and mean successful latency
+  come from recent host observations. Don't
   trust the seed numbers for cost reasoning on a fresh host.
 - **Codex ranks near-free by design** (subscription = sunk cost, seeded ≈ $0), so
   a cheapest-first policy prefers it when available — deliberate, not a bug.
