@@ -35,7 +35,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 import control_plane_client
 from env_coerce import env_int
@@ -103,6 +103,7 @@ class ChatRequest(BaseModel):
     # policy). When present it takes precedence over policy_ir/model. Admission
     # failure -> 400 invalid_flow.
     flow_ir: list | None = None
+    flow_input: dict | list | str | None = None  # typed data for a generic flow
     # Conversation/session id (optional). When present the host learns which peer
     # served this session (route_cache) and, next turn, marks that peer's offer
     # cache_hot so a cache-aware policy keeps the prompt-cache-hot peer sticky.
@@ -169,6 +170,9 @@ class CompactRequest(BaseModel):
     keep_recent: int = 6          # verbatim tail kept after the seal
     policy_ir: list | None = None  # cheap routing for the summarizer
     max_tokens: int | None = 512
+    decision_policy_ir: list | None = None  # opt-in fragment triage
+    target_ratio: float = Field(default=0.1, gt=0, le=1)
+    pinned_indices: list[int] | None = None  # default: every user message
 
 
 class FlowNormalizeRequest(BaseModel):
@@ -1111,6 +1115,29 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         that precede execution made no call and carry neither key."""
         msgs = req.messages or []
         keep = max(1, req.keep_recent)
+        if req.decision_policy_ir is not None:
+            from flow_presets.compaction import prepare, finish
+            if req.pinned_indices is not None and any(i < 0 or i >= len(msgs) for i in req.pinned_indices):
+                return _openai_error('pinned_indices must reference existing messages', 'invalid_request_error', 400)
+            prepared = prepare(msgs, keep_recent=keep, pinned_indices=req.pinned_indices,
+                target_ratio=req.target_ratio, decision_policy=req.decision_policy_ir,
+                summary_policy=req.policy_ir or _DEFAULT_COMPACT_POLICY, max_tokens=req.max_tokens or 512)
+            try:
+                # The same admitted flow executor exposed through flow_ir on chat.
+                res = await host.execute_flow_async(prepared['flow_ir'],
+                    {'flow_input': prepared['flow_input'], 'messages': []})
+            except Exception as exc:
+                admission = _flow_admission_error(exc)
+                if admission is not None:
+                    return _invalid_flow_response(admission)
+                raise
+            body = finish(prepared, res)
+            if (res.get('trace') or {}).get('flow_nodes'):
+                usage = _openai_usage(res.get('response') or {})
+                if usage:
+                    body['usage'] = usage
+                body['x_router'] = _build_x_router(res, subscription_providers)
+            return body
         # frozen prefix = a leading system message (the skill/tools/rules), if any
         frozen = msgs[:1] if (msgs and msgs[0].get("role") == "system") else []
         head = len(frozen)
@@ -1580,6 +1607,8 @@ def _request_to_contract(
 ) -> dict:
     model = (req.model or "").strip()
     contract: dict = {"messages": req.messages or []}
+    if req.flow_input is not None:
+        contract['flow_input'] = req.flow_input
 
     if not model:
         contract["profile"] = default_profile

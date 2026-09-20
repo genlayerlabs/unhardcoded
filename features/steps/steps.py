@@ -503,6 +503,27 @@ def step_is_compacted(context):
     assert len(j["messages"]) < len(context.compact_input), "no length reduction"
 
 
+@when('the agent requests fragment compaction with an explicit decision policy')
+def step_fragment_compact(context):
+    import os
+    policy = json.loads(os.environ['DECISION_COMPACTION_POLICY_IR'])
+    _do(context, 'POST', '/v1/compact', auth='consumer', body={
+        'messages': context.compact_input, 'keep_recent': 4, 'target_ratio': .1,
+        'policy_ir': _seal_via_ollama_policy(), 'decision_policy_ir': policy})
+    assert context.resp.status_code == 200, context.resp_text[:300]
+
+
+@then('fragment compaction reports its actual size and protected user inputs')
+def step_fragment_metrics(context):
+    data = context.json
+    metrics = data['compaction']
+    assert metrics['target_met'] == (metrics['output_bytes'] <= metrics['target_bytes'])
+    assert metrics['output_bytes'] <= metrics['original_bytes']
+    for message in context.compact_input:
+        if message['role'] == 'user':
+            assert message in data['messages']
+
+
 @then('the system prefix is preserved')
 def step_prefix_preserved(context):
     assert context.json["messages"][0] == context.compact_input[0], "prefix changed"
@@ -536,3 +557,22 @@ def step_decision_flow_choices(context):
     node = next(n for n in nodes if n.get('routing'))
     assert set(node['routing']['choices']) == {'economy', 'capable'}
     assert node['routing']['fallback'] == 'capable'
+
+
+@when('I normalize the generic ticket triage preset')
+def step_typed_flow_normalize(context):
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[2] / 'examples/flows/ticket-triage.json'
+    _do(context, 'POST', '/x/flow/normalize', auth='consumer',
+        body={'flow_ir': json.loads(path.read_text())})
+
+
+@then('the normalized ticket flow retains typed operations')
+def step_typed_flow_nodes(context):
+    nodes = list(context.json['flow_ir'][1].values())
+    assert sum(n['kind'] == 'decision' for n in nodes) == 1
+    assert {n['operation'] for n in nodes if n['kind'] == 'data'} == {'select', 'overlay'}
+    generation = next(n for n in nodes if n['kind'] == 'llm')
+    assert generation['output_format'] == 'json'
+    assert generation['skip_empty'] is True
+    assert generation['context'] == 'inputs'

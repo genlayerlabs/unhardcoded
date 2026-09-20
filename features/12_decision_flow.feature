@@ -16,3 +16,9 @@ Feature: Decision-routed generation flows
   Scenario: An unknown fallback is rejected before inference
     When I normalize a decision-routed flow with fallback "unknown"
     Then the status is 400
+
+  @p1 @flow
+  Scenario: Generic ticket flow supports decisions and conditional JSON generation
+    When I normalize the generic ticket triage preset
+    Then the status is 200
+    And the normalized ticket flow retains typed operations

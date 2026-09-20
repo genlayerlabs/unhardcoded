@@ -333,6 +333,12 @@ end
         the shim maps it to 400 invalid_flow, the flow twin of invalid_policy.
         Admission is the core's job (one boundary), like policy_ir."""
         F = self._flow_module()
+        from flow_data import bounded, is_typed
+        try:
+            if is_typed(flow_ir):
+                bounded(flow_ir)
+        except (ValueError, TypeError, RecursionError) as exc:
+            raise FlowAdmissionError("flow: " + str(exc)) from exc
         lf = _to_lua(self.lua, flow_ir)
         # flow.check returns `true` (one value) or `nil, err` (two); lupa hands
         # back a bare value or a tuple accordingly.
@@ -361,6 +367,21 @@ end
 
         admitted = self.flow_admit(flow_ir)
         fp = admitted["fingerprint"]
+        from decision_protocol import validate_payload, validate_response
+        from flow_data import bounded, is_typed
+        for node in admitted['flow_ir'][1].values():
+            if node['kind'] == 'decision':
+                try:
+                    validate_payload({'state': {}, 'questions': node['questions']})
+                except (ValueError, TypeError) as exc:
+                    raise FlowAdmissionError("flow: " + str(exc)) from exc
+        typed = is_typed(admitted['flow_ir']) or 'flow_input' in base_contract
+        input_data = base_contract.get('flow_input')
+        if input_data is not None:
+            try:
+                bounded(input_data)
+            except (ValueError, TypeError, RecursionError) as exc:
+                raise FlowAdmissionError("flow: " + str(exc)) from exc
         input_text = _last_user_text(base_contract.get("messages") or [])
         carry = {k: base_contract[k] for k in
                  ("max_tokens", "tools", "tool_choice", "response_format",
@@ -374,7 +395,7 @@ end
             # assembled prompt (input passthrough, or the template'd drafts for a
             # synthesizer) is the final user turn. Cost: each node sees the whole
             # conversation, so an N-node flow is ~N× the input tokens.
-            msgs = list(base_contract.get("messages") or [])
+            msgs = [] if node.get("context") == "inputs" else list(base_contract.get("messages") or [])
             if node.get("system"):
                 msgs.append({"role": "system", "content": node["system"]})
             msgs.append({"role": "user", "content": prompt})
@@ -386,9 +407,24 @@ end
                     policy, routing_trace = await select_node_policy(
                         self, node["routing"], msgs, prompt,
                         session=base_contract.get("session"), call_override=call_override)
-                res = await self.execute_async(
-                    {**carry, "messages": msgs, "policy_ir": policy},
-                    call_override=call_override)
+                if node['kind'] == 'decision':
+                    payload = validate_payload({'state': prompt, 'questions': node['questions']})
+                    contract = {'protocol': 'decisions', 'decision': payload, 'policy_ir': policy,
+                                'session': base_contract.get('session'), 'timeout_ms': node.get('timeout_ms', 7000)}
+                else:
+                    contract = {**carry, 'messages': msgs, 'policy_ir': policy}
+                    for key in ('max_tokens', 'timeout_ms'):
+                        if key in node:
+                            contract[key] = node[key]
+                    if node.get('output_format') == 'json':
+                        contract['response_format'] = {'type': 'json_object'}
+                        contract.pop('tools', None)
+                        contract.pop('tool_choice', None)
+                if 'timeout_ms' in node or node['kind'] == 'decision':
+                    async with asyncio.timeout(contract['timeout_ms'] / 1000):
+                        res = await self.execute_async(contract, call_override=call_override)
+                else:
+                    res = await self.execute_async(contract, call_override=call_override)
             except Exception as exc:
                 # A node's routed call must NEVER crash the whole flow: an
                 # unhandled exception here bubbles past the shim and surfaces as a
@@ -398,13 +434,21 @@ end
                         "node_trace": {"node": nid, "error": str(exc)}}
             resp, chosen, tr = (res.get("response") or {},
                                 res.get("chosen") or {}, res.get("trace") or {})
+            data, invalid = None, None
+            if node['kind'] == 'decision' and res.get('ok'):
+                try:
+                    data = validate_response(resp.get('decision'), payload)['answers']
+                except (ValueError, TypeError) as exc:
+                    invalid = str(exc)
             return {
-                "ok": bool(res.get("ok")),
+                "ok": bool(res.get("ok")) and invalid is None,
+                **({'data': data} if data is not None else {}),
+                "finish_reason": resp.get('finish_reason'),
                 "text": resp.get("text"),
                 # Proposals from a non-terminal node travel as data to the
                 # synthesizer; the terminal node's are emitted to the caller.
                 "tool_calls": resp.get("tool_calls"),
-                "error": res.get("error") or tr.get("exhausted_reason"),
+                "error": invalid or res.get("error") or tr.get("exhausted_reason"),
                 "node_trace": {
                     "policy_fingerprint": tr.get("policy_fingerprint"),
                     "provider": chosen.get("provider_id"),
@@ -427,7 +471,12 @@ end
                 },
             }
 
-        fr = await run_flow(admitted["flow_ir"], input_text, run_node)
+        # Typed flows share one host deadline. Individual node fallbacks retain
+        # their trace; cancellation from the caller still propagates.
+        if typed:
+            fr = await run_flow(admitted["flow_ir"], input_text, run_node, input_data=input_data, timeout_seconds=40)
+        else:
+            fr = await run_flow(admitted["flow_ir"], input_text, run_node)
         nodes = fr.get("trace") or []
         tok_in = sum((n.get("tokens_in") or 0) for n in nodes) or None
         tok_out = sum((n.get("tokens_out") or 0) for n in nodes) or None
@@ -445,6 +494,8 @@ end
             pout = n.get("raw_price_out", n.get("price_out"))
             if pin is None and pout is None:
                 return None
+            if n.get('tokens_in') is None or n.get('tokens_out') is None:
+                return None
             if n.get("raw_price_in") is None and n.get("raw_price_out") is None:
                 mult = n.get("price_multiplier")
                 if isinstance(mult, (int, float)) and not isinstance(mult, bool) and mult > 0:
@@ -460,7 +511,7 @@ end
         routing_traces = [n["routing"] for n in nodes if n.get("routing") is not None]
         routing_costs = [r["cost_usd"] for r in routing_traces if r.get("cost_usd") is not None]
         # A timed-out decision may still be billable; never report its cost as zero.
-        cost_known = len(routing_costs) == len(routing_traces)
+        cost_known = len(routing_costs) == len(routing_traces) and len(_costs) == len(nodes)
         flow_cost = round(sum(_costs) + sum(routing_costs), 12) if _costs and cost_known else None
         tok_in = (tok_in or 0) + sum(r.get("tokens_in") or 0 for r in routing_traces) or None
         tok_out = (tok_out or 0) + sum(r.get("tokens_out") or 0 for r in routing_traces) or None
@@ -476,6 +527,8 @@ end
             # no_candidates, but the wrapper hid it behind a 502). Keep the flow
             # context in the trace.
             return {"ok": False, "error": fr.get("error") or "flow_node_failed",
+                    "response": {"tokens_in": tok_in, "tokens_out": tok_out,
+                                 "tokens_cached": tok_cached, "cost_reported": flow_cost},
                     # carry chosen + the per-node trace on FAILURE too, so a failed
                     # flow is visible in Activity (provider:"flow" + which node
                     # failed) instead of an empty row — the shim emits this as the
@@ -488,6 +541,7 @@ end
         return {
             "ok": True,
             "response": {"text": fr.get("text") or "",
+                         **({"data": fr["data"]} if "data" in fr else {}),
                          "tool_calls": final_tool_calls or None,
                          "finish_reason": "tool_calls" if final_tool_calls else "stop",
                          "tokens_in": tok_in, "tokens_out": tok_out,

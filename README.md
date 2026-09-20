@@ -11,6 +11,8 @@ why.
 engine through `POST /v1/decisions` (`/v1/systemone` alias). Discover them in the
 dashboard's **Decision models** category or `/v1/models?type=decisions`.
 See [decision routing, provider requirements and examples](docs/DECISION-MODELS.md).
+The same decision policies can [classify context fragments for selective
+compaction](docs/FRAGMENT-COMPACTION.md), with generative summaries only where needed.
 
 Concretely it's an async FastAPI shim that runs the
 [`unhardcoded-engine`](https://github.com/genlayerlabs/unhardcoded-engine) core
@@ -208,5 +210,7 @@ behave
 
 *(Nix users: `nix-shell -p ...` with the same packages — plus `chromium
 chromedriver` for the browser pass — works as before.)*
+
+See [generic typed decision/data flows](docs/TYPED-FLOWS.md) for classification, selection and conditional generation.
 
 See [decision routing within generative flows](docs/DECISION-FLOWS.md) to select an economical or capable generation policy from conversation and tool history.

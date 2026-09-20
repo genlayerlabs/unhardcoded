@@ -16,3 +16,11 @@ Feature: Agent context compaction — append-only sealing over /v1/compact
     Then the context is compacted
     And the system prefix is preserved
     And the last 4 turns are preserved verbatim
+
+  @manual @api @agent @compact @decisions
+  Scenario: Decision-guided compaction reports its target without removing protected evidence
+    Given a long agent conversation sealable by the local model
+    When the agent requests fragment compaction with an explicit decision policy
+    Then the system prefix is preserved
+    And the last 4 turns are preserved verbatim
+    And fragment compaction reports its actual size and protected user inputs
