@@ -25,6 +25,8 @@ from provider_adapters.common import (
     _provider_error_message,
 )
 
+from provider_adapters.diagnostics import ProviderTiming, upstream_metadata
+
 Emit = Callable[[str], Awaitable[None]]
 
 
@@ -428,19 +430,21 @@ def make_async_call_provider(
         # adapter. Acquiring here as well would deadlock a cap=1 peer against
         # this same request.
         uses_streaming_backend = request.get("first_token_timeout_ms") is not None
+        timing = ProviderTiming(request, timeout, "buffered_sse" if uses_streaming_backend else "buffered")
         slot = None
         if not uses_streaming_backend:
             slot, gate_error = await _acquire_peer_capacity(request, timeout)
             if gate_error:
-                return _peer_capacity_error(
-                    str(peer_id or ""), int(cap or 0), gate_error, t0)
+                return timing.attach(_peer_capacity_error(
+                    str(peer_id or ""), int(cap or 0), gate_error, t0))
         try:
             try:
                 # HTTPX limits inactivity between reads; a trickling response can
                 # exceed it indefinitely. Bound the complete buffered call, including
                 # time already spent waiting for peer capacity.
                 remaining = max(0.0, timeout - (_time.monotonic() - t0))
-                async with asyncio.timeout(remaining):
+                deadline = asyncio.timeout(remaining)
+                async with deadline:
                     if uses_streaming_backend:
                         # Reuse the streaming backend (defined below in this module) to
                         # get a first-token bound, discarding deltas — a non-stream call.
@@ -455,29 +459,33 @@ def make_async_call_provider(
                             extra_headers=_extra,
                             timeout_s=timeout_s,
                             token_providers=token_providers,
-                            provider_rules=provider_rules,
+                            provider_rules=provider_rules, _timing=timing,
                         )
                     else:
                         from byo_http import buyer_client, is_byo_buyer
                         if is_byo_buyer(request, _env_get):
                             async with buyer_client() as buyer:
-                                resp = await buyer.post(url, json=body, headers=headers, timeout=timeout)
+                                timing.data["phase"] = "connection_pool"
+                                resp = await buyer.post(url, json=body, headers=headers, timeout=timeout, **timing.http_options(buyer))
                         elif client is not None:
+                            timing.data["phase"] = "connection_pool"
                             resp = await client.post(
-                                url, json=body, headers=headers, timeout=timeout)
+                                url, json=body, headers=headers, timeout=timeout, **timing.http_options(client))
                         else:
                             async with httpx.AsyncClient() as c:
+                                timing.data["phase"] = "connection_pool"
                                 resp = await c.post(
-                                    url, json=body, headers=headers, timeout=timeout)
+                                    url, json=body, headers=headers, timeout=timeout, **timing.http_options(c))
                         rules = (provider_rules or {}).get(request.get("provider_id")) or {}
                         result = _parse_openai_response(
                             resp, _elapsed_ms(t0), error_map=rules.get("error_map"))
-            except (TimeoutError, httpx.TimeoutException):
+            except (TimeoutError, httpx.TimeoutException) as exc:
+                timing.data["timeout_source"] = "attempt_deadline" if deadline.expired() else type(exc).__name__
                 result = _err("timeout", 0, _elapsed_ms(t0),
                               f"POST {url} timed out")
             except (httpx.NetworkError, httpx.RequestError) as e:
                 result = _err("network_error", 0, _elapsed_ms(t0), str(e))
-            return result
+            return timing.attach(result)
         finally:
             if slot is not None:
                 await slot.release()
@@ -506,6 +514,27 @@ async def stream_openai_compatible(
     timeout_s: float = 45.0,
     token_providers: dict | None = None,
     provider_rules: dict[str, dict] | None = None,
+    _timing: ProviderTiming | None = None,
+) -> dict:
+    timing = _timing or ProviderTiming(request, (request.get("timeout_ms") or timeout_s * 1000) / 1000, "streaming")
+    result = await _stream_openai_compatible_impl(
+        request, emit, env_get=env_get, extra_headers=extra_headers, client=client,
+        timeout_s=timeout_s, token_providers=token_providers,
+        provider_rules=provider_rules, _timing=timing)
+    return timing.attach(result)
+
+
+async def _stream_openai_compatible_impl(
+    request: dict,
+    emit: Emit,
+    *,
+    client: Any = None,
+    env_get=None,
+    extra_headers: dict | None = None,
+    timeout_s: float = 45.0,
+    token_providers: dict | None = None,
+    provider_rules: dict[str, dict] | None = None,
+    _timing: ProviderTiming,
 ) -> dict:
     """The OpenAI-compatible STREAMING wire backend (sibling of `call`). Returns the
     SAME complete-response dict the non-streaming backend does, so the core's
@@ -556,15 +585,17 @@ async def stream_openai_compatible(
         return saw_output
 
     def _timeout_err() -> dict:
+        _timing.data["timeout_source"] = "first_output_deadline"
         return first_token_timeout_err(first_timeout_s, _latency())
 
     try:
         try:
             async with AsyncExitStack() as stack:
                 try:
+                    _timing.data["phase"] = "connection_pool"
                     resp = await before_first_output(stack.enter_async_context(
                         client.stream("POST", url, json=body, headers=headers,
-                                      timeout=timeout)), first_timeout_s, t0, _saw_output)
+                                      timeout=timeout, **_timing.http_options(client))), first_timeout_s, t0, _saw_output)
                 except (asyncio.TimeoutError, TimeoutError):
                     return _timeout_err()
                 if not (200 <= resp.status_code < 300):
@@ -593,6 +624,7 @@ async def stream_openai_compatible(
                         chunk = json.loads(data)
                     except ValueError:
                         continue
+                    _timing.observe_chunk(chunk)
                     if raw_model is None:
                         raw_model = chunk.get("model")
                     if chunk.get("usage"):
@@ -644,6 +676,8 @@ async def stream_openai_compatible(
                 "tokens_cached": _cached_tokens(usage),
                 "cost_reported": usage.get("cost"),
                 "raw_model": raw_model,
+                "upstream": {k: _timing.data[k] for k in ("upstream_id", "upstream_provider", "tokens_reasoning") if k in _timing.data},
+                "tokens_reasoning": _timing.data.get("tokens_reasoning"),
             },
         }
     finally:
@@ -697,6 +731,8 @@ def _parse_openai_response(
                 "tokens_cached": _cached_tokens(usage),
                 "cost_reported": usage.get("cost"),
                 "raw_model": data.get("model"),
+                "upstream": upstream_metadata(data),
+                "tokens_reasoning": upstream_metadata(data).get("tokens_reasoning"),
             },
         }
 
