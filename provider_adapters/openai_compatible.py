@@ -189,6 +189,8 @@ def make_http_call_provider(
     _extra = dict(extra_headers or {})
 
     def call(request: dict) -> dict:
+        if request.get('protocol') == 'decisions':
+            return _err('unsupported_api_kind', 0, 0, 'Decision requests require the async decision transport')
         api_kind = request.get("api_kind", "openai_compatible")
         if api_kind != "openai_compatible":
             return _err("unsupported_api_kind", 0, 0,

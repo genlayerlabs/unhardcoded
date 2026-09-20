@@ -98,6 +98,22 @@ def test_primary_antseed_success_does_not_call_openrouter(routed):
     assert len(calls) == 1
 
 
+def test_decision_state_and_null_criteria_survive_lua_and_fallback(routed, monkeypatch):
+    import sys
+    payload = copy.deepcopy(PAYLOAD)
+    payload['state'] = {'ticket': None, 'events': [], 'metadata': {}, 'values': [None, [], {}]}
+    payload['questions']['team']['criteria']['billing'] = None
+    monkeypatch.setattr(sys.modules[__name__], 'PAYLOAD', payload)
+    host, _, calls, _ = routed
+    response = TestClient(create_app(host)).post('/v1/decisions', json={**payload, 'policy_ir': POLICY})
+    assert response.status_code == 200, response.text
+    assert len(calls) == 2
+    for call in calls:
+        body = json.loads(call.content)
+        assert body['state'] == payload['state']
+        assert body['questions'] == payload['questions']
+
+
 def test_failure_does_not_fall_back_to_chat(routed):
     host, _, calls, behavior = routed
     behavior['openrouter_status'] = 503
@@ -173,6 +189,12 @@ def test_all_three_question_types_are_validated():
         's': {'type': 'score', 'score': .7, 'probabilities': {'0': .3, '1': .7}}}}, payload)
     with pytest.raises(ValueError):
         validate_response({'model': 'jev', 'answers': {'q': {'type': 'noul', 'noul': 2}}}, payload)
+
+
+def test_sync_chat_adapter_cannot_misroute_decisions():
+    from provider_adapters.openai_compatible import make_http_call_provider
+    result = make_http_call_provider()({'protocol': 'decisions', 'decision': PAYLOAD})
+    assert result['error_kind'] == 'unsupported_api_kind'
 
 
 @pytest.mark.asyncio
