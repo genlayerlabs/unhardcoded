@@ -435,38 +435,43 @@ def make_async_call_provider(
                     str(peer_id or ""), int(cap or 0), gate_error, t0)
         try:
             try:
-                if uses_streaming_backend:
-                    # Reuse the streaming backend (defined below in this module) to
-                    # get a first-token bound, discarding deltas — a non-stream call.
-                    async def _ignore_delta(_delta: str) -> None:
-                        return None
+                # HTTPX limits inactivity between reads; a trickling response can
+                # exceed it indefinitely. Bound the complete buffered call, including
+                # time already spent waiting for peer capacity.
+                remaining = max(0.0, timeout - (_time.monotonic() - t0))
+                async with asyncio.timeout(remaining):
+                    if uses_streaming_backend:
+                        # Reuse the streaming backend (defined below in this module) to
+                        # get a first-token bound, discarding deltas — a non-stream call.
+                        async def _ignore_delta(_delta: str) -> None:
+                            return None
 
-                    result = await stream_openai_compatible(
-                        request,
-                        _ignore_delta,
-                        client=client,
-                        env_get=_env_get,
-                        extra_headers=_extra,
-                        timeout_s=timeout_s,
-                        token_providers=token_providers,
-                        provider_rules=provider_rules,
-                    )
-                else:
-                    from byo_http import buyer_client, is_byo_buyer
-                    if is_byo_buyer(request, _env_get):
-                        async with buyer_client() as buyer:
-                            resp = await buyer.post(url, json=body, headers=headers, timeout=timeout)
-                    elif client is not None:
-                        resp = await client.post(
-                            url, json=body, headers=headers, timeout=timeout)
+                        result = await stream_openai_compatible(
+                            request,
+                            _ignore_delta,
+                            client=client,
+                            env_get=_env_get,
+                            extra_headers=_extra,
+                            timeout_s=timeout_s,
+                            token_providers=token_providers,
+                            provider_rules=provider_rules,
+                        )
                     else:
-                        async with httpx.AsyncClient() as c:
-                            resp = await c.post(
+                        from byo_http import buyer_client, is_byo_buyer
+                        if is_byo_buyer(request, _env_get):
+                            async with buyer_client() as buyer:
+                                resp = await buyer.post(url, json=body, headers=headers, timeout=timeout)
+                        elif client is not None:
+                            resp = await client.post(
                                 url, json=body, headers=headers, timeout=timeout)
-                    rules = (provider_rules or {}).get(request.get("provider_id")) or {}
-                    result = _parse_openai_response(
-                        resp, _elapsed_ms(t0), error_map=rules.get("error_map"))
-            except httpx.TimeoutException:
+                        else:
+                            async with httpx.AsyncClient() as c:
+                                resp = await c.post(
+                                    url, json=body, headers=headers, timeout=timeout)
+                        rules = (provider_rules or {}).get(request.get("provider_id")) or {}
+                        result = _parse_openai_response(
+                            resp, _elapsed_ms(t0), error_map=rules.get("error_map"))
+            except (TimeoutError, httpx.TimeoutException):
                 result = _err("timeout", 0, _elapsed_ms(t0),
                               f"POST {url} timed out")
             except (httpx.NetworkError, httpx.RequestError) as e:
