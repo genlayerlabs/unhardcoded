@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from provider_adapters.openai_compatible import make_async_call_provider, stream_openai_compatible
-from provider_adapters.diagnostics import ProviderTiming, bounded_diagnostics
+from provider_adapters.diagnostics import ProviderTiming, bounded_diagnostics, upstream_metadata
 from tests.test_antseed_concurrency import _req
 from tests.test_streaming import FakeStreamClient, FakeStreamResponse, _openai_lines, OPENAI_REQ
 from shim import _openai_usage
@@ -130,6 +130,8 @@ def test_ledger_diagnostics_are_bounded_and_allowlisted():
     assert "connect_ms" not in d and "tls_ms" not in d
     assert secret not in json.dumps(summary)
     assert bounded_diagnostics(None) == {}
+    assert bounded_diagnostics({"elapsed_ms": 10 ** 1000}) == {}
+    assert upstream_metadata({"usage": {"completion_tokens_details": "malformed"}}) == {}
 
 
 @pytest.mark.asyncio
@@ -178,3 +180,31 @@ async def test_concurrent_host_requests_keep_diagnostics_separate(host, monkeypa
     results = await asyncio.gather(*(host.execute_async(_request_to_contract(ChatRequest(
         policy_ir=_PIN, messages=[{"role": "user", "content": name}]), "default")) for name in ("a", "b")))
     assert [r["trace"]["provider_diagnostics"][0]["upstream_id"] for r in results] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_connection_pool_has_no_request_sent_event():
+    writers = set()
+    async def hold(reader, writer):
+        writers.add(writer)
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+        await writer.drain()
+    server = await asyncio.start_server(hold, "127.0.0.1", 0)
+    url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+    try:
+        async with httpx.AsyncClient(trust_env=False, limits=httpx.Limits(max_connections=1)) as client:
+            async with client.stream("GET", url):
+                req = {**OPENAI_REQ, "base_url": url, "timeout_ms": 100}
+                result = await make_async_call_provider(client=client)(req)
+        assert result["error_kind"] == "timeout"
+        d = result["diagnostics"]
+        assert d["phase"] == "connection_pool"
+        assert d["timeout_source"] in ("attempt_deadline", "PoolTimeout")
+        assert "request_sent_ms" not in d and "response_headers_ms" not in d
+    finally:
+        server.close()
+        for writer in writers:
+            writer.close()
+            await writer.wait_closed()
+        await server.wait_closed()
