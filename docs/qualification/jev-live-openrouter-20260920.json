@@ -1,0 +1,87 @@
+{
+  "timestamp": "2026-09-20T08:05:34.666274+00:00",
+  "target": "OpenRouter using the router configured provider credential",
+  "results": [
+    {
+      "api": "chat/completions",
+      "status": 400,
+      "elapsed_ms": 221,
+      "error": {
+        "message": "typesafe/jev-1.13 is a decisions model and cannot be used with the chat/completions endpoint. Use the /api/alpha/decisions endpoint instead.",
+        "code": 400
+      }
+    },
+    {
+      "api": "alpha/decisions",
+      "expected": "billing",
+      "selected_id": "billing",
+      "probabilities": {
+        "billing": 1,
+        "technical": 0,
+        "sales": 0
+      },
+      "confidence": 1,
+      "normalized_entropy": 0.0,
+      "provider": "openrouter",
+      "model": "typesafe/jev-1.13-20260917",
+      "latency_ms": 616.210250009317,
+      "cost_usd": 1.4868e-05,
+      "input_tokens": 354,
+      "attempts": 1
+    },
+    {
+      "api": "alpha/decisions",
+      "expected": "technical",
+      "selected_id": "technical",
+      "probabilities": {
+        "sales": 0,
+        "billing": 0,
+        "technical": 1
+      },
+      "confidence": 1,
+      "normalized_entropy": 0.0,
+      "provider": "openrouter",
+      "model": "typesafe/jev-1.13-20260917",
+      "latency_ms": 363.5135420045117,
+      "cost_usd": 1.5036e-05,
+      "input_tokens": 358,
+      "attempts": 1
+    },
+    {
+      "api": "alpha/decisions",
+      "expected": "sales",
+      "selected_id": "sales",
+      "probabilities": {
+        "technical": 0,
+        "billing": 0,
+        "sales": 1
+      },
+      "confidence": 1,
+      "normalized_entropy": 0.0,
+      "provider": "openrouter",
+      "model": "typesafe/jev-1.13-20260917",
+      "latency_ms": 441.2713329948019,
+      "cost_usd": 1.5036e-05,
+      "input_tokens": 358,
+      "attempts": 1
+    },
+    {
+      "api": "alpha/decisions",
+      "expected": "billing",
+      "selected_id": "billing",
+      "probabilities": {
+        "technical": 0,
+        "sales": 0,
+        "billing": 1
+      },
+      "confidence": 1,
+      "normalized_entropy": 0.0,
+      "provider": "openrouter",
+      "model": "typesafe/jev-1.13-20260917",
+      "latency_ms": 338.7774169968907,
+      "cost_usd": 1.4826e-05,
+      "input_tokens": 353,
+      "attempts": 1
+    }
+  ]
+}

@@ -16,6 +16,7 @@ Dependencies:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
@@ -560,7 +561,13 @@ end
         # fold so route_cache learns which peer served this conversation. It is a
         # local of this coroutine, so concurrent executes never share it.
         session = contract.get("session")
-        step = self.router.execute_step(None, _to_lua(self.lua, contract), None)
+        engine_contract = contract
+        if contract.get('protocol') == 'decisions':
+            # Lua tables cannot represent JSON null or distinguish [] from {}.
+            # The engine only carries this payload; encode it as an opaque scalar
+            # and restore its exact JSON structure for each provider attempt.
+            engine_contract = {**contract, 'decision': json.dumps(contract.get('decision'), allow_nan=False)}
+        step = self.router.execute_step(None, _to_lua(self.lua, engine_contract), None)
         while True:
             status = step["status"]
             if status == "done":
@@ -569,6 +576,8 @@ end
             handle = step["state_handle"]
             if status == "call":
                 req = _to_py(step["request"]) or {}
+                if req.get('protocol') == 'decisions':
+                    req['decision'] = json.loads(req['decision'])
                 if (contract.get("first_token_timeout_ms") is not None
                         and req.get("first_token_timeout_ms") is None):
                     req["first_token_timeout_ms"] = contract["first_token_timeout_ms"]

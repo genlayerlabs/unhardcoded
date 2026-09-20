@@ -1,0 +1,87 @@
+{
+  "timestamp": "2026-09-20T08:32:18.764706+00:00",
+  "scope": "New local ingress + real Lua engine + live OpenRouter. Existing consumer key admitted in isolated local configuration. Not a production-router test; no real AntSeed fallback.",
+  "results": [
+    {
+      "status": 200,
+      "expected": "billing",
+      "model": "typesafe/jev-1.13-20260917",
+      "answers": {
+        "team": {
+          "choice": "billing",
+          "probabilities": {
+            "billing": 1,
+            "technical": 0
+          },
+          "type": "choice",
+          "confidence": 1
+        }
+      },
+      "usage": {
+        "output_tokens": 31,
+        "input_tokens": 324,
+        "cost": 1.3608e-05
+      },
+      "provider": "openrouter_market",
+      "served_by": "openrouter_market",
+      "cost_usd": 1.3608e-05,
+      "latency_ms": 628,
+      "error_code": null
+    },
+    {
+      "status": 200,
+      "expected": "technical",
+      "model": "typesafe/jev-1.13-20260917",
+      "answers": {
+        "team": {
+          "choice": "technical",
+          "probabilities": {
+            "billing": 0,
+            "technical": 1
+          },
+          "type": "choice",
+          "confidence": 1
+        }
+      },
+      "usage": {
+        "output_tokens": 31,
+        "input_tokens": 328,
+        "cost": 1.3776e-05
+      },
+      "provider": "openrouter_market",
+      "served_by": "openrouter_market",
+      "cost_usd": 1.3776e-05,
+      "latency_ms": 432,
+      "error_code": null
+    },
+    {
+      "status": 200,
+      "expected": "billing",
+      "model": "typesafe/jev-1.13-20260917",
+      "answers": {
+        "team": {
+          "choice": "billing",
+          "probabilities": {
+            "billing": 1,
+            "technical": 0
+          },
+          "type": "choice",
+          "confidence": 1
+        }
+      },
+      "usage": {
+        "output_tokens": 31,
+        "input_tokens": 325,
+        "cost": 1.365e-05
+      },
+      "provider": "openrouter_market",
+      "served_by": "openrouter_market",
+      "cost_usd": 1.365e-05,
+      "latency_ms": 426,
+      "error_code": null
+    }
+  ],
+  "discovered_decision_families": [
+    "jev-1.13"
+  ]
+}

@@ -765,6 +765,7 @@ return {
         in_file                = mfield("in_file",                "Bool", false),
         in_video               = mfield("in_video",               "Bool", false),
         out_image              = mfield("out_image",              "Bool", false),
+        out_decisions          = mfield("out_decisions",          "Bool", false),
         cap_tools              = mfield("cap_tools",              "Bool", false),
         cap_tool_choice        = mfield("cap_tool_choice",        "Bool", false),
         cap_parallel_tools     = mfield("cap_parallel_tools",     "Bool", false),

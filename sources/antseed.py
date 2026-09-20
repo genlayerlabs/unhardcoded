@@ -287,8 +287,11 @@ class AntSeedSource:
     name = "antseed"
     poll_interval_s = 300
 
-    def __init__(self, catalog: dict, store=None):
+    def __init__(self, catalog: dict, store=None, client=None):
         self._store = store if store is not None else host_store
+        self._decision_client = client
+        self._decision_rows = {}
+        self._decision_names = set()
         self._models = catalog.get("models") or {}
         # provider_id -> its marketplace config (cap, aliases, endpoint)
         self._providers: dict[str, dict] = {
@@ -338,6 +341,69 @@ class AntSeedSource:
         restrict offers to that peer's services to match what the proxy serves."""
         data = self._store.buyer_status(provider_id)
         return (data or {}).get("pinned_peer_id") or None
+
+    async def _refresh_decisions(self):
+        """Read protocol metadata from the buyer; never infer support from price rows.
+
+        CLI >=0.1.161 exposes decision models and exact peer service IDs. Join
+        those rows to the browse store for concurrency and reachability metadata.
+        Snapshots expire and a failed refresh removes their routes.
+        """
+        import httpx
+        from decision_protocol import decision_family
+        for pid, cfg in self._providers.items():
+            rows = []
+            try:
+                url = cfg.get('base_url', '').rstrip('/') + '/models?type=decisions'
+                async def fetch(client):
+                    response = await client.get(url, timeout=5, follow_redirects=False)
+                    response.raise_for_status()
+                    return response.json()
+                if self._decision_client is not None:
+                    data = await fetch(self._decision_client)
+                else:
+                    async with httpx.AsyncClient(trust_env=False) as client:
+                        data = await fetch(client)
+                for model in data.get('data', []):
+                    if model.get('type') != 'decision' or 'typesafe-systemone' not in model.get('supported_protocols', []):
+                        continue
+                    family = decision_family(model['id'])
+                    self._decision_names.update([model['id'], *model.get('aliases', [])])
+                    for peer in model.get('peers', []):
+                        if peer.get('type') != 'decision' or 'typesafe-systemone' not in [peer.get('protocol'), *peer.get('protocols', [])]:
+                            continue
+                        service, peer_id = peer.get('serviceId'), peer.get('peerId')
+                        if not isinstance(service, str) or not isinstance(peer_id, str):
+                            continue
+                        self._decision_names.add(service)
+                        price_in, price_out = as_float(peer.get('inputUsdPerMillion')), as_float(peer.get('outputUsdPerMillion'))
+                        if price_in is None or price_out is None or min(price_in, price_out) < 0:
+                            continue
+                        rows.append({'peer_id': peer_id, 'service': service,
+                            'price_in': price_in, 'price_out': price_out,
+                            'price_cached_in': as_float(peer.get('cachedInputUsdPerMillion')),
+                            'reputation': as_float(peer.get('onChainReputationScore')),
+                            'decision_family': family, 'decision_context': model.get('context_length'),
+                            'protocol': 'decisions'})
+            except Exception:
+                _log.warning('AntSeed decision catalog unavailable for %s', pid)
+            self._decision_rows[pid] = (time.monotonic(), rows)
+
+    def _market_for_provider(self, provider_id):
+        from decision_protocol import known_decision_model
+        raw = self._load_market()
+        index = {(r['peer_id'], r['service']): r for r in raw}
+        fetched, decisions = self._decision_rows.get(provider_id, (0, []))
+        if time.monotonic() - fetched > STALE_AFTER_S:
+            decisions = []
+        # No decision service may silently become chat after metadata expires.
+        rows = [r for r in raw if r['service'] not in self._decision_names
+                and not known_decision_model(r['service'])
+                and 'typesafe-systemone' not in (r.get('protocols') or [])]
+        for row in decisions:
+            old = index.get((row['peer_id'], row['service']), {})
+            rows.append({**old, **row})
+        return rows
 
     def _family_vendor(self, fam: str, canon: str) -> str | None:
         """The vendor a curated family belongs to, or None when it is UNKNOWN.
@@ -721,7 +787,7 @@ class AntSeedSource:
         unbound: dict[str, set[str]] = {}
         # family -> rows, one per advertising peer
         by_family: dict[str, list[dict]] = {}
-        for row in self._load_market():
+        for row in self._market_for_provider(provider_id):
             if pinned and row["peer_id"] != pinned:
                 continue
             # Operator allow/deny by peer id. Deny wins; a non-empty allowlist
@@ -755,7 +821,8 @@ class AntSeedSource:
                 # family, killing it). Drop it to mirror the buyer's admission.
                 rejected_by_buyer += 1
                 continue
-            bound = self._bind(cfg, row["service"])
+            bound = ({'family': row['decision_family'], 'base_family': None, 'variant': None}
+                     if row.get('protocol') == 'decisions' else self._bind(cfg, row["service"]))
             if bound is None:
                 # expose every advertised service, not only curated ones.
                 bound = {"family": row["service"], "base_family": None,
@@ -846,8 +913,13 @@ class AntSeedSource:
                 caps.setdefault("supports_tools", True)
             else:
                 caps.pop("supports_tools", None)
+            if row.get('protocol') == 'decisions':
+                context = row.get('decision_context')
+                caps = {'context': context} if type(context) is int and context > 0 else {}
+                meta['traits'] = {'out_decisions': True}
             offers.append({
                 "model_family": family,
+                "protocol": row.get('protocol', 'chat'),
                 # the curated family this offer resolved to — `model_family`
                 # itself for a plain match, the base for a `<base>@<variant>`, and
                 # None when nothing curated matched. Stamped so a policy can opt
@@ -997,12 +1069,27 @@ class AntSeedSource:
                     "pinned_by": pinned.get(r["peer_id"], []),
                     "tradable_via": tradable_via,
                 })
+        from decision_protocol import known_decision_model
+        rows_out = [r for r in rows_out if not known_decision_model(r['wire_model_id'])
+                    and r['wire_model_id'] not in self._decision_names]
+        for pid in self.provider_ids:
+            for offer in self.offers_sync(pid):
+                if offer.get('protocol') != 'decisions':
+                    continue
+                family = offer['model_family']
+                rows_out.append({'model_family': family, 'category': 'decision',
+                    'seller': offer['peer_id'], 'wire_model_id': offer['wire_model_id'],
+                    'price_in': offer['price_in_usd_per_mtok'], 'price_out': offer['price_out_usd_per_mtok'],
+                    'pinned_by': [], 'tradable_via': [pid]})
+                families[family] = {'category': 'decision', 'meta': {'out_decisions': True},
+                    'sellers_total': sum(r['model_family'] == family for r in rows_out)}
         return {"rows": rows_out, "families": families,
                 "fetched_at": int(time.time())}
 
     # ---- ProviderSource capabilities -------------------------------------
 
     async def pricing(self) -> list[Price]:
+        await self._refresh_decisions()
         prices: list[Price] = []
         for pid in self.provider_ids:
             for o in self.offers_sync(pid):

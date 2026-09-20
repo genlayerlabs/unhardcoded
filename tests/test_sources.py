@@ -410,6 +410,7 @@ def test_openrouter_endpoint_details_do_not_follow_foreign_origins():
 
     assert [url for url, _headers in s._client.calls] == [
         "https://openrouter.ai/api/v1/models",
+        "https://openrouter.ai/api/v1/models?output_modalities=decisions",
     ]
     assert {p["served_model_id"] for p in prices} == {"z-ai/glm-5.2"}
 

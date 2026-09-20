@@ -89,13 +89,14 @@ def seed_peer_offers(peers, observed_at=None):
         rep = peer.get("onChainReputationScore")
         last_seen = peer.get("lastSeen")
         last_reached_at = peer.get("lastReachedAt")
-        for pricing in (peer.get("providerPricing") or {}).values():
+        for provider, pricing in (peer.get("providerPricing") or {}).items():
             for service, sp in ((pricing or {}).get("services") or {}).items():
                 rows.append((
                     peer["peerId"], service,
                     sp.get("inputUsdPerMillion"), sp.get("outputUsdPerMillion"),
                     sp.get("cachedInputUsdPerMillion"),
-                    maxc, rep, last_seen, last_reached_at, obs, obs, obs))
+                    maxc, rep, last_seen, last_reached_at, obs, obs, obs,
+                    ((peer.get('providerServiceApiProtocols') or {}).get(provider) or {}).get('services', {}).get(service)))
     with host_store._get_pool().connection() as conn:
         if rows:
             # UPSERT, mirroring the real writer (antseed/write-market.js): a peer
@@ -103,15 +104,16 @@ def seed_peer_offers(peers, observed_at=None):
             conn.cursor().executemany(
                 "INSERT INTO peer_offers (peer_id, service, price_in, price_out,"
                 " price_cached_in, max_concurrency, reputation, last_seen,"
-                " last_reached_at, observed_at, first_seen, fetched_at)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                " last_reached_at, observed_at, first_seen, fetched_at, protocols)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
                 " ON CONFLICT (peer_id, service) DO UPDATE SET"
                 " price_in=EXCLUDED.price_in, price_out=EXCLUDED.price_out,"
                 " price_cached_in=EXCLUDED.price_cached_in,"
                 " max_concurrency=EXCLUDED.max_concurrency,"
                 " reputation=EXCLUDED.reputation, last_seen=EXCLUDED.last_seen,"
                 " last_reached_at=COALESCE(EXCLUDED.last_reached_at, peer_offers.last_reached_at),"
-                " observed_at=EXCLUDED.observed_at, fetched_at=EXCLUDED.fetched_at",
+                " observed_at=EXCLUDED.observed_at, fetched_at=EXCLUDED.fetched_at,"
+                " protocols=COALESCE(EXCLUDED.protocols, peer_offers.protocols)",
                 rows)
 
 
