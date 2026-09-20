@@ -33,7 +33,8 @@ the fragment manifest (`start` inclusive, `end` exclusive), and limit/failure
 reasons. The 10% target never overrides protected or explicitly kept content.
 When it cannot fit, summaries use a small best-effort budget and the result
 reports the actual size. Expansion is rejected. There are at most 128 selectable
-fragments, 32 decision calls and 8 summary calls per request; oversized evidence
+fragments, 32 decision calls and 8 summary calls per request, within a shared
+40-second deadline (7 seconds per decision, 20 per summary); oversized evidence
 remains intact. Summary input batches are at most approximately 60 KB and each
 summary call has at most 4,096 output tokens (or the caller's smaller limit).
 

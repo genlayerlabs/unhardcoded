@@ -3,10 +3,14 @@
 Size budgets are serialized UTF-8 bytes, not tokenizer estimates. A missed
 target is explicit; instructions and failed summaries are never cut to fit.
 """
+import asyncio
 import json
 import math
+from time import monotonic
 
 from decision_protocol import validate_payload, validate_response
+
+MAX_SECONDS = 40  # fit the gateway budget; individual legs share this deadline
 
 
 def encoded(value):
@@ -32,6 +36,7 @@ def units(messages):
 
 async def compact_fragments(messages, *, keep_recent, pinned_indices, target_ratio,
                             decision_policy, summary_policy, max_tokens, execute, costed):
+    deadline = monotonic() + MAX_SECONDS
     fragments = list(units(messages))
     pins = set(pinned_indices if pinned_indices is not None else
                (i for i, m in enumerate(messages) if m.get('role') == 'user'))
@@ -84,8 +89,13 @@ async def compact_fragments(messages, *, keep_recent, pinned_indices, target_rat
         return body
 
     async def call(contract, kind):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            reasons.append('compaction_deadline')
+            return None
         try:
-            res = await execute(contract)
+            async with asyncio.timeout(min(remaining, 7 if kind == 'decision' else 20)):
+                res = await execute(contract)
         except Exception:
             legs.append({'kind': kind, 'x_router': {'cost_usd': None}, 'failed': True})
             return None
@@ -184,7 +194,7 @@ async def compact_fragments(messages, *, keep_recent, pinned_indices, target_rat
         if batch_index >= 8:
             reasons.append('summary_call_limit')
             continue
-        res = await call({'policy_ir': summary_policy, 'max_tokens': min(max_tokens, 4096),
+        res = await call({'policy_ir': summary_policy, 'max_tokens': min(max_tokens, 4096), 'timeout_ms': 20000,
             'response_format': {'type': 'json_object'},
             'messages': [{'role': 'system', 'content':
                 'Summarize each fragment independently. Return ONLY a JSON object mapping each supplied id '

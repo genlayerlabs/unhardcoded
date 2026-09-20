@@ -194,3 +194,22 @@ def test_large_recent_observation_is_kept_but_only_excerpted_for_triage():
     assert not out['compaction']['target_met']
     assert all(len(json.dumps(c['decision']).encode()) <= 32000
                for c in models.calls if 'decision' in c)
+
+
+def test_wall_deadline_cancels_slow_inference_and_prevents_further_calls(monkeypatch):
+    import fragment_compaction
+    monkeypatch.setattr(fragment_compaction, 'MAX_SECONDS', .01)
+    models = Models()
+    cancelled = []
+    async def slow(contract):
+        models.calls.append(contract)
+        try:
+            await asyncio.sleep(10)
+        finally:
+            cancelled.append(True)
+    models.execute = slow
+    messages = transcript()
+    out = run(messages, models)
+    assert cancelled == [True] and len(models.calls) == 1
+    assert out['messages'] == messages and out['x_router']['cost_usd'] is None
+    assert 'compaction_deadline' in out['compaction']['reasons']
