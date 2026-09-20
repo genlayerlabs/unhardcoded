@@ -82,3 +82,9 @@ def step_not_see(context, text):
     time.sleep(1.0)
     assert text.lower() not in _body_text(context.driver).lower(), \
         f'unexpectedly saw {text!r} on screen'
+
+
+@when('I choose the "{label}" agent skill')
+def step_choose_agent_skill(context, label):
+    from selenium.webdriver.support.ui import Select
+    Select(context.driver.find_element(By.ID, "skillSelect")).select_by_visible_text(label)

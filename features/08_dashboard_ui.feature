@@ -44,3 +44,14 @@ Feature: Dashboard UI rendered in a real headless browser
     And I wait 17 seconds
     Then an Activity row is still expanded
 
+
+  @browser @p1
+  Scenario: Skills provides separate authoring and optimization downloads
+    Given I open the dashboard in a browser
+    When I click the "Skills" tab
+    Then I see "Create a routing policy" rendered
+    When I choose the "Optimize a policy" agent skill
+    Then I see "Optimize a routing policy" rendered
+    And I see "/skill?name=policy-optimization" rendered
+    When I choose the "Create a policy" agent skill
+    Then I see "Create a routing policy" rendered

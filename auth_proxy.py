@@ -28,6 +28,7 @@ import control_plane_client
 import host_store
 import internal_api
 from env_secrets import load_env_secrets
+from policy_templates import template_catalog
 from shim import _CACHE_READ_FACTOR   # the billing cache-read discount — one source
 
 # Operator-managed keys/consumer-hashes live on the PVC (.env.secrets) and are
@@ -1942,6 +1943,7 @@ async def dashboard_market(request: Request) -> Response:
 
 
 SKILL_PATH = Path(__file__).resolve().parent / "SKILL.md"
+OPTIMIZATION_SKILL_PATH = SKILL_PATH.parent / "skills" / "policy-optimization" / "SKILL.md"
 SKILL_MARKER = "<!-- LIVE_CATALOG_TABLE -->"
 FIELDS_MARKER = "<!-- FIELD_VOCABULARY -->"
 
@@ -2014,28 +2016,25 @@ def _field_vocabulary_markdown(fields: list | None) -> str:
     return "\n".join(out)
 
 
-def _render_skill(market: dict | None, fields: list | None = None) -> str:
+def _render_skill(market: dict | None, fields: list | None = None,
+                  *, path: Path | None = None) -> str:
     """The committed SKILL.md with the live catalog table AND the live field
     vocabulary injected at their markers — a self-contained doc to load into
     any assistant. The catalog and the vocabulary are both derived from the
     host/core at download time so the guide cannot drift from what the host
     actually serves."""
-    try:
-        text = SKILL_PATH.read_text()
-    except OSError:
-        text = ("# SKILL.md not found on host\n\n"
-                "The authoring guide file is missing.\n\n"
-                + FIELDS_MARKER + "\n\n" + SKILL_MARKER)
+    text = (path or SKILL_PATH).read_text()
     vocab = ("The fields below are read live from this host's core schema "
              "(`GET /x/fields`); `core` fields exist on every conforming host, "
-             "`host` fields are this host's registered extensions. Defaults "
-             "when a field is absent are conservative — see *Rules* below.\n\n"
+             "`host` fields are this host's registered extensions. A field's "
+             "presence does not prove every route has measured data.\n\n"
              + _field_vocabulary_markdown(fields))
     if FIELDS_MARKER in text:
         text = text.replace(FIELDS_MARKER, vocab, 1)
     catalog = ("## Live catalog (this host)\n\n"
-               "Families this host serves right now — gate/score policies on "
-               "these. Benchmarks are 0–100 with catalog rank in parentheses "
+               "Catalog snapshot at download time, not a guarantee of eligible "
+               "or reachable routes. Preview with the intended protocol and "
+               "requirements before calling. Benchmarks are 0–100 with catalog rank in parentheses "
                "(1 = best); prices are the cheapest seller per family in "
                "USD/Mtok.\n\n" + _catalog_table_markdown(market))
     if SKILL_MARKER in text:
@@ -2059,22 +2058,18 @@ async def _fetch_live_fields() -> list | None:
 
 
 @app.get("/dashboard/api/skill")
-async def dashboard_skill(request: Request) -> Response:
-    """Download a self-contained SKILL.md: the Σ_pol/Σ_flow authoring guide with
-    this host's live catalog table and field vocabulary baked in. Load it into
-    any assistant to generate policies that target models this host serves."""
+async def dashboard_skill(request: Request, name: str = "policy-authoring") -> Response:
+    """Download the selected agent guide with the live catalog and vocabulary.
+    Defaults to policy authoring for existing dashboard clients."""
     ctx, error = _require_admin_dashboard_auth(request)
     if error:
         return error
-    text = _render_skill(await _fetch_live_market(), await _fetch_live_fields())
-    return Response(content=text, media_type="text/markdown; charset=utf-8",
-                    headers={"Content-Disposition": "attachment; filename=SKILL.md"})
+    return await _skill_response(name)
 
 
 @app.get("/skill")
-async def consumer_skill(request: Request) -> Response:
-    """Download the same self-contained SKILL.md as /dashboard/api/skill (the
-    Σ_pol/Σ_flow authoring guide + this host's live catalog + field vocabulary),
+async def consumer_skill(request: Request, name: str = "policy-authoring") -> Response:
+    """Download the selected SKILL.md with live catalog and field vocabulary,
     but authenticated by a CONSUMER KEY (Bearer) instead of a dashboard session —
     so an agent can fetch the guide for the host it routes through, using the same
     credential it calls /v1/* with, no dashboard login. Reuses the same renderer
@@ -2085,7 +2080,24 @@ async def consumer_skill(request: Request) -> Response:
         return JSONResponse(status_code=401, content={"error": {
             "message": "invalid or inactive API key",
             "type": "auth_error", "code": "consumer_auth"}})
-    text = _render_skill(await _fetch_live_market(), await _fetch_live_fields())
+    return await _skill_response(name)
+
+
+async def _skill_response(name: str) -> Response:
+    # Select only committed files; never turn a query parameter into a path.
+    paths = {"policy-authoring": SKILL_PATH,
+             "policy-optimization": OPTIMIZATION_SKILL_PATH}
+    if name not in paths:
+        return JSONResponse(status_code=404, content={"error": {
+            "message": "Unknown skill. Choose policy-authoring or policy-optimization.",
+            "code": "skill_not_found"}})
+    try:
+        text = _render_skill(await _fetch_live_market(), await _fetch_live_fields(),
+                             path=paths[name])
+    except OSError:
+        return JSONResponse(status_code=503, content={"error": {
+            "message": "Skill file unavailable on this host.",
+            "code": "skill_unavailable"}})
     return Response(content=text, media_type="text/markdown; charset=utf-8",
                     headers={"Content-Disposition": "attachment; filename=SKILL.md"})
 
@@ -2131,6 +2143,23 @@ async def _consumer_x_proxy(request: Request, method: str, path: str) -> Respons
 @app.get("/x/fields")
 async def consumer_x_fields(request: Request) -> Response:
     return await _consumer_x_proxy(request, "GET", "/x/fields")
+
+
+@app.get("/x/policy/templates")
+async def consumer_x_policy_templates(request: Request) -> Response:
+    return await _consumer_x_proxy(request, "GET", "/x/policy/templates")
+
+
+@app.post("/x/policy/templates/{template_id}")
+async def consumer_x_policy_template(request: Request, template_id: str) -> Response:
+    if template_id not in {item["id"] for item in template_catalog()}:
+        # Keep the forwarded path bounded, including encoded path fragments.
+        if not (await _caller_auth_async(_extract_token(request))).get("ok"):
+            return JSONResponse(status_code=401, content={"error": {
+                "message": "invalid or inactive API key", "code": "consumer_auth"}})
+        return JSONResponse(status_code=404, content={"error": {
+            "message": "Unknown policy template", "code": "template_not_found"}})
+    return await _consumer_x_proxy(request, "POST", f"/x/policy/templates/{template_id}")
 
 
 @app.post("/x/policy/normalize")
@@ -5302,7 +5331,7 @@ def _dashboard_html() -> str:
       <button class='tab' id='tabBuilder' data-tab='builder' type='button'><span class='navIcon'>⌖</span>Debugger</button>
       <button class='tab' id='tabActivity' data-tab='activity' type='button'><span class='navIcon'>◷</span>Activity</button>
       <button class='tab' id='tabMarket' data-tab='market' type='button'><span class='navIcon'>⚖</span>Catalog</button>
-      <button class='tab' id='tabSkill' data-tab='skill' type='button'><span class='navIcon'>▤</span>SKILL.md</button>
+      <button class='tab' id='tabSkill' data-tab='skill' type='button'><span class='navIcon'>▤</span>Skills</button>
       <button class='tab' id='tabConfig' data-tab='config' type='button'><span class='navIcon'>⚙</span>Config</button>
       <div class='navSection'>Settings</div>
       <button class='tab' id='tabConsumers' data-tab='consumers' type='button'><span class='navIcon'>◉</span>Consumers</button>
@@ -5426,7 +5455,12 @@ def _dashboard_html() -> str:
     <section class='hidden page' id='marketPage'><div class='card'><div class='toolbar'><div class='label'>Catalog</div><select class='select' id='marketCategory' aria-label='Model category' style='width:auto'><option value='all'>All models</option><option value='text'>Text models</option><option value='decision'>Decision models</option></select><input class='search' id='marketSearch' placeholder='Filter families…' style='margin-left:auto'><label class='checkRow'><input type='checkbox' id='tradableOnly'> Tradable only</label><button class='btn' id='marketCopy' title='Copy the current catalog view as JSON'>⧉ Copy</button></div><div id='market'></div></div></section>
     <section class='grid hidden page' id='activityPage'><div class='card span12'><div class='toolbar'><div class='toolbarLeft'><div class='label'>Activity</div><div class='seg' id='activitySeg'><button data-kind='' class='active'>All</button><button data-kind='request'>Requests</button><button data-kind='reject'>Rejects</button><button data-kind='probe'>Probes</button></div></div></div><div id='recent'></div></div></section>
     <section class='hidden page' id='configPage'><div class='grid' id='config'></div></section>
-    <section class='hidden page' id='skillPage'><div class='card'><div class='toolbar'><div class='label'>SKILL.md</div><span class='muted small' style='margin-left:auto'>the Σ_pol/Σ_flow authoring guide for this host — paste into any agent, or download</span><button class='btn primary' id='skillDownload'>↓ Download</button></div><pre id='skillContent' class='mono small' style='white-space:pre-wrap;overflow:auto;padding:16px;margin:0'>Loading…</pre></div></section>
+    <section class='hidden page' id='skillPage'><div class='card'>
+      <div class='toolbar' style='flex-wrap:wrap'><div class='label'>Agent skills</div><select class='select' id='skillSelect' aria-label='Agent skill' style='width:auto'><option value='policy-authoring'>Create a policy</option><option value='policy-optimization'>Optimize a policy</option></select><button class='btn primary' id='skillDownload' style='margin-left:auto;white-space:nowrap' disabled>↓ Download SKILL.md</button></div>
+      <p class='muted small' id='skillDescription' style='padding:0 16px'>Create policies using current fields, templates and routing evidence.</p>
+      <p class='muted small' style='padding:0 16px'>Agent endpoint: <code id='skillEndpoint'>/skill</code> · use your router API key. Both downloads include this host’s live catalog and field vocabulary.</p>
+      <pre id='skillContent' class='mono small' aria-live='polite' style='white-space:pre-wrap;overflow:auto;padding:16px;margin:0'>Loading…</pre>
+    </div></section>
   </main>
 </div>
 
@@ -5453,7 +5487,7 @@ function syncConsumers(list,selected){const sel=$('consumer');const cur=selected
 function showLogin(){document.querySelectorAll('.page').forEach(el=>el.classList.add('hidden'));$('login').classList.remove('hidden');closeDrawer();closeNewKey();$('newKeyValue').value='';$('newKeyHandoffValue').value='';$('keyReady').innerHTML='';$('keyReady').style.display='none'}
 function renderHealthSummary(s){s=s||{};const state=s.state||'unknown';const cls=state==='ok'?'ok':state==='unknown'?'warn':state==='degraded'?'degraded':'down';const errors=Object.entries(s.error_kinds||{}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<span class="pill"><span class="dot bad"></span>${esc(k)} × ${fmt(v)}</span>`).join('');return `<div class="healthBanner ${cls}"><div><div class="label">Live chat health</div><div class="healthState ${cls==='ok'?'ok':cls==='down'?'bad':'warn'}">${esc(state)}</div></div><div><div>${fmt(s.success_count)} successful / ${fmt(s.request_count)} recent chat requests</div><div class="healthMeta"><span class="pill">success ${pct(s.success_rate)}</span><span class="pill">errors ${fmt(s.error_count)}</span><span class="pill">route failures ${fmt(s.route_failures)}</span></div></div><div class="errorChips">${errors||'<span class="pill"><span class="dot ok"></span>No dominant error</span>'}</div></div>`}
 function failureRows(s){return (s?.failing_recent||[]).map(r=>({time:ts(r.ts),...r}))}function renderFailures(s,target){$(target).innerHTML=table(failureRows(s),[{label:'Time',f:r=>esc(r.time)},{label:'Caller',f:r=>esc(r.caller||'—')},{label:'Route',f:r=>esc(r.route||'—')},{label:'Status',cls:'right',f:r=>esc(r.status||'—')},{label:'Error',f:r=>`<span class="pill"><span class="dot bad"></span>${esc(r.error_kind||'unknown')}</span>`},{label:'Message',f:r=>esc(r.error_message||'—')}])}
-let activeTab='overview';let lastStats={keys:[],consumers:[]};let consumerFilterStatus='';let activityKind='';function showPage(tab){activeTab=tab;const pages={overview:'app',consumers:'consumersPage',providerKeys:'providerKeysPage',keyUsage:'keyUsagePage',market:'marketPage',builder:'builderPage',activity:'activityPage',config:'configPage',skill:'skillPage'};Object.values(pages).forEach(id=>$(id).classList.add('hidden'));$(pages[tab]||'app').classList.remove('hidden');const nav={overview:'tabOverview',consumers:'tabConsumers',providerKeys:'tabProviderKeys',keyUsage:'tabKeyUsage',market:'tabMarket',builder:'tabBuilder',activity:'tabActivity',config:'tabConfig',skill:'tabSkill'};Object.values(nav).forEach(id=>$(id).classList.remove('active'));$(nav[tab]||'tabOverview').classList.add('active');const titles={overview:['Analytics','Spend, traffic and errors — filter by timeframe, consumer, provider and model.'],consumers:['Consumers','Key handoff and consumer management without noisy row buttons.'],providerKeys:['Provider keys','Available LLM provider credentials, status, and usage.'],keyUsage:['Key usage','Lookup persistent per-key usage, costs, windows, and paginated recent calls.'],market:['Catalog','Providers data — every model family with prices, benchmarks and live performance. Download a SKILL.md to author Σ_pol/Σ_flow against this catalog.'],builder:['Policy debugger','Paste a Σ_pol policy or Σ_flow term and see exactly what it does over the live catalog — admission, the ranked survivors, and what gets filtered out and why.'],activity:['Activity','Recent requests, rejects, probes, and failures.'],config:['Config','Per-provider runtime knobs — applied live, persisted on the PVC.'],skill:['SKILL.md','The Σ_pol/Σ_flow authoring guide for this host — paste it into any agent to author policies, or download it.']};$('pageTitle').textContent=(titles[tab]||titles.overview)[0];$('pageSub').textContent=(titles[tab]||titles.overview)[1];$('consumer').classList.toggle('hidden',tab==='policies'||tab==='market'||tab==='builder'||tab==='keyUsage'||tab==='skill')}function tabFromLocation(){const q=new URLSearchParams(location.search).get('tab');if(q)return q;if(location.hash)return location.hash.slice(1);if(location.pathname.includes('/provider-keys'))return 'providerKeys';return 'overview'}function setTab(tab,opts={}){showPage(tab);if(tab==='providerKeys')loadCodexAccounts();if(!opts.silent){const url=new URL(location.href);if(tab==='providerKeys'){url.pathname='/dashboard/provider-keys';url.searchParams.delete('tab');url.hash=''}else{url.pathname='/dashboard';url.searchParams.set('tab',tab);url.hash=''}history.replaceState(null,'',url)}if(tab==='policies')loadPolicies();else if(tab==='market')loadMarket();else if(tab==='keyUsage'){}else if(tab==='config')loadConfig();else if(tab==='skill')loadSkill();else{if(tab==='builder'){loadBuilderFamilies();loadBuilderFields()}load()}}
+let activeTab='overview';let lastStats={keys:[],consumers:[]};let consumerFilterStatus='';let activityKind='';function showPage(tab){activeTab=tab;if(tab==='skill')$('dashboardLoading').style.display='none';$('timeframe').classList.toggle('hidden',tab==='skill');const pages={overview:'app',consumers:'consumersPage',providerKeys:'providerKeysPage',keyUsage:'keyUsagePage',market:'marketPage',builder:'builderPage',activity:'activityPage',config:'configPage',skill:'skillPage'};Object.values(pages).forEach(id=>$(id).classList.add('hidden'));$(pages[tab]||'app').classList.remove('hidden');const nav={overview:'tabOverview',consumers:'tabConsumers',providerKeys:'tabProviderKeys',keyUsage:'tabKeyUsage',market:'tabMarket',builder:'tabBuilder',activity:'tabActivity',config:'tabConfig',skill:'tabSkill'};Object.values(nav).forEach(id=>$(id).classList.remove('active'));$(nav[tab]||'tabOverview').classList.add('active');const titles={overview:['Analytics','Spend, traffic and errors — filter by timeframe, consumer, provider and model.'],consumers:['Consumers','Key handoff and consumer management without noisy row buttons.'],providerKeys:['Provider keys','Available LLM provider credentials, status, and usage.'],keyUsage:['Key usage','Lookup persistent per-key usage, costs, windows, and paginated recent calls.'],market:['Catalog','Providers data — every model family with prices, benchmarks and live performance. Download a SKILL.md to author Σ_pol/Σ_flow against this catalog.'],builder:['Policy debugger','Paste a Σ_pol policy or Σ_flow term and see exactly what it does over the live catalog — admission, the ranked survivors, and what gets filtered out and why.'],activity:['Activity','Recent requests, rejects, probes, and failures.'],config:['Config','Per-provider runtime knobs — applied live, persisted on the PVC.'],skill:['Agent skills','Create a policy, then test and refine it against a measured baseline. Download either guide for your agent.']};$('pageTitle').textContent=(titles[tab]||titles.overview)[0];$('pageSub').textContent=(titles[tab]||titles.overview)[1];$('consumer').classList.toggle('hidden',tab==='policies'||tab==='market'||tab==='builder'||tab==='keyUsage'||tab==='skill')}function tabFromLocation(){const q=new URLSearchParams(location.search).get('tab');if(q)return q;if(location.hash)return location.hash.slice(1);if(location.pathname.includes('/provider-keys'))return 'providerKeys';return 'overview'}function setTab(tab,opts={}){showPage(tab);if(tab==='providerKeys')loadCodexAccounts();if(!opts.silent){const url=new URL(location.href);if(tab==='providerKeys'){url.pathname='/dashboard/provider-keys';url.searchParams.delete('tab');url.hash=''}else{url.pathname='/dashboard';url.searchParams.set('tab',tab);url.hash=''}history.replaceState(null,'',url)}if(tab==='policies')loadPolicies();else if(tab==='market')loadMarket();else if(tab==='keyUsage'){}else if(tab==='config')loadConfig();else if(tab==='skill')loadSkill();else{if(tab==='builder'){loadBuilderFamilies();loadBuilderFields()}load()}}
 /* regression marker for JS-context escaping: onclick="pickConsumer(${jsarg(r.name)})" */
 function money(v){return v?('$'+Number(v).toFixed(4)):'—'}
 function consumerStats(k){return k.stats||{}}
@@ -5679,7 +5713,25 @@ async function postConfig(updates){try{const r=await fetch('/dashboard/api/confi
 async function selectCodexAccount(value){try{let mode=value,account=null;if(value.indexOf('account:')===0){mode='account';account=value.slice('account:'.length)}const r=await fetch('/dashboard/api/codex/select',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({mode,account})});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`select ${r.status}`);toast(mode==='balanced'?'Codex: balanced across accounts':(mode==='account'?('Codex: serving '+account):'Codex: auto'));loadCodexAccounts()}catch(e){showErr(e.message)}}
 async function deleteCodexAccount(name){if(!confirm('Delete codex account '+name+'?'))return;try{const r=await fetch('/dashboard/api/codex/accounts/'+encodeURIComponent(name),{method:'DELETE',credentials:'same-origin'});if(r.status===401){showLogin();return}const d=await r.json();if(!r.ok)throw new Error(d.error?.message||`delete ${r.status}`);toast('Codex account deleted');loadCodexAccounts()}catch(e){showErr(e.message)}}
 $('bTemplate').onchange=bTemplateChanged;$('bLoadTemplate').onclick=bCreateTemplate;bTemplateChanged();
-$('loginBtn').onclick=login;$('apiKeyLoginBtn').onclick=apiKeyLogin;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});$('apiKeyLogin').addEventListener('keydown',e=>{if(e.key==='Enter')apiKeyLogin()});$('logout').onclick=logout;$('tabOverview').onclick=()=>setTab('overview');$('tabConsumers').onclick=()=>setTab('consumers');$('tabProviderKeys').onclick=()=>setTab('providerKeys');$('tabKeyUsage').onclick=()=>setTab('keyUsage');$('tabMarket').onclick=()=>setTab('market');$('tabBuilder').onclick=()=>setTab('builder');$('tabActivity').onclick=()=>setTab('activity');$('recent').addEventListener('click',e=>{const cp=e.target.closest('[data-copyterm]');if(cp){navigator.clipboard.writeText(cp.dataset.copyterm).then(()=>toast('Policy term copied'));return}const row=e.target.closest('.actRow');if(!row)return;const det=$('recent').querySelector('.actDetail[data-d="'+row.dataset.i+'"]');if(!det)return;det.classList.toggle('hidden');const tog=row.querySelector('.actToggle');if(tog)tog.textContent=det.classList.contains('hidden')?'▸':'▾'});$('bReview').onclick=bReview;$('bBacktest').onclick=bBacktest;$('bDownload').onclick=bDownload;$('bTestBtn').onclick=bTest;$('bEx1').onclick=()=>bLoadExample('ex1');$('bEx2').onclick=()=>bLoadExample('ex2');$('bAddCond').onclick=()=>{bSync();bFilters.push({field:'latency_ms',rel:'le',val:''});bRender()};$('bAddOr').onclick=()=>{bSync();bFilters.push({kind:'or',subs:[{field:'latency_ms',rel:'le',val:''}]});bRender()};$('bAddScore').onclick=()=>{bSync();bScores.push({field:'field:price_in',w:'0.5',norm:true,inv:true});bRender()};$('b_selector').onchange=()=>{$('bTempWrap').style.display=$('b_selector').value==='sample'?'':'none'};document.querySelectorAll('#bModeSeg button').forEach(b=>b.onclick=()=>bSetMode(b.dataset.mode));$('bStructured').addEventListener('change',e=>{if(e.target.classList.contains('bF-field'))bSyncRender()});$('bStructured').addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b)return;bSync();const i=+b.dataset.i,j=+b.dataset.j,act=b.dataset.act;if(act==='del')bFilters.splice(i,1);else if(act==='addsub')bFilters[i].subs.push({field:'latency_ms',rel:'le',val:''});else if(act==='delsub')bFilters[i].subs.splice(j,1);else if(act==='delscore')bScores.splice(i,1);bRender()});bRender();document.querySelector('.nav').addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b){e.preventDefault();setTab(b.dataset.tab)}});$('refresh').onclick=()=>{if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else if(activeTab==='keyUsage')loadKeyUsage();else load()};$('market').addEventListener('click',e=>{const h=e.target.closest('[data-fam]');if(!h)return;const fam=h.dataset.fam;if(marketOpen.has(fam))marketOpen.delete(fam);else marketOpen.add(fam);if(lastMarket)renderMarket(lastMarket)});$('marketCategory').onchange=()=>{if(lastMarket)renderMarket(lastMarket)};$('marketSearch').oninput=()=>{if(lastMarket)renderMarket(lastMarket)};$('tradableOnly').checked=localStorage.getItem('tradableOnly')==='1';$('tradableOnly').onchange=()=>{localStorage.setItem('tradableOnly',$('tradableOnly').checked?'1':'0');if(lastMarket)renderMarket(lastMarket)};$('marketCopy').onclick=()=>{if(!lastMarket){showErr('No catalog data loaded yet');return}navigator.clipboard.writeText(JSON.stringify(lastMarket,null,2)).then(()=>toast('Catalog copied to clipboard')).catch(e=>showErr(e.message))};let skillText='';async function loadSkill(){try{$('skillContent').textContent='Loading…';const r=await fetch('/dashboard/api/skill',{credentials:'same-origin'});if(r.status===401){showLogin();return}if(!r.ok)throw new Error('skill '+r.status);skillText=await r.text();$('skillContent').textContent=skillText}catch(e){$('skillContent').textContent='';showErr(e.message)}}function downloadSkill(){if(!skillText){toast('Still loading…');return}const blob=new Blob([skillText],{type:'text/markdown'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='SKILL.md';a.click();URL.revokeObjectURL(a.href);toast('SKILL.md downloaded')}$('skillDownload').onclick=downloadSkill;$('tabSkill').onclick=()=>setTab('skill');$('toggleAddProvider').onclick=()=>{const c=$('addProviderCard');c.style.display=c.style.display==='none'?'':'none'};$('addProvCancel').onclick=()=>{$('addProviderCard').style.display='none'};$('addProvSubmit').onclick=addProvider;$('toggleAddCodex').onclick=()=>{const c=$('addCodexCard');c.style.display=c.style.display==='none'?'':'none'};$('addCodexCancel').onclick=()=>{$('addCodexCard').style.display='none'};$('addCodexSubmit').onclick=addCodexAccount;$('toggleInviteCodex').onclick=()=>{const c=$('inviteCodexCard');c.style.display=c.style.display==='none'?'':'none'};$('inviteCodexCancel').onclick=()=>{$('inviteCodexCard').style.display='none'};$('inviteCodexSubmit').onclick=generateCodexInvite;$('addProvId').addEventListener('blur',()=>{if(!$('addProvEnv').value.trim()&&$('addProvId').value.trim())$('addProvEnv').value=$('addProvId').value.trim().toUpperCase().replace(/[^A-Z0-9]+/g,'_')+'_API_KEY'});$('loadKeyUsage').onclick=loadKeyUsage;$('consumer').onchange=load;$('timeframe').onchange=load;$('consumerSearch').oninput=()=>renderConsumers(lastStats.keys||[]);document.querySelectorAll('#consumerStatusSeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#consumerStatusSeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');consumerFilterStatus=b.dataset.status;renderConsumers(lastStats.keys||[])});document.querySelectorAll('#activitySeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#activitySeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');activityKind=b.dataset.kind;render(lastStats)});$('newConsumerKey').onclick=openNewKey;$('closeDrawer').onclick=closeDrawer;$('drawerShade').addEventListener('click',e=>{if(e.target===$('drawerShade'))closeDrawer()});$('drawerGenerateKey').onclick=()=>{closeDrawer();openNewKey();if(drawerConsumer)$('newKeyConsumer').value=drawerConsumer};$('saveConsumerSettings').onclick=saveConsumerSettings;$('closeNewKey').onclick=closeNewKey;$('newKeyShade').addEventListener('click',e=>{if(e.target===$('newKeyShade'))closeNewKey()});$('newKeyDone').onclick=closeNewKey;$('createKey').onclick=createKey;$('newKeyConsumer').addEventListener('keydown',e=>{if(e.key==='Enter')createKey()});$('copyKey').onclick=()=>navigator.clipboard.writeText($('newKeyValue').value).then(()=>toast('Key copied'));$('copyKeyHandoff').onclick=()=>navigator.clipboard.writeText($('newKeyHandoffValue').value).then(()=>toast('Setup blurb copied'));$('anProvider').onchange=load;$('anModel').onchange=load;setTab(tabFromLocation(),{silent:true});setInterval(()=>{const ds=$('drawerShade');if(ds&&ds.classList.contains('open'))return;const nk=$('newKeyShade');if(nk&&nk.classList.contains('open'))return;const ap=$('addProviderCard'),ac=$('addCodexCard'),ic=$('inviteCodexCard');if((ap&&ap.style.display&&ap.style.display!=='none')||(ac&&ac.style.display&&ac.style.display!=='none')||(ic&&ic.style.display&&ic.style.display!=='none'))return;if(document.querySelector('#recent .actDetail:not(.hidden)'))return;if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else load()},15000);
+$('loginBtn').onclick=login;$('apiKeyLoginBtn').onclick=apiKeyLogin;$('password').addEventListener('keydown',e=>{if(e.key==='Enter')login()});$('apiKeyLogin').addEventListener('keydown',e=>{if(e.key==='Enter')apiKeyLogin()});$('logout').onclick=logout;$('tabOverview').onclick=()=>setTab('overview');$('tabConsumers').onclick=()=>setTab('consumers');$('tabProviderKeys').onclick=()=>setTab('providerKeys');$('tabKeyUsage').onclick=()=>setTab('keyUsage');$('tabMarket').onclick=()=>setTab('market');$('tabBuilder').onclick=()=>setTab('builder');$('tabActivity').onclick=()=>setTab('activity');$('recent').addEventListener('click',e=>{const cp=e.target.closest('[data-copyterm]');if(cp){navigator.clipboard.writeText(cp.dataset.copyterm).then(()=>toast('Policy term copied'));return}const row=e.target.closest('.actRow');if(!row)return;const det=$('recent').querySelector('.actDetail[data-d="'+row.dataset.i+'"]');if(!det)return;det.classList.toggle('hidden');const tog=row.querySelector('.actToggle');if(tog)tog.textContent=det.classList.contains('hidden')?'▸':'▾'});$('bReview').onclick=bReview;$('bBacktest').onclick=bBacktest;$('bDownload').onclick=bDownload;$('bTestBtn').onclick=bTest;$('bEx1').onclick=()=>bLoadExample('ex1');$('bEx2').onclick=()=>bLoadExample('ex2');$('bAddCond').onclick=()=>{bSync();bFilters.push({field:'latency_ms',rel:'le',val:''});bRender()};$('bAddOr').onclick=()=>{bSync();bFilters.push({kind:'or',subs:[{field:'latency_ms',rel:'le',val:''}]});bRender()};$('bAddScore').onclick=()=>{bSync();bScores.push({field:'field:price_in',w:'0.5',norm:true,inv:true});bRender()};$('b_selector').onchange=()=>{$('bTempWrap').style.display=$('b_selector').value==='sample'?'':'none'};document.querySelectorAll('#bModeSeg button').forEach(b=>b.onclick=()=>bSetMode(b.dataset.mode));$('bStructured').addEventListener('change',e=>{if(e.target.classList.contains('bF-field'))bSyncRender()});$('bStructured').addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b)return;bSync();const i=+b.dataset.i,j=+b.dataset.j,act=b.dataset.act;if(act==='del')bFilters.splice(i,1);else if(act==='addsub')bFilters[i].subs.push({field:'latency_ms',rel:'le',val:''});else if(act==='delsub')bFilters[i].subs.splice(j,1);else if(act==='delscore')bScores.splice(i,1);bRender()});bRender();document.querySelector('.nav').addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b){e.preventDefault();setTab(b.dataset.tab)}});$('refresh').onclick=()=>{if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else if(activeTab==='keyUsage')loadKeyUsage();else if(activeTab==='skill')loadSkill();else load()};$('market').addEventListener('click',e=>{const h=e.target.closest('[data-fam]');if(!h)return;const fam=h.dataset.fam;if(marketOpen.has(fam))marketOpen.delete(fam);else marketOpen.add(fam);if(lastMarket)renderMarket(lastMarket)});$('marketCategory').onchange=()=>{if(lastMarket)renderMarket(lastMarket)};$('marketSearch').oninput=()=>{if(lastMarket)renderMarket(lastMarket)};$('tradableOnly').checked=localStorage.getItem('tradableOnly')==='1';$('tradableOnly').onchange=()=>{localStorage.setItem('tradableOnly',$('tradableOnly').checked?'1':'0');if(lastMarket)renderMarket(lastMarket)};$('marketCopy').onclick=()=>{if(!lastMarket){showErr('No catalog data loaded yet');return}navigator.clipboard.writeText(JSON.stringify(lastMarket,null,2)).then(()=>toast('Catalog copied to clipboard')).catch(e=>showErr(e.message))};let skillText='',skillLoadId=0;
+async function loadSkill(){
+  const loadId=++skillLoadId,name=$('skillSelect').value;
+  const query=name==='policy-authoring'?'':'?name='+encodeURIComponent(name);
+  skillText='';$('skillDownload').disabled=true;$('skillContent').textContent='Loading…';
+  $('skillEndpoint').textContent='/skill'+query;
+  $('skillDescription').textContent=name==='policy-authoring'?'Create policies using current fields, templates and routing evidence.':'Compare a baseline and candidate policies within a fixed budget. Measure quality, cost, latency and fallbacks before adopting changes.';
+  try{
+    const r=await fetch('/dashboard/api/skill'+query,{credentials:'same-origin'});
+    if(loadId!==skillLoadId)return;
+    if(r.status===401){$('skillContent').textContent='Sign in to load this skill.';showLogin();return}
+    if(!r.ok)throw new Error('Could not load skill ('+r.status+'). Select it again to retry.');
+    const text=await r.text();if(loadId!==skillLoadId)return;
+    skillText=text;$('skillContent').textContent=text;$('skillDownload').disabled=false;
+  }catch(e){if(loadId===skillLoadId)$('skillContent').textContent=e.message}
+}
+function downloadSkill(){if(!skillText)return;const url=URL.createObjectURL(new Blob([skillText],{type:'text/markdown'}));const a=document.createElement('a');a.href=url;a.download='SKILL.md';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)}
+$('skillSelect').onchange=loadSkill;$('skillDownload').onclick=downloadSkill;
+$('tabSkill').onclick=()=>setTab('skill');$('toggleAddProvider').onclick=()=>{const c=$('addProviderCard');c.style.display=c.style.display==='none'?'':'none'};$('addProvCancel').onclick=()=>{$('addProviderCard').style.display='none'};$('addProvSubmit').onclick=addProvider;$('toggleAddCodex').onclick=()=>{const c=$('addCodexCard');c.style.display=c.style.display==='none'?'':'none'};$('addCodexCancel').onclick=()=>{$('addCodexCard').style.display='none'};$('addCodexSubmit').onclick=addCodexAccount;$('toggleInviteCodex').onclick=()=>{const c=$('inviteCodexCard');c.style.display=c.style.display==='none'?'':'none'};$('inviteCodexCancel').onclick=()=>{$('inviteCodexCard').style.display='none'};$('inviteCodexSubmit').onclick=generateCodexInvite;$('addProvId').addEventListener('blur',()=>{if(!$('addProvEnv').value.trim()&&$('addProvId').value.trim())$('addProvEnv').value=$('addProvId').value.trim().toUpperCase().replace(/[^A-Z0-9]+/g,'_')+'_API_KEY'});$('loadKeyUsage').onclick=loadKeyUsage;$('consumer').onchange=load;$('timeframe').onchange=load;$('consumerSearch').oninput=()=>renderConsumers(lastStats.keys||[]);document.querySelectorAll('#consumerStatusSeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#consumerStatusSeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');consumerFilterStatus=b.dataset.status;renderConsumers(lastStats.keys||[])});document.querySelectorAll('#activitySeg button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#activitySeg button').forEach(x=>x.classList.remove('active'));b.classList.add('active');activityKind=b.dataset.kind;render(lastStats)});$('newConsumerKey').onclick=openNewKey;$('closeDrawer').onclick=closeDrawer;$('drawerShade').addEventListener('click',e=>{if(e.target===$('drawerShade'))closeDrawer()});$('drawerGenerateKey').onclick=()=>{closeDrawer();openNewKey();if(drawerConsumer)$('newKeyConsumer').value=drawerConsumer};$('saveConsumerSettings').onclick=saveConsumerSettings;$('closeNewKey').onclick=closeNewKey;$('newKeyShade').addEventListener('click',e=>{if(e.target===$('newKeyShade'))closeNewKey()});$('newKeyDone').onclick=closeNewKey;$('createKey').onclick=createKey;$('newKeyConsumer').addEventListener('keydown',e=>{if(e.key==='Enter')createKey()});$('copyKey').onclick=()=>navigator.clipboard.writeText($('newKeyValue').value).then(()=>toast('Key copied'));$('copyKeyHandoff').onclick=()=>navigator.clipboard.writeText($('newKeyHandoffValue').value).then(()=>toast('Setup blurb copied'));$('anProvider').onchange=load;$('anModel').onchange=load;setTab(tabFromLocation(),{silent:true});setInterval(()=>{if(activeTab==='skill')return;const ds=$('drawerShade');if(ds&&ds.classList.contains('open'))return;const nk=$('newKeyShade');if(nk&&nk.classList.contains('open'))return;const ap=$('addProviderCard'),ac=$('addCodexCard'),ic=$('inviteCodexCard');if((ap&&ap.style.display&&ap.style.display!=='none')||(ac&&ac.style.display&&ac.style.display!=='none')||(ic&&ic.style.display&&ic.style.display!=='none'))return;if(document.querySelector('#recent .actDetail:not(.hidden)'))return;if(activeTab==='policies')loadPolicies();else if(activeTab==='market')loadMarket();else load()},15000);
 /* ---- Flow builder: a DAG of nodes, each reusing the policy builder ---- */
 let fNodes=[];let fSeq=0;let fOutput=null;
 const F_DEFAULT_POLICY=()=>['policy',['and',['meets_req'],['not',['is','disabled']]],['add',['scale',0.5,['field','bench_intelligence']],['scale',0.5,['neg',['normalize',['field','price_in']]]]],['argmax'],['id'],['always',{action:'next_candidate'}]];

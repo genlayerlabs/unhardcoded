@@ -1,92 +1,162 @@
 ---
 name: sigma-policy-author
 description: >-
-  Author Σ_pol policies and Σ_flow flows for this LLM policy host. Load this
-  file into any assistant and it can generate valid `policy_ir` / `flow_ir`
-  terms (as JSON) to POST against the host's OpenAI-compatible endpoint —
-  the live model/provider catalog is embedded below so the policies target
-  models this host actually serves.
+  Create and debug Unhardcoded router policies and flows. Use when an agent
+  needs to turn workload, cost, latency, reliability or provider constraints
+  into policy_ir or flow_ir, preview eligible routes, and verify real routing.
 ---
 
-# Authoring Σ_pol & Σ_flow for this host
+# Create a routing policy
 
-This host routes one OpenAI-compatible call to the best provider for it. **You
-do not pick a provider or a model name** — you submit a *policy* (a piece of
-data) that says how to choose, and the host evaluates it over its live catalog
-(prices, benchmarks, latency, breakers) and picks. Two languages:
+Use this guide for the normal Unhardcoded router. Download it with the same
+consumer key used for inference: `GET /skill`. The dashboard Skills tab serves
+it with an admin session. For experiments on an existing policy, fetch
+`GET /skill?name=policy-optimization`. These guides do not change Cloud tenant
+keys' published-route API contract.
 
-- **Σ_pol** (`policy_ir`) — decides *which model serves one call*: a filter
-  (who qualifies) → a score (rank the survivors) → a selector (pick / cascade).
-- **Σ_flow** (`flow_ir`) — decides *how several calls compose*: a DAG of nodes,
-  each node carrying its own Σ_pol policy.
+A `policy_ir` is JSON data: a hard filter, a score, a selector, request
+transforms and a failure plan. The router evaluates it against current offers.
+A `flow_ir` composes several chat calls as a DAG. Neither is executable code.
 
-Both are **data**: serializable JSON arrays, hashable, admitted before they run.
-There are no loops, no I/O, no side effects — a term *decides*, it does not *do*.
+## 1. Turn intent into a contract
 
-## How to send a policy
+Reuse requirements already given by the user. Ask only for missing choices that
+change the result: workload and output type, acceptable quality, permitted
+providers/data handling, latency target, price or spend budget, and whether
+model versions may change. State assumptions for everything else.
 
-**Decision models (for example Jev):** use `POST /v1/decisions` with `state`,
-typed `questions`, and `policy_ir`, not chat messages. Discover them with
-`GET /v1/models?type=decisions`; preview using `POST /x/rank` with
-`{"protocol":"decisions","policy_ir": ...}`. The engine keeps chat and
-decision candidates separate through every pin and fallback. See
-`docs/DECISION-MODELS.md` and `policies/jev-value-v1.json`.
+- **Hard constraints belong in the filter:** provider/peer allowlists, exact
+  model families, capabilities, context capacity and token-price ceilings.
+  Ranking preferences cannot enforce them. Every fallback must satisfy them.
+- **Optimize within those constraints:** expected input/output cost, observed
+  latency and reliability. Generic model benchmarks are starting signals, not
+  evidence of task correctness. A ticket classifier needs labelled tickets;
+  a coding agent needs passing task tests.
+- **Sensitive data:** allow only explicitly acceptable routes (for example
+  `provider_eq` on a configured Bedrock provider). A provider name or tier alone
+  proves neither region nor retention/compliance. Check the deployment's
+  configuration; apply the same data restrictions to Jev selectors, evaluators,
+  summarizers and all flow nodes. Fail closed if no compliant candidate exists.
 
-`POST /v1/chat/completions` (OpenAI-compatible). Put the term in `policy_ir`
-(or `flow_ir`). The `model` field is ignored for selection when `policy_ir` is
-present — the policy drives the choice.
+## 2. Discover and compile without inference spend
+
+All endpoints in this section accept `Authorization: Bearer <consumer-key>`.
+Keep credentials in the environment; never put them in a policy or report.
+
+1. Fetch `GET /x/fields`, `GET /x/policy/templates` and `GET /v1/models`.
+   Use `GET /v1/models?type=decisions` for Jev. The catalog embedded below is a
+   download-time snapshot; refresh before testing. Do not invent field names.
+2. Prefer a template from `POST /x/policy/templates/{id}`:
+
+   | Template | Use | Options |
+   |---|---|---|
+   | `default` | General chat baseline | `{}`; matches the default chat policy |
+   | `agent` | Tool agents with context, trust gates and bounded fallbacks | `{}`; also available as `model: "profile:agent"` |
+   | `cheapest-family` | Compare providers for one exact family | required `family`; `provider_strategy`: `cost` or `ordered`; optional `provider_order` |
+   | `smart-value` | Cost preference within an intelligence shortlist | optional `top_n` |
+
+   For `cheapest-family` and `smart-value`, optional `expected_input_share`
+   (0–1), `reliability_floor` (0–1), `max_price_in` and `max_price_out` control
+   the tradeoff. Read returned `intent` and actual `policy_ir`; defaults can
+   change. Price limits are USD per million tokens, not per-call spend limits.
+   `agent` and `default` do not accept overrides. Chat benchmark gates may
+   exclude Jev entirely; use a decision-specific policy for decision models.
+3. For custom constraints, edit the returned term or author one below.
+   `POST /x/policy/normalize` with `{"policy_ir": term}` returns the normalized
+   term, `fingerprint` and `version`. This identifies the term; **it does not
+   replace live admission**.
+4. Send `POST /x/rank` with `policy_ir`, `protocol` (`chat` or `decisions`) and
+   `requirements`. Include actual family, context and capability constraints;
+   for example `requirements: {"min_context": 32000, "needs": ["tools"]}`.
+   Response: `ranked`, `rejected`, `ts`. Fix admission errors before inference.
+   Inspect rejected reasons and the whole fallback list, not only rank one.
+
+An empty ranking is a blocked preflight, not a reason to weaken security or
+silently substitute a model. Check protocol, exact family vs mutable alias,
+capabilities, missing metrics, price ceilings and the host envelope. Discovery
+may suppress an offer before ranking, so it need not appear in `rejected`.
+Wallet/reputation/cooldown/concurrency gates can prevent advertised free
+AntSeed offers from entering the catalog. A policy cannot override host gates.
+
+## 3. Make a bounded real call and inspect the result
+
+A chat example (save the complete object as `request.json`):
 
 ```json
 {
-  "model": "policy:auto",
-  "messages": [{"role": "user", "content": "..."}],
+  "model": "",
+  "messages": [{"role": "user", "content": "Reply with the integer: 17 times 23."}],
+  "max_tokens": 32,
   "policy_ir": ["policy",
-    ["and", ["meets_req"], ["not", ["is", "disabled"]]],
-    ["add", ["scale", 0.7, ["normalize", ["field", "bench_intelligence"]]],
-            ["scale", 0.3, ["neg", ["normalize", ["field", "price_out"]]]]],
-    ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
+    ["and", ["meets_req"], ["not", ["is", "disabled"]],
+      ["cmp", "price_in", "le", 1], ["cmp", "price_out", "le", 5]],
+    ["neg", ["normalize", ["field", "price_out"]]],
+    ["top_k", 3, ["argmax"]], ["id"],
+    ["always", {"action": "next_candidate"}]]
 }
 ```
 
-## The feedback loop — author → preview → run → read
+This is a routing smoke test, not a validated quality policy. After previewing:
 
-Every step is a request with the **same** `Authorization: Bearer <key>` you used to fetch this guide. You never have to fly blind:
+```bash
+curl --fail-with-body "$ROUTER_URL/v1/chat/completions" \
+  -H "Authorization: Bearer $ROUTER_API_KEY" \
+  -H 'Content-Type: application/json' --data-binary @request.json
+```
 
-1. **Start from an intent template whenever it fits.** `GET /x/policy/templates`
-   lists the blessed choices. Compile one with
-   `POST /x/policy/templates/{id}` (for example
-   `{"family":"glm-5.2","provider_strategy":"ordered"}` against
-   `cheapest-family`, or `agent` for a tool-running autonomous client). Author
-   raw `policy_ir` only when the templates cannot
-   express the intent. The published `default` template is byte-for-byte
-   equivalent after normalization to the policy used when an
-   OpenAI-compatible request sends no `policy_ir`.
-   The published `agent` template is likewise identical to `profile:agent` and
-   owns its first-token/per-attempt budgets, trust gate, and fast-fallback plan;
-   callers should select the profile instead of copying its raw term.
-2. **Admit & identify — no spend.** `POST /x/policy/normalize` `{policy_ir}` → `{policy_ir, fingerprint, version}`. A `400` here pinpoints what's invalid (unknown op, undeclared field, …) so you fix the term before paying.
-3. **Preview the ranking — no spend.** `POST /x/rank` `{policy_ir}` → `{ranked, rejected}`: the candidates this host would admit and how it orders them, plus the ones it filtered out, each with the `reason` it failed. This is how you see *what your policy does* without a single call.
-4. **Run it for real.** `POST /v1/chat/completions` with `policy_ir` (or `flow_ir`) + `messages` (the example above). A real call — real spend.
-5. **Read how it routed.** The response carries **`x_router`** — your debugger for what actually happened:
+Use an empty `model` when the custom policy owns selection. Do not assume a
+family or provider pin is ignored when a policy is supplied; request constraints
+still matter. Session affinity is not a security boundary or guaranteed pin.
 
-   | `x_router` field | what it tells you |
-   |---|---|
-   | `provider` · `served_model_id` | the model that answered |
-   | `served_by` | the *executed route* — the marketplace peer, or the provider for a direct route |
-   | `cost_usd` · `price_in` · `price_out` | what the call cost |
-   | `policy_fingerprint` | the identity of the policy that ran (matches `/x/policy/normalize`) |
-   | `decision_trace` | `ranked` (the candidates considered) **and** `decision_path` (the real fallback attempts — which routes were tried, and `ok` or the error each hit) |
-   | `session_acc` | running totals, when the call carries a session |
+**Decision models (Jev)** use `POST /v1/decisions` (alias `/v1/systemone`), with
+`state` and typed `questions`, never chat messages or streaming. A minimal
+choice call with a version-constrained, price-bounded Jev cascade:
 
-   `decision_trace.decision_path` is the fallback story — exactly which routes were tried and why it fell through; `served_by` + `cost_usd` say where it landed and what it cost. Refine the term and loop.
+```json
+{
+  "state": {"ticket": "I was charged twice."},
+  "questions": {"team": {
+    "type": "choice", "instructions": "Which team handles this ticket?",
+    "criteria": {"billing": "Payments and refunds", "technical": "Software issues"}
+  }},
+  "policy_ir": ["policy",
+    ["and", ["meets_req"], ["not", ["is", "disabled"]],
+      ["family_eq", "jev-1.13"],
+      ["cmp", "price_in", "le", 0.1], ["cmp", "price_out", "le", 0.1]],
+    ["neg", ["normalize", ["field", "price_in"]]],
+    ["top_k", 4, ["prefer", ["not", ["is", "breaker_open"]], ["argmax"]]],
+    ["set_param", "timeout_ms", 2500], ["always", {"action": "next_candidate"}]]
+}
+```
 
-**The same loop for a Σ_flow** (a DAG of nodes, each with its own `policy_ir` — see *Σ_flow* below):
+Preview that term with `protocol: "decisions"`; chat is the rank default.
+Discover actual family names: `jev-latest` is mutable and is not proof of
+`jev-1.13`. Add it to an `or` family filter only when version flexibility is
+acceptable. Prefer advertised zero-price routes using `prefer` inside the
+healthy group, rather than filtering out all paid fallbacks. Validate actual
+billing; zero token prices do not establish the absence of other fees.
 
-1. **Author** the `flow_ir`.
-2. **Admit & identify — no spend.** `POST /x/flow/normalize` `{flow_ir}` → `{flow_ir, fingerprint, version}`.
-3. **Preview — no spend.** A flow has no single ranking (each node routes on its own policy), so preview a node by sending *its* `policy_ir` to `POST /x/rank`.
-4. **Run it for real.** `POST /v1/chat/completions` with `flow_ir` + `messages`.
-5. **Read how it routed.** `x_router.decision_trace` carries **`flow_nodes`** — one entry per node with its `node` id, `provider` / `served_by`, tokens, latency, and the node's own `decision_path` (its fallback attempts). That's the per-node debugger: you see which node ran what, where each landed, and any fallback inside a node.
+Decision requests allow `choice`, `score` and `noul`, up to 32 KB, 32 questions
+and 32 criteria per question. Typed answers do not guarantee correct decisions.
+`first_token_timeout_ms` bounds the complete nonstreamed decision response;
+`timeout_ms` bounds an attempt, not the whole multi-attempt request. Leave room
+for fallbacks within the server's overall request deadline.
+
+Read the actual response, including errors:
+
+| Evidence | Meaning |
+|---|---|
+| `x_router.provider`, `served_model_id`, `served_by` | Executed provider, model and actual peer/direct route |
+| `x_router.decision_trace.decision_path` | Attempts, failures and fallback outcomes; inspect rather than infer from preview |
+| `x_router.cost_usd`, `cost_basis`, `usage` | Reported/estimated winning-attempt cost and tokens; failed-attempt charges may be unknown |
+| `x_router.price_in`, `price_out` | USD per million tokens; not the total bill |
+| `x_router.policy_fingerprint` | Effective policy identity; host envelope can make this differ from normalization |
+| Client elapsed time + checked output | End-to-end latency and task correctness; HTTP 200 alone proves neither quality nor a latency target |
+
+Use bounded test calls within the user's existing authorization and budget.
+For streaming, do not replay visible partial output on a fallback. For sustained
+optimization, fetch `/skill?name=policy-optimization`. Return the policy JSON,
+requirements/assumptions, preview, measured results and unresolved limitations.
 
 ## The Σ_pol term, exactly
 
@@ -96,7 +166,7 @@ Every step is a request with the **same** `Authorization: Bearer <key>` you used
 > spec. The **field vocabulary**, by contrast, is injected live from the host
 > (see *Field vocabulary* below), so it never drifts from what the host serves.
 
-A policy is a 6-element array — fill the three middle slots, keep the rest as-is:
+A policy is a 6-element array — the last two slots can set request parameters and failure behavior:
 
 ```
 ["policy", <Pred>, <Scorer>, <Selector>, ["id"], ["always", {"action":"next_candidate"}]]
@@ -171,47 +241,27 @@ Score on the **raw observable fields** (the same names the filter gates on; see
   candidates inside both groups. Nest it for lexicographic provider order; an
   outer `prefer(not(is("breaker_open")), ...)` keeps unhealthy routes last.
 
-## Worked examples (copy, adjust the numbers)
+## Example: provider restriction with explicit cost tradeoff
 
-**Cheapest model that's decent and not over a price ceiling:**
+This example allows only `bedrock`. Replace the identifier only with approved,
+live provider IDs. It intentionally fails if none qualifies. Weight input/output
+prices according to your workload; this 80/20 split is an example, not a measured
+optimum. Preview it and qualify task quality before adoption.
+
 ```json
 ["policy",
   ["and", ["meets_req"], ["not", ["is", "disabled"]],
-          ["cmp", "bench_intelligence", "ge", 0.5], ["cmp", "price_out", "le", 10]],
-  ["neg", ["normalize", ["field", "price_out"]]],
-  ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
+    ["provider_eq", "bedrock"],
+    ["cmp", "price_in", "le", 5], ["cmp", "price_out", "le", 25]],
+  ["neg", ["normalize", ["add", ["scale", 0.8, ["field", "price_in"]],
+                                ["scale", 0.2, ["field", "price_out"]]]]],
+  ["top_k", 3, ["prefer", ["not", ["is", "breaker_open"]], ["argmax"]]],
+  ["id"], ["always", {"action": "next_candidate"}]]
 ```
 
-**Cheapest in the top-5 on intelligence ∩ top-5 on coding** (the host's Σ_pol
-example #1):
-```json
-["policy",
-  ["and", ["meets_req"], ["not", ["is", "disabled"]],
-          ["cmp", "bench_intelligence_rank", "le", 5],
-          ["cmp", "bench_coding_rank", "le", 5]],
-  ["neg", ["normalize", ["field", "price_in"]]],
-  ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
-```
-
-**Top-3 by combined benchmarks, as a cascade** (example #2):
-```json
-["policy",
-  ["and", ["meets_req"], ["not", ["is", "disabled"]]],
-  ["add", ["scale", 1, ["normalize", ["field", "bench_intelligence"]]],
-          ["scale", 1, ["normalize", ["field", "bench_coding"]]],
-          ["scale", 1, ["normalize", ["field", "bench_agentic"]]]],
-  ["top_k", 3, ["argmax"]], ["id"], ["always", {"action": "next_candidate"}]]
-```
-
-**Quality-leaning blend, partners only** (tier gated in the filter, so the score
-is just benchmark vs latency):
-```json
-["policy",
-  ["and", ["meets_req"], ["not", ["is", "disabled"]], ["tier_eq", "partner"]],
-  ["add", ["scale", 0.7, ["normalize", ["field", "bench_intelligence"]]],
-          ["scale", 0.3, ["neg", ["normalize", ["field", "latency_ms"]]]]],
-  ["argmax"], ["id"], ["always", {"action": "next_candidate"}]]
-```
+Normalize the combined token-price estimate when preserving the input/output
+ratio matters. Normalizing each price separately before adding them expresses
+relative preferences and can change that ratio as the catalog changes.
 
 ## Field vocabulary
 
@@ -233,11 +283,21 @@ huge, so a family without it is correctly outside every top-N. Marketplace-only
 families (no OpenRouter data) have empty benchmarks — gate on price/latency for
 those.
 
-Defaults when a field is absent are deliberately conservative (prices **+inf**
-so a missing price fails a ceiling; `tok_s`/`credits` 0;
-`success_rate` 1; bools false) — see *Rules* below.
+Missing values are not measurements: prices and latency default to **+inf**;
+throughput, credits and context to 0; booleans to false. `success_rate` defaults
+to **1**, optimistically, so a new unmeasured route may pass a reliability floor.
+`quality` and `quality_hint` are not observable fields in this schema.
+
+On this host, route success and mean successful latency use a recent observation
+window; they do not measure task correctness or p95. AntSeed reputation is an
+additional signal, not an SLA. Advertised concurrency is a capacity limit, not
+currently idle slots. Do not invent p95, sample-count or confidence fields when
+`/x/fields` does not expose them. Measure these in your evaluation report.
 
 ## Σ_flow — composing several calls
+
+Use chat flows only when multiple billable calls are justified. Apply the same
+provider/data constraints to every node, including the synthesizer.
 
 A flow is `["flow", { <id>: <node>, ... }]` with exactly one `input` and one
 `output` node; every `llm` node carries a `system` prompt, a `policy` (a full
@@ -269,10 +329,11 @@ a multi-input node joins its predecessors' outputs.
 
 ## Rules that keep a policy valid
 
-- **Defaults are conservative.** A candidate with no declared price does *not*
-  pass a `price_out` ceiling (`price_in/out` default to +inf). Enforce spend
-  with a hard `cmp` ceiling on `price_*` in the filter — a scorer only ranks
-  softly, it does not bound anything.
+- **Check missing-value behavior.** A candidate with no declared price does *not*
+  pass a `price_out` ceiling (`price_in/out` default to +inf). Bound token
+  rates with `cmp` on `price_*`; bound output length and experiment spend
+  separately. Include retries, evaluator/selector calls and unknown failed-call
+  charges in the budget. A score does not enforce a ceiling.
 - **Score on raw fields, not the composite scorer atoms.** Author scores as
   `["field", "<name>"]` (+ `normalize`/`neg`/`scale`/`add`). Don't use the bare
   `cost` / `speed` / `quality` / `partner` / `free_credit` scorer atoms: they
@@ -294,5 +355,5 @@ a multi-input node joins its predecessors' outputs.
 
 <!-- LIVE_CATALOG_TABLE -->
 *(The live model/provider catalog is injected here when this file is downloaded
-from the host's **Catalog** tab. Without it, target the field vocabulary above
+from the host's **Skills** tab or `/skill`. Without it, target the field vocabulary above
 and confirm families with `POST /x/rank`.)*

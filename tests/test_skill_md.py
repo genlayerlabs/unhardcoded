@@ -16,10 +16,16 @@ import json
 import re
 from pathlib import Path
 
+import pytest
 from lupa import LuaRuntime
+
+from llm_router_host import LLMRouterHost
+from decision_protocol import validate_payload
+from shim import DecisionsRequest
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / "SKILL.md"
+SKILLS = [SKILL, ROOT / "skills/policy-optimization/SKILL.md"]
 SIG = ROOT / "core" / "llm_policy" / "sig.lua"
 
 
@@ -87,8 +93,9 @@ def _ops_in_block(block, seen: set[str]) -> None:
     _collect_ops(block, seen)
 
 
-def test_skill_md_examples_use_only_real_sigma_pol_ops():
-    blocks = _json_blocks(SKILL.read_text())
+@pytest.mark.parametrize("skill", SKILLS, ids=lambda p: str(p.relative_to(ROOT)))
+def test_skill_md_examples_use_only_real_sigma_pol_ops(skill):
+    blocks = _json_blocks(skill.read_text())
     assert blocks, "SKILL.md should contain ```json policy examples"
     seen: set[str] = set()
     for b in blocks:
@@ -116,3 +123,34 @@ def test_skill_md_gate_covers_reference_table_and_prose_ops():
     assert not missing, f"inline gate regressed — not extracted: {sorted(missing)}"
     # and they are real ops (the whole point: the guide teaches no phantom op)
     assert table_and_prose_only <= _sig_ops()
+
+
+@pytest.fixture(scope="module")
+def skill_host():
+    host = LLMRouterHost(router_path=ROOT / "core/router.lua",
+                         config_path=ROOT / "config.live.lua")
+    host.set_discover_hook(lambda _: {"ok": True, "offers": []})
+    host.init()
+    return host
+
+
+@pytest.mark.parametrize("skill", SKILLS, ids=lambda p: str(p.relative_to(ROOT)))
+def test_complete_skill_examples_admit_against_host_schema(skill_host, skill):
+    """Check arity, sorts and declared fields, not just operator spelling."""
+    checked = 0
+    for raw in re.findall(r"```json\n(.*?)```", skill.read_text(), flags=re.S):
+        if "<" in raw:  # explicitly labelled grammar templates, not runnable examples
+            continue
+        block = json.loads(raw)
+        if isinstance(block, dict) and "questions" in block:
+            request = DecisionsRequest.model_validate(block)
+            validate_payload({"state": request.state, "questions": request.questions})
+        term = block.get("policy_ir") if isinstance(block, dict) else block
+        if term[0] == "flow":
+            skill_host.flow_admit(term)
+        elif term[0] == "policy":
+            skill_host.normalize_policy(term, admit=True)
+        else:
+            continue  # standalone scorer illustration
+        checked += 1
+    assert checked
