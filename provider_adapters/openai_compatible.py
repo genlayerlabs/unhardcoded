@@ -120,7 +120,8 @@ def _prepare_openai_call(
         "model": offer.get("wire_model_id") or request["served_model_id"],
         "messages": request.get("messages") or [],
     }
-    for field in ("tools", "response_format", "temperature", "seed", "max_tokens"):
+    for field in ("tools", "response_format", "temperature", "seed", "max_tokens",
+                  "reasoning", "reasoning_effort"):
         v = request.get(field)
         if v is not None:
             body[field] = v
