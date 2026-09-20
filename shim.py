@@ -1737,23 +1737,33 @@ async def _await_delta_or_beat(getter: "asyncio.Task", task: "asyncio.Task",
 
 
 def _cap_ranked(trace):
-    """Return `trace` with its `ranked` capped to top-N (+ ranked_total), or
-    unchanged. `ranked` is the WHOLE ranked catalog (hundreds of candidates) and
-    alone bloats a response to ~95 KB (measured); the chosen route plus the next
-    few fallbacks is all Activity needs. decision_path (the real attempts) is
-    untouched."""
+    """Bound catalog samples, preserving totals, rejection reasons and attempts.
+
+    Narrow policies reject almost the entire catalog. Leaving `rejected`
+    unbounded emitted ~538 KB for each small decision in a live trace replay.
+    This view does not mutate the engine's result or its decision_path.
+    """
     if not isinstance(trace, dict):
         return trace
     ranked = trace.get("ranked")
     if isinstance(ranked, list) and len(ranked) > _TRACE_RANKED_TOP_N:
-        return {**trace, "ranked": ranked[:_TRACE_RANKED_TOP_N],
-                "ranked_total": len(ranked)}
+        trace = {**trace, "ranked": ranked[:_TRACE_RANKED_TOP_N],
+                 "ranked_total": len(ranked)}
+    rejected = trace.get("rejected")
+    if isinstance(rejected, list) and len(rejected) > _TRACE_RANKED_TOP_N:
+        reasons = {}
+        for row in rejected:
+            reason = row.get("reason") if isinstance(row, dict) else None
+            reason = reason if isinstance(reason, str) else "unknown"
+            reasons[reason] = reasons.get(reason, 0) + 1
+        trace = {**trace, "rejected": rejected[:_TRACE_RANKED_TOP_N],
+                 "rejected_total": len(rejected), "rejected_reasons": reasons}
     return trace
 
 
 def _trim_trace(trace):
-    """Bound the decision_trace emitted to the client. Caps the top-level `ranked`
-    AND, for a Σ_flow, the `ranked` nested inside each per-node decision_trace —
+    """Bound the decision_trace emitted to the client. Caps `ranked` and `rejected`
+    AND, for a Σ_flow, those lists inside each per-node decision_trace —
     an N-node flow otherwise emits N× the full catalog (the reason the flow trace
     overflowed the proxy tail and Activity showed nothing for the ensemble). The
     per-node provider / peer / decision_path / tokens — what makes the flow
@@ -1763,7 +1773,7 @@ def _trim_trace(trace):
     out = _cap_ranked(trace)
     nodes = out.get("flow_nodes")
     if isinstance(nodes, list) and nodes:
-        trimmed = [{**n, "decision_trace": _cap_ranked(n["decision_trace"])}
+        trimmed = [{**n, "decision_trace": _trim_trace(n["decision_trace"])}
                    if isinstance(n, dict) and isinstance(n.get("decision_trace"), dict)
                    else n
                    for n in nodes]
@@ -2020,7 +2030,7 @@ def _openai_error_from_router(result: dict) -> JSONResponse:
                 "provider": None,
                 "model_family": None,
                 "served_model_id": None,
-                "decision_trace": trace or None,
+                "decision_trace": _trim_trace(trace),
                 **({"decision_cost_usd": trace["automatic"].get("cost_usd"),
                     "cost_usd": None,
                     "cost_basis": "unknown_total"} if isinstance(trace.get("automatic"), dict) else {}),
