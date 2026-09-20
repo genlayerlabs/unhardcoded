@@ -37,6 +37,7 @@ from provider_adapters.common import (
     _provider_error_message,
 )
 from provider_adapters.dispatcher import make_api_kind_dispatcher
+from provider_adapters.diagnostics import bounded_diagnostics
 from provider_adapters.google import make_google_async_call_provider
 from provider_adapters.openai_compatible import (
     _PEER_GATES,
@@ -629,6 +630,8 @@ end
         # fold so route_cache learns which peer served this conversation. It is a
         # local of this coroutine, so concurrent executes never share it.
         session = contract.get("session")
+        provider_diagnostics = []
+        provider_attempt = 0
         engine_contract = contract
         if contract.get('protocol') == 'decisions':
             # Lua tables cannot represent JSON null or distinguish [] from {}.
@@ -639,10 +642,14 @@ end
         while True:
             status = step["status"]
             if status == "done":
-                return _to_py(step["result"])
+                result = _to_py(step["result"])
+                if provider_diagnostics:
+                    result.setdefault("trace", {})["provider_diagnostics"] = provider_diagnostics
+                return result
 
             handle = step["state_handle"]
             if status == "call":
+                provider_attempt += 1
                 req = _to_py(step["request"]) or {}
                 if req.get('protocol') == 'decisions':
                     req['decision'] = json.loads(req['decision'])
@@ -650,6 +657,15 @@ end
                         and req.get("first_token_timeout_ms") is None):
                     req["first_token_timeout_ms"] = contract["first_token_timeout_ms"]
                 resp = await self._resolve_call_async(req, call_override, session=session)
+                diagnostic = bounded_diagnostics(resp.get("diagnostics"))
+                if diagnostic and len(provider_diagnostics) < 32:
+                    diagnostic.update(bounded_diagnostics({
+                        "attempt": provider_attempt,
+                        "provider_id": req.get("provider_id"),
+                        "model_family": req.get("model_family"),
+                        "error_kind": resp.get("error_kind"),
+                    }))
+                    provider_diagnostics.append(diagnostic)
                 step = self.router.execute_step(handle, None, _to_lua(self.lua, resp))
             elif status == "wait":
                 until_ms = step["until_ms"] or 0

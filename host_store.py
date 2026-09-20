@@ -398,6 +398,11 @@ def routing_summary(trace) -> dict | None:
         if isinstance(step, dict) and step.get('event') == 'attempted'
     ]
     summary['deadline_exceeded'] = trace.get('request_deadline_exceeded') is True
+    from provider_adapters.diagnostics import bounded_diagnostics
+    diagnostics = trace.get('provider_diagnostics')
+    if isinstance(diagnostics, list):
+        summary['provider_diagnostics'] = [bounded_diagnostics(item) for item in diagnostics[:32]
+                                           if isinstance(item, dict)]
     decision = trace.get('automatic')
     if isinstance(decision, dict):
         # A closed allowlist excludes payloads, instructions and arbitrary provider bodies.

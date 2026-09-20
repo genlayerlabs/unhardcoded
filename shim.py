@@ -1904,6 +1904,8 @@ def _openai_usage(response: dict) -> dict:
     # x_router already passes that 0 through — the OpenAI block must agree.
     if response.get("tokens_cached") is not None:
         usage["prompt_tokens_details"] = {"cached_tokens": response["tokens_cached"]}
+    if response.get("tokens_reasoning") is not None:
+        usage["completion_tokens_details"] = {"reasoning_tokens": response["tokens_reasoning"]}
     return usage
 
 
