@@ -512,3 +512,27 @@ def step_prefix_preserved(context):
 def step_tail_preserved(context, keep):
     assert context.json["messages"][-keep:] == context.compact_input[-keep:], \
         "recent tail not verbatim"
+
+
+@when('I normalize a decision-routed flow with fallback "{validity}"')
+def step_decision_flow_normalize(context, validity):
+    # Admission only: no provider calls, keys or model spend beyond the consumer.
+    policy = FREE_POLICY_IR
+    routing = {'policy': policy, 'instructions': 'Choose the needed generation capability.',
+               'choices': {'economy': {'description': 'Routine work', 'policy': policy},
+                           'capable': {'description': 'Difficult work', 'policy': policy}},
+               'fallback': 'capable', 'min_confidence': .7, 'timeout_ms': 1500}
+    if validity == 'unknown':
+        routing['fallback'] = 'undeclared'
+    flow = ['flow', {'input': {'kind': 'input'},
+        'generate': {'kind': 'llm', 'system': '', 'inputs': ['input'], 'policy': policy, 'routing': routing},
+        'output': {'kind': 'output', 'inputs': ['generate']}}]
+    _do(context, 'POST', '/x/flow/normalize', auth='consumer', body={'flow_ir': flow})
+
+
+@then('the normalized flow retains both generation choices')
+def step_decision_flow_choices(context):
+    nodes = context.json['flow_ir'][1].values()
+    node = next(n for n in nodes if n.get('routing'))
+    assert set(node['routing']['choices']) == {'economy', 'capable'}
+    assert node['routing']['fallback'] == 'capable'
