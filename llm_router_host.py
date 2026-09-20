@@ -378,9 +378,16 @@ end
             if node.get("system"):
                 msgs.append({"role": "system", "content": node["system"]})
             msgs.append({"role": "user", "content": prompt})
+            routing_trace = None
             try:
+                policy = node["policy"]
+                if node.get("routing"):
+                    from flow_routing import select_node_policy
+                    policy, routing_trace = await select_node_policy(
+                        self, node["routing"], msgs, prompt,
+                        session=base_contract.get("session"), call_override=call_override)
                 res = await self.execute_async(
-                    {**carry, "messages": msgs, "policy_ir": node["policy"]},
+                    {**carry, "messages": msgs, "policy_ir": policy},
                     call_override=call_override)
             except Exception as exc:
                 # A node's routed call must NEVER crash the whole flow: an
@@ -416,6 +423,7 @@ end
                     # 0.9s gpt-5.5 node).
                     "latency_ms": tr.get("total_latency_ms"),
                     "decision_trace": tr or None,
+                    **({"routing": routing_trace} if routing_trace is not None else {}),
                 },
             }
 
@@ -449,7 +457,13 @@ end
                     + cached / 1e6 * (pin or 0) * 0.1
                     + (n.get("tokens_out") or 0) / 1e6 * (pout or 0))
         _costs = [c for c in (_node_cost(n) for n in nodes) if c is not None]
-        flow_cost = round(sum(_costs), 6) if _costs else None
+        routing_traces = [n["routing"] for n in nodes if n.get("routing") is not None]
+        routing_costs = [r["cost_usd"] for r in routing_traces if r.get("cost_usd") is not None]
+        # A timed-out decision may still be billable; never report its cost as zero.
+        cost_known = len(routing_costs) == len(routing_traces)
+        flow_cost = round(sum(_costs) + sum(routing_costs), 12) if _costs and cost_known else None
+        tok_in = (tok_in or 0) + sum(r.get("tokens_in") or 0 for r in routing_traces) or None
+        tok_out = (tok_out or 0) + sum(r.get("tokens_out") or 0 for r in routing_traces) or None
         base_trace = {"policy_fingerprint": None, "flow_fingerprint": fp,
                       "flow_nodes": nodes}
         if not fr.get("ok"):

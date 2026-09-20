@@ -208,3 +208,5 @@ behave
 
 *(Nix users: `nix-shell -p ...` with the same packages — plus `chromium
 chromedriver` for the browser pass — works as before.)*
+
+See [decision routing within generative flows](docs/DECISION-FLOWS.md) to select an economical or capable generation policy from conversation and tool history.
