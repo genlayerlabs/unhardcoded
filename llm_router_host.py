@@ -385,7 +385,7 @@ end
         input_text = _last_user_text(base_contract.get("messages") or [])
         carry = {k: base_contract[k] for k in
                  ("max_tokens", "tools", "tool_choice", "response_format",
-                  "temperature", "seed", "session", "cache_hot_route")
+                  "temperature", "seed", "reasoning", "reasoning_effort", "session", "cache_hot_route")
                  if k in base_contract}
 
         async def run_node(nid, node, prompt):

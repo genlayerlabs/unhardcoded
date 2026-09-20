@@ -14,6 +14,16 @@ See [decision routing, provider requirements and examples](docs/DECISION-MODELS.
 The same decision policies can [classify context fragments for selective
 compaction](docs/FRAGMENT-COMPACTION.md), with generative summaries only where needed.
 
+Generation requests on `/v1/chat/completions` and `/v1/responses` can pass
+`reasoning` (an object) or `reasoning_effort` (a string) through to
+OpenAI-compatible providers. For example, `"reasoning":{"effort":"low"}`
+selects a lower effort when the chosen model supports it. The provider validates
+supported values; omitting the fields preserves its defaults. A policy can set
+`["set_param","reasoning_effort","low"]` for its generation calls, including
+compaction. Generic flows carry request controls to their generation nodes;
+native decision nodes receive their own independent contracts. These controls
+do not translate to the native Bedrock, Anthropic or Google APIs.
+
 Concretely it's an async FastAPI shim that runs the
 [`unhardcoded-engine`](https://github.com/genlayerlabs/unhardcoded-engine) core
 and inherits its provider selection, fallback, retry and per-provider auth. The core

@@ -82,6 +82,8 @@ class ChatRequest(BaseModel):
     tools: list[dict] | None = None
     tool_choice: Any = None
     response_format: dict | None = None
+    reasoning: dict | None = None
+    reasoning_effort: str | None = None
     temperature: float | None = None
     seed: int | None = None
     max_tokens: int | None = None
@@ -130,7 +132,7 @@ class DecisionsRequest(BaseModel):
 
 class ResponsesRequest(BaseModel):
     """Permissive OpenAI /v1/responses body. Unknown fields are kept
-    (extra="allow") so Responses params the shim does not read (reasoning,
+    (extra="allow") so Responses params the shim does not read (
     include, store, parallel_tool_calls, prompt_cache_key, text,
     previous_response_id, …) never break the request."""
     model_config = ConfigDict(extra="allow")
@@ -142,6 +144,8 @@ class ResponsesRequest(BaseModel):
     tool_choice: Any = None
     stream: bool = False
     max_output_tokens: int | None = None
+    reasoning: dict | None = None
+    reasoning_effort: str | None = None
     temperature: float | None = None
     first_token_timeout_ms: int | None = None
     timeout_ms: int | None = None
@@ -1304,6 +1308,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             tools=_rapi.tools_to_chat(req.tools),
             tool_choice=_rapi.tool_choice_to_chat(req.tool_choice),
             temperature=req.temperature,
+            reasoning=req.reasoning,
+            reasoning_effort=req.reasoning_effort,
             max_tokens=req.max_output_tokens,
             first_token_timeout_ms=req.first_token_timeout_ms,
             timeout_ms=req.timeout_ms,
@@ -1635,6 +1641,10 @@ def _request_to_contract(
         contract["tool_choice"] = req.tool_choice
     if req.response_format is not None:
         contract["response_format"] = req.response_format
+    if req.reasoning is not None:
+        contract["reasoning"] = req.reasoning
+    if req.reasoning_effort is not None:
+        contract["reasoning_effort"] = req.reasoning_effort
     if req.temperature is not None:
         contract["temperature"] = req.temperature
     if req.seed is not None:
