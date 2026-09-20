@@ -234,9 +234,11 @@ _SCHEMA_STATEMENTS = [
         observed_at     BIGINT NOT NULL,
         first_seen      BIGINT,
         fetched_at      BIGINT,
+        protocols       TEXT[],
         PRIMARY KEY (peer_id, service)
     )""",
     "ALTER TABLE peer_offers ADD COLUMN IF NOT EXISTS last_reached_at BIGINT",
+    "ALTER TABLE peer_offers ADD COLUMN IF NOT EXISTS protocols TEXT[]",
     "CREATE INDEX IF NOT EXISTS idx_peer_offers_observed ON peer_offers(observed_at)",
     # The antseed buyer's status (escrow + session pin + wallet), one row per
     # buyer pid. WRITTEN by the antseed sidecar (write-status.js on the poll loop
@@ -1948,7 +1950,7 @@ def recent_logins(limit: int = 100) -> list[dict[str, Any]]:
 # window/housekeeping columns (observed_at/first_seen/fetched_at) stay internal.
 _PEER_OFFER_FIELDS = ("peer_id", "service", "price_in", "price_out",
                       "price_cached_in", "max_concurrency", "reputation",
-                      "last_seen", "last_reached_at")
+                      "last_seen", "last_reached_at", "protocols")
 
 
 def peer_offers(window_ms: int = 900_000) -> list[dict[str, Any]]:

@@ -1,0 +1,24 @@
+[
+  "policy",
+  ["and",
+    ["meets_req"],
+    ["not", ["is", "disabled"]],
+    ["family_eq", "jev-1.13"],
+    ["cmp", "price_in", "ge", 0],
+    ["cmp", "price_in", "le", 0.1],
+    ["cmp", "price_out", "ge", 0],
+    ["cmp", "price_out", "le", 0.1],
+    ["cmp", "success_rate", "ge", 0.9]
+  ],
+  ["add",
+    ["scale", 0.7, ["neg", ["clamp", 0, 1, ["scale", 10, ["field", "price_in"]]]]],
+    ["scale", 0.3, ["neg", ["clamp", 0, 1, ["scale", 0.0006666666666666666, ["field", "latency_ms"]]]]]
+  ],
+  ["top_k", 4,
+    ["prefer", ["not", ["is", "breaker_open"]],
+      ["prefer", ["cmp", "latency_ms", "le", 1500], ["argmax"]]
+    ]
+  ],
+  ["seq", ["set_param", "first_token_timeout_ms", 1500], ["set_param", "timeout_ms", 2500]],
+  ["always", {"action": "next_candidate"}]
+]

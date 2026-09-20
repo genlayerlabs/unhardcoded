@@ -1,0 +1,221 @@
+{
+  "timestamp": "2026-09-20T08:02:33.847526+00:00",
+  "router": "https://router.ygr.ai",
+  "requests": [
+    {
+      "method": "GET",
+      "path": "/v1/models",
+      "status": 200,
+      "elapsed_ms": 720,
+      "model_count": 660,
+      "jev_models": []
+    },
+    {
+      "method": "POST",
+      "path": "/x/policy/normalize",
+      "status": 200,
+      "elapsed_ms": 416,
+      "policy_id": "1d81600760af8c4999f7f84afcb317c6ad59144c8eda5388c5e0964c37b40bc7",
+      "fingerprint": "1966173220-592579890",
+      "version": "sigma-pol/v2"
+    },
+    {
+      "method": "POST",
+      "path": "/x/rank",
+      "status": 200,
+      "elapsed_ms": 361,
+      "ranked": [],
+      "rejected_count": 789,
+      "jev_rejected": []
+    },
+    {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "status": 503,
+      "elapsed_ms": 336,
+      "x_router": {
+        "provider": null,
+        "model_family": null,
+        "served_model_id": null,
+        "decision_trace": {
+          "ranked": {},
+          "total_latency_ms": 20,
+          "policy_term": [
+            "policy",
+            [
+              "and",
+              [
+                "cmp",
+                "price_in",
+                "ge",
+                0
+              ],
+              [
+                "cmp",
+                "price_in",
+                "le",
+                0.1
+              ],
+              [
+                "cmp",
+                "price_out",
+                "ge",
+                0
+              ],
+              [
+                "cmp",
+                "price_out",
+                "le",
+                0.1
+              ],
+              [
+                "cmp",
+                "success_rate",
+                "ge",
+                0.9
+              ],
+              [
+                "family_eq",
+                "jev-1.13"
+              ],
+              [
+                "meets_req"
+              ],
+              [
+                "meets_req"
+              ],
+              [
+                "not",
+                [
+                  "is",
+                  "disabled"
+                ]
+              ],
+              [
+                "not",
+                [
+                  "is",
+                  "disabled"
+                ]
+              ],
+              [
+                "or",
+                [
+                  "cmp",
+                  "credits",
+                  "ge",
+                  1.0
+                ],
+                [
+                  "not",
+                  [
+                    "provider_eq",
+                    "antseed"
+                  ]
+                ]
+              ]
+            ],
+            [
+              "add",
+              [
+                "scale",
+                0.3,
+                [
+                  "neg",
+                  [
+                    "clamp",
+                    0,
+                    1,
+                    [
+                      "scale",
+                      0.0006666666666666666,
+                      [
+                        "field",
+                        "latency_ms"
+                      ]
+                    ]
+                  ]
+                ]
+              ],
+              [
+                "scale",
+                0.7,
+                [
+                  "neg",
+                  [
+                    "clamp",
+                    0,
+                    1,
+                    [
+                      "scale",
+                      10,
+                      [
+                        "field",
+                        "price_in"
+                      ]
+                    ]
+                  ]
+                ]
+              ]
+            ],
+            [
+              "top_k",
+              4,
+              [
+                "prefer",
+                [
+                  "not",
+                  [
+                    "is",
+                    "breaker_open"
+                  ]
+                ],
+                [
+                  "prefer",
+                  [
+                    "cmp",
+                    "latency_ms",
+                    "le",
+                    1500
+                  ],
+                  [
+                    "argmax"
+                  ]
+                ]
+              ]
+            ],
+            [
+              "seq",
+              [
+                "set_param",
+                "first_token_timeout_ms",
+                1500
+              ],
+              [
+                "set_param",
+                "timeout_ms",
+                2500
+              ]
+            ],
+            [
+              "always",
+              {
+                "action": "next_candidate"
+              }
+            ]
+          ],
+          "policy_fingerprint": "1180696799-342482462",
+          "decision_path": {},
+          "started_at_ms": 1789891355650,
+          "rejected_count": 789
+        }
+      },
+      "choices": null,
+      "error": {
+        "message": "router: no_candidates",
+        "type": "router_error",
+        "code": "no_candidates"
+      }
+    }
+  ]
+}

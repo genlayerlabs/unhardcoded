@@ -7,6 +7,11 @@ passes) — over your own provider keys — and falls back automatically when a
 provider errors. Every run records which models passed, which were rejected and
 why.
 
+**Decision models**, including Jev, use the same policy selection and fallback
+engine through `POST /v1/decisions` (`/v1/systemone` alias). Discover them in the
+dashboard's **Decision models** category or `/v1/models?type=decisions`.
+See [decision routing, provider requirements and examples](docs/DECISION-MODELS.md).
+
 Concretely it's an async FastAPI shim that runs the
 [`unhardcoded-engine`](https://github.com/genlayerlabs/unhardcoded-engine) core
 and inherits its provider selection, fallback, retry and per-provider auth. The core

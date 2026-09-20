@@ -116,6 +116,17 @@ class ChatRequest(BaseModel):
     caller: str | None = None
 
 
+class DecisionsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model: str = ""
+    state: Any
+    questions: dict
+    policy_ir: list | None = None
+    timeout_ms: int | None = None
+    first_token_timeout_ms: int | None = None
+    session: str | None = None
+
+
 class ResponsesRequest(BaseModel):
     """Permissive OpenAI /v1/responses body. Unknown fields are kept
     (extra="allow") so Responses params the shim does not read (reasoning,
@@ -143,6 +154,7 @@ class PolicyRankRequest(BaseModel):
     policy_ir: list
     context: int = 32000
     requirements: dict | None = None
+    protocol: str = "chat"
 
 
 class CompactRequest(BaseModel):
@@ -626,8 +638,11 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         return {"ok": True, "initialized": info.get("initialized", False)}
 
     @app.get("/v1/models")
-    def list_models():
+    def list_models(type: str | None = None):
         import sources as _sources
+        from decision_protocol import known_decision_model
+        if type not in (None, 'all', 'text', 'decision', 'decisions'):
+            return _openai_error('Unknown model category', 'invalid_request_error', 400)
         info = host.info()
         ids = [f"profile:{p}" for p in (info.get("profile_names") or [])]
         seen = set(info.get("models_loaded") or [])
@@ -640,7 +655,21 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 if fam and fam not in seen:
                     seen.add(fam)
                     ids.append(f"family:{fam}")
-        return {"object": "list", "data": [{"id": i, "object": "model"} for i in ids]}
+        decision_families = {f for f, m in (host.catalog().get('models') or {}).items()
+                             if m.get('protocol') == 'decisions'}
+        for sstate in _sources.SOURCE_STATE.values():
+            for row in (sstate.get('book') or {}).get('rows', []):
+                if row.get('category') == 'decision':
+                    decision_families.add(row['model_family'])
+        data = []
+        for model_id in ids:
+            family = model_id.removeprefix('family:')
+            category = 'decision' if family in decision_families or known_decision_model(family) else 'text'
+            if type in ('decision', 'decisions') and category != 'decision' or type == 'text' and category != 'text':
+                continue
+            data.append({'id': model_id, 'object': 'model', 'type': category,
+                         'category': 'Decision models' if category == 'decision' else 'Text models'})
+        return {"object": "list", "data": data}
 
     @app.get("/x/runtime")
     def runtime_state():
@@ -844,6 +873,16 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 else (f.get("meta") or {}).get("bench_intelligence")
             return (grp, -(q if q is not None else -1), f["family"])
         families.sort(key=_family_sort_key)
+        from decision_protocol import known_decision_model
+        decision_families = {f for f, m in models.items() if m.get('protocol') == 'decisions'}
+        for sstate in _sources.SOURCE_STATE.values():
+            for row in (sstate.get('book') or {}).get('rows', []):
+                if row.get('category') == 'decision':
+                    decision_families.add(row['model_family'])
+        for family in families:
+            is_decision = family['family'] in decision_families or known_decision_model(family['family'])
+            family['type'] = 'decision' if is_decision else 'text'
+            family['category'] = 'Decision models' if is_decision else 'Text models'
         # AntSeed buyer hot-wallet: address (where to top up), deposits and
         # connection, read live from the source's balances() — so the address
         # always reflects the CURRENT identity (if the data volume regenerates
@@ -1042,7 +1081,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         """Dry-run ranking for a per-call Σ_pol policy term — the policy
         builder's preview. Same admission path as execution: the core checks
         the term and ∧-applies the host envelope; nothing is called."""
-        contract: dict = {"policy_ir": body.policy_ir,
+        contract: dict = {"policy_ir": body.policy_ir, "protocol": body.protocol,
                           "requirements": body.requirements
                                           or {"context": body.context}}
         try:
@@ -1122,6 +1161,49 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         _session_from_header(req, request)
         await _activate_tenant(request)
         return await _handle_chat(req)
+
+    @app.post("/v1/decisions")
+    @app.post("/v1/systemone")
+    async def decisions(req: DecisionsRequest, request: Request):
+        from decision_protocol import validate_payload, decision_family
+        try:
+            payload = validate_payload({'state': req.state, 'questions': req.questions})
+            for value in (req.timeout_ms, req.first_token_timeout_ms):
+                if value is not None and not 1 <= value <= 120000:
+                    raise ValueError('Decision timeouts must be between 1 and 120000 ms.')
+        except (ValueError, TypeError, RecursionError) as exc:
+            return _openai_error(str(exc), 'invalid_request_error', 400)
+        await _activate_tenant(request)
+        chat = ChatRequest(model=req.model, session=req.session,
+                           timeout_ms=req.timeout_ms, first_token_timeout_ms=req.first_token_timeout_ms)
+        _session_from_header(chat, request)
+        contract = _request_to_contract(chat, default_profile, None)
+        contract.update(protocol='decisions', decision=payload)
+        if req.model and not req.model.startswith(('family:', 'pin:', 'policy:')):
+            contract['requirements'] = {'model_family': decision_family(req.model)}
+        if req.policy_ir is not None:
+            contract['policy_ir'] = req.policy_ir
+        else:
+            # A bounded, cost/latency policy for the decisions category. The
+            # published Jev policy adds an exact family constraint when desired.
+            contract['policy_ir'] = ["policy", ["and", ["meets_req"], ["not", ["is", "disabled"]]],
+                ["neg", ["field", "price_in"]], ["top_k", 4, ["prefer", ["not", ["is", "breaker_open"]], ["argmax"]]],
+                ["id"], ["always", {"action": "next_candidate"}]]
+        contract['timeout_ms'] = req.timeout_ms or 2500
+        try:
+            result = await _execute_with_deadline(host.execute_async(contract))
+        except Exception as exc:
+            admission = _policy_admission_error(exc)
+            if admission is None:
+                raise
+            return _invalid_policy_response(admission)
+        if not result.get('ok'):
+            return _openai_error_from_router(result)
+        data = (result.get('response') or {}).get('decision')
+        if not isinstance(data, dict):
+            return _openai_error('Invalid decision provider response', 'server_error', 502)
+        return {**data, 'x_router': _build_x_router(result, subscription_providers,
+                                                  session=chat.session, owner=chat.caller)}
 
     @app.post("/{profile_name}/v1/chat/completions")
     async def chat_completions_profiled(profile_name: str, req: ChatRequest, request: Request):
@@ -1721,10 +1803,11 @@ def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> floa
     fraction. None when uncomputable (read-time estimator is the fallback)."""
     basis = _cost_basis(result, subscription_providers)
     resp = result.get("response") or {}
+    precision = 12 if resp.get('decision') is not None else 6
     if basis == "subscription":
         return 0.0
     if basis == "reported":
-        return round(float(resp["cost_reported"]), 6)
+        return round(float(resp["cost_reported"]), precision)
     if basis != "computed":
         return None
     # (3) compute from the raw price, discounting cache-read input tokens
@@ -1752,7 +1835,7 @@ def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> floa
     # A negative price (unpriced sentinel / shadow scarcity price) must never bill
     # negative — clamp at the source (we once saw a large negative-spend row that
     # was exactly tokens × a negative chosen price).
-    return max(0.0, round(cost, 6))
+    return max(0.0, round(cost, precision))
 
 
 def _openai_usage(response: dict) -> dict:

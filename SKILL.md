@@ -25,6 +25,13 @@ There are no loops, no I/O, no side effects — a term *decides*, it does not *d
 
 ## How to send a policy
 
+**Decision models (for example Jev):** use `POST /v1/decisions` with `state`,
+typed `questions`, and `policy_ir`, not chat messages. Discover them with
+`GET /v1/models?type=decisions`; preview using `POST /x/rank` with
+`{"protocol":"decisions","policy_ir": ...}`. The engine keeps chat and
+decision candidates separate through every pin and fallback. See
+`docs/DECISION-MODELS.md` and `policies/jev-value-v1.json`.
+
 `POST /v1/chat/completions` (OpenAI-compatible). Put the term in `policy_ir`
 (or `flow_ir`). The `model` field is ignored for selection when `policy_ir` is
 present — the policy drives the choice.

@@ -345,7 +345,7 @@ def test_peer_offers_returns_rows_in_reader_shape(store):
     assert r == {"peer_id": "peerA", "service": "gpt-5", "price_in": 0.5,
                  "price_out": 1.0, "price_cached_in": None, "max_concurrency": 5,
                  "reputation": 80.0, "last_seen": 1,
-                 "last_reached_at": now - 500}
+                 "last_reached_at": now - 500, "protocols": None}
 
 
 def test_peer_offers_window_filters_stale_rows(store):

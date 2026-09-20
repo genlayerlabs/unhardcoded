@@ -5,6 +5,7 @@ strings) and account credits (GET /credits — needs OPENROUTER_API_KEY).
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from typing import Any
@@ -35,6 +36,7 @@ class OpenRouterSource:
         # /models snapshot cached by the async pricing() refresh so the SYNC
         # discover hook (offers_sync, called inside rank) never blocks on HTTP.
         self._models_snapshot: list[dict] = []
+        self._decision_snapshot: list[dict] = []
         # model id -> endpoint availability. A missing entry means "unknown" and
         # stays routable; a present false means OpenRouter explicitly reported no
         # usable endpoint for that model.
@@ -145,8 +147,18 @@ class OpenRouterSource:
 
     async def pricing(self) -> list[Price]:
         body = await self._get("/models")
+        # Decisions are absent from the default OpenRouter catalog. A failure
+        # here must not interrupt chat discovery or preserve stale decision offers.
+        try:
+            decisions = await self._get("/models?output_modalities=decisions")
+            self._decision_snapshot = [m for m in decisions.get("data", [])
+                if "decisions" in (m.get("architecture") or {}).get("output_modalities", [])]
+        except Exception:
+            self._decision_snapshot = []
+            logging.getLogger(__name__).warning("OpenRouter decision catalog unavailable")
         # cache for the sync offers_sync()/market_book() (whole-catalog discovery)
-        self._models_snapshot = body.get("data") or []
+        merged = {m['id']: m for m in (body.get("data") or []) + self._decision_snapshot if m.get('id')}
+        self._models_snapshot = list(merged.values())
         await self._refresh_endpoint_availability(self._models_snapshot)
         # Live, full model-level traits (benchmarks/modalities/caps + ranks) for
         # EVERY model, keyed by raw id, ranked across the whole OpenRouter
@@ -231,6 +243,7 @@ class OpenRouterSource:
             # full live model_meta inline as `traits`, so it ranks on real
             # benchmark just like a curated family.
             "model_family": family,
+            "protocol": "decisions" if traits.get("out_decisions") else "chat",
             "wire_model_id": mid,
             "seller_endpoint": self._base_url,
             "price_in_usd_per_mtok": price_in,
@@ -273,7 +286,8 @@ class OpenRouterSource:
         out = []
         for o in self._offers:
             lkey = _route_reliability.route_key(provider_id, o["model_family"], provider_id)
-            out.append({**o, "latency_ms": (stats.get(lkey) or {}).get("latency_ms")})
+            out.append({**o, "latency_ms": (stats.get(lkey) or {}).get("latency_ms"),
+                        "success_rate": (stats.get(lkey) or {}).get("success_rate")})
         return out
 
     def live_offers(self) -> list[dict]:
@@ -294,6 +308,7 @@ class OpenRouterSource:
             fam = o["model_family"]
             rows.append({
                 "model_family": fam,
+                "category": "decision" if o.get("protocol") == "decisions" else "text",
                 "source": "openrouter",
                 "seller": "openrouter",
                 "wire_model_id": o["wire_model_id"],
@@ -304,7 +319,8 @@ class OpenRouterSource:
                 "via": "openrouter",
             })
             # full live traits surfaced to the dashboard Catalog as the family meta
-            families[fam] = {"sellers_total": 1, "meta": o.get("traits") or {}}
+            families[fam] = {"sellers_total": 1, "meta": o.get("traits") or {},
+                             "category": "decision" if o.get("protocol") == "decisions" else "text"}
         return {"rows": rows, "families": families, "fetched_at": int(time.time())}
 
     # Model-level traits (same whoever serves the family): benchmarks,
@@ -341,6 +357,9 @@ class OpenRouterSource:
         for mod in ("image", "audio", "file", "video"):
             traits["in_" + mod] = mod in im
         traits["out_image"] = "image" in set(arch.get("output_modalities") or [])
+        from decision_protocol import known_decision_model
+        traits["out_decisions"] = ("decisions" in set(arch.get("output_modalities") or [])
+                                   or known_decision_model(m.get("id", "")))
         sp = set(m.get("supported_parameters") or [])
         for cap, param in self._PARAM_CAPS.items():
             traits[cap] = param in sp
