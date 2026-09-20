@@ -82,27 +82,28 @@ def test_compact_splices_append_only(client, host):
 def test_decision_compaction_endpoint_routes_and_accounts_each_leg(client, host, monkeypatch):
     import json
     calls = []
-    async def execute(contract):
+    async def execute(contract, **kwargs):
         calls.append(contract)
         if contract.get('protocol') == 'decisions':
             answers = {key: {'type': 'choice', 'choice': 'summarize',
-                       'probabilities': {'keep': 0, 'summarize': 1, 'archive': 0}}
-                       for key in contract['decision']['questions']}
+                       'probabilities': {k: float(k == 'summarize') for k in q['criteria']}}
+                       for key, q in contract['decision']['questions'].items()}
             return {'ok': True, 'response': {'decision': {'model': 'fixture', 'answers': answers},
                                              'tokens_in': 10, 'cost_reported': .001}}
         fragments = json.loads(contract['messages'][1]['content'])
-        return {'ok': True, 'response': {'text': json.dumps({f['id']: 'Fact.' for f in fragments}),
+        return {'ok': True, 'response': {'text': json.dumps({key: 'Fact.' for key in fragments}),
                                          'tokens_in': 20, 'tokens_out': 5, 'cost_reported': .002}}
     monkeypatch.setattr(host, 'execute_async', execute)
     msgs = [{'role': 'system', 'content': 'Rules'}, {'role': 'user', 'content': 'Task'},
             {'role': 'assistant', 'content': 'Evidence ' * 600}, {'role': 'assistant', 'content': 'Recent'}]
     r = client.post('/v1/compact', json={'messages': msgs, 'keep_recent': 1,
-        'decision_policy_ir': ['decision-fixture'], 'policy_ir': _PIN})
+        'decision_policy_ir': _PIN, 'policy_ir': _PIN})
     assert r.status_code == 200, r.text
     data = r.json()
     assert data['compacted'] and data['compaction']['target_met']
-    assert calls[0]['policy_ir'] == ['decision-fixture'] and calls[1]['policy_ir'] == _PIN
-    assert len(data['x_router']['compaction_legs']) == 2
+    normalized = host.normalize_policy(_PIN)['policy_ir']
+    assert calls[0]['policy_ir'] == normalized and calls[1]['policy_ir'] == normalized
+    assert len([n for n in data['x_router']['decision_trace']['flow_nodes'] if n['kind'] in ('decision', 'llm')]) == 2
     assert data['x_router']['cost_usd'] == .003
     assert data['usage']['prompt_tokens'] == 30
     assert data['messages'][:2] == msgs[:2] and data['messages'][-1] == msgs[-1]

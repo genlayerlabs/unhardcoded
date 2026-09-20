@@ -557,3 +557,22 @@ def step_decision_flow_choices(context):
     node = next(n for n in nodes if n.get('routing'))
     assert set(node['routing']['choices']) == {'economy', 'capable'}
     assert node['routing']['fallback'] == 'capable'
+
+
+@when('I normalize the generic ticket triage preset')
+def step_typed_flow_normalize(context):
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[2] / 'examples/flows/ticket-triage.json'
+    _do(context, 'POST', '/x/flow/normalize', auth='consumer',
+        body={'flow_ir': json.loads(path.read_text())})
+
+
+@then('the normalized ticket flow retains typed operations')
+def step_typed_flow_nodes(context):
+    nodes = list(context.json['flow_ir'][1].values())
+    assert sum(n['kind'] == 'decision' for n in nodes) == 1
+    assert {n['operation'] for n in nodes if n['kind'] == 'data'} == {'select', 'overlay'}
+    generation = next(n for n in nodes if n['kind'] == 'llm')
+    assert generation['output_format'] == 'json'
+    assert generation['skip_empty'] is True
+    assert generation['context'] == 'inputs'

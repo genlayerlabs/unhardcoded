@@ -211,4 +211,6 @@ behave
 *(Nix users: `nix-shell -p ...` with the same packages — plus `chromium
 chromedriver` for the browser pass — works as before.)*
 
+See [generic typed decision/data flows](docs/TYPED-FLOWS.md) for classification, selection and conditional generation.
+
 See [decision routing within generative flows](docs/DECISION-FLOWS.md) to select an economical or capable generation policy from conversation and tool history.

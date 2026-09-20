@@ -1,57 +1,59 @@
-# Decision-guided context compaction
+# Decision-guided compaction preset
 
 `POST /v1/compact` retains its existing single-summary behavior unless the caller
-supplies `decision_policy_ir`. With that field it performs fragment triage:
+supplies `decision_policy_ir`. With that field, a pure adapter materializes the
+[`selective-compaction.json`](../examples/flows/selective-compaction.json) preset
+and executes it through the same [typed flow runtime](TYPED-FLOWS.md) exposed by
+`flow_ir` on chat completions. All inference, selection and replacement run in
+that shared engine. The core and scheduler contain no compaction-specific nodes.
 
-1. Group each assistant tool call with its adjacent tool results. Preserve all
-   system/developer messages, pinned user input, and the recent tail verbatim.
-2. Ask the decision policy to classify aged fragments as `keep`, `summarize`, or
-   `archive`. Questions are batched, with smaller batches when the decision API's
-   32 KB ASCII-serialized request limit requires it. Invalid decisions keep data.
-3. Send only `summarize` fragments, with their full evidence and stable IDs, to
-   the generative `policy_ir`. Batch summaries within bounded input windows.
-4. Validate IDs, text and size; reassemble in original order. A failed, truncated
-   or oversized summary retains its original fragment. Excerpt-only decisions
-   cannot delete unseen evidence: `archive` becomes `summarize` for those units.
+1. Group each assistant tool call with adjacent tool results. Preserve all
+   system/developer messages, pinned input and complete recent units verbatim.
+2. Prepare bounded batches and static native questions in the flow. The decision
+   policy classifies old fragments as `keep`, `summarize` or `archive`.
+3. Select only `summarize` records for a JSON generation node. Empty selections
+   make no generative calls. Select `archive` records for deterministic removal.
+4. Overlay validated summaries and removals, then reassemble in original order.
+   Failed, truncated, expanded or invalid summaries preserve the original unit.
+   When classification sees only an excerpt, `archive` is not an allowed choice.
 
-The request adds these optional fields to `messages`, `policy_ir`, `max_tokens`
-and `keep_recent`:
-
-| Field | Meaning |
+| Optional request field | Meaning |
 | --- | --- |
-| `decision_policy_ir` | Routing policy for the decision model; enables this mode. |
-| `target_ratio` | Desired output/input serialized UTF-8 byte ratio, default `0.1`, range `(0,1]`. This is not a tokenizer count. |
-| `pinned_indices` | Original zero-based message indexes to retain. Defaults to every user message. System/developer messages and complete recent units are always retained. |
+| `decision_policy_ir` | Policy for native decision nodes; enables this preset. |
+| `target_ratio` | Desired output/input serialized UTF-8 byte ratio, default `0.1`, range `(0,1]`; not a tokenizer count. |
+| `pinned_indices` | Original zero-based message indexes to retain; defaults to all user messages. System/developer messages and complete recent units remain protected. |
 
-Agents that use the `user` role for generated execution observations should send
-the indexes of their actual user instructions. SubZeroClaw does this from its
-canonical transcript. No heuristic attempts to distinguish real instructions
-from generated observations by inspecting their text.
+`policy_ir` selects summary generators. Both policies must include required
+provider restrictions. Clients that encode generated observations as user messages
+should explicitly pin their real user instructions; the adapter does not infer
+instruction provenance from message text.
 
-`compaction` in the response reports original/output/target bytes, `target_met`,
-the fragment manifest (`start` inclusive, `end` exclusive), and limit/failure
-reasons. The 10% target never overrides protected or explicitly kept content.
-When it cannot fit, summaries use a small best-effort budget and the result
-reports the actual size. Expansion is rejected. There are at most 128 selectable
-fragments, 32 decision calls and 8 summary calls per request, within a shared
-40-second deadline (7 seconds per decision, 20 per summary); oversized evidence
-remains intact. Summary input batches are at most approximately 60 KB and each
-summary call has at most 4,096 output tokens (or the caller's smaller limit).
+The response's `compaction` object reports original/output/target bytes,
+`target_met`, fragment actions (`start` inclusive, `end` exclusive), preparation
+limit reasons, and `flow_fingerprint`. Model failures and fallback details appear
+in `x_router.decision_trace.flow_nodes`. The 10% target never overrides protected
+or kept evidence; expansion is rejected and the actual result size is reported.
 
-`x_router.compaction_legs` contains each decision/summary leg's routing and cost
-metadata, including failures. Top-level `x_router.cost_usd` sums known leg costs;
-it is null if any leg's cost is unknown. Usage sums reported tokens and cache reads;
-`usage_complete:false` identifies missing leg usage. No-call responses omit cost
-and usage. Both routing policies must include any required provider restrictions.
+Limits: at most 128 selectable fragments and 32 batches, with at most eight
+fragments, one decision and one conditional summary call per batch. Decision
+requests fit the native 32 KB ASCII bound; full summary input records fit 50 KB.
+The complete flow input stays below 900 KB. All nodes share a 40-second execution
+budget (individual decision timeout 7 seconds, summary timeout 20 seconds).
+Summary calls allow at most 4,096 output tokens or the caller's smaller limit.
+Oversized units, context that cannot fit, and failed decisions retain evidence.
 
-This is a stateless transform: **the caller must retain the original transcript**
-before applying it. `archive` removes active context; the router does not create
-an archive. A summary includes its fragment ID for reference in the caller's
-snapshot manifest. In SubZeroClaw, shell evidence also carries archive call IDs.
-Prefix bytes before the first replaced fragment stay unchanged. Compaction can
-invalidate cached tokens after that point; it does not guarantee provider cache
-hits, factual summary correctness, or a particular savings/latency improvement.
+`x_router.cost_usd` includes model calls and any routing decisions; it is null if
+an attempted leg has unknown cost. Reported token usage is aggregated, but may be
+incomplete when a provider fails. Skipped generation and deterministic operations
+cost zero. Responses with no executed nodes omit cost and usage metadata.
 
-Hermetic coverage: `pytest tests/test_fragment_compaction.py tests/test_compact.py`.
-The opt-in live BDD scenario additionally needs the local stack and an explicit
-`DECISION_COMPACTION_POLICY_IR` environment value; it may incur provider charges.
+This is a stateless transform: **the caller must retain the original transcript**.
+`archive` removes active context; the router does not persist an archive. Summary
+markers identify original fragments. Unchanged prefix messages stay byte-for-byte
+equivalent; compaction can invalidate provider cache entries after the first
+change. Summary correctness, cache hits and latency savings need workload-specific
+evaluation and are not guaranteed by this preset.
+
+Hermetic coverage: `pytest tests/test_flow_data.py tests/test_fragment_compaction.py
+tests/test_compact.py`. The optional live compaction BDD requires an explicit
+`DECISION_COMPACTION_POLICY_IR` and can incur provider charges.

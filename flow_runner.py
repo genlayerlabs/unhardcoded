@@ -17,6 +17,9 @@ machinery for free.
 from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
+import asyncio
+from time import monotonic
+from flow_data import bounded, encode, decode, run as run_data
 
 
 def _nodes(flow: Any) -> dict:
@@ -67,7 +70,7 @@ def _part_view(part: dict) -> str:
     executed inside the flow (nobody runs a node's tools; they are proposals), so
     they travel as data to the consuming node, letting a synthesizer/terminal node
     weigh the proposed actions before deciding the one it will actually emit."""
-    text = part.get("text") or ""
+    text = encode(part['data']) if 'data' in part else part.get("text") or ""
     tcs = part.get("tool_calls")
     if not tcs:
         return text
@@ -102,6 +105,7 @@ async def run_flow(
     flow: Any,
     input_text: str,
     run_node: Callable[[str, dict, str], Awaitable[dict]],
+    *, input_data: Any = None, timeout_seconds: float | None = None,
 ) -> dict:
     """Schedule the (already-admitted, normalized) flow.
 
@@ -113,9 +117,12 @@ async def run_flow(
     assembled prompt (see _part_view). A node that fails short-circuits the flow
     (the rest of the DAG can't proceed without its output)."""
     nodes = _nodes(flow)
+    deadline = monotonic() + timeout_seconds if timeout_seconds is not None else None
     src, sink = _endpoints(nodes)
     _EMPTY = {"text": "", "tool_calls": None}
     out: dict[str, dict] = {src: {"text": input_text, "tool_calls": None}}
+    if input_data is not None:
+        out[src] = {'data': bounded(input_data), 'text': encode(input_data), 'tool_calls': None}
     trace: list[dict] = []
 
     for nid in topo_order(nodes):
@@ -126,21 +133,51 @@ async def run_flow(
         if kind == "output":
             out[nid] = out.get(node["inputs"][0], _EMPTY)
             continue
-        # llm node
         parts = [{"id": pre, **out.get(pre, _EMPTY)} for pre in node.get("inputs") or []]
-        prompt = assemble(node, parts)
-        result = await run_node(nid, node, prompt)
+        values = [p['data'] if 'data' in p else p.get('text', '') for p in parts]
+        skipped = node.get('skip_empty') and isinstance(values[0], (dict, list)) and not values[0]
+        result = {'node_trace': {'cost_reported': 0}} if kind == 'data' else {}
+        try:
+            if skipped:
+                result = {'ok': True, 'data': values[0], 'node_trace': {'skipped': True, 'cost_reported': 0}}
+            elif kind == 'data':
+                result = {'ok': True, 'data': run_data(node, values), 'node_trace': {'cost_reported': 0}}
+            else:
+                prompt = (values[0] if len(values) == 1 else values) if kind == 'decision' else assemble(node, parts)
+                remaining = deadline - monotonic() if deadline is not None else None
+                if remaining is not None and remaining <= 0:
+                    result = {'ok': False, 'error': 'flow_deadline',
+                              'node_trace': {'skipped': True, 'cost_reported': 0}}
+                elif remaining is not None:
+                    async with asyncio.timeout(remaining):
+                        result = await run_node(nid, node, prompt)
+                else:
+                    result = await run_node(nid, node, prompt)
+            if result.get('ok') and node.get('output_format') == 'json' and not skipped:
+                if result.get('tool_calls') or result.get('finish_reason') == 'length':
+                    raise ValueError('typed generation must return complete JSON without tool calls')
+                result['data'] = decode(result.get('text') or '')
+            if 'data' in result:
+                bounded(result['data'])
+                result['text'] = encode(result['data'])
+        except (ValueError, TypeError, KeyError, RecursionError, TimeoutError) as exc:
+            result = {**result, 'ok': False, 'error': str(exc) or type(exc).__name__}
+        if not result.get('ok') and node.get('on_error') == 'input':
+            result = {**result, 'ok': True, 'data': values[0], 'text': encode(values[0]), 'tool_calls': None,
+                      'node_trace': {**(result.get('node_trace') or {}), 'fallback': 'input', 'error': result.get('error')}}
         # Carry the node's edges (its inputs) so the dashboard can reconstruct the
         # DAG topology — parallel branches and where they merge — not just a flat
         # per-node list.
-        trace.append({"node": nid, "inputs": list(node.get("inputs") or []),
+        trace.append({"node": nid, "kind": kind, "inputs": list(node.get("inputs") or []),
                       **(result.get("node_trace") or {})})
         if not result.get("ok"):
             return {"ok": False, "failed_node": nid, "text": "", "tool_calls": None,
                     "error": result.get("error"), "trace": trace}
         out[nid] = {"text": result.get("text") or "",
-                    "tool_calls": result.get("tool_calls") or None}
+                    "tool_calls": result.get("tool_calls") or None,
+                    **({'data': result['data']} if 'data' in result else {})}
 
     final = out.get(sink, _EMPTY)
     return {"ok": True, "text": final["text"], "tool_calls": final["tool_calls"],
+            **({'data': final['data']} if 'data' in final else {}),
             "trace": trace}
