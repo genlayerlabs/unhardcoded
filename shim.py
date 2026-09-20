@@ -35,7 +35,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 import control_plane_client
 from env_coerce import env_int
@@ -169,6 +169,9 @@ class CompactRequest(BaseModel):
     keep_recent: int = 6          # verbatim tail kept after the seal
     policy_ir: list | None = None  # cheap routing for the summarizer
     max_tokens: int | None = 512
+    decision_policy_ir: list | None = None  # opt-in fragment triage
+    target_ratio: float = Field(default=0.1, gt=0, le=1)
+    pinned_indices: list[int] | None = None  # default: every user message
 
 
 class FlowNormalizeRequest(BaseModel):
@@ -1111,6 +1114,22 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         that precede execution made no call and carry neither key."""
         msgs = req.messages or []
         keep = max(1, req.keep_recent)
+        if req.decision_policy_ir is not None:
+            from fragment_compaction import compact_fragments
+            if req.pinned_indices is not None and any(i < 0 or i >= len(msgs) for i in req.pinned_indices):
+                return _openai_error('pinned_indices must reference existing messages', 'invalid_request_error', 400)
+
+            async def execute(contract):
+                return await _execute_with_deadline(host.execute_async(contract))
+
+            def costed(res):
+                usage = _openai_usage(res.get('response') or {})
+                return {'x_router': _build_x_router(res, subscription_providers), **({'usage': usage} if usage else {})}
+
+            return await compact_fragments(msgs, keep_recent=keep, pinned_indices=req.pinned_indices,
+                target_ratio=req.target_ratio, decision_policy=req.decision_policy_ir,
+                summary_policy=req.policy_ir or _DEFAULT_COMPACT_POLICY,
+                max_tokens=req.max_tokens or 512, execute=execute, costed=costed)
         # frozen prefix = a leading system message (the skill/tools/rules), if any
         frozen = msgs[:1] if (msgs and msgs[0].get("role") == "system") else []
         head = len(frozen)

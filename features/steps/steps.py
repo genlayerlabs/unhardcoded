@@ -503,6 +503,27 @@ def step_is_compacted(context):
     assert len(j["messages"]) < len(context.compact_input), "no length reduction"
 
 
+@when('the agent requests fragment compaction with an explicit decision policy')
+def step_fragment_compact(context):
+    import os
+    policy = json.loads(os.environ['DECISION_COMPACTION_POLICY_IR'])
+    _do(context, 'POST', '/v1/compact', auth='consumer', body={
+        'messages': context.compact_input, 'keep_recent': 4, 'target_ratio': .1,
+        'policy_ir': _seal_via_ollama_policy(), 'decision_policy_ir': policy})
+    assert context.resp.status_code == 200, context.resp_text[:300]
+
+
+@then('fragment compaction reports its actual size and protected user inputs')
+def step_fragment_metrics(context):
+    data = context.json
+    metrics = data['compaction']
+    assert metrics['target_met'] == (metrics['output_bytes'] <= metrics['target_bytes'])
+    assert metrics['output_bytes'] <= metrics['original_bytes']
+    for message in context.compact_input:
+        if message['role'] == 'user':
+            assert message in data['messages']
+
+
 @then('the system prefix is preserved')
 def step_prefix_preserved(context):
     assert context.json["messages"][0] == context.compact_input[0], "prefix changed"
