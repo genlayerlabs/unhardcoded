@@ -3,7 +3,8 @@ import json
 import math
 import re
 
-from decision_providers import DecisionError, probability, validate_answer
+from decision_providers import (DecisionError, probability, validate_answer,
+                                probability_decimals_for_model, probability_sum_valid)
 
 MAX_REQUEST_BYTES = 32000
 MAX_RESPONSE_BYTES = 131072
@@ -63,6 +64,7 @@ def validate_response(data, payload):
     if not isinstance(data, dict) or not isinstance(data.get('model'), str) or not data['model']:
         raise ValueError('Missing decision model.')
     answers = data.get('answers')
+    decimals = probability_decimals_for_model(data['model'])
     if not isinstance(answers, dict) or set(answers) != set(payload['questions']):
         raise ValueError('Missing or unexpected answers.')
     for key, question in payload['questions'].items():
@@ -74,7 +76,7 @@ def validate_response(data, payload):
             raise ValueError('Invalid confidence.')
         if kind == 'choice':
             try:
-                validate_answer(answer, list(question['criteria']))
+                validate_answer(answer, list(question['criteria']), probability_decimals=decimals)
             except DecisionError as exc:
                 raise ValueError('Invalid choice answer.') from exc
         elif kind == 'noul':
@@ -87,7 +89,8 @@ def validate_response(data, payload):
             probs = answer.get('probabilities')
             if probs is not None:
                 if (not isinstance(probs, dict) or set(probs) != {str(i) for i in range(len(question['criteria']))}
-                        or any(not probability(p) for p in probs.values()) or abs(sum(probs.values()) - 1) > 1e-6):
+                        or any(not probability(p) for p in probs.values())
+                        or not probability_sum_valid(probs.values(), decimal_places=decimals)):
                     raise ValueError('Invalid score distribution.')
     usage = data.get('usage') or {}
     if not isinstance(usage, dict):

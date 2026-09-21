@@ -98,6 +98,23 @@ def test_primary_antseed_success_does_not_call_openrouter(routed):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize('antseed_status', [200, 503])
+def test_public_decisions_accept_jev_display_rounding(routed, monkeypatch, antseed_status):
+    import sys
+    payload = copy.deepcopy(PAYLOAD)
+    payload['questions']['team']['criteria']['operations'] = 'Operations'
+    answer = copy.deepcopy(ANSWER)
+    answer['answers']['team']['probabilities'] = {'billing': .33, 'technical': .33, 'operations': .33}
+    monkeypatch.setattr(sys.modules[__name__], 'PAYLOAD', payload)
+    monkeypatch.setattr(sys.modules[__name__], 'ANSWER', answer)
+    host, _, calls, behavior = routed
+    behavior['antseed_status'] = antseed_status
+    response = TestClient(create_app(host)).post('/v1/decisions', json={**payload, 'policy_ir': POLICY})
+    assert response.status_code == 200, response.text
+    assert response.json()['answers'] == answer['answers']
+    assert len(calls) == (1 if antseed_status == 200 else 2)
+
+
 def test_decision_state_and_null_criteria_survive_lua_and_fallback(routed, monkeypatch):
     import sys
     payload = copy.deepcopy(PAYLOAD)
