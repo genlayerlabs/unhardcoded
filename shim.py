@@ -1892,7 +1892,7 @@ def _openai_usage(response: dict) -> dict:
     shared by the unary chat body, the streaming final chunk and /v1/compact.
     Empty dict when the provider reported no token counts (caller omits the
     key, per the additive wire contract)."""
-    usage: dict = {}
+    usage: dict = dict(response.get("provider_usage") or {})
     for src_key, dst_key in (("tokens_in", "prompt_tokens"),
                              ("tokens_out", "completion_tokens"),
                              ("tokens_total", "total_tokens")):
@@ -1903,9 +1903,9 @@ def _openai_usage(response: dict) -> dict:
     # explicit tokens_cached: 0 means caching was evaluated with no hits, and
     # x_router already passes that 0 through — the OpenAI block must agree.
     if response.get("tokens_cached") is not None:
-        usage["prompt_tokens_details"] = {"cached_tokens": response["tokens_cached"]}
+        usage["prompt_tokens_details"] = {**(usage.get("prompt_tokens_details") or {}), "cached_tokens": response["tokens_cached"]}
     if response.get("tokens_reasoning") is not None:
-        usage["completion_tokens_details"] = {"reasoning_tokens": response["tokens_reasoning"]}
+        usage["completion_tokens_details"] = {**(usage.get("completion_tokens_details") or {}), "reasoning_tokens": response["tokens_reasoning"]}
     return usage
 
 
@@ -1971,7 +1971,8 @@ def _router_response_to_openai(result: dict, requested_model: str,
     response = result.get("response") or {}
     chosen = result.get("chosen") or {}
 
-    message: dict = {"role": "assistant", "content": response.get("text") or ""}
+    message: dict = dict(response.get("provider_message") or {})
+    message.update(role="assistant", content=response.get("text") or "")
     if response.get("tool_calls"):
         message["tool_calls"] = response["tool_calls"]
 
@@ -1991,6 +1992,9 @@ def _router_response_to_openai(result: dict, requested_model: str,
             "finish_reason": response.get("finish_reason") or "stop",
         }],
     }
+
+    if response.get("reasoning_items"):
+        out["x_reasoning_items"] = response["reasoning_items"]
 
     usage = _openai_usage(response)
     if usage:

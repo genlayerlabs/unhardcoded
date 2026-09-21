@@ -200,7 +200,7 @@ def result_to_responses_object(
              or requested_model or "")
     ts = created_at if created_at is not None else int((now or time.time)())
 
-    output: list[dict] = []
+    output: list[dict] = list(resp.get("reasoning_items") or [])
     if text:
         output.append({
             "type": "message",
@@ -239,6 +239,8 @@ def result_to_responses_object(
     # cache reads correctly (mirrors the chat path's usage.prompt_tokens_details).
     if resp.get("tokens_cached"):
         usage["input_tokens_details"] = {"cached_tokens": resp["tokens_cached"]}
+    if resp.get("tokens_reasoning") is not None:
+        usage["output_tokens_details"] = {"reasoning_tokens": resp["tokens_reasoning"]}
     if usage:
         obj["usage"] = usage
     return obj
