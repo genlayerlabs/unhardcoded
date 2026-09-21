@@ -11,8 +11,8 @@ HTTP200 decision response and expose a public502. Live architecture tests found
 every observed failure had this cause. This patch fixes the independently
 reproducible compatibility defect, not generative-provider timeouts.
 
-For versioned Jev model identifiers (including vendor prefixes), distributions
-whose values are displayed at two decimal places are accepted when their clipped
+For versioned Jev model identifiers and the mutable `jev-latest` alias
+(including vendor-prefixed forms of both), distributions whose values are displayed at two decimal places are accepted when their clipped
 rounding intervals jointly contain a unit mass. Each value still must be finite
 and within0..1; keys must match all requested choices; the selected choice must
 have maximal displayed probability. Unexplained mass errors and distributions
