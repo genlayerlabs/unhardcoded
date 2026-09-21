@@ -30,6 +30,20 @@ from provider_adapters.diagnostics import ProviderTiming, upstream_metadata
 Emit = Callable[[str], Awaitable[None]]
 
 
+def _has_reasoning_content(message: dict) -> bool:
+    """Empty deltas and detail metadata alone are not generated output."""
+    def nonblank(value):
+        return isinstance(value, str) and bool(value.strip())
+
+    if any(nonblank(message.get(key)) for key in ("reasoning", "reasoning_content")):
+        return True
+    details = message.get("reasoning_details")
+    return isinstance(details, list) and any(
+        isinstance(part, dict) and any(nonblank(part.get(key))
+                                      for key in ("text", "summary", "data", "encrypted_content"))
+        for part in details)
+
+
 def _resolve_auth_headers(
     request: dict,
     env_get: Callable[[str], str | None],
@@ -571,6 +585,8 @@ async def _stream_openai_compatible_impl(
 
     emitted = False
     text_parts: list[str] = []
+    reasoning_parts: dict[str, list[str]] = {}
+    reasoning_details: list[dict] = []
     tool_calls_acc: dict[int, dict] = {}
     finish_reason = None
     usage: dict = {}
@@ -633,6 +649,13 @@ async def _stream_openai_compatible_impl(
                         delta = choice.get("delta") or {}
                         if choice.get("finish_reason"):
                             finish_reason = choice["finish_reason"]
+                        for key in ("reasoning", "reasoning_content"):
+                            if isinstance(delta.get(key), str):
+                                reasoning_parts.setdefault(key, []).append(delta[key])
+                        if isinstance(delta.get("reasoning_details"), list):
+                            reasoning_details.extend(delta["reasoning_details"])
+                        if _has_reasoning_content(delta):
+                            saw_output = True
                         content = delta.get("content")
                         if content:
                             saw_output = True
@@ -661,7 +684,9 @@ async def _stream_openai_compatible_impl(
 
         tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)] or None
         text = "".join(text_parts)
-        if not text.strip() and not tool_calls:
+        provider_message = {**{k: "".join(v) for k, v in reasoning_parts.items()},
+                            **({"reasoning_details": reasoning_details} if reasoning_details else {})}
+        if not text.strip() and not tool_calls and not _has_reasoning_content(provider_message):
             return _err("bad_response", 200, _latency(), "empty assistant content")
         return {
             "ok": True,
@@ -676,6 +701,8 @@ async def _stream_openai_compatible_impl(
                 "tokens_cached": _cached_tokens(usage),
                 "cost_reported": usage.get("cost"),
                 "raw_model": raw_model,
+                "provider_message": provider_message,
+                "provider_usage": usage,
                 "upstream": {k: _timing.data[k] for k in ("upstream_id", "upstream_provider", "tokens_reasoning") if k in _timing.data},
                 "tokens_reasoning": _timing.data.get("tokens_reasoning"),
             },
@@ -716,7 +743,7 @@ def _parse_openai_response(
         usage = data.get("usage") or {}
         text = msg.get("content") or ""
         tool_calls = msg.get("tool_calls")
-        if not str(text).strip() and not tool_calls:
+        if not str(text).strip() and not tool_calls and not _has_reasoning_content(msg):
             return _err("bad_response", status, latency, "empty assistant content")
         return {
             "ok": True,
@@ -731,6 +758,8 @@ def _parse_openai_response(
                 "tokens_cached": _cached_tokens(usage),
                 "cost_reported": usage.get("cost"),
                 "raw_model": data.get("model"),
+                "provider_message": msg,
+                "provider_usage": usage,
                 "upstream": upstream_metadata(data),
                 "tokens_reasoning": upstream_metadata(data).get("tokens_reasoning"),
             },

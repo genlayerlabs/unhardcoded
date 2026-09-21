@@ -178,3 +178,24 @@ def test_responses_stream_failure_sequence_numbers_strictly_increase(
     seqs = [d["sequence_number"] for d in datas if "sequence_number" in d]
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), \
         f"sequence_numbers must be strictly increasing, got {seqs}"
+
+
+def test_responses_stream_replays_reasoning_before_text_and_tools(client, host):
+    item = {"id": "rs_fixture", "type": "reasoning", "summary": [
+        {"type": "summary_text", "text": "Exposed summary"}], "encrypted_content": "opaque"}
+    result = _ok(text="Answer", tool_calls=[{"id": "call_1", "type": "function",
+        "function": {"name": "shell", "arguments": "{}"}}])
+    result["response"]["reasoning_items"] = [item]
+    _seed(host, result)
+    response = client.post("/v1/responses", json={"input": "hi", "stream": True})
+    assert response.status_code == 200
+    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+    added = [e for e in events if e["type"] == "response.output_item.added"]
+    done = [e for e in events if e["type"] == "response.output_item.done"]
+    assert [e["output_index"] for e in added] == [0, 1, 2]
+    assert [e["item"]["type"] for e in added] == ["reasoning", "message", "function_call"]
+    completed = next(e["response"] for e in events if e["type"] == "response.completed")
+    assert [e["item"] for e in done] == completed["output"]
+    assert completed["output"][0] == item
+    assert any(e["type"] == "response.reasoning_summary_text.delta" and
+               e["delta"] == "Exposed summary" for e in events)

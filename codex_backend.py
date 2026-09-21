@@ -168,6 +168,13 @@ def build_codex_body(request: dict) -> dict:
         tc = _to_responses_tool_choice(request.get("tool_choice"))
         if tc is not None:
             body["tool_choice"] = tc
+    controls = request.get("reasoning") or {}
+    reasoning = {k: controls[k] for k in ("effort", "summary") if k in controls}
+    if request.get("reasoning_effort") is not None:
+        reasoning.setdefault("effort", request["reasoning_effort"])
+    if reasoning:
+        reasoning.setdefault("summary", "auto")
+        body["reasoning"] = reasoning
     # The ChatGPT-account Codex endpoint rejects some public Responses API
     # params even though they are accepted elsewhere. Do not forward max_tokens
     # as max_output_tokens, and do not forward temperature; live endpoint errors
@@ -213,6 +220,8 @@ def aggregate_codex_sse(lines: Iterable[str], latency_ms: int) -> dict:
     # function_call items keyed by their streaming item id, in arrival order.
     fcalls: dict = {}
     fcorder: list = []
+    reasoning_items: dict = {}
+    summaries: dict = {}
 
     for line in lines:
         line = line.strip()
@@ -229,6 +238,12 @@ def aggregate_codex_sse(lines: Iterable[str], latency_ms: int) -> dict:
         if etype == "response.output_text.delta":
             if ev.get("delta"):
                 text_parts.append(ev["delta"])
+        elif etype == "response.reasoning_summary_text.delta":
+            key = (ev.get("item_id", "reasoning"), ev.get("summary_index", 0))
+            summaries.setdefault(key, []).append(ev.get("delta") or "")
+        elif etype == "response.output_item.done" and (ev.get("item") or {}).get("type") == "reasoning":
+            item = ev["item"]
+            reasoning_items[item.get("id", "reasoning")] = item
         elif etype == "response.output_item.added":
             item = ev.get("item") or {}
             if item.get("type") == "function_call":
@@ -248,9 +263,12 @@ def aggregate_codex_sse(lines: Iterable[str], latency_ms: int) -> dict:
             iid = ev.get("item_id")
             if iid in fcalls and ev.get("arguments") is not None:
                 fcalls[iid]["done"] = ev["arguments"]
-        elif etype == "response.completed":
+        elif etype in ("response.completed", "response.incomplete"):
             resp = ev.get("response") or {}
             usage = resp.get("usage") or usage
+            for item in resp.get("output") or []:
+                if item.get("type") == "reasoning":
+                    reasoning_items[item.get("id", "reasoning")] = item
             if resp.get("status") == "incomplete":
                 finish_reason = "length"
         elif etype in ("response.failed", "error"):
@@ -260,6 +278,14 @@ def aggregate_codex_sse(lines: Iterable[str], latency_ms: int) -> dict:
     if err is not None:
         return err
 
+    for (iid, index), parts in summaries.items():
+        if iid not in reasoning_items:
+            reasoning_items[iid] = {"id": iid, "type": "reasoning", "summary": []}
+        if not any(p.get("text") == "".join(parts) for p in reasoning_items[iid].get("summary", [])):
+            # Final items are authoritative; delta-only streams remain explicitly partial.
+            if not reasoning_items[iid].get("summary") or reasoning_items[iid].get("partial"):
+                reasoning_items[iid].setdefault("summary", []).append({"type": "summary_text", "text": "".join(parts)})
+                reasoning_items[iid]["partial"] = True
     tool_calls: "list[dict] | None" = None
     if fcorder:
         tool_calls = []
@@ -286,6 +312,12 @@ def aggregate_codex_sse(lines: Iterable[str], latency_ms: int) -> dict:
             "tokens_cached": _cached_tokens(usage),
             "cost_reported": usage.get("cost"),
             "raw_model":     None,
+            "reasoning_items": list(reasoning_items.values()),
+            "provider_message": {"reasoning_details": [
+                {"type": "reasoning.summary", "summary": part.get("text", ""), "source": "codex"}
+                for item in reasoning_items.values() for part in item.get("summary", [])
+            ]} if reasoning_items else {},
+            "tokens_reasoning": (usage.get("output_tokens_details") or {}).get("reasoning_tokens"),
         },
     }
 
@@ -301,7 +333,7 @@ def _codex_line_has_output_delta(line: str) -> bool:
         ev = json.loads(payload)
     except ValueError:
         return False
-    return ev.get("type") == "response.output_text.delta" and bool(ev.get("delta"))
+    return ev.get("type") in ("response.output_text.delta", "response.reasoning_summary_text.delta") and bool(ev.get("delta"))
 
 
 def make_codex_async_call_provider(

@@ -200,7 +200,7 @@ def result_to_responses_object(
              or requested_model or "")
     ts = created_at if created_at is not None else int((now or time.time)())
 
-    output: list[dict] = []
+    output: list[dict] = list(resp.get("reasoning_items") or [])
     if text:
         output.append({
             "type": "message",
@@ -239,6 +239,8 @@ def result_to_responses_object(
     # cache reads correctly (mirrors the chat path's usage.prompt_tokens_details).
     if resp.get("tokens_cached"):
         usage["input_tokens_details"] = {"cached_tokens": resp["tokens_cached"]}
+    if resp.get("tokens_reasoning") is not None:
+        usage["output_tokens_details"] = {"reasoning_tokens": resp["tokens_reasoning"]}
     if usage:
         obj["usage"] = usage
     return obj
@@ -281,7 +283,25 @@ def responses_sse_events(obj: dict, start_seq: int = 1) -> Iterable[str]:
         return frame
 
     for out_index, item in enumerate(obj.get("output") or []):
-        if item.get("type") == "message":
+        if item.get("type") == "reasoning":
+            yield _emit("response.output_item.added",
+                        {"output_index": out_index, "item": {**item, "summary": []}})
+            for summary_index, part in enumerate(item.get("summary") or []):
+                position = {"item_id": item["id"], "output_index": out_index,
+                            "summary_index": summary_index}
+                text = part.get("text", "")
+                yield _emit("response.reasoning_summary_part.added",
+                            {**position, "part": {**part, "text": ""}})
+                if text:
+                    yield _emit("response.reasoning_summary_text.delta",
+                                {**position, "delta": text})
+                yield _emit("response.reasoning_summary_text.done",
+                            {**position, "text": text})
+                yield _emit("response.reasoning_summary_part.done",
+                            {**position, "part": part})
+            yield _emit("response.output_item.done",
+                        {"output_index": out_index, "item": item})
+        elif item.get("type") == "message":
             text = (item.get("content") or [{}])[0].get("text", "")
             yield _emit("response.output_item.added",
                         {"output_index": out_index, "item": {**item, "content": []}})

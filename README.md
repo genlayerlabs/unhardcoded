@@ -224,3 +224,30 @@ chromedriver` for the browser pass — works as before.)*
 See [generic typed decision/data flows](docs/TYPED-FLOWS.md) for classification, selection and conditional generation.
 
 See [decision routing within generative flows](docs/DECISION-FLOWS.md) to select an economical or capable generation policy from conversation and tool history.
+
+### Provider-exposed reasoning in buffered chat
+
+OpenAI-compatible adapters retain the upstream assistant message (including
+`reasoning`, `reasoning_content` and `reasoning_details`) and usage details through
+the public buffered chat response. A reasoning-only response is returned with
+its original finish reason, so callers can diagnose an exhausted output budget
+instead of losing the result to an empty-content fallback. The stream-backed
+buffered adapter also retains exposed reasoning.
+Empty or whitespace-only reasoning and detail metadata without a payload do not
+count as output: they retain empty-response fallback and first-output deadlines.
+
+The existing Codex OAuth backend forwards explicit `reasoning.effort` and
+`reasoning.summary` controls (or `reasoning_effort`); when effort is specified,
+summary defaults to `auto`. It preserves returned Responses reasoning items as
+`x_reasoning_items` on chat responses, and exposes readable summaries as typed
+`message.reasoning_details`. Encrypted items remain opaque. Responses output
+also retains the original reasoning items. Its buffered SSE replay emits each
+reasoning item and summary before subsequent text or tool items, with contiguous
+output indexes. These fields describe only data the
+provider returned, never undisclosed internal chain-of-thought.
+
+This does not introduce a new OAuth login path, enable reasoning by default for
+all routes, or deploy the router. The Codex endpoint still has its existing
+parameter restrictions. The host application remains responsible for private
+trace persistence and spend controls. No provider credentials are included in
+these returned artifacts.
