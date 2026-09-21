@@ -85,6 +85,21 @@ async def test_uncertainty_and_unknown_selection_fall_back(automatic_host):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('model,selected', [('typesafe/jev-1.13-20260917', 'coding-agent'),
+                                          ('another-decision-model', 'general')])
+async def test_automatic_revalidation_respects_only_jev_display_precision(automatic_host, model, selected):
+    class Rounded:
+        async def decide(self, req, *, deadline):
+            probs = {c.id: .95 if c.id == 'coding-agent' else .02 for c in req.choices}
+            assert len(probs) == 3
+            return DecisionResult('coding-agent', probs, .95, None, 'test', model, 1, .001, 10, 1)
+    execution = {**compile_automatic(automatic_host, intent())["execution"], "automatic_mode": "active"}
+    _, trace = await select_policy(automatic_host, {}, execution, provider=Rounded())
+    assert trace['selected_id'] == selected
+    if selected == 'general':assert trace['fallback_reason'] == 'invalid_probabilities'
+
+
+@pytest.mark.asyncio
 async def test_mutated_policy_or_description_is_rejected_before_network(automatic_host):
     execution = compile_automatic(automatic_host, intent())["execution"]
     provider = Choose()

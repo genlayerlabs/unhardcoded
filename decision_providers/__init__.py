@@ -59,7 +59,30 @@ def probability(value):
     return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1
 
 
-def validate_answer(answer, choices):
+def probability_decimals_for_model(model):
+    """TypeSafe displays probabilities to two decimals; other models stay strict."""
+    if isinstance(model, str) and re.fullmatch(r"jev-(?:latest|\d[\w.-]*)", model.rsplit('/', 1)[-1], re.I):
+        return 2
+    return None
+
+
+def probability_sum_valid(values, *, decimal_places=None):
+    values = list(values)
+    if not values or any(not probability(p) for p in values):
+        return False
+    if abs(math.fsum(values) - 1) <= 1e-6:
+        return True
+    # Permit only the declared display precision. Do not apply a blanket loose
+    # tolerance to arbitrary high-precision or malformed distributions.
+    if decimal_places != 2 or any(abs(p * 100 - round(p * 100)) > 1e-8 for p in values):
+        return False
+    half_step = .005
+    lower = math.fsum(max(0., p - half_step) for p in values)
+    upper = math.fsum(min(1., p + half_step) for p in values)
+    return lower <= 1 + 1e-12 and upper >= 1 - 1e-12
+
+
+def validate_answer(answer, choices, *, probability_decimals=None):
     if not isinstance(answer, dict) or answer.get("type") != "choice":
         raise DecisionError("invalid_response")
     selected = answer.get("choice")
@@ -73,10 +96,12 @@ def validate_answer(answer, choices):
     if distribution is not None:
         if (not isinstance(distribution, dict) or set(distribution) != set(choices)
                 or any(not probability(p) for p in distribution.values())
-                or abs(sum(distribution.values()) - 1) > 1e-6
+                or not probability_sum_valid(distribution.values(), decimal_places=probability_decimals)
                 or distribution[selected] + 1e-9 < max(distribution.values())):
             raise DecisionError("invalid_probabilities")
-        entropy = (-sum(p * math.log(p) for p in distribution.values() if p > 0)
+        # Preserve the reported probabilities; normalize only the derived entropy.
+        total = math.fsum(distribution.values())
+        entropy = (-sum((p / total) * math.log(p / total) for p in distribution.values() if p > 0)
                    / math.log(len(choices))) if len(choices) > 1 else 0.0
         entropy = max(0.0, min(1.0, entropy))
     return selected, distribution, confidence, entropy

@@ -12,7 +12,7 @@ import time
 
 import httpx
 
-from . import DecisionError, DecisionResult, validate_answer
+from . import DecisionError, DecisionResult, validate_answer, probability_decimals_for_model
 
 ENDPOINTS = {"openrouter": "https://openrouter.ai/api/alpha/decisions",
              "typesafe": "https://api.typesafe.ai/v1/systemone"}
@@ -108,7 +108,8 @@ class JevDecisionProvider:
             if not isinstance(model, str) or not model or len(model) > 160:
                 raise ValueError("Missing model")
             selected, probs, confidence, entropy = validate_answer(
-                data.get("answers", {}).get("selection"), [c.id for c in request.choices])
+                data.get("answers", {}).get("selection"), [c.id for c in request.choices],
+                probability_decimals=probability_decimals_for_model(model))
             return DecisionResult(selected, probs, confidence, entropy, self.transport, model,
                 (time.monotonic() - started) * 1000, None if had_unmetered_attempt else cost, tokens, attempts)
         except (ValueError, AttributeError, TypeError, DecisionError) as exc:
