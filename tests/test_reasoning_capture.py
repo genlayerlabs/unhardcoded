@@ -34,11 +34,20 @@ def test_reasoning_survives_real_engine_and_chat_endpoint(host):
     async def provider(req):
         return {"ok": True, "response": {"text": "{}", "provider_message": {
             "reasoning": "explanation", "reasoning_details": [{"type": "reasoning.summary", "summary": "summary"}]},
-            "provider_usage": {"completion_tokens_details": {"reasoning_tokens": 8}}, "tokens_out": 10}}
+            "provider_usage": {"completion_tokens_details": {"reasoning_tokens": 8}}, "tokens_out": 10},
+            "diagnostics": {"upstream_id": "fixture-id", "messages": "explanation",
+                            "headers": {"Authorization": "fixture-credential"}}}
     host.set_async_call_hook(provider)
     response = TestClient(create_app(host)).post('/v1/chat/completions', json={"messages": [], "policy_ir": _PIN})
     assert response.status_code == 200
     assert response.json()['choices'][0]['message']['reasoning'] == 'explanation'
+    import json
+    from host_store import routing_summary
+    trace = response.json()['x_router']['decision_trace']
+    assert trace['provider_diagnostics'][0]['upstream_id'] == 'fixture-id'
+    assert 'explanation' not in json.dumps(trace)
+    assert 'explanation' not in json.dumps(routing_summary(trace))
+    assert 'fixture-credential' not in response.text
 
 @pytest.mark.asyncio
 async def test_buffered_sse_keeps_reasoning():
@@ -66,3 +75,64 @@ def test_codex_oauth_summary_survives_without_exposing_internal_thought():
     assert public['x_reasoning_items'] == [item]
     assert public['choices'][0]['message']['reasoning_details'][0]['summary'] == 'Exposed summary'
     assert public['usage']['completion_tokens_details']['reasoning_tokens'] == 20
+
+
+EMPTY_REASONING = [
+    {"reasoning": ""}, {"reasoning": " \n\t"}, {"reasoning_content": ""},
+    {"reasoning_details": []}, {"reasoning_details": [{}]},
+    {"reasoning_details": [{"type": "reasoning.text", "text": " "}]},
+    {"reasoning_details": [{"type": "reasoning.encrypted", "id": "r1", "index": 0}]},
+]
+REAL_REASONING = [
+    {"reasoning": "Exposed explanation"}, {"reasoning_content": " Exposed explanation\n"},
+    {"reasoning_details": [{"type": "reasoning.summary", "summary": "Summary"}]},
+    {"reasoning_details": [{"type": "reasoning.text", "text": "Explanation"}]},
+    {"reasoning_details": [{"type": "reasoning.encrypted", "data": "opaque"}]},
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream_backed", [False, True])
+@pytest.mark.parametrize("fields", EMPTY_REASONING + REAL_REASONING)
+async def test_reasoning_only_requires_nonempty_payload(fields, stream_backed):
+    import json
+    from tests.test_streaming import FakeStreamClient, FakeStreamResponse
+    message = {"role": "assistant", "content": "", **fields}
+    expected_ok = fields in REAL_REASONING
+    if stream_backed:
+        chunks = [{"choices": [{"delta": fields, "finish_reason": "length"}]}]
+        client = FakeStreamClient(FakeStreamResponse(200,
+            ['data: '+json.dumps(c) for c in chunks] + ['data: [DONE]']))
+        result = await make_async_call_provider(client=client)({**OPENAI_REQ, "first_token_timeout_ms": 1000})
+    else:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200,
+                json={"choices": [{"message": message, "finish_reason": "length"}]}))) as client:
+            result = await make_async_call_provider(client=client)(OPENAI_REQ)
+    assert result["ok"] is expected_ok
+    if expected_ok:
+        public = _router_response_to_openai(result, "fixture")
+        assert public["choices"][0]["finish_reason"] == "length"
+        for key, value in fields.items():
+            assert public["choices"][0]["message"][key] == value
+    else:
+        assert result["error_kind"] == "bad_response"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fields", EMPTY_REASONING)
+async def test_empty_reasoning_does_not_disable_first_output_deadline(fields):
+    import asyncio
+    import json
+    from tests.test_streaming import FakeStreamClient, FakeStreamResponse
+
+    class DelayedOutput(FakeStreamResponse):
+        async def aiter_lines(self):
+            yield 'data: ' + json.dumps({"choices": [{"delta": fields}]})
+            await asyncio.sleep(.05)
+            yield 'data: ' + json.dumps({"choices": [{"delta": {"content": "late"}}]})
+            yield 'data: [DONE]'
+
+    result = await make_async_call_provider(client=FakeStreamClient(DelayedOutput(200)))(
+        {**OPENAI_REQ, "first_token_timeout_ms": 10})
+    assert not result["ok"] and result["error_kind"] == "timeout"
+    assert result["diagnostics"]["timeout_source"] == "first_output_deadline"

@@ -5,6 +5,7 @@ independent of any provider."""
 from __future__ import annotations
 
 import json
+import pytest
 import sys
 from pathlib import Path
 
@@ -338,3 +339,39 @@ def test_sse_events_sequence_numbers_increase():
                                         created_at=1)
     seqs = [d["sequence_number"] for _, d in _parse_sse(list(ra.responses_sse_events(obj)))]
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+
+
+@pytest.mark.parametrize("summary", [[], [{"type": "summary_text", "text": ""}],
+    [{"type": "summary_text", "text": "First"}, {"type": "summary_text", "text": "Second"}]])
+def test_reasoning_sse_reconstructs_every_output_item_and_summary(summary):
+    import copy
+    reasoning = {"id": "rs_1", "type": "reasoning", "summary": summary,
+                 "encrypted_content": "opaque"}
+    result = _result(text="Answer", tool_calls=[{"id": "call_1", "type": "function",
+        "function": {"name": "shell", "arguments": "{}"}}])
+    result["response"]["reasoning_items"] = [reasoning]
+    obj = ra.result_to_responses_object(result)
+    original = copy.deepcopy(obj)
+    reconstructed = []
+    summaries = {}
+    events = _parse_sse(list(ra.responses_sse_events(obj)))
+    for event, data in events:
+        if event == "response.output_item.added":
+            assert data["output_index"] == len(reconstructed)
+            reconstructed.append(data["item"])
+        elif event == "response.reasoning_summary_part.added":
+            assert reconstructed[data["output_index"]]["id"] == data["item_id"]
+            summaries[data["summary_index"]] = data["part"]["text"]
+        elif event == "response.reasoning_summary_text.delta":
+            summaries[data["summary_index"]] += data["delta"]
+        elif event == "response.reasoning_summary_text.done":
+            assert summaries[data["summary_index"]] == data["text"]
+        elif event == "response.reasoning_summary_part.done":
+            assert summaries[data["summary_index"]] == data["part"]["text"]
+        elif event == "response.output_item.done":
+            reconstructed[data["output_index"]] = data["item"]
+    assert reconstructed == obj["output"] == events[-1][1]["response"]["output"]
+    assert [summaries[i] for i in range(len(summary))] == [p["text"] for p in summary]
+    assert reconstructed[0]["encrypted_content"] == "opaque"
+    assert obj == original
+    assert [d["sequence_number"] for _, d in events] == list(range(1, len(events)+1))

@@ -71,7 +71,7 @@ async def test_timeout_distinguishes_headers_from_incomplete_body(send_headers):
 
 
 @pytest.mark.asyncio
-async def test_buffered_preserves_metadata_without_reasoning_text_or_credentials():
+async def test_buffered_preserves_reasoning_only_in_response_not_diagnostics():
     async def handler(request):
         assert json.loads(request.content)["reasoning_effort"] == "low"
         return httpx.Response(200, json={
@@ -87,7 +87,9 @@ async def test_buffered_preserves_metadata_without_reasoning_text_or_credentials
     assert d["upstream_id"] == "gen-for-support"
     assert d["upstream_provider"] == "Example Provider"
     assert d["tokens_reasoning"] == 7
-    assert "PRIVATE REASONING" not in json.dumps(result)
+    assert result["response"]["provider_message"]["reasoning"] == "PRIVATE REASONING"
+    assert "PRIVATE REASONING" not in json.dumps(d)
+    assert "PRIVATE REASONING" not in json.dumps(routing_summary({"provider_diagnostics": [d]}))
     usage = _openai_usage(result["response"])
     assert usage["completion_tokens"] == 9
     assert usage["completion_tokens_details"] == {"reasoning_tokens": 7}
@@ -114,7 +116,9 @@ async def test_stream_observes_reasoning_and_tool_output_without_emitting_reason
     assert d["first_reasoning_ms"] <= d["first_output_ms"] <= d["elapsed_ms"]
     assert d["upstream_id"] == "gen-stream"
     assert d["tokens_reasoning"] == 0
-    assert "PRIVATE REASONING" not in json.dumps(result)
+    assert result["response"]["provider_message"]["reasoning"] == "PRIVATE REASONING"
+    assert "PRIVATE REASONING" not in json.dumps(d)
+    assert "PRIVATE REASONING" not in json.dumps(routing_summary({"provider_diagnostics": [d]}))
 
 
 def test_ledger_diagnostics_are_bounded_and_allowlisted():

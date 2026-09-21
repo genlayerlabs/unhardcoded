@@ -283,7 +283,25 @@ def responses_sse_events(obj: dict, start_seq: int = 1) -> Iterable[str]:
         return frame
 
     for out_index, item in enumerate(obj.get("output") or []):
-        if item.get("type") == "message":
+        if item.get("type") == "reasoning":
+            yield _emit("response.output_item.added",
+                        {"output_index": out_index, "item": {**item, "summary": []}})
+            for summary_index, part in enumerate(item.get("summary") or []):
+                position = {"item_id": item["id"], "output_index": out_index,
+                            "summary_index": summary_index}
+                text = part.get("text", "")
+                yield _emit("response.reasoning_summary_part.added",
+                            {**position, "part": {**part, "text": ""}})
+                if text:
+                    yield _emit("response.reasoning_summary_text.delta",
+                                {**position, "delta": text})
+                yield _emit("response.reasoning_summary_text.done",
+                            {**position, "text": text})
+                yield _emit("response.reasoning_summary_part.done",
+                            {**position, "part": part})
+            yield _emit("response.output_item.done",
+                        {"output_index": out_index, "item": item})
+        elif item.get("type") == "message":
             text = (item.get("content") or [{}])[0].get("text", "")
             yield _emit("response.output_item.added",
                         {"output_index": out_index, "item": {**item, "content": []}})
