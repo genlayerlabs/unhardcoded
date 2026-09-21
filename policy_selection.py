@@ -11,7 +11,8 @@ import time
 import uuid
 
 from auto_policies import CATALOG_VERSION, build_bundle, catalog, validate_constraints
-from decision_providers import DecisionChoice, DecisionError, DecisionRequest, validate_answer
+from decision_providers import (DecisionChoice, DecisionError, DecisionRequest, validate_answer,
+                                probability_decimals_for_model)
 from decision_providers.jev import JevDecisionProvider
 
 log = logging.getLogger(__name__)
@@ -188,7 +189,8 @@ async def select_policy(host, contract, execution, *, provider=None, trace=None)
                 result = await provider.decide(request, deadline=started + config["decision_timeout_ms"] / 1000)
             trace.update(cost_usd=result.cost_usd, attempts=result.attempts)
             selected_id, _, confidence, entropy = validate_answer({"type": "choice", "choice": result.selected_id,
-                "probabilities": result.probabilities, "confidence": result.confidence}, legal)
+                "probabilities": result.probabilities, "confidence": result.confidence}, legal,
+                probability_decimals=probability_decimals_for_model(result.model))
             trace.update(provider=result.provider, model=result.model, cost_usd=result.cost_usd,
                          confidence=confidence, normalized_entropy=entropy, attempts=result.attempts,
                          proposed_id=selected_id, disagrees_with_default=selected_id != "general")
