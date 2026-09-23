@@ -100,6 +100,57 @@ async def _aws(host):
             await source._client.aclose()
 
 
+# OpenRouter's /models listing is public and identical for every tenant: one
+# shared snapshot, refreshed on demand by at most one request at a time. It is
+# used only for tenants with their own OpenRouter key; offers carry no operator
+# latency/health, and calls still authenticate with the tenant's key.
+OPENROUTER_CATALOG_TTL_S = 600
+OPENROUTER_CATALOG_STALE_S = 3600
+_openrouter_public = {'at': 0.0, 'value': None}
+_openrouter_lock = None
+
+
+async def _openrouter_catalog(catalog):
+    global _openrouter_lock
+    loop = asyncio.get_running_loop()
+    if _openrouter_lock is None or _openrouter_lock[0] is not loop:
+        _openrouter_lock = (loop, asyncio.Lock())
+    async with _openrouter_lock[1]:
+        age = time.monotonic() - _openrouter_public['at']
+        if _openrouter_public['value'] is not None and age < OPENROUTER_CATALOG_TTL_S:
+            return _openrouter_public['value']
+        from sources.openrouter import OpenRouterSource
+        source = OpenRouterSource(catalog, env_get=lambda _key: None, route_stats=lambda: {},
+                                  endpoint_details=False)
+        try:
+            prices = await source.pricing()
+            value = ({pid: source.offers_sync(pid) for pid in source.provider_ids if pid != 'openrouter'}, prices)
+        except Exception:
+            if _openrouter_public['value'] is not None and age < OPENROUTER_CATALOG_STALE_S:
+                return _openrouter_public['value']  # public data: a short outage keeps the last list
+            raise
+        finally:
+            if source._client is not None:
+                await source._client.aclose()
+        _openrouter_public.update(at=time.monotonic(), value=value)
+        return value
+
+
+async def _openrouter(host):
+    from sources import push_prices
+    market = [pid for pid, p in host.catalog()['providers'].items()
+              if p.get('discovery_id') == 'openrouter_market']
+    host._tenant_offers.update({pid: [] for pid in market})
+    try:
+        offers, prices = await asyncio.wait_for(_openrouter_catalog(host.catalog()), timeout=35)
+        host._tenant_offers.update({pid: offers.get(pid, []) for pid in market})
+        # Curated families keep the static `openrouter` provider; this only fills
+        # their current prices, in this request-local engine.
+        push_prices(host, host.catalog(), prices)
+    except Exception:
+        host._connection_errors['openrouter'] = 'Could not load the OpenRouter model list. Try again shortly.'
+
+
 async def prepare(host):
     configs = getattr(host, '_tenant_connections', {})
     host._connection_errors = {}
@@ -133,4 +184,6 @@ async def prepare(host):
         tasks.append(one('bedrock', _aws, ids))
     if configs.get('antseed') and host._env.get('ANTSEED_BYO_URL'):
         tasks.append(one('antseed', _buyer, ['antseed']))
+    if host._env.get('OPENROUTER_API_KEY') and 'openrouter_market' in (host._tenant_allowed or ()):
+        tasks.append(_openrouter(host))
     await asyncio.gather(*tasks)
