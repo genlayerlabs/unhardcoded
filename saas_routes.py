@@ -169,7 +169,8 @@ def preview(host, intent):
             explanation = "Not available through your connected provider accounts."
         else:
             explanation = "Does not meet the mandatory requirements."
-        exclusions.append({"id": target, "label": target.replace("|", " · "), "reason": explanation})
+        pid, _, family = target.partition("|")
+        exclusions.append({"id": target, "label": f"{family} · {label(pid)}", "reason": explanation})
     warnings = []
     if len(rows) == 1:
         warnings.append("Only one model qualifies. There is no fallback if it fails.")

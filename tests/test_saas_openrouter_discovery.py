@@ -118,3 +118,15 @@ def test_short_outage_serves_the_last_public_listing(base, openrouter, monkeypat
     asyncio.run(tp.prepare(child))
     assert "openrouter_market|brand-new-model" in {r["id"] for r in choices(child)}
     assert child._connection_errors == {}
+
+
+
+def test_preview_ranks_long_tail_models_and_names_exclusions_by_public_provider(base, openrouter):
+    from saas_routes import preview
+    child = tenant(base, 1)
+    asyncio.run(tp.prepare(child))
+    result = preview(child, {"goal": "cost", "workload": "agent", "timeout_seconds": 8,
+                             "targets": ["openrouter|curated-model", "openrouter_market|brand-new-model",
+                                         "openrouter_market|retired-model"]})
+    assert [row["id"] for row in result["ranked"]] == ["openrouter_market|brand-new-model", "openrouter|curated-model"]
+    assert [row["label"] for row in result["excluded"]] == ["retired-model · OpenRouter"]
