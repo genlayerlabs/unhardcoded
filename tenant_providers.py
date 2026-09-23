@@ -133,7 +133,10 @@ async def _openrouter_catalog(catalog):
                                   endpoint_details=False)
         try:
             prices = await source.pricing()
-            value = ({pid: source.offers_sync(pid) for pid in source.provider_ids if pid != 'openrouter'}, prices)
+            # `:batch` slugs are OpenRouter batch-processing endpoints at a discount: not
+            # for interactive calls, yet a cost-led policy would always pick them.
+            value = ({pid: [o for o in source.offers_sync(pid) if not o['wire_model_id'].endswith(':batch')]
+                      for pid in source.provider_ids if pid != 'openrouter'}, prices)
         except Exception:
             _openrouter_public['failed_at'] = time.monotonic()
             if stale:

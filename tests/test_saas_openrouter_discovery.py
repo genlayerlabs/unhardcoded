@@ -155,3 +155,18 @@ def test_first_failure_without_a_listing_fails_fast_for_the_next_caller(base, op
     asyncio.run(tp.prepare(child))
     assert child._connection_errors["openrouter"]
     assert len([p for p in openrouter["paths"] if p.endswith("/models")]) == 1
+
+
+def test_batch_endpoints_are_not_offered_and_prices_are_rounded(base, openrouter):
+    openrouter["models"] = MODELS + [
+        {"id": "anthropic/claude-opus-5.5", "context_length": 200000, "supported_parameters": ["tools"],
+         "pricing": {"prompt": "0.0000002", "completion": "0.0000012"}},
+        {"id": "anthropic/claude-opus-5.5:batch", "context_length": 200000, "supported_parameters": ["tools"],
+         "pricing": {"prompt": "0.0000001", "completion": "0.0000006"}}]
+    child = tenant(base, 1)
+    asyncio.run(tp.prepare(child))
+    rows = {row["id"]: row for row in choices(child)}
+    assert "openrouter_market|claude-opus-5.5" in rows
+    assert not any(i.endswith(":batch") for i in rows)
+    opus = rows["openrouter_market|claude-opus-5.5"]
+    assert (opus["price_in"], opus["price_out"]) == (0.2, 1.2)
