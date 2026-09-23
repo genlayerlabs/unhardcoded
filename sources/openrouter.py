@@ -28,11 +28,15 @@ class OpenRouterSource:
 
     def __init__(self, catalog: dict, env_get=os.environ.get,
                  client: Any = None, base_url: str = BASE_URL,
-                 route_stats=None):
+                 route_stats=None, endpoint_details: bool = True):
         self._env_get = env_get
         self._base_url = base_url.rstrip("/")
         self._client = client  # injected in tests; lazy httpx otherwise
         self._route_stats = route_stats or host_store.route_stats
+        # One detail request per model (~1000) is affordable on the hourly
+        # operator refresh, not on an on-demand SaaS catalog request. Without
+        # details every listed model stays routable (see _model_available).
+        self._endpoint_details = endpoint_details
         # /models snapshot cached by the async pricing() refresh so the SYNC
         # discover hook (offers_sync, called inside rank) never blocks on HTTP.
         self._models_snapshot: list[dict] = []
@@ -159,7 +163,8 @@ class OpenRouterSource:
         # cache for the sync offers_sync()/market_book() (whole-catalog discovery)
         merged = {m['id']: m for m in (body.get("data") or []) + self._decision_snapshot if m.get('id')}
         self._models_snapshot = list(merged.values())
-        await self._refresh_endpoint_availability(self._models_snapshot)
+        if self._endpoint_details:
+            await self._refresh_endpoint_availability(self._models_snapshot)
         # Live, full model-level traits (benchmarks/modalities/caps + ranks) for
         # EVERY model, keyed by raw id, ranked across the whole OpenRouter
         # catalog. Discovered families carry these inline so they rank on real

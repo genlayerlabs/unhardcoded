@@ -69,7 +69,13 @@ def choices(host):
                     "tools": bool((c.get("capabilities") or {}).get("supports_tools")),
                     "price_in": finite(c.get("raw_price_in", c.get("price_in"))),
                     "price_out": finite(c.get("raw_price_out", c.get("price_out")))}
-    return sorted(out.values(), key=lambda c: (c["provider"], c["family"]))
+    # A curated family and its marketplace twin (`openrouter` / `openrouter_market`)
+    # are one choice for the user: keep the curated identity, which carries the
+    # benchmark ranking, and drop the duplicate label.
+    for key, row in list(out.items()):
+        if row["provider"] == "openrouter_market" and f"openrouter|{row['family']}" in out:
+            del out[key]
+    return sorted(out.values(), key=lambda c: (label(c["provider"]), c["family"]))
 
 
 def finite(value):
@@ -163,7 +169,8 @@ def preview(host, intent):
             explanation = "Not available through your connected provider accounts."
         else:
             explanation = "Does not meet the mandatory requirements."
-        exclusions.append({"id": target, "label": target.replace("|", " · "), "reason": explanation})
+        pid, _, family = target.partition("|")
+        exclusions.append({"id": target, "label": f"{family} · {label(pid)}", "reason": explanation})
     warnings = []
     if len(rows) == 1:
         warnings.append("Only one model qualifies. There is no fallback if it fails.")
