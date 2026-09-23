@@ -106,7 +106,8 @@ async def _aws(host):
 # latency/health, and calls still authenticate with the tenant's key.
 OPENROUTER_CATALOG_TTL_S = 600
 OPENROUTER_CATALOG_STALE_S = 3600
-_openrouter_public = {'at': 0.0, 'value': None}
+OPENROUTER_CATALOG_RETRY_S = 60  # after a failed refresh, do not call OpenRouter again for this long
+_openrouter_public = {'at': 0.0, 'value': None, 'failed_at': None}
 _openrouter_lock = None
 
 
@@ -116,9 +117,17 @@ async def _openrouter_catalog(catalog):
     if _openrouter_lock is None or _openrouter_lock[0] is not loop:
         _openrouter_lock = (loop, asyncio.Lock())
     async with _openrouter_lock[1]:
-        age = time.monotonic() - _openrouter_public['at']
+        now = time.monotonic()
+        age = now - _openrouter_public['at']
+        stale = _openrouter_public['value'] is not None and age < OPENROUTER_CATALOG_STALE_S
         if _openrouter_public['value'] is not None and age < OPENROUTER_CATALOG_TTL_S:
             return _openrouter_public['value']
+        failed_at = _openrouter_public['failed_at']
+        if failed_at is not None and now - failed_at < OPENROUTER_CATALOG_RETRY_S:
+            # Serialized callers must not each wait for another upstream timeout.
+            if stale:
+                return _openrouter_public['value']
+            raise RuntimeError('OpenRouter catalog recently unavailable')
         from sources.openrouter import OpenRouterSource
         source = OpenRouterSource(catalog, env_get=lambda _key: None, route_stats=lambda: {},
                                   endpoint_details=False)
@@ -126,13 +135,14 @@ async def _openrouter_catalog(catalog):
             prices = await source.pricing()
             value = ({pid: source.offers_sync(pid) for pid in source.provider_ids if pid != 'openrouter'}, prices)
         except Exception:
-            if _openrouter_public['value'] is not None and age < OPENROUTER_CATALOG_STALE_S:
+            _openrouter_public['failed_at'] = time.monotonic()
+            if stale:
                 return _openrouter_public['value']  # public data: a short outage keeps the last list
             raise
         finally:
             if source._client is not None:
                 await source._client.aclose()
-        _openrouter_public.update(at=time.monotonic(), value=value)
+        _openrouter_public.update(at=time.monotonic(), value=value, failed_at=None)
         return value
 
 

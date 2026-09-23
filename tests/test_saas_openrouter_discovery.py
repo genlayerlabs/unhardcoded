@@ -26,7 +26,7 @@ MODELS = [
 @pytest.fixture
 def base(host_store_clean):
     tp._cache.clear()
-    tp._openrouter_public.update(at=0.0, value=None)
+    tp._openrouter_public.update(at=0.0, value=None, failed_at=None)
     host = LLMRouterHost(ROOT/'core/router.lua', ROOT/'tests/fixtures/openrouter_byo.lua',
         discover=lambda _: {'ok': True, 'offers': [{'model_family': 'OPERATOR-ONLY'}]})
     host.init()
@@ -130,3 +130,28 @@ def test_preview_ranks_long_tail_models_and_names_exclusions_by_public_provider(
                                          "openrouter_market|retired-model"]})
     assert [row["id"] for row in result["ranked"]] == ["openrouter_market|brand-new-model", "openrouter|curated-model"]
     assert [row["label"] for row in result["excluded"]] == ["retired-model · OpenRouter"]
+
+
+def test_failed_refresh_is_not_retried_by_every_caller(base, openrouter, monkeypatch):
+    asyncio.run(tp.prepare(tenant(base, 1)))
+    monkeypatch.setattr(tp, "OPENROUTER_CATALOG_TTL_S", 0)
+    openrouter["fail"] = True
+    for tid in (2, 3, 4):
+        child = tenant(base, tid)
+        asyncio.run(tp.prepare(child))
+        assert "openrouter_market|brand-new-model" in {r["id"] for r in choices(child)}
+    # One listing, one failed refresh; later callers are served the last list without upstream calls.
+    assert [p for p in openrouter["paths"] if p.endswith("/models")] == ["/api/v1/models", "/api/v1/models"]
+    monkeypatch.setattr(tp, "OPENROUTER_CATALOG_RETRY_S", 0)
+    openrouter["fail"] = False
+    asyncio.run(tp.prepare(tenant(base, 5)))
+    assert tp._openrouter_public["failed_at"] is None
+
+
+def test_first_failure_without_a_listing_fails_fast_for_the_next_caller(base, openrouter):
+    openrouter["fail"] = True
+    asyncio.run(tp.prepare(tenant(base, 1)))
+    child = tenant(base, 2)
+    asyncio.run(tp.prepare(child))
+    assert child._connection_errors["openrouter"]
+    assert len([p for p in openrouter["paths"] if p.endswith("/models")]) == 1
