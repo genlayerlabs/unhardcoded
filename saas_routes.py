@@ -79,7 +79,8 @@ def choices(host):
 
 
 def finite(value):
-    return value if isinstance(value, (float, int)) and math.isfinite(value) else None
+    # Per-token source prices scaled to $/Mtok carry float noise (0.19999999999999998).
+    return round(value, 6) if isinstance(value, (float, int)) and math.isfinite(value) else None
 
 
 def compile_intent(intent):

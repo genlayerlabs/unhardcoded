@@ -509,7 +509,7 @@ return {
         ["claude-opus-4-8"] = {
             served_by = {
                 { provider = "anthropic",    provider_model_id = "claude-opus-4-8" },
-                { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4-8" },
+                { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4.8" },
             },
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.93,
@@ -522,7 +522,7 @@ return {
         ["claude-opus-4-7"] = {
             served_by = {
                 { provider = "anthropic",    provider_model_id = "claude-opus-4-7" },
-                { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4-7" },
+                { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4.7" },
             },
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.92,
@@ -530,7 +530,7 @@ return {
         ["claude-opus-4-6"] = {
             served_by = {
                 { provider = "anthropic",    provider_model_id = "claude-opus-4-6" },
-                { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4-6" },
+                { provider = "openrouter",   provider_model_id = "anthropic/claude-opus-4.6" },
             },
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.91,
@@ -602,7 +602,7 @@ return {
             served_by = {
                 { provider = "anthropic",     provider_model_id = "claude-sonnet-4-6" },
                 { provider = "bedrock",       provider_model_id = "us.anthropic.claude-sonnet-4-6" },
-                { provider = "openrouter",    provider_model_id = "anthropic/claude-sonnet-4-6" },
+                { provider = "openrouter",    provider_model_id = "anthropic/claude-sonnet-4.6" },
             },
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.88,
@@ -616,7 +616,7 @@ return {
         ["claude-sonnet-4-5"] = {
             served_by = {
                 { provider = "anthropic",     provider_model_id = "claude-sonnet-4-5" },
-                { provider = "openrouter",    provider_model_id = "anthropic/claude-sonnet-4-5" },
+                { provider = "openrouter",    provider_model_id = "anthropic/claude-sonnet-4.5" },
             },
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.86,
@@ -624,7 +624,7 @@ return {
         ["claude-haiku-4-5"] = {
             served_by = {
                 { provider = "anthropic",     provider_model_id = "claude-haiku-4-5" },
-                { provider = "openrouter",    provider_model_id = "anthropic/claude-haiku-4-5" },
+                { provider = "openrouter",    provider_model_id = "anthropic/claude-haiku-4.5" },
             },
             capabilities = { context = 200000, supports_tools = true, supports_json_mode = true },
             static_quality_hint = 0.80,
