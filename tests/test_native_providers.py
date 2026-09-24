@@ -656,3 +656,37 @@ async def test_google_native_never_leaks_key_in_url_or_errors():
     assert result["ok"] is False
     assert result["error_kind"] == "timeout"
     assert "super-secret-key" not in result["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_bedrock_parallel_no_argument_tools_roundtrip():
+    client = FakeBedrockClient({"stream": [
+        {"contentBlockStart": {"contentBlockIndex": i,
+          "start": {"toolUse": {"toolUseId": f"call_{i}", "name": name}}}}
+        for i, name in enumerate(["read_context", "learning_query"])
+    ] + [{"messageStop": {"stopReason": "tool_use"}}]})
+
+    async def emit(_):
+        pass
+
+    result = await stream_bedrock({
+        "api_kind": "bedrock", "served_model_id": "sonnet",
+        "messages": [{"role": "user", "content": "Review evidence"}],
+    }, emit, env_get={"AWS_REGION": "us-east-1"}.get, client=client)
+    calls = result["response"]["tool_calls"]
+    assert [c["function"]["arguments"] for c in calls] == ["{}", "{}"]
+    from provider_adapters.bedrock import _openai_messages_to_bedrock
+    messages, _ = _openai_messages_to_bedrock([
+        {"role": "user", "content": "Review evidence"},
+        {"role": "assistant", "tool_calls": calls},
+        {"role": "tool", "tool_call_id": "call_0", "content": "context"},
+        {"role": "tool", "tool_call_id": "call_1", "content": "memory"},
+        {"role": "assistant", "content": "Done"},
+        {"role": "user", "content": "Next turn"},
+    ])
+    assert len(messages) == 5
+    assert messages[2]["role"] == "user"
+    assert [b["toolResult"]["toolUseId"] for b in messages[2]["content"]] == ["call_0", "call_1"]
+    assert [b["toolResult"]["content"][0]["text"] for b in messages[2]["content"]] == ["context", "memory"]
+    assert messages[3]["role"] == "assistant"
+    assert messages[4]["content"] == [{"text": "Next turn"}]

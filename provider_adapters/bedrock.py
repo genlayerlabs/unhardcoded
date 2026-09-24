@@ -79,15 +79,16 @@ def _openai_messages_to_bedrock(
             tool_use_id = msg.get("tool_call_id") or msg.get("id")
             if not tool_use_id:
                 continue
-            out.append({
-                "role": "user",
-                "content": [{
-                    "toolResult": {
-                        "toolUseId": tool_use_id,
-                        "content": [{"text": text or ""}],
-                    },
-                }],
-            })
+            block = {"toolResult": {
+                "toolUseId": tool_use_id,
+                "content": [{"text": text or ""}],
+            }}
+            # Converse requires parallel results in one following user turn.
+            if (out and out[-1]["role"] == "user"
+                    and all("toolResult" in b for b in out[-1]["content"])):
+                out[-1]["content"].append(block)
+            else:
+                out.append({"role": "user", "content": [block]})
             continue
 
         if role == "assistant":
@@ -366,6 +367,10 @@ async def stream_bedrock(
         return _err(_classify_bedrock_error(exc), 0, _latency(), str(exc)[:500])
 
     tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)] or None
+    for call in tool_calls or []:
+        # A completed no-argument tool may emit no input delta at all.
+        if call["function"]["arguments"] == "":
+            call["function"]["arguments"] = "{}"
     text = "".join(text_parts)
     if not text.strip() and not tool_calls:
         return _err("bad_response", 200, _latency(), "empty assistant content")
