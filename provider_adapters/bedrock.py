@@ -61,6 +61,10 @@ def _bedrock_model_id(request: dict) -> str:
                or request["served_model_id"])
 
 
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
 def _openai_messages_to_bedrock(
     messages: list[dict],
 ) -> tuple[list[dict], list[dict] | None]:
@@ -79,15 +83,27 @@ def _openai_messages_to_bedrock(
             tool_use_id = msg.get("tool_call_id") or msg.get("id")
             if not tool_use_id:
                 continue
-            out.append({
-                "role": "user",
-                "content": [{
-                    "toolResult": {
-                        "toolUseId": tool_use_id,
-                        "content": [{"text": text or ""}],
-                    },
-                }],
-            })
+            previous = out[-1] if out else {}
+            if previous.get("role") == "user":
+                previous = out[-2] if len(out) > 1 else {}
+            expected = {
+                b["toolUse"]["toolUseId"] for b in previous.get("content", [])
+                if "toolUse" in b
+            } if previous.get("role") == "assistant" else set()
+            if tool_use_id not in expected:
+                raise ValueError("tool result has no matching preceding tool use")
+            block = {"toolResult": {
+                "toolUseId": tool_use_id,
+                "content": [{"text": text or ""}],
+            }}
+            # Converse requires parallel results in one following user turn.
+            if out and out[-1]["role"] == "user":
+                content = out[-1]["content"]
+                # Claude-backed Converse requires results before ordinary text.
+                position = next((i for i, b in enumerate(content) if "toolResult" not in b), len(content))
+                content.insert(position, block)
+            else:
+                out.append({"role": "user", "content": [block]})
             continue
 
         if role == "assistant":
@@ -111,7 +127,10 @@ def _openai_messages_to_bedrock(
             continue
 
         if text:
-            out.append({"role": "user", "content": [{"text": text}]})
+            if out and out[-1]["role"] == "user":
+                out[-1]["content"].append({"text": text})
+            else:
+                out.append({"role": "user", "content": [{"text": text}]})
 
     system = [{"text": "\n\n".join(system_parts)}] if system_parts else None
     return out, system
@@ -265,12 +284,16 @@ async def stream_bedrock(
     region = _aws_region(request, _env_get)
     bedrock = client or (client_factory(region) if client_factory
                          else _bedrock_client(region, timeout_s, _env_get))
-    body = _bedrock_request(request)
+    try:
+        body = _bedrock_request(request)
+    except ValueError as exc:
+        return _err("bad_request", 400, 0, str(exc))
     t0 = time.monotonic()
     saw_output = False
     emitted = False
     text_parts: list[str] = []
     tool_calls_acc: dict[int, dict] = {}
+    closed_tool_blocks: set[int] = set()
     finish_reason = None
     usage: dict = {}
     first_timeout_s = first_token_timeout_s(request)
@@ -313,6 +336,11 @@ async def stream_bedrock(
             if "messageStop" in event:
                 finish_reason = (event["messageStop"] or {}).get("stopReason") \
                     or finish_reason
+                continue
+            if "contentBlockStop" in event:
+                idx = (event["contentBlockStop"] or {}).get("contentBlockIndex")
+                if idx in tool_calls_acc:
+                    closed_tool_blocks.add(idx)
                 continue
             if "metadata" in event:
                 usage = (event["metadata"] or {}).get("usage") or usage
@@ -366,6 +394,28 @@ async def stream_bedrock(
         return _err(_classify_bedrock_error(exc), 0, _latency(), str(exc)[:500])
 
     tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)] or None
+    if tool_calls:
+        failure_kind = "stream_interrupted" if emitted else "bad_response"
+        # Never turn an interrupted or token-limited tool request into an action.
+        if finish_reason != "tool_use" or set(tool_calls_acc) != closed_tool_blocks:
+            return _err(failure_kind, 200, _latency(),
+                        "incomplete Bedrock tool-use response")
+        for call in tool_calls:
+            if not call["id"] or not call["function"]["name"]:
+                return _err(failure_kind, 200, _latency(),
+                            "missing Bedrock tool identity")
+            # A closed no-argument tool may emit no input delta at all.
+            arguments = call["function"]["arguments"]
+            if arguments == "":
+                arguments = "{}"
+            try:
+                parsed = json.loads(arguments, parse_constant=_reject_json_constant)
+                if not isinstance(parsed, dict):
+                    raise ValueError("tool arguments must be an object")
+            except (ValueError, TypeError):
+                return _err(failure_kind, 200, _latency(),
+                            "invalid Bedrock tool arguments JSON")
+            call["function"]["arguments"] = arguments
     text = "".join(text_parts)
     if not text.strip() and not tool_calls:
         return _err("bad_response", 200, _latency(), "empty assistant content")
@@ -411,7 +461,10 @@ def make_bedrock_async_call_provider(
                 request, ignore_delta, env_get=_env_get, timeout_s=timeout_s,
                 client=client, client_factory=client_factory)
 
-        body = _bedrock_request(request)
+        try:
+            body = _bedrock_request(request)
+        except ValueError as exc:
+            return _err("bad_request", 400, 0, str(exc))
 
         region = _aws_region(request, _env_get)
         bedrock = _client(region)
