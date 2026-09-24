@@ -408,6 +408,7 @@ async def test_bedrock_native_stream_emits_and_aggregates():
                                "delta": {"toolUse": {
                                    "input": '{"id": "abc"}',
                                }}}},
+        {"contentBlockStop": {"contentBlockIndex": 1}},
         {"messageStop": {"stopReason": "tool_use"}},
         {"metadata": {"usage": {"inputTokens": 11, "outputTokens": 7,
                                 "totalTokens": 18}}},
@@ -664,7 +665,8 @@ async def test_bedrock_parallel_no_argument_tools_roundtrip():
         {"contentBlockStart": {"contentBlockIndex": i,
           "start": {"toolUse": {"toolUseId": f"call_{i}", "name": name}}}}
         for i, name in enumerate(["read_context", "learning_query"])
-    ] + [{"messageStop": {"stopReason": "tool_use"}}]})
+    ] + [{"contentBlockStop": {"contentBlockIndex": i}} for i in range(2)]
+      + [{"messageStop": {"stopReason": "tool_use"}}]})
 
     async def emit(_):
         pass
@@ -690,3 +692,131 @@ async def test_bedrock_parallel_no_argument_tools_roundtrip():
     assert [b["toolResult"]["content"][0]["text"] for b in messages[2]["content"]] == ["context", "memory"]
     assert messages[3]["role"] == "assistant"
     assert messages[4]["content"] == [{"text": "Next turn"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop,closed,args,valid", [
+    (None, False, "", False),
+    (None, True, "", False),
+    ("max_tokens", True, "", False),
+    ("max_tokens", True, "{}", False),
+    ("end_turn", True, "{}", False),
+    ("tool_use", False, "{}", False),
+    ("tool_use", True, '{"city":', False),
+    ("tool_use", True, " ", False),
+    ("tool_use", True, "[]", False),
+    ("tool_use", True, "null", False),
+    ("tool_use", True, "42", False),
+    ("tool_use", True, '{"value": NaN}', False),
+    ("tool_use", True, '{"value": Infinity}', False),
+    ("tool_use", True, "", True),
+    ("tool_use", True, '{"city":"Madrid"}', True),
+])
+async def test_bedrock_only_complete_tool_calls_are_returned(stop, closed, args, valid):
+    events = [{"contentBlockStart": {"contentBlockIndex": 0, "start": {
+        "toolUse": {"toolUseId": "weather_1", "name": "weather"}}}}]
+    if args:
+        # Preserve actual fragment concatenation; do not repair partial JSON.
+        for fragment in [args[:len(args)//2], args[len(args)//2:]]:
+            events.append({"contentBlockDelta": {"contentBlockIndex": 0,
+                           "delta": {"toolUse": {"input": fragment}}}})
+    if closed:
+        events.append({"contentBlockStop": {"contentBlockIndex": 0}})
+    if stop:
+        events.append({"messageStop": {"stopReason": stop}})
+    async def emit(_):
+        pass
+    result = await stream_bedrock({
+        "api_kind": "bedrock", "served_model_id": "test",
+        "messages": [{"role": "user", "content": "Weather?"}],
+    }, emit, client=FakeBedrockClient({"stream": events}))
+    assert result["ok"] is valid
+    if valid:
+        assert result["response"]["tool_calls"][0]["function"]["arguments"] == (args or "{}")
+    else:
+        assert result["error_kind"] == "bad_response"
+        assert "response" not in result
+
+
+def test_bedrock_parallel_results_preserve_ids_order_and_turn_boundaries():
+    from provider_adapters.bedrock import _openai_messages_to_bedrock
+    calls = [{"id": str(i), "function": {"name": "lookup", "arguments": "{}"}}
+             for i in range(3)]
+    messages, _ = _openai_messages_to_bedrock([
+        {"role": "assistant", "tool_calls": calls},
+        *[{"role": "tool", "tool_call_id": str(i), "content": str(i)} for i in [2, 0, 1]],
+        {"role": "user", "content": "A separate user message"},
+        {"role": "assistant", "tool_calls": [calls[0]]},
+        {"role": "tool", "tool_call_id": "0", "content": "next result"},
+    ])
+    assert len(messages) == 4
+    assert [b["toolResult"]["toolUseId"] for b in messages[1]["content"][:3]] == ["2", "0", "1"]
+    assert messages[1]["content"][3] == {"text": "A separate user message"}
+    assert messages[2]["role"] == "assistant"
+    assert messages[3]["content"][0]["toolResult"]["content"] == [{"text": "next result"}]
+
+
+@pytest.mark.asyncio
+async def test_bedrock_incomplete_parallel_call_rejects_entire_batch():
+    events = []
+    for i in range(2):
+        events.append({"contentBlockStart": {"contentBlockIndex": i,
+                       "start": {"toolUse": {"toolUseId": str(i), "name": "lookup"}}}})
+    events.extend([{"contentBlockStop": {"contentBlockIndex": 0}},
+                   {"messageStop": {"stopReason": "tool_use"}}])
+    async def emit(_):
+        pass
+    result = await stream_bedrock({
+        "api_kind": "bedrock", "served_model_id": "test",
+        "messages": [{"role": "user", "content": "Lookup"}],
+    }, emit, client=FakeBedrockClient({"stream": events}))
+    assert result["ok"] is False
+    assert "response" not in result
+
+
+def test_bedrock_user_text_before_results_keeps_block_order():
+    from provider_adapters.bedrock import _openai_messages_to_bedrock
+    messages, _ = _openai_messages_to_bedrock([
+        {"role": "assistant", "tool_calls": [{"id": "id1", "function": {"name": "lookup", "arguments": "{}"}}]},
+        {"role": "user", "content": "context"},
+        {"role": "tool", "tool_call_id": "id1", "content": "result"},
+        {"role": "user", "content": "reminder"},
+    ])
+    assert len(messages) == 2
+    assert messages[1]["content"][0]["toolResult"]["toolUseId"] == "id1"
+    assert messages[1]["content"][1] == {"text": "context"}
+    assert messages[1]["content"][2] == {"text": "reminder"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_bedrock_orphan_tool_result_fails_before_provider(streaming):
+    client = FakeBedrockClient({})
+    call = make_bedrock_async_call_provider(client=client)
+    request = {"api_kind": "bedrock", "served_model_id": "test", "messages": [
+        {"role": "user", "content": "hello"},
+        {"role": "tool", "tool_call_id": "orphan", "content": "result"}]}
+    if streaming:
+        request["first_token_timeout_ms"] = 1000
+    result = await call(request)
+    assert result["ok"] is False
+    assert result["error_kind"] == "bad_request"
+    assert client.requests == []
+
+
+@pytest.mark.asyncio
+async def test_bedrock_text_then_incomplete_tool_is_interrupted():
+    client = FakeBedrockClient({"stream": [
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "Checking"}}},
+        {"contentBlockStart": {"contentBlockIndex": 1, "start": {
+            "toolUse": {"toolUseId": "id1", "name": "lookup"}}}},
+    ]})
+    emitted = []
+    async def emit(text):
+        emitted.append(text)
+    result = await stream_bedrock({"api_kind": "bedrock", "served_model_id": "test",
+                                  "messages": [{"role": "user", "content": "hi"}]},
+                                 emit, client=client)
+    assert emitted == ["Checking"]
+    assert result["error_kind"] == "stream_interrupted"
+    assert "response" not in result
