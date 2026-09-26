@@ -1259,7 +1259,19 @@ _SESSION_TOTALS_ZERO = {"calls": 0, "tokens_in": 0, "tokens_out": 0,
                         "tokens_cached": 0, "cost_usd": 0.0}
 
 
-def hot_route(session: "str | None") -> "str | None":
+def _session_where(session: str, owner: "str | None") -> "tuple[str, list]":
+    """A session id is client-chosen, so two callers can collide on one: with an
+    owner (the ingress-authenticated caller) every read sees only that caller's
+    calls. Bounded to the retention horizon (older rows are pruned anyway)."""
+    where = " WHERE session_id = %s AND ts >= %s"
+    params: list = [session, int(time.time()) - _retention_days() * 86_400]
+    if owner is not None:
+        where += " AND caller = %s"
+        params.append(owner)
+    return where, params
+
+
+def hot_route(session: "str | None", owner: "str | None" = None) -> "str | None":
     """The route (provider|family|served_by) that most recently served this
     session SUCCESSFULLY — its prompt-cache prefix is hot there. None when unknown.
     Matches route_reliability.route_key; resolved per request into the cache_hot
@@ -1267,29 +1279,33 @@ def hot_route(session: "str | None") -> "str | None":
     if not session:
         return None
     try:
+        where, params = _session_where(session, owner)
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             row = conn.execute(
-                "SELECT provider_id, model_family, served_by FROM calls"
-                " WHERE session_id = %s AND status < 400 AND served_by IS NOT NULL"
-                " ORDER BY ts DESC, id DESC LIMIT 1", (session,)).fetchone()
+                "SELECT provider_id, model_family, served_by FROM calls" + where +
+                " AND status < 400 AND served_by IS NOT NULL"
+                " ORDER BY ts DESC, id DESC LIMIT 1", params).fetchone()
             return f"{row[0]}|{row[1]}|{row[2]}" if row else None
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store hot_route failed: %s", exc)
         return None
 
 
-def session_totals(session: "str | None") -> dict[str, Any]:
+def session_totals(session: "str | None", owner: "str | None" = None) -> dict[str, Any]:
     """The session's running totals (calls, tokens_in/out/cached, cost_usd) summed
     over its committed `calls`. The caller adds the in-flight call on top. Fail-soft
     -> zeros."""
     if not session:
         return dict(_SESSION_TOTALS_ZERO)
     try:
+        where, params = _session_where(session, owner)
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             r = conn.execute(
                 "SELECT count(*), coalesce(sum(tokens_in),0), coalesce(sum(tokens_out),0),"
                 " coalesce(sum(tokens_cached),0), coalesce(sum(cost_usd),0)"
-                " FROM calls WHERE session_id = %s", (session,)).fetchone()
+                " FROM calls" + where, params).fetchone()
             return {"calls": int(r[0]), "tokens_in": int(r[1]), "tokens_out": int(r[2]),
                     "tokens_cached": int(r[3]), "cost_usd": round(float(r[4]), 6)}
     except Exception as exc:  # noqa: BLE001
@@ -1297,18 +1313,20 @@ def session_totals(session: "str | None") -> dict[str, Any]:
         return dict(_SESSION_TOTALS_ZERO)
 
 
-def session_warm(session: "str | None") -> list[dict[str, Any]]:
+def session_warm(session: "str | None", owner: "str | None" = None) -> list[dict[str, Any]]:
     """The session's warm routes for DISPLAY: per family, the most recent route
     that served it successfully ({family, provider, served_by}). Fail-soft -> []."""
     if not session:
         return []
     try:
+        where, params = _session_where(session, owner)
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             cur = conn.execute(
                 "SELECT DISTINCT ON (model_family) model_family, provider_id, served_by"
-                " FROM calls WHERE session_id = %s AND status < 400"
+                " FROM calls" + where + " AND status < 400"
                 " AND model_family IS NOT NULL"
-                " ORDER BY model_family, ts DESC, id DESC", (session,))
+                " ORDER BY model_family, ts DESC, id DESC LIMIT 64", params)
             return [{"family": f, "provider": p, "served_by": s or p}
                     for f, p, s in cur.fetchall()]
     except Exception as exc:  # noqa: BLE001
@@ -1322,10 +1340,12 @@ def session_owner(session: "str | None") -> "str | None":
     if not session:
         return None
     try:
+        where, params = _session_where(session, None)
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             row = conn.execute(
-                "SELECT caller FROM calls WHERE session_id = %s"
-                " ORDER BY ts ASC, id ASC LIMIT 1", (session,)).fetchone()
+                "SELECT caller FROM calls" + where +
+                " ORDER BY ts ASC, id ASC LIMIT 1", params).fetchone()
             return row[0] if row else None
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store session_owner failed: %s", exc)
@@ -1336,11 +1356,14 @@ def all_session_totals() -> dict[str, dict[str, Any]]:
     """Every session's totals (operator /x/sessions view), derived from calls."""
     try:
         with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
             cur = conn.execute(
                 "SELECT session_id, count(*), coalesce(sum(tokens_in),0),"
                 " coalesce(sum(tokens_out),0), coalesce(sum(tokens_cached),0),"
                 " coalesce(sum(cost_usd),0) FROM calls"
-                " WHERE session_id IS NOT NULL GROUP BY session_id")
+                " WHERE session_id IS NOT NULL AND ts >= %s GROUP BY session_id"
+                " ORDER BY max(ts) DESC LIMIT 5000",
+                [int(time.time()) - _retention_days() * 86_400])
             return {s: {"calls": int(c), "tokens_in": int(ti), "tokens_out": int(to),
                         "tokens_cached": int(tc), "cost_usd": round(float(cu), 6)}
                     for s, c, ti, to, tc, cu in cur.fetchall()}
@@ -2634,3 +2657,22 @@ def truncate_all_for_tests() -> None:
                      " consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
                      " login_history, provider_prices, wallet_ops,"
                      " subject_budget_usage, subject_budget_reservations")
+
+
+def key_usage_rows(consumer_sha: str, since_ts: "int | None" = None,
+                   caller: "str | None" = None, limit: int = 20_000) -> list[dict[str, Any]]:
+    """One key's usage rows for the consumer-facing /v1/usage: filtered by
+    consumer_sha IN SQL (idx_calls_consumer), newest `limit` in the window, under
+    the dashboard statement timeout — never the caller's whole 30-day history
+    loaded and filtered in Python. Fail-soft -> []."""
+    try:
+        where, params = _usage_where(since_ts=since_ts, caller=caller, consumer_sha=consumer_sha)
+        with _get_pool().connection() as conn:
+            _set_dashboard_statement_timeout(conn)
+            cur = conn.execute(
+                f"SELECT {', '.join(_USAGE_COLS)} FROM calls{where}"
+                " ORDER BY ts DESC, id ASC LIMIT %s", params + [max(1, int(limit))])
+            return [_map_usage_row(r) for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store key_usage_rows failed: %s", exc)
+        return []

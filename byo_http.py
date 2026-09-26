@@ -10,6 +10,19 @@ import socket
 
 import httpx
 
+# Prefixes that embed (and route to) an IPv4 address: NAT64 well-known/local-use,
+# IPv4-compatible, 6to4. `is_global` judges the IPv6 wrapper, not the target.
+_EMBEDDED_V4 = tuple(ipaddress.ip_network(n) for n in
+                     ('64:ff9b::/96', '64:ff9b:1::/48', '::/96', '2002::/16'))
+
+
+def public_address(ip):
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.version == 6 and any(ip in net for net in _EMBEDDED_V4):
+        return False
+    return ip.is_global
+
 
 class PublicHTTPS(httpx.AsyncBaseTransport):
     def __init__(self):
@@ -25,7 +38,7 @@ class PublicHTTPS(httpx.AsyncBaseTransport):
             rows = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(
                 url.host, url.port or 443, type=socket.SOCK_STREAM), 5)
             addresses = [ipaddress.ip_address(row[4][0]) for row in rows]
-            if not addresses or any(not ip.is_global for ip in addresses):
+            if not addresses or not all(public_address(ip) for ip in addresses):
                 raise ValueError('non-public endpoint')
         except (ValueError, OSError, TimeoutError) as exc:
             raise httpx.ConnectError('Buyer gateway is not a public HTTPS endpoint', request=request) from exc

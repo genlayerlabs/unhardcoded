@@ -7,7 +7,9 @@ router result plus sanitized quota signals.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
+import os
 import time
 from typing import Any, Awaitable, Callable
 
@@ -18,6 +20,24 @@ from provider_adapters.common import _err
 Emit = Callable[[str], Awaitable[None]]
 
 
+def _broker_transport_ok(url: str) -> bool:
+    """The broker bearer rides every call: plain http never leaves the pod or
+    cluster network (loopback, single-label service names, *.svc/*.internal)."""
+    parsed = httpx.URL(url)
+    host = (parsed.host or "").rstrip(".").lower()
+    if parsed.scheme == "https":
+        return bool(host)
+    if parsed.scheme != "http" or not host:
+        return False
+    if os.getenv("CODEX_BROKER_ALLOW_HTTP", "0").lower() in {"1", "true", "yes"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return (host == "localhost" or "." not in host
+                or host.endswith((".svc", ".svc.cluster.local", ".internal")))
+
+
 class RemoteCodexClient:
     def __init__(self, base_url: str, token: str, *,
                  timeout_s: float = 120.0, client: Any = None):
@@ -25,6 +45,9 @@ class RemoteCodexClient:
         token = str(token or "").strip()
         if not base_url:
             raise ValueError("CODEX_BROKER_URL must not be empty")
+        if not _broker_transport_ok(base_url):
+            raise ValueError("CODEX_BROKER_URL must be https (plain http only to a "
+                             "loopback/cluster-internal host, or CODEX_BROKER_ALLOW_HTTP=1)")
         if not token:
             raise ValueError("CODEX_BROKER_TOKEN must not be empty")
         self.base_url = base_url

@@ -24,6 +24,7 @@ from typing import Callable
 
 import host_store
 import route_reliability as _route_reliability
+from byo_http import is_byo_buyer
 from provider_adapters.anthropic import make_anthropic_async_call_provider
 from provider_adapters.bedrock import make_bedrock_async_call_provider
 from provider_adapters.common import (
@@ -84,7 +85,27 @@ Logger = Callable[[str, str, dict], None]
 Clock = Callable[[], int]
 
 _AUTH_UNCONFIGURED = "auth_unconfigured"
+# Host-side backstop for the engine's per-execution cap (core DEFAULTS).
+_MAX_PROVIDER_ATTEMPTS = 32
 _SECRET_PLACEHOLDERS = {"", "CHANGE_ME", "TODO", "TODO_CHANGE_ME", "PLACEHOLDER"}
+
+
+def _operator_local(provider: dict) -> bool:
+    """Whether a provider endpoint is on the operator's own network."""
+    import ipaddress
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(str(provider.get("base_url") or ""))
+        host = (parts.hostname or "").rstrip(".").lower()
+    except ValueError:
+        return True
+    if parts.scheme not in ("http", "https") or not host:
+        return False  # no HTTP endpoint: the adapter's fixed public API (bedrock://, ...)
+    try:
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        return ("." not in host or host.endswith((".localhost", ".local", ".internal", ".svc"))
+                or ".svc." in host)
 
 
 def _secret_configured(value: str | None) -> bool:
@@ -131,6 +152,7 @@ class LLMRouterHost:
         self._source_paths = (router_path, config_path, metrics_path)
         self._tenant_id = None
         self._tenant_allowed = None
+        self._tenant_managed = None
         self.lua = LuaRuntime(unpack_returned_tuples=True)
 
         self._custom_call_hook = call_provider is not None
@@ -275,7 +297,9 @@ end
         allowed = set(managed)
         for pid, provider in (catalog.get('providers') or {}).items():
             key = auth_env(provider)
-            if key and env.get(key):
+            # A tenant key never unlocks an operator-local endpoint (e.g. a
+            # keyless local Ollama): only an explicit operator share can.
+            if key and env.get(key) and not _operator_local(provider):
                 allowed.add(pid)
                 managed.discard(pid)  # BYO credentials take precedence for this provider.
             elif key and pid in managed and self._env.get(key):
@@ -640,6 +664,10 @@ end
             engine_contract = {**contract, 'decision': json.dumps(contract.get('decision'), allow_nan=False)}
         step = self.router.execute_step(None, _to_lua(self.lua, engine_contract), None)
         while True:
+            # A provider hook that fails without awaiting (and a zero-backoff
+            # retry) would otherwise spin here without ever yielding, so the
+            # request deadline could never cancel it.
+            await asyncio.sleep(0)
             status = step["status"]
             if status == "done":
                 result = _to_py(step["result"])
@@ -650,7 +678,10 @@ end
             handle = step["state_handle"]
             if status == "call":
                 provider_attempt += 1
-                req = _to_py(step["request"]) or {}
+                if provider_attempt > _MAX_PROVIDER_ATTEMPTS:
+                    return {"ok": False, "error": "exhausted: attempt_cap",
+                            "trace": {"provider_diagnostics": provider_diagnostics}}
+                req = self._pin_route(_to_py(step["request"]) or {})
                 if req.get('protocol') == 'decisions':
                     req['decision'] = json.loads(req['decision'])
                 if (contract.get("first_token_timeout_ms") is not None
@@ -676,6 +707,19 @@ end
             else:
                 return {"ok": False, "error": f"internal: bad step status {status}", "trace": {}}
 
+    def _pin_route(self, req: dict) -> dict:
+        """Where a call goes and which credential it carries come from the
+        catalog, never from the engine's (policy-transformed) request."""
+        provider = self.config.providers[req["provider_id"]] if req.get("provider_id") else None
+        if provider is None:
+            return req  # per-call extra candidate: no catalog row to pin to
+        for key in ("auth_env", "auth", "api_kind", "aws_region"):
+            req[key] = _to_py(provider[key])
+        offer = req.get("offer")
+        req["base_url"] = ((offer.get("seller_endpoint") if isinstance(offer, dict) else None)
+                           if provider.discovery == "marketplace" else None) or provider.base_url
+        return req
+
     async def _resolve_call_async(self, request: dict, call_override=None,
                                   session: "str | None" = None) -> dict:
         """Resolve one provider call for the async driver: mock first (so the
@@ -695,8 +739,14 @@ end
         # observation too, the host-owned perf the algebra reads (derived) and the
         # market view surfaces (#15/#4a). Mocks record as well, so a mocked call
         # is measured exactly like a live one.
-        if not (self._tenant_id is not None and result.get("error_kind") in
-                {"auth_error", "rate_limit", "payment_required"}):
+        # Shared route_observations are operator evidence. A tenant outcome counts
+        # only on an operator-managed route (operator credential and endpoint):
+        # BYO gateways/keys are tenant-controlled and could forge peer health,
+        # cooldowns or tool capability for everyone.
+        if self._tenant_id is None or (
+                request.get("provider_id") in (self._tenant_managed or ())
+                and not is_byo_buyer(request, self._env.get)
+                and result.get("error_kind") not in {"auth_error", "rate_limit", "payment_required"}):
             _fold_route_outcome(request, result, session=session)
         return result
 
@@ -862,7 +912,7 @@ end
         return self._env.get(key)
 
     def _h_call_provider(self, request):
-        py_req = _to_py(request) or {}
+        py_req = self._pin_route(_to_py(request) or {})
         provider = py_req.get("provider_id")
         model = py_req.get("model_family")
         if (provider, model) in self._mock_responses:

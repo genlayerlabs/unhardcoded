@@ -44,6 +44,9 @@ os.environ.setdefault("HOST_STORE_POOL_TIMEOUT", "1")
 
 # Test HTTP endpoints are local/fake; production requires TLS by default.
 os.environ["CP_ALLOW_INSECURE_HTTP"] = "1"
+# TestClient peers are not loopback; the router /x/* admin gate is exercised
+# explicitly in test_security_router.py.
+os.environ.setdefault("ROUTER_ADMIN_ALLOW_UNAUTHENTICATED", "1")
 
 import host_store  # noqa: E402
 

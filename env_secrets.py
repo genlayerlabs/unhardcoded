@@ -24,6 +24,21 @@ from pathlib import Path
 DEFAULT_ENV_SECRETS_PATH = "/run/llm-router/.env.secrets"
 
 
+_FORBIDDEN_ENV_PREFIXES = ("CONTROL_PLANE_", "ANTSEED_", "CODEX_", "AWS_", "DASHBOARD_",
+                           "ROUTER_", "POSTGRES", "DATABASE", "CP_", "SAAS_", "GITHUB_")
+_FORBIDDEN_ENV_PARTS = ("SECRET", "PASSWORD", "INTERNAL", "ADMIN", "SESSION")
+
+
+def is_forbidden_auth_env(name: str) -> bool:
+    """Infrastructure/security variables a dashboard write must never set."""
+    name = str(name or "")
+    return name.startswith(_FORBIDDEN_ENV_PREFIXES) or any(p in name for p in _FORBIDDEN_ENV_PARTS)
+
+
+def _protected(key: str) -> bool:
+    return is_forbidden_auth_env(key) or "URL" in key
+
+
 def load_env_secrets(path: str | os.PathLike | None = None) -> list[str]:
     """Merge KEY=value lines from the env-secrets file into os.environ.
 
@@ -42,7 +57,10 @@ def load_env_secrets(path: str | os.PathLike | None = None) -> list[str]:
                 continue
             key, value = line.split("=", 1)
             key = key.strip()
-            if not key:
+            # The file is dashboard-writable: it may carry provider keys and the
+            # dashboard's own key maps, never override infrastructure/security
+            # variables (DB DSN, internal secrets, wallet/control tokens).
+            if not key or (key in os.environ and _protected(key)):
                 continue
             os.environ[key] = value
             loaded.append(key)

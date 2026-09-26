@@ -28,6 +28,12 @@ function numOrNull(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
+// peerId/service are seller-announced strings that end up as a DB key, an
+// x-antseed-pin-peer header and dashboard text. Bound them: an oversized or
+// control-char id is not one a real peer announces, so the row is dropped.
+const PEER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+const SERVICE_RE = /^[A-Za-z0-9][A-Za-z0-9_.:@\/+-]{0,127}$/;
+const validId = (re, v) => typeof v === "string" && re.test(v);
 function posIntOrNull(v) {  // maxConcurrency: positive int, else ungated (null)
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
@@ -43,7 +49,7 @@ if (fresh === null || typeof fresh !== "object" || !Array.isArray(fresh.peers))
 // row per (peerId, service). No services -> the peer contributes no rows.
 const rows = [];
 for (const peer of fresh.peers) {
-  if (!peer || !peer.peerId) continue;
+  if (!peer || !validId(PEER_ID_RE, peer.peerId)) continue;
   const maxc = posIntOrNull(peer.maxConcurrency);
   const rep = numOrNull(peer.onChainReputationScore);
   const lastSeen = numOrNull(peer.lastSeen);
@@ -54,6 +60,7 @@ for (const peer of fresh.peers) {
   const lastReachedAt = numOrNull(peer.lastReachedAt);
   for (const [provider, pricing] of Object.entries(peer.providerPricing || {})) {
     for (const [service, sp] of Object.entries((pricing || {}).services || {})) {
+      if (!validId(SERVICE_RE, service)) continue;
       const rawProtocols = peer.providerServiceApiProtocols?.[provider]?.services?.[service];
       const protocols = Array.isArray(rawProtocols) && rawProtocols.every(p => typeof p === 'string')
         ? rawProtocols : null;

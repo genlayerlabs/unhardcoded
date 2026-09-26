@@ -71,8 +71,13 @@ def internal_secret_ok(headers: Mapping[str, str]) -> bool:
     secret is unconfigured — callers must treat that as 'feature hidden'."""
     if not CONTROL_PLANE_INTERNAL_SECRET:
         return False
-    presented = headers.get("x-internal-secret") or ""
-    return hmac.compare_digest(presented, CONTROL_PLANE_INTERNAL_SECRET)
+    return secret_equal(headers.get("x-internal-secret") or "", CONTROL_PLANE_INTERNAL_SECRET)
+
+
+def secret_equal(presented: str, expected: str) -> bool:
+    """Constant-time compare over UTF-8 bytes: hmac.compare_digest raises
+    TypeError on non-ASCII str, which would turn a junk header into a 500."""
+    return hmac.compare_digest(str(presented).encode(), str(expected).encode())
 
 
 @dataclass

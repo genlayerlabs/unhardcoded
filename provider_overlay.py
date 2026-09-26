@@ -24,12 +24,26 @@ that exists in config.live.lua.
 """
 from __future__ import annotations
 
+import ipaddress
 import re
+from urllib.parse import urlsplit
 
 import host_store
+from env_secrets import is_forbidden_auth_env  # noqa: F401  (re-exported)
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,39}$")   # 2-40 chars (1 + up to 39)
-_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,60}$")
+# A runtime-added key names a provider credential, never infrastructure: the
+# value is written to .env.secrets, which load_env_secrets() applies at boot.
+AUTH_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,60}_(API_KEY|TOKEN)\Z")
+
+
+def _private_host(host: str) -> bool:
+    host = (host or "").rstrip(".").lower()
+    try:
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        return (not host or host == "localhost" or "." not in host
+                or host.endswith((".localhost", ".local", ".internal", ".svc")) or ".svc." in host)
 
 
 def load_overlay() -> dict:
@@ -45,20 +59,35 @@ def save_overlay(overlay: dict) -> bool:
     return host_store.set_provider_overlays((overlay or {}).get("providers") or {})
 
 
-def validate_entry(pid: str, entry: dict, catalog: dict) -> list[str]:
-    """Validation errors for one overlay provider against the loaded catalog."""
+def validate_entry(pid: str, entry: dict, catalog: dict, *, key_supplied: bool = False) -> list[str]:
+    """Validation errors for one overlay provider against the loaded catalog.
+    An existing provider's auth_env may be named only together with a new key:
+    otherwise the operator's credential would be sent to this base_url."""
     errors: list[str] = []
     if not _ID_RE.match(pid or ""):
         errors.append("id must be lowercase [a-z0-9_-], 2-40 chars")
     if pid in (catalog.get("providers") or {}):
         errors.append(f"provider {pid!r} already exists")
     base_url = str(entry.get("base_url") or "")
-    if not base_url.startswith(("http://", "https://")):
-        errors.append("base_url must be http(s)")
+    try:
+        parts = urlsplit(base_url)
+        host = parts.hostname or ""
+    except ValueError:
+        parts, host = None, ""
+    if parts is None or parts.scheme != "https" or parts.username or parts.password:
+        errors.append("base_url must be https")
+    elif _private_host(host):
+        errors.append("base_url must be a public host")
     if entry.get("api_kind", "openai_compatible") != "openai_compatible":
         errors.append("only api_kind=openai_compatible can be added at runtime")
-    if not _ENV_RE.match(str(entry.get("auth_env") or "")):
-        errors.append("auth_env must be UPPER_SNAKE_CASE")
+    auth_env = str(entry.get("auth_env") or "")
+    if not AUTH_ENV_RE.match(auth_env) or is_forbidden_auth_env(auth_env):
+        errors.append("auth_env must be an UPPER_SNAKE_CASE *_API_KEY/*_TOKEN provider "
+                      "credential name, not an infrastructure variable")
+    elif not key_supplied and any(
+            isinstance(p, dict) and auth_env in (p.get("auth_env"), (p.get("auth") or {}).get("env"))
+            for p in (catalog.get("providers") or {}).values()):
+        errors.append(f"auth_env {auth_env!r} belongs to an existing provider; supply a key")
     served = entry.get("served_models")
     if not isinstance(served, list) or not served:
         errors.append("served_models must be a non-empty list")

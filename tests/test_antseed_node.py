@@ -45,6 +45,18 @@ def test_antseed_market_protocol_writer():
     _run_node_test('antseed/write-market.test.js')
 
 
+def test_antseed_control_token_and_bind():
+    """The wallet control server compares its token in constant time and binds
+    pod-local unless the deployment opts in (compose)."""
+    _run_node_test('antseed/auth.test.js')
+
+
+def test_antseed_public_proxy_requires_bearer():
+    """The network face of the funded buyer proxy (:8378) demands a bearer when
+    ANTSEED_PROXY_TOKEN is configured instead of forwarding anyone's traffic."""
+    _run_node_test('antseed/public-proxy.test.js')
+
+
 def test_antseed_control_amount_cap():
     """The control server's deposit-amount guard (antseed/amount.js). /deposit is
     now called autonomously by the router's wallet keeper, so the per-deposit
