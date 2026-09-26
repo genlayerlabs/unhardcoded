@@ -374,7 +374,9 @@ def make_codex_async_call_provider(
             return _err("auth_error", 0, 0, "no codex access token (run `codex login`)")
         body = build_codex_body(request)
         headers = build_codex_headers(token, acct.account_id(), extra_headers)
-        url = (request.get("base_url") or base_url).rstrip("/") + "/responses"
+        # The OAuth token only ever goes to the configured upstream: a request's
+        # base_url (broker /v1/call bodies, policy output) is never trusted here.
+        url = base_url.rstrip("/") + "/responses"
         timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
 
         t0 = time.monotonic()

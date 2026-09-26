@@ -20,19 +20,28 @@ services:
       # compose runs antseed on its own network; socat re-exposes the
       # localhost-only buyer proxy on :8378 (k8s leaves this unset -> localhost)
       ANTSEED_BASE_URL: http://antseed:8378/v1
+      # Bearer for the sidecar's funded buyer proxy on :8378 (same value on the
+      # antseed service). Unset -> the sidecar falls back to unauthenticated socat.
+      ANTSEED_PROXY_TOKEN: ${ANTSEED_PROXY_TOKEN:-}
       # wallet control server in the sidecar (deposit/withdraw/refresh from the
       # dashboard). Unset token -> the wallet endpoints return 503. k8s: same pod
       # -> http://127.0.0.1:8379.
       ANTSEED_CONTROL_URL: http://antseed:8379
       ANTSEED_CONTROL_TOKEN: ${ANTSEED_CONTROL_TOKEN:-}
       # Operational store (router reads operator config from it). Prod = RDS.
-      DATABASE_URL: ${DATABASE_URL:-postgresql://hoststore:hoststore@postgres:5432/hoststore}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://hoststore:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/hoststore}
       # Optional external control plane: per-tenant BYO provider credentials
       # (fetched by tenant id from the trusted x-llm-router-tenant header the
       # ingress stamps). Both unset -> feature off, platform keys only.
       CP_ALLOW_INSECURE_HTTP: ${CP_ALLOW_INSECURE_HTTP:-0}
       CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-}
       CONTROL_PLANE_INTERNAL_SECRET: ${CONTROL_PLANE_INTERNAL_SECRET:-}
+      # Router /x/* admin endpoints (wallet, providers, keys, reloads, calls,
+      # sessions) require x-internal-secret = CONTROL_PLANE_INTERNAL_SECRET; with
+      # no secret only a loopback caller may use them. The ingress reaches the
+      # router across the compose network, so set the secret (both services) or,
+      # for a trusted local stack only, opt in to the old unauthenticated mode.
+      ROUTER_ADMIN_ALLOW_UNAUTHENTICATED: ${ROUTER_ADMIN_ALLOW_UNAUTHENTICATED:-0}
       SAAS_SHARED_PROVIDERS: ${SAAS_SHARED_PROVIDERS:-}
     depends_on:
       postgres:
@@ -88,7 +97,7 @@ services:
       ROUTER_UPSTREAM: http://router:18080
       # Operational store: the ingress is the writer (consumer keys, the ledger,
       # operator-config writes). Prod = RDS.
-      DATABASE_URL: ${DATABASE_URL:-postgresql://hoststore:hoststore@postgres:5432/hoststore}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://hoststore:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/hoststore}
       RATE_PER_MIN: ${RATE_PER_MIN:-600}
       BURST: ${BURST:-200}
       # Optional external control plane: consumer-key resolve fallback plus the
@@ -157,10 +166,15 @@ services:
       # Wallet control server (deposit/withdraw/status from the dashboard).
       # Shared secret with the router; unset -> control.js does not start.
       ANTSEED_CONTROL_PORT: ${ANTSEED_CONTROL_PORT:-8379}
+      # control.js binds 127.0.0.1 by default (k8s: same pod as the router);
+      # here the router reaches it across the compose network.
+      ANTSEED_CONTROL_HOST: 0.0.0.0
       ANTSEED_CONTROL_TOKEN: ${ANTSEED_CONTROL_TOKEN:-}
+      # >= 32 chars; the router sends it as a bearer (see router env).
+      ANTSEED_PROXY_TOKEN: ${ANTSEED_PROXY_TOKEN:-}
       # The sidecar writes the marketplace book (peer_offers) into the shared
       # host store; same DATABASE_URL as router/ingress. Prod = RDS.
-      DATABASE_URL: ${DATABASE_URL:-postgresql://hoststore:hoststore@postgres:5432/hoststore}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://hoststore:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/hoststore}
     volumes:
       - antseed-data:/data
     depends_on:
@@ -196,7 +210,10 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: hoststore
-      POSTGRES_PASSWORD: hoststore
+      # No default: a well-known password on the shared host store is a
+      # credential anyone who reaches the network already has. Set it in .env
+      # (an existing postgres-data volume keeps its old password: set that one).
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: hoststore
     volumes:
       - postgres-data:/var/lib/postgresql/data

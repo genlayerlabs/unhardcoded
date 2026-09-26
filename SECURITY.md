@@ -22,3 +22,12 @@ extra care:
   as critical and rotate immediately. This provider is opt-in (off by default).
 - **Codex provider** uses an unofficial ChatGPT-subscription auth path and is
   ToS-risky; see `docs/OPENAI-CODEX.md`.
+- **Router admin endpoints** (`/x/wallet*`, `/x/providers`, `/x/provider-key`,
+  `/x/config/reload`, `/x/codex/reload`, `/x/calls`, `/x/sessions`,
+  `/x/session/*`) require `x-internal-secret` = `CONTROL_PLANE_INTERNAL_SECRET`
+  (the ingress sends it). With no secret configured only a loopback (same-pod)
+  caller is accepted; `ROUTER_ADMIN_ALLOW_UNAUTHENTICATED=1` restores the old
+  open behaviour for a trusted local stack only.
+- **AntSeed buyer proxy** (`:8378`) spends the funded wallet: set
+  `ANTSEED_PROXY_TOKEN` (>= 32 chars) on the sidecar and the router so the port
+  requires a bearer. Unset keeps the legacy unauthenticated forwarder.

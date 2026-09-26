@@ -67,7 +67,7 @@ async def call_decisions(request, *, env_get, client=None, timeout_s=30,
 
     try:
         async with asyncio.timeout(timeout):
-            slot, gate_error = await _acquire_peer_capacity(request, timeout)
+            slot, gate_error = await _acquire_peer_capacity(request, timeout, env_get)
             if gate_error:
                 return _peer_capacity_error(str(offer.get('peer_id') or ''),
                                            int(offer.get('max_concurrency') or 0), gate_error, started)

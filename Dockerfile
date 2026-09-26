@@ -20,4 +20,7 @@ RUN test -f core/router.lua && test -f core/llm_policy.lua
 
 EXPOSE 8080
 
-CMD ["python", "serve.py", "--config", "config.internal.lua", "--default-profile", "agent", "--host", "0.0.0.0", "--port", "8080"]
+# Default to the authenticated ingress. The router (serve.py) has no caller auth
+# of its own and must only ever be reached through it, so every deployment that
+# runs the router names that command explicitly (compose, k8s, CI).
+CMD ["uvicorn", "auth_proxy:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers"]
