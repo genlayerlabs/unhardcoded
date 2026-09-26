@@ -671,3 +671,28 @@ def test_budgets_endpoint_auth_validation_and_tenant_scoping(monkeypatch):
     assert client.get("/internal/budgets", params=ok, headers=SECRET).status_code == 503
     monkeypatch.setattr(cpc, "CONTROL_PLANE_INTERNAL_SECRET", "")
     assert client.get("/internal/budgets", params=ok).status_code == 404
+
+
+def test_successful_call_with_unknown_cost_books_the_reservation(monkeypatch):
+    """An unpriced model, or a stream closed before its usage chunk, must not
+    make a successful call free against the budget."""
+    require_host_store()
+    _saas(monkeypatch, limits={"monthly_budget_usd": "1", "rate_per_min": None, "burst": None},
+          upstream=_Upstream(lambda: _JsonResp(cost=None)))
+    assert _post(TestClient(auth_proxy.app)).status_code == 200
+    assert _live_reservations() == 0
+    assert _budget()["spent_usd"] == pytest.approx(auth_proxy.CLOUD_BUDGET_RESERVATION_USD)
+
+
+def test_failed_settle_is_retried(monkeypatch):
+    require_host_store()
+    monkeypatch.setattr(auth_proxy, "SETTLE_RETRY_DELAYS_S", (0.0, 0.0, 0.0))
+    real, calls = host_store.settle_subject_budget, []
+
+    def flaky(reservation_id, cost):
+        calls.append(reservation_id)
+        return (False, False) if len(calls) < 3 else real(reservation_id, cost)
+    monkeypatch.setattr(host_store, "settle_subject_budget", flaky)
+    _saas(monkeypatch, limits={"monthly_budget_usd": "1.00", "rate_per_min": None, "burst": None})
+    assert _post(TestClient(auth_proxy.app)).status_code == 200
+    assert _budget()["spent_usd"] == 0.02 and len(calls) == 3

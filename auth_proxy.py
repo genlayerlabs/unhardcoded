@@ -813,14 +813,20 @@ def _rate_ok(caller: str, meta: dict[str, Any] | None = None) \
 # errs toward rejecting; if it fails, the reservation expires (TTL).
 _SETTLE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="budget-settle")
 _pending_settles: set[concurrent.futures.Future] = set()
+SETTLE_RETRY_DELAYS_S = (0.5, 2.0, 5.0, 15.0, 60.0)
 
 
 def _submit_settle(reservation_id: str, cost: float | None, caller: str) -> None:
     def settle() -> None:
-        _settled, store_ok = host_store.settle_subject_budget(reservation_id, cost)
-        if not store_ok:
+        # Retried so a brief store outage does not lose the call's cost; a
+        # reservation swept after its TTL still books its cost once.
+        for delay in SETTLE_RETRY_DELAYS_S:
+            _settled, store_ok = host_store.settle_subject_budget(reservation_id, cost)
+            if store_ok:
+                return
             _metric_store_error("key_budget")
-            _log({"event": "key_budget_settle_failed", "caller": caller})
+            time.sleep(delay)
+        _log({"event": "key_budget_settle_failed", "caller": caller})
     future = _SETTLE_POOL.submit(settle)
     _pending_settles.add(future)
     future.add_done_callback(_pending_settles.discard)
@@ -4132,12 +4138,13 @@ async def proxy(path: str, request: Request) -> Response:
     reservation: dict[str, Any] | None = None
     budget_limit = key_limits.get("monthly_budget_usd")
     if budget_limit is not None:
-        reservation = {"id": secrets.token_hex(16), "done": False}
+        reservation = {"id": secrets.token_hex(16), "done": False,
+                       # A budget below one reservation still admits a first call.
+                       "amount": min(CLOUD_BUDGET_RESERVATION_USD, float(budget_limit))}
         allowed, store_ok, spent_usd, _reserved = await asyncio.to_thread(
             host_store.reserve_subject_budget, int(auth["tenant_id"]), key_identity["subject"],
             time.strftime("%Y-%m", time.gmtime()), float(budget_limit),
-            # A budget below one reservation still admits a first call.
-            min(CLOUD_BUDGET_RESERVATION_USD, float(budget_limit)), reservation["id"],
+            reservation["amount"], reservation["id"],
             KEY_BUDGET_RESERVATION_TTL_S)
         if not store_ok:
             _metric_store_error("key_budget")
@@ -4220,9 +4227,12 @@ async def proxy(path: str, request: Request) -> Response:
             _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
         finally:
             try:
-                # Synchronous (not the droppable ledger queue): the budget must
-                # reflect this call before the next request is admitted.
-                _settle_reservation(cost_usd)
+                # Not the droppable ledger queue: a dedicated settle, retried.
+                # A successful call whose cost is unknown (a stream the client
+                # closed before its usage chunk, or an unpriced model) books the
+                # reservation, never $0; failed calls book only what they report.
+                _settle_reservation(cost_usd if cost_usd is not None or status >= 400
+                                    else reservation["amount"] if reservation else None)
             finally:
                 _capacity_release()
 
