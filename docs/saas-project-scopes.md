@@ -84,3 +84,62 @@ Cloud's production settings also reject plaintext router/ingress URLs. Existing
 operator-only deployments are unaffected because their control-plane integration
 is disabled. Existing HTTP control-plane deployments must configure HTTPS or
 explicitly opt into their existing insecure transport before adopting this release.
+
+## Key limits, budgets and reconciliation
+
+The route response may carry the calling key's identity and limits:
+
+```json
+"key": {"id": 42, "subject": "g:7", "labels": {"team": "search"}},
+"limits": {"monthly_budget_usd": "40.00", "rate_per_min": 120, "burst": 40}
+```
+
+`subject` (`g:<group id>` or `k:<key id>`) is the unit that limits apply to; any
+limit may be `null`. Both objects absent means no key limits (older control
+planes). A present but malformed object makes the route unavailable (`503
+route_unavailable`): a limit is never silently dropped.
+
+After the plan rate check the ingress enforces, in order:
+
+1. the subject token bucket `"{caller}|{subject}"` (`429 key_rate_limit` with
+   `Retry-After`);
+2. an atomic PostgreSQL reservation of `CLOUD_BUDGET_RESERVATION_USD` (default
+   0.05, capped at the budget itself) against `(tenant, subject, UTC month)`,
+   admitted only if `spent + reserved + reservation <= budget`
+   (`402 key_budget_exhausted` with `budget_usd` and `spent_usd`);
+3. the per-pod capacity permit.
+
+An unavailable store fails closed (`503 key_rate_limit_unavailable` /
+`key_budget_unavailable`). The reservation is settled synchronously when the
+call finishes on every path (success, upstream error, exception, capacity
+rejection, stream end or client disconnect): it is released and the actual cost
+(unknown cost counts as 0) is added. A reservation whose holder died expires
+after 15 minutes. Overshoot is bounded by concurrent in-flight calls times
+(actual cost - reservation). The recorded `routing_summary` includes `key_id`
+and `subject`.
+
+Because the scoped route lookup is uncached and carries the key digest, a key
+revoked in the control plane is refused on its very next request even while the
+key resolution itself is still cached.
+
+Reconciliation endpoints (same shared secret; `caller` and the complete
+project/environment pair behave as for `/internal/usage`, filtering before
+aggregation or paging):
+
+* `GET /internal/usage?...&until_ts=&group_by=key|model|route|day|hour` adds a
+  `groups` list (`key` groups by the full key digest). Windows are half-open
+  (`since_ts <= ts < until_ts`). Every response carries `watermark_ts`
+  (`now - LEDGER_WATERMARK_LAG_S`, capped by the oldest call still queued in
+  this replica's ledger writer); a window with `until_ts <= watermark_ts` is
+  closed.
+* `GET /internal/usage/export?caller=&after_id=&limit=<=5000` returns ledger
+  rows in id order with `next_after_id` and `watermark_ts`. Rows are delivered
+  once they were inserted at least `LEDGER_WATERMARK_LAG_S` (default 120) ago, so
+  the id cursor cannot pass a lower id still committing on another replica.
+  `watermark_ts` is `now - LEDGER_WATERMARK_LAG_S`, capped by the oldest call
+  still queued in this replica's ledger writer and by the oldest matching row
+  not yet delivered: every call with `ts < watermark_ts` is in a page at or
+  before `next_after_id`. Other replicas' writer backlogs are covered only by
+  the lag.
+* `GET /internal/budgets?tenant_id=&period=YYYY-MM&subject=...` (repeatable, at
+  most 500) returns `spent_usd` and live `reserved_usd` per subject.
