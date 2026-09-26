@@ -123,10 +123,12 @@ def _period():
 
 
 def _budget(subject="g:7", tenant=5):
+    auth_proxy.drain_settles()
     return host_store.subject_budgets(tenant, _period(), [subject])[0]
 
 
 def _live_reservations():
+    auth_proxy.drain_settles()
     with host_store._get_pool().connection() as conn:
         return conn.execute("SELECT count(*) FROM subject_budget_reservations"
                             " WHERE NOT released").fetchone()[0]

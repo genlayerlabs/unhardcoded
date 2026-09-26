@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import base64
 import contextlib
 import hashlib
@@ -807,6 +808,29 @@ def _rate_ok(caller: str, meta: dict[str, Any] | None = None) \
     return host_store.consume_rate_token(caller, rate_per_min, burst)
 
 
+# Settles run off the event loop: a slow store must not stall every request on
+# this worker. Until a settle lands its reservation still counts, which only
+# errs toward rejecting; if it fails, the reservation expires (TTL).
+_SETTLE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="budget-settle")
+_pending_settles: set[concurrent.futures.Future] = set()
+
+
+def _submit_settle(reservation_id: str, cost: float | None, caller: str) -> None:
+    def settle() -> None:
+        _settled, store_ok = host_store.settle_subject_budget(reservation_id, cost)
+        if not store_ok:
+            _metric_store_error("key_budget")
+            _log({"event": "key_budget_settle_failed", "caller": caller})
+    future = _SETTLE_POOL.submit(settle)
+    _pending_settles.add(future)
+    future.add_done_callback(_pending_settles.discard)
+
+
+def drain_settles(timeout: float = 10.0) -> None:
+    """Wait for in-flight settles (tests and graceful shutdown)."""
+    concurrent.futures.wait(list(_pending_settles), timeout=timeout)
+
+
 def _requested_route_from(path: str, body: bytes | None) -> str | None:
     route = None
     if body:
@@ -1312,6 +1336,7 @@ async def startup() -> None:
 @app.on_event("shutdown")
 async def shutdown() -> None:
     global _probe_task
+    await asyncio.to_thread(drain_settles)
     if _probe_task:
         _probe_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -4135,10 +4160,7 @@ async def proxy(path: str, request: Request) -> Response:
         if reservation is None or reservation["done"]:
             return
         reservation["done"] = True
-        _settled, store_ok = host_store.settle_subject_budget(reservation["id"], cost)
-        if not store_ok:
-            _metric_store_error("key_budget")
-            _log({"event": "key_budget_settle_failed", "caller": caller})
+        _submit_settle(reservation["id"], cost, caller)
 
     try:
         acquired = await _capacity_acquire()
