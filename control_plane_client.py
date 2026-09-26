@@ -12,6 +12,10 @@ Contract (all requests carry the shared secret in `x-internal-secret`):
           "rate_per_min": int|null, "burst": int|null}
   GET {CONTROL_PLANE_URL}/internal/tenants/<id>/provider-env
       -> {"env": {ENV_NAME: secret, ...}}
+  GET {CONTROL_PLANE_URL}/internal/tenants/<t>[/projects/<p>/environments/<e>]/routes/<slug>
+      -> the published route, optionally with the key's limits:
+         "key": {"id", "subject": "g:<n>"|"k:<n>", "labels"},
+         "limits": {"monthly_budget_usd", "rate_per_min", "burst"}
 
 The module is a leaf (no imports from auth_proxy/shim) shared by the ingress
 (key resolution) and the router (per-tenant provider env). Secrets are never
@@ -25,7 +29,9 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -333,8 +339,68 @@ def _validate_scope(data, tenant_id, project_id, environment_id):
         raise ValueError("Mismatched project/environment scope")
 
 
+_SUBJECT_RE = re.compile(r"[gk]:[1-9][0-9]{0,17}")
+_BUDGET_RE = re.compile(r"[0-9]{1,12}(\.[0-9]{1,12})?")
+_LABELS_MAX, _LABEL_KEY_MAX, _LABEL_VALUE_MAX = 32, 64, 256
+
+
+def _positive_int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value <= 0:
+        raise ValueError("invalid limit")
+    return value
+
+
+def _parse_key_limits(data: dict) -> tuple[dict | None, dict | None]:
+    """Strict parse of the route's optional `key` identity and `limits`.
+
+    Both absent (older control plane) -> (None, None): no key limits. Anything
+    present but malformed raises ValueError so the route is UNAVAILABLE — a
+    limit silently dropped would let a capped key spend without a cap."""
+    key, limits = data.get("key"), data.get("limits")
+    if key is None and limits is None:
+        return None, None
+    if not isinstance(key, dict):
+        raise ValueError("limits without a key identity")
+    key_id, subject, labels = key.get("id"), key.get("subject"), key.get("labels")
+    if type(key_id) is not int or key_id <= 0:
+        raise ValueError("invalid key id")
+    if not isinstance(subject, str) or not _SUBJECT_RE.fullmatch(subject):
+        raise ValueError("invalid key subject")
+    labels = {} if labels is None else labels
+    if (not isinstance(labels, dict) or len(labels) > _LABELS_MAX
+            or any(not isinstance(k, str) or not isinstance(v, str) or not k
+                   or len(k) > _LABEL_KEY_MAX or len(v) > _LABEL_VALUE_MAX
+                   for k, v in labels.items())):
+        raise ValueError("invalid key labels")
+    limits = {} if limits is None else limits
+    if not isinstance(limits, dict):
+        raise ValueError("invalid key limits")
+    budget = limits.get("monthly_budget_usd")
+    if budget is not None:
+        # A decimal string ("40.00") or a JSON number; bool is an int subclass.
+        if isinstance(budget, str) and _BUDGET_RE.fullmatch(budget):
+            budget = float(budget)
+        elif type(budget) in (int, float) and math.isfinite(budget):
+            budget = float(budget)
+        else:
+            raise ValueError("invalid monthly budget")
+        if not budget > 0:
+            raise ValueError("invalid monthly budget")
+    rate, burst = _positive_int_or_none(limits.get("rate_per_min")), _positive_int_or_none(limits.get("burst"))
+    return ({"id": key_id, "subject": subject, "labels": dict(labels)},
+            {"monthly_budget_usd": budget, "rate_per_min": rate, "burst": burst})
+
+
 async def resolve_route(tenant_id: int, name: str, *, project_id=None, environment_id=None, key_digest=None) -> dict:
-    """Resolve the published revision on every call, so publish/pause is immediate."""
+    """Resolve the published revision on every call, so publish/pause is immediate.
+
+    The response may carry the calling key's identity and limits (`key`:
+    {id, subject, labels}; `limits`: {monthly_budget_usd, rate_per_min, burst});
+    they are returned normalized (budget as float, absent -> None) and enforced
+    by the ingress. Because this lookup is uncached and keyed by the digest, a
+    revoked scoped key is refused on its very next request."""
     try:
         scoped = project_id is not None or environment_id is not None
         if scoped:
@@ -358,6 +424,7 @@ async def resolve_route(tenant_id: int, name: str, *, project_id=None, environme
                 or not isinstance(data.get("revision"), int) or data["revision"] <= 0
                 or not isinstance(data.get("execution", {}), dict)):
             raise ValueError("invalid route contract")
+        data["key"], data["limits"] = _parse_key_limits(data)
         return data
     except (httpx.HTTPError, ValueError, AttributeError) as exc:
         raise RouteUnavailable("This route is unavailable or has not been published.") from exc

@@ -53,6 +53,22 @@ BURST = int(os.getenv("BURST", "200"))
 MAX_INFLIGHT_REQUESTS = max(0, int(os.getenv("MAX_INFLIGHT_REQUESTS", "0")))
 MAX_PENDING_REQUESTS = max(0, int(os.getenv("MAX_PENDING_REQUESTS", "0")))
 CAPACITY_QUEUE_TIMEOUT_S = max(0.0, float(os.getenv("CAPACITY_QUEUE_TIMEOUT_S", "2")))
+
+
+def _reservation_usd() -> float:
+    raw = os.getenv("CLOUD_BUDGET_RESERVATION_USD", "0.05")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.05
+    return value if math.isfinite(value) and value > 0 else 0.05
+
+
+# Held against a control-plane key subject's monthly budget per in-flight call
+# and replaced by the actual cost when the call is recorded; overshoot is
+# bounded by concurrent calls x (actual cost - reservation).
+CLOUD_BUDGET_RESERVATION_USD = _reservation_usd()
+KEY_BUDGET_RESERVATION_TTL_S = 900.0
 UPSTREAM_MAX_CONNECTIONS = max(1, int(os.getenv("UPSTREAM_MAX_CONNECTIONS", "100")))
 UPSTREAM_MAX_KEEPALIVE_CONNECTIONS = max(
     1, int(os.getenv("UPSTREAM_MAX_KEEPALIVE_CONNECTIONS", "40")))
@@ -4026,6 +4042,31 @@ async def proxy(path: str, request: Request) -> Response:
             headers={"Retry-After": str(max(1, math.ceil(retry_after_s)))},
             content={"error": {"message": "caller rate limit exceeded", "type": "rate_limit_error", "code": "caller_rate_limit"}})
 
+    # Control-plane key limits ride the (uncached) route resolution. A subject
+    # (`g:<group>` / `k:<key>`) may span keys, so its bucket and budget are
+    # shared by every key in it, inside this caller's namespace.
+    key_identity = (published_route or {}).get("key")
+    key_limits = ((published_route or {}).get("limits") or {}) if key_identity else {}
+    if key_limits.get("rate_per_min"):
+        subject_rate = int(key_limits["rate_per_min"])
+        rate_allowed, rate_store_ok, retry_after_s = await asyncio.to_thread(
+            host_store.consume_rate_token, f"{caller}|{key_identity['subject']}",
+            subject_rate, int(key_limits.get("burst") or subject_rate))
+        if not rate_store_ok:
+            _metric_store_error("rate_limit")
+            _record_reject(reason="key_rate_limit_unavailable", path="/" + path,
+                           caller=caller, status=503)
+            return JSONResponse(status_code=503, content={"error": {
+                "message": "key rate-limit state is temporarily unavailable",
+                "type": "server_error", "code": "key_rate_limit_unavailable"}})
+        if not rate_allowed:
+            _record_reject(reason="key_rate_limit", path="/" + path, caller=caller, status=429)
+            _log({"event": "reject", "reason": "key_rate_limit", "caller": caller, "path": "/" + path})
+            return JSONResponse(
+                status_code=429,
+                headers={"Retry-After": str(max(1, math.ceil(retry_after_s)))},
+                content={"error": {"message": "key rate limit exceeded", "type": "rate_limit_error", "code": "key_rate_limit"}})
+
     if path == "api/show" and request.method.upper() == "POST":
         requested_model = None
         if body:
@@ -4060,7 +4101,52 @@ async def proxy(path: str, request: Request) -> Response:
             "message": "Trusted router bridge requires HTTPS", "type": "server_error",
             "code": "bridge_transport_unavailable"}})
     assert _client is not None
-    if not await _capacity_acquire():
+
+    # Budget reservation is the LAST admission step before the capacity permit;
+    # from here on every exit path must settle it (see _settle_reservation).
+    reservation: dict[str, Any] | None = None
+    budget_limit = key_limits.get("monthly_budget_usd")
+    if budget_limit is not None:
+        reservation = {"id": secrets.token_hex(16), "done": False}
+        allowed, store_ok, spent_usd, _reserved = await asyncio.to_thread(
+            host_store.reserve_subject_budget, int(auth["tenant_id"]), key_identity["subject"],
+            time.strftime("%Y-%m", time.gmtime()), float(budget_limit),
+            # A budget below one reservation still admits a first call.
+            min(CLOUD_BUDGET_RESERVATION_USD, float(budget_limit)), reservation["id"],
+            KEY_BUDGET_RESERVATION_TTL_S)
+        if not store_ok:
+            _metric_store_error("key_budget")
+            _record_reject(reason="key_budget_unavailable", path="/" + path,
+                           caller=caller, status=503, route=requested_route)
+            return JSONResponse(status_code=503, content={"error": {
+                "message": "key budget state is temporarily unavailable",
+                "type": "server_error", "code": "key_budget_unavailable"}})
+        if not allowed:
+            _record_reject(reason="key_budget_exhausted", path="/" + path,
+                           caller=caller, status=402, route=requested_route)
+            return JSONResponse(status_code=402, content={"error": {
+                "message": "key budget exhausted", "type": "budget_error",
+                "code": "key_budget_exhausted",
+                "budget_usd": float(budget_limit), "spent_usd": round(spent_usd, 6)}})
+
+    def _settle_reservation(cost: float | None) -> None:
+        # Idempotent per request; the store is idempotent per reservation too.
+        # A failed settle leaves the reservation to expire (TTL), never to leak.
+        if reservation is None or reservation["done"]:
+            return
+        reservation["done"] = True
+        _settled, store_ok = host_store.settle_subject_budget(reservation["id"], cost)
+        if not store_ok:
+            _metric_store_error("key_budget")
+            _log({"event": "key_budget_settle_failed", "caller": caller})
+
+    try:
+        acquired = await _capacity_acquire()
+    except BaseException:
+        _settle_reservation(None)
+        raise
+    if not acquired:
+        _settle_reservation(None)
         _record_reject(reason="router_overloaded", path="/" + path,
                        caller=caller, status=503, route=requested_route)
         return JSONResponse(
@@ -4069,33 +4155,6 @@ async def proxy(path: str, request: Request) -> Response:
             content={"error": {
                 "message": "router capacity is temporarily exhausted; retry shortly",
                 "type": "server_error", "code": "router_overloaded"}})
-
-    upstream_url = f"{UPSTREAM}/{path}"
-    if request.url.query:
-        upstream_url += f"?{request.url.query}"
-
-    headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in {"authorization", "host", "connection", "content-length",
-                             "x-llm-router-tenant", "x-internal-secret",
-                             "x-unhardcoded-scope-version", "x-unhardcoded-project", "x-unhardcoded-environment",
-                             "x-unhardcoded-route", "x-unhardcoded-revision", "x-unhardcoded-policy-id", "x-unhardcoded-preference"}
-    }
-    headers["x-llm-router-caller"] = caller
-    # Tenant identity for per-tenant provider credentials (BYO keys): set ONLY
-    # from the authenticated resolve — the client-sent header is stripped above,
-    # so it can never be smuggled past auth.
-    if auth.get("tenant_id") is not None:
-        headers["x-llm-router-tenant"] = str(auth["tenant_id"])
-        headers["x-internal-secret"] = control_plane_client.CONTROL_PLANE_INTERNAL_SECRET
-        if auth.get("scope_version") == 2:
-            headers["x-unhardcoded-scope-version"] = "2"
-            headers["x-unhardcoded-project"] = str(auth["project_id"])
-            headers["x-unhardcoded-environment"] = str(auth["environment_id"])
-        headers["x-unhardcoded-route"] = requested_route
-        headers["x-unhardcoded-revision"] = str(published_route["revision"])
-        headers["x-unhardcoded-policy-id"] = published_route["policy_id"]
-        headers['x-unhardcoded-preference'] = published_route.get('routing_preference', 'default')
 
     status = 502
     provider = None
@@ -4124,21 +4183,56 @@ async def proxy(path: str, request: Request) -> Response:
             return
         capacity_released = True
         latency_ms = round((time.perf_counter() - started) * 1000, 1)
-        if published_route:
-            decision_trace = {**(decision_trace or {}), 'route': requested_route,
-                              'route_revision': published_route['revision'],
-                              'policy_id': (decision_trace or {}).get('policy_id') or published_route['policy_id'],
-                              'routing_preference': published_route.get('routing_preference', 'default')}
-            if auth.get('scope_version') == 2:
-                decision_trace.update(project_id=auth['project_id'], environment_id=auth['environment_id'])
         try:
+            if published_route:
+                decision_trace = {**(decision_trace or {}), 'route': requested_route,
+                                  'route_revision': published_route['revision'],
+                                  'policy_id': (decision_trace or {}).get('policy_id') or published_route['policy_id'],
+                                  'routing_preference': published_route.get('routing_preference', 'default')}
+                if auth.get('scope_version') == 2:
+                    decision_trace.update(project_id=auth['project_id'], environment_id=auth['environment_id'])
+                if key_identity:
+                    decision_trace.update(key_id=key_identity['id'], subject=key_identity['subject'])
             _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
             _metric_request(status, latency_ms)
             _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
         finally:
-            _capacity_release()
+            try:
+                # Synchronous (not the droppable ledger queue): the budget must
+                # reflect this call before the next request is admitted.
+                _settle_reservation(cost_usd)
+            finally:
+                _capacity_release()
 
     try:
+        # Built inside the try so a failure here still reaches _finish, which
+        # releases the capacity permit and the budget reservation.
+        upstream_url = f"{UPSTREAM}/{path}"
+        if request.url.query:
+            upstream_url += f"?{request.url.query}"
+
+        headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in {"authorization", "host", "connection", "content-length",
+                                 "x-llm-router-tenant", "x-internal-secret",
+                                 "x-unhardcoded-scope-version", "x-unhardcoded-project", "x-unhardcoded-environment",
+                                 "x-unhardcoded-route", "x-unhardcoded-revision", "x-unhardcoded-policy-id", "x-unhardcoded-preference"}
+        }
+        headers["x-llm-router-caller"] = caller
+        # Tenant identity for per-tenant provider credentials (BYO keys): set ONLY
+        # from the authenticated resolve — the client-sent header is stripped above,
+        # so it can never be smuggled past auth.
+        if auth.get("tenant_id") is not None:
+            headers["x-llm-router-tenant"] = str(auth["tenant_id"])
+            headers["x-internal-secret"] = control_plane_client.CONTROL_PLANE_INTERNAL_SECRET
+            if auth.get("scope_version") == 2:
+                headers["x-unhardcoded-scope-version"] = "2"
+                headers["x-unhardcoded-project"] = str(auth["project_id"])
+                headers["x-unhardcoded-environment"] = str(auth["environment_id"])
+            headers["x-unhardcoded-route"] = requested_route
+            headers["x-unhardcoded-revision"] = str(published_route["revision"])
+            headers["x-unhardcoded-policy-id"] = published_route["policy_id"]
+            headers['x-unhardcoded-preference'] = published_route.get('routing_preference', 'default')
         if body:
             try:
                 parsed_body = json.loads(body.decode("utf-8"))

@@ -310,6 +310,42 @@ _SCHEMA_STATEMENTS = [
         updated_at      BIGINT,
         PRIMARY KEY (provider_id, model_family)
     )""",
+    # Insert time of a ledger row (DB clock, epoch seconds). `ts` is the CALL
+    # time stamped by the ingress, which can precede the insert by the writer
+    # queue's backlog; the usage export holds back freshly inserted rows so its
+    # id cursor never passes a lower id that is still committing on another pod.
+    # Nullable + a separate SET DEFAULT: a volatile default on ADD COLUMN would
+    # rewrite the whole table; pre-existing rows stay NULL (= long settled).
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS recorded_at DOUBLE PRECISION",
+    "ALTER TABLE calls ALTER COLUMN recorded_at SET DEFAULT extract(epoch FROM clock_timestamp())",
+    # Monthly budget per control-plane key subject (`g:<group>` / `k:<key>`),
+    # enforced by atomic reservation BEFORE forwarding. `spent_usd` accumulates
+    # settled actual cost; `reserved_usd` mirrors the sum of live reservations
+    # (admission recomputes it from the rows, so it cannot drift). Money state:
+    # never pruned by the retention sweep.
+    """CREATE TABLE IF NOT EXISTS subject_budget_usage (
+        tenant_id    BIGINT NOT NULL,
+        subject      TEXT NOT NULL,
+        period       TEXT NOT NULL,
+        spent_usd    DOUBLE PRECISION NOT NULL DEFAULT 0,
+        reserved_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+        updated_at   BIGINT NOT NULL,
+        PRIMARY KEY (tenant_id, subject, period)
+    )""",
+    # One row per in-flight call. `released` = swept after expiry (the holder
+    # died): it no longer counts as reserved, but the row survives so a late
+    # settle still books the actual cost exactly once.
+    """CREATE TABLE IF NOT EXISTS subject_budget_reservations (
+        id         TEXT PRIMARY KEY,
+        tenant_id  BIGINT NOT NULL,
+        subject    TEXT NOT NULL,
+        period     TEXT NOT NULL,
+        amount_usd DOUBLE PRECISION NOT NULL,
+        expires_at DOUBLE PRECISION NOT NULL,
+        released   BOOLEAN NOT NULL DEFAULT FALSE
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_subject_budget_reservations_subject"
+    " ON subject_budget_reservations(tenant_id, subject, period, expires_at)",
 ]
 
 _pool_lock = threading.Lock()
@@ -389,7 +425,7 @@ def routing_summary(trace) -> dict | None:
     or the full candidate catalog in the tenant activity ledger."""
     if not isinstance(trace, dict):
         return None
-    summary = {key: str(trace[key])[:100] for key in ('route', 'route_revision', 'policy_id', 'routing_preference', 'project_id', 'environment_id')
+    summary = {key: str(trace[key])[:100] for key in ('route', 'route_revision', 'policy_id', 'routing_preference', 'project_id', 'environment_id', 'key_id', 'subject')
                if trace.get(key) is not None}
     summary['attempts'] = [
         {key: str(step[key])[:160] for key in ('provider_id', 'model_family', 'error_kind')
@@ -489,6 +525,9 @@ def _prune() -> None:
                          (int(now * 1000) - _RETENTION_DAYS * 86400 * 1000,))
             conn.execute("DELETE FROM login_history WHERE ts < %s",
                          (int(now) - _RETENTION_DAYS * 86400,))
+            # Swept reservations only wait for a late settle; a day is plenty.
+            conn.execute("DELETE FROM subject_budget_reservations"
+                         " WHERE released AND expires_at < %s", (now - 86400,))
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store prune failed: %s", exc)
 
@@ -499,16 +538,38 @@ def _prune() -> None:
 # backlog — best-effort telemetry, so a dropped row is acceptable. The queue holds
 # thunks so it serves both the call ledger and the per-attempt route observations.
 _write_q: "queue.Queue" = queue.Queue(maxsize=_WRITE_QUEUE_MAX)
+# Call timestamps of ledger rows queued OR being written by this process's
+# writer (ts -> count). The ledger is incomplete at the oldest of them, which
+# bounds ledger_watermark(); a job leaves only after its write returned.
+_pending_ts: dict[int, int] = {}
+_pending_lock = threading.Lock()
+
+
+def _pending_add(ts: "int | None") -> None:
+    if ts is not None:
+        with _pending_lock:
+            _pending_ts[ts] = _pending_ts.get(ts, 0) + 1
+
+
+def _pending_done(ts: "int | None") -> None:
+    if ts is not None:
+        with _pending_lock:
+            left = _pending_ts.get(ts, 0) - 1
+            if left > 0:
+                _pending_ts[ts] = left
+            else:
+                _pending_ts.pop(ts, None)
 
 
 def _writer_loop() -> None:
     while True:
-        job = _write_q.get()
+        job, ts = _write_q.get()
         try:
             job()
         except Exception as exc:  # noqa: BLE001 — a bad row must not kill the writer
             _log.warning("host_store background write failed: %s", exc)
         finally:
+            _pending_done(ts)
             _write_q.task_done()
 
 
@@ -523,18 +584,21 @@ threading.Thread(target=_writer_loop, name="host-store-writer", daemon=True).sta
 _SYNC_WRITES = bool(os.getenv("HOST_STORE_SYNC_WRITES"))
 
 
-def _enqueue(job) -> None:
+def _enqueue(job, ts: "int | None" = None) -> None:
     if _SYNC_WRITES:
         try:
             job()
         except Exception as exc:  # noqa: BLE001 — mirror the writer loop's tolerance
             _log.warning("host_store sync write failed: %s", exc)
         return
+    _pending_add(ts)
     try:
-        _write_q.put_nowait(job)
+        _write_q.put_nowait((job, ts))
     except queue.Full:
+        _pending_done(ts)
         _log.warning("host_store: write queue full (%d); dropping row", _WRITE_QUEUE_MAX)
     except Exception as exc:  # noqa: BLE001 — never break a request
+        _pending_done(ts)
         _log.warning("host_store enqueue failed: %s", exc)
 
 
@@ -542,7 +606,31 @@ def insert_call_async(row: dict[str, Any]) -> None:
     """Record a call WITHOUT blocking the caller — enqueue a SNAPSHOT for the
     background writer. Drops the row (best-effort) if the queue is full."""
     snap = dict(row)
-    _enqueue(lambda: insert_call(snap))
+    # Stamp ts NOW (insert_call would default it at write time) so the pending
+    # watermark bound and the stored row agree on the call time.
+    snap["ts"] = int(snap.get("ts") or time.time())
+    _enqueue(lambda: insert_call(snap), snap["ts"])
+
+
+def _watermark_lag_s() -> float:
+    raw = os.getenv("LEDGER_WATERMARK_LAG_S", "120")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def ledger_watermark(now: "float | None" = None) -> int:
+    """Epoch second up to which (exclusive) this ledger is complete.
+
+    `now - LEDGER_WATERMARK_LAG_S` covers other replicas' writer queues and
+    in-flight commits, which this process cannot see; it is further capped by
+    the oldest call still queued or being written by THIS process's writer
+    (a backlog longer than the lag would otherwise be settled as complete)."""
+    mark = int(float(time.time() if now is None else now) - _watermark_lag_s())
+    with _pending_lock:
+        oldest = min(_pending_ts) if _pending_ts else None
+    return mark if oldest is None else min(mark, oldest)
 
 
 def observe_route_call_async(row: dict[str, Any]) -> None:
@@ -1297,7 +1385,8 @@ _USAGE_COLS = ("ts", "caller", "provider_id", "model_family", "served_model_id",
 def _usage_where(since_ts: "int | None" = None, caller: "str | None" = None,
                  caller_is_null: bool = False, consumer_sha: "str | None" = None,
                  provider: "str | None" = None,
-                 model_family: "str | None" = None, project_id=None, environment_id=None) -> "tuple[str, list[Any]]":
+                 model_family: "str | None" = None, project_id=None, environment_id=None,
+                 until_ts: "int | None" = None) -> "tuple[str, list[Any]]":
     """The shared WHERE for every calls-derived usage read. "all" (since_ts=None)
     is still bounded to the retention horizon so the read is ALWAYS time-bounded
     (never a bare table scan): rows older than retention are pruned anyway, so the
@@ -1310,6 +1399,8 @@ def _usage_where(since_ts: "int | None" = None, caller: "str | None" = None,
     if since_ts is not None:
         floor = max(int(since_ts), floor)
     clauses, params = ["ts >= %s"], [floor]
+    if until_ts is not None:   # half-open window [since_ts, until_ts)
+        clauses.append("ts < %s"); params.append(int(until_ts))
     if caller is not None:
         clauses.append("caller = %s"); params.append(caller)
     elif caller_is_null:
@@ -1460,7 +1551,8 @@ def _empty_usage_aggregate() -> dict[str, Any]:
 def usage_aggregate(since_ts: "int | None" = None, caller: "str | None" = None,
                     caller_is_null: bool = False, consumer_sha: "str | None" = None,
                     provider: "str | None" = None,
-                    model_family: "str | None" = None, *, project_id=None, environment_id=None, strict=False) -> dict[str, Any]:
+                    model_family: "str | None" = None, *, project_id=None, environment_id=None,
+                    until_ts: "int | None" = None, strict=False) -> dict[str, Any]:
     """Every dashboard stats aggregate in ONE window scan: overall totals plus
     the by_caller / by_provider / by_model_family / by_route / by_served_model /
     by_status / by_day breakdowns, as raw counters (see _agg_counter). Fail-soft
@@ -1469,7 +1561,8 @@ def usage_aggregate(since_ts: "int | None" = None, caller: "str | None" = None,
         where, params = _usage_where(since_ts=since_ts, caller=caller,
                                      caller_is_null=caller_is_null,
                                      consumer_sha=consumer_sha, provider=provider,
-                                     model_family=model_family, project_id=project_id, environment_id=environment_id)
+                                     model_family=model_family, project_id=project_id, environment_id=environment_id,
+                                     until_ts=until_ts)
         sql = ("SELECT grouping(caller_k, provider_k, family_k, route_k,"
                " served_k, status_k, day_k) AS gset,"
                " caller_k, provider_k, family_k, route_k, served_k, status_k,"
@@ -1504,14 +1597,16 @@ def usage_aggregate(since_ts: "int | None" = None, caller: "str | None" = None,
 
 
 def usage_totals(since_ts: "int | None" = None,
-                 caller: "str | None" = None, *, project_id=None, environment_id=None, strict=False) -> dict[str, Any]:
+                 caller: "str | None" = None, *, project_id=None, environment_id=None,
+                 until_ts: "int | None" = None, strict=False) -> dict[str, Any]:
     """One-row window totals over `calls`, including cached tokens (which the
     dashboard aggregate doesn't sum) — the control-plane metering read.
     Fail-soft -> zeros (same keys)."""
     zeros = {"requests": 0, "errors": 0, "tokens_in": 0, "tokens_out": 0,
              "tokens_cached": 0, "tokens_total": 0, "cost_usd": 0.0, "priced": 0}
     try:
-        where, params = _usage_where(since_ts=since_ts, caller=caller, project_id=project_id, environment_id=environment_id)
+        where, params = _usage_where(since_ts=since_ts, caller=caller, project_id=project_id,
+                                     environment_id=environment_id, until_ts=until_ts)
         sql = (
             "SELECT count(*),"
             " count(*) FILTER (WHERE COALESCE(status,0) >= 400),"
@@ -1536,6 +1631,191 @@ def usage_totals(since_ts: "int | None" = None,
         if strict:
             raise
         return zeros
+
+
+# The metering group keys. `key` is the FULL key digest (the control plane maps
+# it to its key/labels); `route` prefers the published route recorded in the
+# routing summary over the raw requested model.
+_USAGE_GROUPS = {
+    "key": "COALESCE(NULLIF(consumer_sha,''),'unknown')",
+    "model": "COALESCE(NULLIF(model_family,''),NULLIF(requested_model,''),'unknown')",
+    "route": "COALESCE(NULLIF(routing_summary->>'route',''),NULLIF(requested_model,''),'unknown')",
+    "day": "to_char(to_timestamp(ts) AT TIME ZONE 'UTC','YYYY-MM-DD')",
+    "hour": "to_char(to_timestamp(ts) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:00:00\"Z\"')",
+}
+_TOKENS_TOTAL_SQL = ("CASE WHEN COALESCE(tokens_total,0) <> 0 THEN tokens_total"
+                     " ELSE COALESCE(tokens_in,0)+COALESCE(tokens_out,0) END")
+
+
+def usage_groups(group_by: str, since_ts: "int | None" = None, caller: "str | None" = None, *,
+                 until_ts: "int | None" = None, project_id=None, environment_id=None) -> list[dict[str, Any]]:
+    """Window usage per `group_by` (key|model|route|day|hour), ordered by key.
+    The scope filter is part of the WHERE, so it applies before aggregation.
+    Raises on a store error (metering reads must not answer a false zero)."""
+    expr = _USAGE_GROUPS[group_by]
+    where, params = _usage_where(since_ts=since_ts, caller=caller, project_id=project_id,
+                                 environment_id=environment_id, until_ts=until_ts)
+    sql = (f"SELECT {expr} AS k, count(*),"
+           " count(*) FILTER (WHERE COALESCE(status,0) >= 400),"
+           " COALESCE(sum(COALESCE(tokens_in,0)),0), COALESCE(sum(COALESCE(tokens_out,0)),0),"
+           f" COALESCE(sum(COALESCE(tokens_cached,0)),0), COALESCE(sum({_TOKENS_TOTAL_SQL}),0),"
+           " round(COALESCE(sum(GREATEST(cost_usd,0)),0)::numeric,6)::float8"
+           f" FROM calls{where} GROUP BY 1 ORDER BY 1")
+    with _get_pool().connection() as conn:
+        _set_dashboard_statement_timeout(conn)
+        rows = conn.execute(sql, params).fetchall()
+    return [{"key": k, "runs": int(n), "errors": int(e), "tokens_in": int(ti),
+             "tokens_out": int(to), "tokens_cached": int(tc), "tokens_total": int(tt),
+             "cost_usd": float(c)} for k, n, e, ti, to, tc, tt, c in rows]
+
+
+_EXPORT_COLS = ("id", "ts", "key_sha256", "subject", "route", "model_family", "provider",
+                "status", "tokens_in", "tokens_out", "tokens_cached", "tokens_total",
+                "cost_usd", "cost_basis")
+
+
+def usage_export(caller: str, after_id: int = 0, limit: int = 1000, *, project_id=None,
+                 environment_id=None, now: "float | None" = None) -> dict[str, Any]:
+    """One page of raw ledger rows in id order, for reconciliation.
+
+    Only rows inserted at least LEDGER_WATERMARK_LAG_S ago are returned: ids are
+    allocated at INSERT but become visible at COMMIT, so on a multi-writer
+    deployment a lower id can appear after a higher one; holding back fresh rows
+    keeps the cursor from skipping it. `watermark_ts` is additionally capped by
+    the oldest call NOT yet delivered (held back or beyond this page), so
+    every call with ts < watermark_ts is in a page at or before next_after_id.
+    Raises on a store error."""
+    stamp = float(time.time() if now is None else now)
+    where, params = _usage_where(caller=caller, project_id=project_id,
+                                 environment_id=environment_id)
+    after_id, limit = max(0, int(after_id)), max(1, int(limit))
+    sql = ("SELECT id, ts, consumer_sha, routing_summary->>'subject',"
+           " COALESCE(NULLIF(routing_summary->>'route',''),requested_model),"
+           " model_family, provider_id, status, tokens_in, tokens_out, tokens_cached,"
+           f" {_TOKENS_TOTAL_SQL}, cost_usd, cost_basis FROM calls{where}"
+           " AND id > %s AND COALESCE(recorded_at,0) <= %s ORDER BY id LIMIT %s")
+    with _get_pool().connection() as conn:
+        _set_dashboard_statement_timeout(conn)
+        rows = conn.execute(sql, params + [after_id, stamp - _watermark_lag_s(), limit]).fetchall()
+        next_after_id = int(rows[-1][0]) if rows else after_id
+        oldest = conn.execute(f"SELECT min(ts) FROM calls{where} AND id > %s",
+                              params + [next_after_id]).fetchone()[0]
+    watermark = ledger_watermark(stamp)
+    if oldest is not None:
+        watermark = min(watermark, int(oldest))
+    return {"rows": [dict(zip(_EXPORT_COLS, row)) for row in rows],
+            "next_after_id": next_after_id, "watermark_ts": watermark}
+
+
+# ---- per-subject monthly budgets (control-plane key limits) ---------------------
+
+def reserve_subject_budget(tenant_id: int, subject: str, period: str, limit_usd: float,
+                           amount_usd: float, reservation_id: str, ttl_s: float = 900.0, *,
+                           now: "float | None" = None) -> "tuple[bool, bool, float, float]":
+    """Atomically admit one in-flight call against a subject's monthly budget.
+
+    Returns ``(allowed, store_ok, spent_usd, reserved_usd)`` (reserved as seen
+    after this call). The subject's usage row is locked for one short
+    transaction, so concurrent replicas serialize: expired reservations are
+    swept first (their holder died), then the call is admitted only if
+    spent + live reservations + amount <= limit."""
+    try:
+        stamp = float(time.time() if now is None else now)
+        key = (int(tenant_id), str(subject), str(period))
+        with _get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO subject_budget_usage(tenant_id,subject,period,updated_at)"
+                " VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING", key + (int(stamp),))
+            spent = float(conn.execute(
+                "SELECT spent_usd FROM subject_budget_usage"
+                " WHERE tenant_id=%s AND subject=%s AND period=%s FOR UPDATE", key).fetchone()[0])
+            conn.execute(
+                "UPDATE subject_budget_reservations SET released=TRUE"
+                " WHERE tenant_id=%s AND subject=%s AND period=%s AND NOT released"
+                " AND expires_at <= %s", key + (stamp,))
+            # Recomputed from the live rows (not the counter) so float drift or a
+            # lost update can never under-count what is in flight.
+            reserved = float(conn.execute(
+                "SELECT COALESCE(sum(amount_usd),0) FROM subject_budget_reservations"
+                " WHERE tenant_id=%s AND subject=%s AND period=%s AND NOT released",
+                key).fetchone()[0])
+            amount = max(0.0, float(amount_usd))
+            allowed = spent + reserved + amount <= float(limit_usd) + 1e-9
+            if allowed:
+                conn.execute(
+                    "INSERT INTO subject_budget_reservations"
+                    "(id,tenant_id,subject,period,amount_usd,expires_at) VALUES (%s,%s,%s,%s,%s,%s)",
+                    (str(reservation_id),) + key + (amount, stamp + float(ttl_s)))
+                reserved += amount
+            conn.execute(
+                "UPDATE subject_budget_usage SET reserved_usd=%s, updated_at=%s"
+                " WHERE tenant_id=%s AND subject=%s AND period=%s",
+                (reserved, int(stamp)) + key)
+        return allowed, True, spent, reserved
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store reserve_subject_budget failed: %s", exc)
+        return False, False, 0.0, 0.0
+
+
+def settle_subject_budget(reservation_id: str, cost_usd: "float | None") -> "tuple[bool, bool]":
+    """Release a reservation and book the call's actual cost (unknown or
+    negative -> 0). Idempotent: the reservation row is consumed, so a second
+    settle finds nothing and books nothing. A reservation already swept after
+    expiry still books its cost once. Returns ``(settled, store_ok)``.
+
+    Called synchronously on the request's exit path, so the connection wait
+    and statement are bounded: on a store outage the reservation simply
+    expires instead of stalling the event loop."""
+    try:
+        cost = float(cost_usd) if cost_usd is not None else 0.0
+        if not math.isfinite(cost) or cost < 0:
+            cost = 0.0
+        with _get_pool().connection(timeout=2.0) as conn:
+            conn.execute("SELECT set_config('statement_timeout', '2000', true)")
+            found = conn.execute(
+                "SELECT tenant_id,subject,period FROM subject_budget_reservations WHERE id=%s",
+                (str(reservation_id),)).fetchone()
+            if found is None:
+                return False, True
+            key = tuple(found)
+            # Lock order matches reserve (usage row, then reservation).
+            conn.execute("SELECT 1 FROM subject_budget_usage WHERE tenant_id=%s AND subject=%s"
+                         " AND period=%s FOR UPDATE", key)
+            if conn.execute("DELETE FROM subject_budget_reservations WHERE id=%s RETURNING id",
+                            (str(reservation_id),)).fetchone() is None:
+                return False, True   # a concurrent settle won
+            conn.execute(
+                "UPDATE subject_budget_usage SET spent_usd=spent_usd+%s,"
+                " reserved_usd=(SELECT COALESCE(sum(amount_usd),0) FROM subject_budget_reservations r"
+                "  WHERE r.tenant_id=%s AND r.subject=%s AND r.period=%s AND NOT r.released),"
+                " updated_at=%s WHERE tenant_id=%s AND subject=%s AND period=%s",
+                (cost,) + key + (int(time.time()),) + key)
+        return True, True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store settle_subject_budget failed: %s", exc)
+        return False, False
+
+
+def subject_budgets(tenant_id: int, period: str, subjects: list[str], *,
+                    now: "float | None" = None) -> list[dict[str, Any]]:
+    """Spent and live-reserved USD per requested subject for one tenant/period
+    (zeros for a subject with no activity). Reserved excludes expired holders
+    even before a sweep. Raises on a store error."""
+    stamp = float(time.time() if now is None else now)
+    subjects = list(dict.fromkeys(str(s) for s in subjects))
+    with _get_pool().connection() as conn:
+        _set_dashboard_statement_timeout(conn)
+        spent = dict(conn.execute(
+            "SELECT subject, spent_usd FROM subject_budget_usage"
+            " WHERE tenant_id=%s AND period=%s AND subject = ANY(%s)",
+            (int(tenant_id), str(period), subjects)).fetchall())
+        reserved = dict(conn.execute(
+            "SELECT subject, sum(amount_usd) FROM subject_budget_reservations"
+            " WHERE tenant_id=%s AND period=%s AND subject = ANY(%s)"
+            " AND NOT released AND expires_at > %s GROUP BY subject",
+            (int(tenant_id), str(period), subjects, stamp)).fetchall())
+    return [{"subject": s, "spent_usd": round(float(spent.get(s) or 0.0), 6),
+             "reserved_usd": round(float(reserved.get(s) or 0.0), 6)} for s in subjects]
 
 
 def policy_backtest_groups(since_ts: "int | None" = None,
@@ -2352,4 +2632,5 @@ def truncate_all_for_tests() -> None:
                      " consumer_keys, consumer_key_digests, consumer_rate_buckets,"
                      " peer_concurrency_leases,"
                      " consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
-                     " login_history, provider_prices, wallet_ops")
+                     " login_history, provider_prices, wallet_ops,"
+                     " subject_budget_usage, subject_budget_reservations")
