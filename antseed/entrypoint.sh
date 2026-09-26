@@ -56,7 +56,16 @@ antseed buyer start -p "$PORT_PROXY" \
 PROXY_PID=$!
 
 # Expose the localhost-only proxy on the container network for the router.
-socat "TCP-LISTEN:${PORT_PUBLIC},fork,reuseaddr" "TCP:127.0.0.1:${PORT_PROXY}" &
+# Every call through it spends the funded wallet, so with ANTSEED_PROXY_TOKEN
+# set the network face demands that bearer (public-proxy.js). Unset keeps the
+# legacy unauthenticated socat forwarder for routers that do not send it yet —
+# then only network policy stands between the pod network and the wallet.
+if [ -n "${ANTSEED_PROXY_TOKEN:-}" ]; then
+    node "$LIB/public-proxy.js" &
+else
+    echo "[entrypoint] WARNING: ANTSEED_PROXY_TOKEN unset — :${PORT_PUBLIC} forwards to the funded buyer without auth" >&2
+    socat "TCP-LISTEN:${PORT_PUBLIC},fork,reuseaddr" "TCP:127.0.0.1:${PORT_PROXY}" &
+fi
 
 # Wallet control server (deposit/withdraw/status from the dashboard, no kubectl).
 # Self-disables when ANTSEED_CONTROL_TOKEN is unset. See antseed/control.js.

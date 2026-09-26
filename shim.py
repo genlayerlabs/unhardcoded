@@ -28,7 +28,10 @@ of concurrent callers, use a luerl-based host instead.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
+import os
+import re
 import time
 import uuid
 from typing import Any
@@ -321,7 +324,20 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
 
     from saas_routes import ScopedHost, automatic_trace, install as install_saas
     host = ScopedHost(host)
-    app = FastAPI(title="llm-router shim", docs_url=None, redoc_url=None)
+    app = FastAPI(title="llm-router shim", docs_url=None, redoc_url=None, openapi_url=None)
+
+    @app.middleware("http")
+    async def router_admin_auth(request: Request, call_next):
+        # Operator /x/* surfaces (wallet moves funds, providers/keys choose where
+        # credentials go, calls/sessions expose every caller's traffic) require
+        # the internal secret. With none configured only a same-pod (loopback)
+        # ingress may call them, unless ROUTER_ADMIN_ALLOW_UNAUTHENTICATED=1.
+        path = re.sub(r"/{2,}", "/", request.scope.get("path") or "")
+        if path.startswith(_ROUTER_ADMIN_PATHS) and not _router_admin_ok(request):
+            return JSONResponse(status_code=403, content={"error": {
+                "message": "router admin endpoint requires x-internal-secret",
+                "type": "auth_error", "code": "router_admin_forbidden"}})
+        return await call_next(request)
 
     # subscription backends (codex) are billed $0 per request — their ranking
     # price is a scarcity shadow price, not a cost
@@ -382,8 +398,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 return JSONResponse(status_code=404, content={"error": {
                     "message": "session not found", "type": "not_found",
                     "code": "session_not_found"}})
-        acc = host_store.session_totals(sid)
-        return {**acc, "warm": host_store.session_warm(sid)}
+        acc = host_store.session_totals(sid, caller or None)
+        return {**acc, "warm": host_store.session_warm(sid, caller or None)}
 
     @app.get("/x/sessions")
     def session_meters():
@@ -931,7 +947,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             "auth_env": body.get("auth_env"),
             "served_models": body.get("served_models") or [],
         }
-        errors = validate_entry(pid, entry, host.catalog())
+        errors = validate_entry(pid, entry, host.catalog(), key_supplied=bool(body.get("key")))
         if any("already exists" in e for e in errors):
             return JSONResponse(status_code=409, content={"error": {
                 "message": f"provider {pid!r} already exists",
@@ -1128,8 +1144,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 summary_policy=req.policy_ir or _DEFAULT_COMPACT_POLICY, max_tokens=req.max_tokens or 512)
             try:
                 # The same admitted flow executor exposed through flow_ir on chat.
-                res = await host.execute_flow_async(prepared['flow_ir'],
-                    {'flow_input': prepared['flow_input'], 'messages': []})
+                res = await _execute_with_deadline(host.execute_flow_async(prepared['flow_ir'],
+                    {'flow_input': prepared['flow_input'], 'messages': []}))
             except Exception as exc:
                 admission = _flow_admission_error(exc)
                 if admission is not None:
@@ -1399,7 +1415,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         if req.flow_ir is not None:
             if not req.stream:
                 try:
-                    result = await host.execute_flow_async(req.flow_ir, contract)
+                    result = await _execute_with_deadline(host.execute_flow_async(req.flow_ir, contract))
                 except Exception as exc:
                     admission = _flow_admission_error(exc)
                     if admission is None:
@@ -1416,7 +1432,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             # JSON error. Anything slower commits to SSE and HEARTBEATs while the
             # flow runs (flows have no token stream, so without this they sat
             # silent ~60s and the idle timeout cut them into an empty 200).
-            task = asyncio.create_task(host.execute_flow_async(req.flow_ir, contract))
+            task = asyncio.create_task(_execute_with_deadline(host.execute_flow_async(req.flow_ir, contract)))
             done, _ = await asyncio.wait({task}, timeout=_EARLY_FAIL_S,
                                          return_when=asyncio.FIRST_COMPLETED)
             if task in done:
@@ -1533,11 +1549,15 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         # Activity and to the client instead of nothing.
         stream_id = _streaming.new_stream_id()
         model = req.model or ""
-        yield _streaming.encode_role_chunk(stream_id, model)
-        while not task.done():
-            await asyncio.wait({task}, timeout=_HEARTBEAT_S)
-            if not task.done():
-                yield _streaming.HEARTBEAT
+        try:
+            yield _streaming.encode_role_chunk(stream_id, model)
+            while not task.done():
+                await asyncio.wait({task}, timeout=_HEARTBEAT_S)
+                if not task.done():
+                    yield _streaming.HEARTBEAT
+        finally:
+            if not task.done():   # client went away: stop spending on its flow
+                task.cancel()
         try:
             result = task.result()
         except Exception as exc:
@@ -1563,21 +1583,25 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     async def _sse_gen(queue: "asyncio.Queue", task: "asyncio.Task", req: ChatRequest):
         stream_id = _streaming.new_stream_id()
         model = req.model or ""
-        yield _streaming.encode_role_chunk(stream_id, model)  # first byte, now
         streamed_any = False
-        while True:
-            getter = asyncio.create_task(queue.get())
-            kind, payload = await _await_delta_or_beat(getter, task, _HEARTBEAT_S)
-            if kind == "delta":
-                streamed_any = True
-                yield _streaming.encode_text_chunk(stream_id, model, payload)
-                continue
-            if kind == "done":
-                while not queue.empty():
+        try:
+            yield _streaming.encode_role_chunk(stream_id, model)  # first byte, now
+            while True:
+                getter = asyncio.create_task(queue.get())
+                kind, payload = await _await_delta_or_beat(getter, task, _HEARTBEAT_S)
+                if kind == "delta":
                     streamed_any = True
-                    yield _streaming.encode_text_chunk(stream_id, model, queue.get_nowait())
-                break
-            yield _streaming.HEARTBEAT  # 'beat' — keep the line warm
+                    yield _streaming.encode_text_chunk(stream_id, model, payload)
+                    continue
+                if kind == "done":
+                    while not queue.empty():
+                        streamed_any = True
+                        yield _streaming.encode_text_chunk(stream_id, model, queue.get_nowait())
+                    break
+                yield _streaming.HEARTBEAT  # 'beat' — keep the line warm
+        finally:
+            if not task.done():   # client went away: cancel the run
+                task.cancel()
         result = task.result()
         if result.get("ok"):
             resp, usage, x_router = _final_chunk_parts(result, req.session, req.caller)
@@ -1670,11 +1694,26 @@ def _request_to_contract(
         # reads off ctx.request. A brand-new session has no hot route -> the key
         # is simply absent -> cache_hot is false for everyone (no phantom pin).
         contract["session"] = req.session
-        hot = host_store.hot_route(req.session)
+        hot = host_store.hot_route(req.session, req.caller)
         if hot is not None:
             contract["cache_hot_route"] = hot
 
     return contract
+
+
+_ROUTER_ADMIN_PATHS = ("/x/wallet", "/x/providers", "/x/provider-key", "/x/config/",
+                       "/x/codex/", "/x/calls", "/x/sessions", "/x/session/")
+
+
+def _router_admin_ok(request: Request) -> bool:
+    secret = control_plane_client.CONTROL_PLANE_INTERNAL_SECRET
+    if secret:
+        presented = request.headers.get("x-internal-secret") or ""
+        return hmac.compare_digest(presented.encode(), secret.encode())
+    if os.getenv("ROUTER_ADMIN_ALLOW_UNAUTHENTICATED", "0").lower() in {"1", "true", "yes"}:
+        return True
+    host = request.client.host if request.client else ""
+    return host in {"127.0.0.1", "::1", "localhost"}
 
 
 def _invalid_policy_response(message: str) -> JSONResponse:
@@ -1953,7 +1992,7 @@ def _build_x_router(result: dict, subscription_providers=frozenset(),
         # #4b: derive the running total from the committed `calls` and add THIS
         # in-flight call (not yet in the ledger). Owner is derived from the
         # session's earliest call, so no explicit binding is needed here.
-        prior = host_store.session_totals(session)
+        prior = host_store.session_totals(session, owner)
         x_router["session_acc"] = {
             "calls": prior["calls"] + 1,
             "tokens_in": prior["tokens_in"] + (resp.get("tokens_in") or 0),

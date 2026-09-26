@@ -180,6 +180,9 @@ def _prepare_openai_call(
             auth_headers = {}
 
     headers = {"Content-Type": "application/json", **auth_headers, **extra}
+    if provider_id.startswith("antseed") and os.getenv("ANTSEED_PROXY_TOKEN"):
+        # The operator's funded buyer proxy (antseed/public-proxy.js) requires it.
+        headers["Authorization"] = "Bearer " + os.environ["ANTSEED_PROXY_TOKEN"]
     from byo_http import is_byo_buyer
     if is_byo_buyer(request, env_get):
         # Never trust an offer's endpoint to choose where a tenant secret goes.
@@ -354,7 +357,7 @@ class _PeerCapacitySlot:
 
 
 async def _acquire_peer_capacity(
-        request: dict, call_timeout_s: float) \
+        request: dict, call_timeout_s: float, env_get=None) \
         -> tuple[_PeerCapacitySlot | None, str | None]:
     """Acquire the selected seller's cap locally or across all replicas.
 
@@ -367,6 +370,11 @@ async def _acquire_peer_capacity(
     if not peer_id or not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0:
         return None, None
     peer_id = str(peer_id).strip().lower()
+    from byo_http import is_byo_buyer
+    if env_get is not None and is_byo_buyer(request, env_get):
+        # A BYO offer's peer_id/max_concurrency come from the tenant's gateway;
+        # never let them size or starve the operator's shared gate for that peer.
+        peer_id = f"tenant:{env_get('SAAS_TENANT_SCOPE')}:{peer_id}"
     wait_s = _peer_gate_wait_s(call_timeout_s)
     if not _enabled("DISTRIBUTED_PEER_GATES"):
         gate = await _peer_gate(peer_id, cap)
@@ -447,7 +455,7 @@ def make_async_call_provider(
         timing = ProviderTiming(request, timeout, "buffered_sse" if uses_streaming_backend else "buffered")
         slot = None
         if not uses_streaming_backend:
-            slot, gate_error = await _acquire_peer_capacity(request, timeout)
+            slot, gate_error = await _acquire_peer_capacity(request, timeout, _env_get)
             if gate_error:
                 return timing.attach(_peer_capacity_error(
                     str(peer_id or ""), int(cap or 0), gate_error, t0))
@@ -480,7 +488,7 @@ def make_async_call_provider(
                         if is_byo_buyer(request, _env_get):
                             async with buyer_client() as buyer:
                                 timing.data["phase"] = "connection_pool"
-                                resp = await buyer.post(url, json=body, headers=headers, timeout=timeout, **timing.http_options(buyer))
+                                resp = await _post_bounded(buyer, url, json=body, headers=headers, timeout=timeout, **timing.http_options(buyer))
                         elif client is not None:
                             timing.data["phase"] = "connection_pool"
                             resp = await client.post(
@@ -499,12 +507,64 @@ def make_async_call_provider(
                               f"POST {url} timed out")
             except (httpx.NetworkError, httpx.RequestError) as e:
                 result = _err("network_error", 0, _elapsed_ms(t0), str(e))
+            except ResponseTooLarge as e:
+                result = _err("bad_response", 200, _elapsed_ms(t0), str(e))
             return timing.attach(result)
         finally:
             if slot is not None:
                 await slot.release()
 
     return call
+
+
+class ResponseTooLarge(Exception):
+    """A tenant (BYO) gateway sent more than the configured byte caps."""
+
+
+def _byo_caps() -> tuple[int, int]:
+    return (int(os.getenv("BYO_MAX_RESPONSE_BYTES", str(32 << 20))),
+            int(os.getenv("BYO_MAX_SSE_LINE_BYTES", str(1 << 20))))
+
+
+async def _post_bounded(http, url: str, **kwargs):
+    """POST and buffer at most BYO_MAX_RESPONSE_BYTES of the body."""
+    import httpx
+    cap = _byo_caps()[0]
+    async with http.stream("POST", url, **kwargs) as resp:
+        raw = bytearray()
+        async for chunk in resp.aiter_bytes():
+            raw.extend(chunk)
+            if len(raw) > cap:
+                raise ResponseTooLarge(f"response exceeds {cap} bytes")
+        return httpx.Response(resp.status_code, headers=resp.headers,
+                              content=bytes(raw), request=resp.request)
+
+
+async def _read_head(resp, limit: int = 4096) -> bytes:
+    raw = b""
+    async for chunk in resp.aiter_bytes():
+        raw += chunk
+        if len(raw) >= limit:
+            break
+    return raw[:limit]
+
+
+async def _bounded_lines(resp):
+    """aiter_lines with a per-line and a total byte cap."""
+    total_cap, line_cap = _byo_caps()
+    buf, total = b"", 0
+    async for chunk in resp.aiter_bytes():
+        total += len(chunk)
+        if total > total_cap:
+            raise ResponseTooLarge(f"stream exceeds {total_cap} bytes")
+        buf += chunk
+        *lines, buf = buf.split(b"\n")
+        if len(buf) > line_cap or any(len(line) > line_cap for line in lines):
+            raise ResponseTooLarge(f"SSE line exceeds {line_cap} bytes")
+        for line in lines:
+            yield line.rstrip(b"\r").decode("utf-8", "replace")
+    if buf:
+        yield buf.rstrip(b"\r").decode("utf-8", "replace")
 
 
 def _classify_from_map(err_msg: str, error_map: dict | None) -> str | None:
@@ -571,7 +631,7 @@ async def _stream_openai_compatible_impl(
     offer = request.get("offer") or {}
     peer_id = offer.get("peer_id")
     cap = offer.get("max_concurrency")
-    slot, gate_error = await _acquire_peer_capacity(request, timeout)
+    slot, gate_error = await _acquire_peer_capacity(request, timeout, env_get or os.environ.get)
     if gate_error:
         return _peer_capacity_error(
             str(peer_id or ""), int(cap or 0), gate_error, t0)
@@ -615,12 +675,13 @@ async def _stream_openai_compatible_impl(
                 except (asyncio.TimeoutError, TimeoutError):
                     return _timeout_err()
                 if not (200 <= resp.status_code < 300):
-                    raw = (await resp.aread()).decode("utf-8", "replace")[:500]
+                    raw = (await _read_head(resp) if _byo else await resp.aread()
+                           ).decode("utf-8", "replace")[:500]
                     kind = _classify_from_map(raw, rules.get("error_map")) \
                         or _classify_status(resp.status_code, raw)
                     return _err(kind, resp.status_code, _latency(), raw)
 
-                lines = resp.aiter_lines().__aiter__()
+                lines = (_bounded_lines(resp) if _byo else resp.aiter_lines()).__aiter__()
                 while True:
                     try:
                         line = await before_first_output(
@@ -675,6 +736,8 @@ async def _stream_openai_compatible_impl(
                                 acc["function"]["name"] = fn["name"]
                             if fn.get("arguments"):
                                 acc["function"]["arguments"] += fn["arguments"]
+        except ResponseTooLarge as exc:
+            return _err("stream_interrupted" if emitted else "bad_response", 200, _latency(), str(exc))
         except Exception as exc:  # noqa: BLE001 — classified below
             partial = "".join(text_parts)
             if emitted:

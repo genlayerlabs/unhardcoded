@@ -8,3 +8,7 @@ __pycache__
 !.env.example
 runtime
 secrets
+# Codex OAuth tokens (compose's default CODEX_AUTH_PATH) and dashboard-added
+# accounts: `COPY . .` would bake them into the image.
+codex-auth*.json
+codex-accounts

@@ -174,11 +174,13 @@ def test_dashboard_add_provider_persists_and_hot_applies(db, monkeypatch, tmp_pa
         status_code = 200
 
     class FakeClient:
-        async def post(self, url, json=None, timeout=None):
-            calls.append((url, json))
+        async def post(self, url, json=None, timeout=None, headers=None):
+            calls.append((url, json, headers))
             return FakeResp()
 
     monkeypatch.setattr(auth_proxy, "_client", FakeClient())
+    import control_plane_client
+    monkeypatch.setattr(control_plane_client, "CONTROL_PLANE_INTERNAL_SECRET", "router-admin")
 
     payload = {"id": "groq", "base_url": "https://api.groq.com/openai/v1",
                "tier": "partner", "auth_env": "GROQ_API_KEY", "key": "gsk-raw",
@@ -201,8 +203,9 @@ def test_dashboard_add_provider_persists_and_hot_applies(db, monkeypatch, tmp_pa
     saved = po.load_overlay()
     assert saved["providers"]["groq"]["auth_env"] == "GROQ_API_KEY"
     assert "key" not in saved["providers"]["groq"]                 # never in overlay
-    url, body = calls[0]
+    url, body, headers = calls[0]
     assert url.endswith("/x/providers") and body["key"] == "gsk-raw"
+    assert headers == {"x-internal-secret": "router-admin"}   # router /x/* admin credential
 
     # second add of the same id is rejected (overlay merged into catalog view)
     monkeypatch.setattr(auth_proxy, "_load_policy_config",

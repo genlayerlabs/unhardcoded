@@ -6,8 +6,9 @@
 //                  -> THIS server (:8379) -> `antseed buyer <cmd>`
 //
 // Guarded by a shared token (ANTSEED_CONTROL_TOKEN); if unset the server does
-// not start (feature disabled, router degrades to 503). Listens on the pod/
-// container network only — never published. Subcommands are whitelisted and run
+// not start (feature disabled, router degrades to 503). Binds 127.0.0.1 (the
+// router shares the pod) unless ANTSEED_CONTROL_HOST says otherwise — compose,
+// where the sidecar is its own service, sets 0.0.0.0. Never published. Subcommands are whitelisted and run
 // via execFile with array args (no shell); amounts are strictly validated.
 'use strict';
 const http = require('http');
@@ -26,11 +27,13 @@ const { createQueue } = require('./queue.js');
 // deserve a file. See antseed/broadcast.js.
 const { classifyCliFailure } = require('./broadcast.js');
 const { walletCommandArgs } = require('./cli-args.js');
+const { tokenMatches, listenHost } = require('./auth.js');
 
 const path = require('path');
 
 const PORT = parseInt(process.env.ANTSEED_CONTROL_PORT || '8379', 10);
 const TOKEN = process.env.ANTSEED_CONTROL_TOKEN || '';
+const HOST = listenHost(process.env, 'ANTSEED_CONTROL_HOST');
 const PID = process.env.ANTSEED_BUYER_PID || 'antseed';
 const DEPOSIT_TIMEOUT_MS = 120000; // on-chain tx
 const STATUS_TIMEOUT_MS = 30000;
@@ -179,7 +182,7 @@ function inconclusive(res, status, error) {    // a broadcast cannot be ruled ou
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.headers['x-antseed-control-token'] !== TOKEN) {
+  if (!tokenMatches(req.headers['x-antseed-control-token'], TOKEN)) {
     return refuse(res, 401, 'unauthorized');
   }
   const url = (req.url || '').split('?')[0];
@@ -283,4 +286,4 @@ const server = http.createServer(async (req, res) => {
   return refuse(res, 404, 'not found');
 });
 
-server.listen(PORT, () => console.error('[control] listening on :' + PORT));
+server.listen(PORT, HOST, () => console.error('[control] listening on ' + HOST + ':' + PORT));

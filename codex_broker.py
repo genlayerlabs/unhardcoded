@@ -64,7 +64,7 @@ def create_app(*, store: Any = None, token: str | None = None,
             return JSONResponse(status_code=503, content={
                 "error": "CODEX_BROKER_TOKEN is not configured"})
         supplied = _bearer(request)
-        if not supplied or not hmac.compare_digest(supplied, expected_token):
+        if not supplied or not hmac.compare_digest(supplied.encode(), expected_token.encode()):
             return JSONResponse(status_code=401, content={"error": "unauthorized"})
         return None
 

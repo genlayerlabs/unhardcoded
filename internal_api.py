@@ -39,6 +39,7 @@ _EXPORT_LIMIT_MAX = 5000
 _BUDGET_SUBJECTS_MAX = 500
 _SUBJECT_RE = re.compile(r"[gk]:[1-9][0-9]{0,17}")
 _PERIOD_RE = re.compile(r"[0-9]{4}-(0[1-9]|1[0-2])")
+_MAX_TS = 253402300799   # 9999-12-31T23:59:59Z: beyond it the ledger's to_timestamp overflows
 
 
 def _gate(request: Request) -> JSONResponse | None:
@@ -74,6 +75,9 @@ async def internal_usage(request: Request, caller: str = "",
         return JSONResponse({"error": "caller_required"}, status_code=400)
     if group_by is not None and group_by not in host_store._USAGE_GROUPS:
         return JSONResponse({"error": "invalid_group_by"}, status_code=400)
+    if any(ts is not None and not 0 <= ts <= _MAX_TS for ts in (since_ts, until_ts)) or (
+            since_ts is not None and until_ts is not None and until_ts < since_ts):
+        return JSONResponse({"error": "invalid_window"}, status_code=400)
     window = {"since_ts": since_ts, "until_ts": until_ts}
     try:
         totals = await asyncio.to_thread(host_store.usage_totals, caller=caller, strict=True, **window, **scope)

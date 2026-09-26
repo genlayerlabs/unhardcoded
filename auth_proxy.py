@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock, RLock
 from typing import Any, Dict
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, Request
@@ -38,6 +39,19 @@ from shim import _CACHE_READ_FACTOR   # the billing cache-read discount — one 
 load_env_secrets()
 
 UPSTREAM = os.getenv("ROUTER_UPSTREAM", "http://router:18080").rstrip("/")
+
+
+def _router_admin_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Headers for the router's operator /x/* endpoints (wallet, providers,
+    provider-key, reloads, sessions/calls), which require the shared internal
+    secret. Only ever sent on these server-originated calls, never on proxied
+    client traffic."""
+    headers = dict(extra or {})
+    if control_plane_client.CONTROL_PLANE_INTERNAL_SECRET:
+        headers["x-internal-secret"] = control_plane_client.CONTROL_PLANE_INTERNAL_SECRET
+    return headers
+
+
 CALLER_KEYS_JSON = os.getenv("CALLER_KEYS_JSON", "{}")
 CALLER_KEYS_SHA256_JSON = os.getenv("CALLER_KEYS_SHA256_JSON", "{}")
 # GitOps/bootstrap keys arrive from a reconciled workload Secret. Keep them in
@@ -426,9 +440,24 @@ def _write_json_file(path: Path, data: Any) -> None:
     path.chmod(0o600)
 
 
+def _provider_env_error(key: str, value: str) -> str | None:
+    """Why KEY=value may not be written to the env-secrets file (applied over
+    the process env at boot), or None. Only provider-credential names, never an
+    infrastructure/security variable, and no control characters: a newline in
+    the value would inject arbitrary extra KEY=value lines."""
+    from provider_overlay import AUTH_ENV_RE, is_forbidden_auth_env
+    if not AUTH_ENV_RE.match(key or "") or is_forbidden_auth_env(key):
+        return f"auth_env {key!r} is not an allowed provider credential name"
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in f"{key}{value}"):
+        return "key must not contain control characters"
+    return None
+
+
 def _upsert_env_line(path: Path, key: str, value: str) -> None:
     """Set KEY=value in an env file (used for provider API keys). Same
     semantics as _upsert_env_json but for plain string values."""
+    if (error := _provider_env_error(key, value)) is not None:
+        raise ValueError(error)
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = path.read_text().splitlines() if path.exists() else []
     rendered = f"{key}={value}"
@@ -642,6 +671,29 @@ def _consumer_meta(consumer: str) -> dict[str, Any]:
     return records.get(consumer, _normalize_consumer_record(consumer, {}))
 
 
+def _consumer_store_unavailable() -> JSONResponse:
+    return JSONResponse(status_code=503, content={"error": {
+        "message": "consumer key store is temporarily unavailable",
+        "type": "server_error", "code": "consumer_store_unavailable"}})
+
+
+def _writable_consumer_records() -> dict[str, dict[str, Any]] | None:
+    """Records for a read-modify-write, or None when the store read failed: the
+    fallback view holds only env-configured consumers, and writing it back would
+    wipe every issued record (keys, budgets, revocations)."""
+    records = _issued_consumer_records()
+    return None if _issued_keys_load_failed else records
+
+
+async def _consumer_view_unavailable(role: str) -> JSONResponse | None:
+    # A consumer dashboard view is scoped to that consumer's records; if the
+    # store cannot confirm them, fail closed rather than render unscoped data.
+    if role == "admin":
+        return None
+    _, ok = await asyncio.to_thread(host_store.get_consumer_keys)
+    return None if ok else _consumer_store_unavailable()
+
+
 def _active_key_rows(keys: list[dict[str, Any]]) -> list[dict[str, Any]]:
     now = int(time.time())
     rows = []
@@ -781,9 +833,15 @@ async def _caller_auth_async(token: str | None) -> dict[str, Any]:
         return auth
     caller = f"{CONTROL_PLANE_CALLER_PREFIX}{resolved.consumer}"
     meta = await asyncio.to_thread(_consumer_meta, caller)
-    if meta.get("keys"):
-        # A local consumer already answers to this name — attribution merges.
+    if meta.get("keys") or caller in CALLER_KEYS.values() or caller in CALLER_KEY_HASHES.values():
+        # A local consumer (its own keys) already answers to this name: serving
+        # the tenant under it would merge attribution, limits and budgets across
+        # two principals. Fail closed until the operator renames one of them
+        # (or sets CONTROL_PLANE_CALLER_PREFIX — which also renames the tenant's
+        # usage caller). A key-less local record stays a kill-switch/override.
         control_plane_client.log_collision_once(caller)
+        return {"ok": False, "caller": caller, "digest": digest,
+                "storage": "control_plane", "error_code": "caller_name_collision"}
     if meta.get("status") != "active":
         return {"ok": False, "caller": caller, "digest": digest,
                 "storage": "control_plane", "error_code": "caller_inactive"}
@@ -913,7 +971,7 @@ def _dashboard_session_context(request: Request) -> dict[str, Any] | None:
         return None
     body, sig = raw.rsplit(".", 1)
     expected = hmac.new(DASHBOARD_SESSION_SECRET.encode(), body.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig, expected):
+    if not control_plane_client.secret_equal(sig, expected):
         return None
     try:
         payload = json.loads(_b64d(body))
@@ -943,7 +1001,7 @@ def _dashboard_password_ok(password: str) -> bool:
     if not DASHBOARD_PASSWORD_SHA256:
         return False
     got = hashlib.sha256(password.encode()).hexdigest()
-    return hmac.compare_digest(got, DASHBOARD_PASSWORD_SHA256)
+    return control_plane_client.secret_equal(got, DASHBOARD_PASSWORD_SHA256)
 
 def _require_dashboard_context(request: Request) -> dict[str, Any] | None:
     if DASHBOARD_NO_AUTH:
@@ -951,7 +1009,7 @@ def _require_dashboard_context(request: Request) -> dict[str, Any] | None:
     if DASHBOARD_TRUSTED_USER_HEADER:
         trusted_user = (request.headers.get(DASHBOARD_TRUSTED_USER_HEADER) or "").strip()
         trusted_secret = (request.headers.get("x-dashboard-trusted-secret") or "").strip()
-        if trusted_user and DASHBOARD_TRUSTED_USER_SECRET and hmac.compare_digest(trusted_secret, DASHBOARD_TRUSTED_USER_SECRET):
+        if trusted_user and DASHBOARD_TRUSTED_USER_SECRET and control_plane_client.secret_equal(trusted_secret, DASHBOARD_TRUSTED_USER_SECRET):
             return {"role": "admin", "user": trusted_user, "viewer": f"dashboard:{trusted_user}", "consumer": None, "key_sha256": None}
     return _dashboard_session_context(request)
 
@@ -1851,6 +1909,8 @@ async def dashboard_stats(request: Request) -> Response:
     consumer = str(ctx.get("consumer") or "").strip() or requested_consumer
     key_sha256 = str(ctx.get("key_sha256") or "").strip() or None
     role = str(ctx.get("role") or "admin")
+    if (unavailable := await _consumer_view_unavailable(role)) is not None:
+        return unavailable
     # _stats_snapshot performs synchronous PostgreSQL aggregation. Keep it off
     # Uvicorn's event loop so a slow query cannot stall health checks and all
     # proxied traffic handled by this worker.
@@ -1890,6 +1950,8 @@ async def _dashboard_full_snapshot(request: Request) -> Response:
     consumer = str(ctx.get("consumer") or "").strip() or requested_consumer
     key_sha256 = str(ctx.get("key_sha256") or "").strip() or None
     role = str(ctx.get("role") or "admin")
+    if (unavailable := await _consumer_view_unavailable(role)) is not None:
+        return unavailable
     stats = await asyncio.to_thread(
         _stats_snapshot, viewer=caller, upstream_status=upstream_status,
         upstream_health=upstream_health, consumer=consumer,
@@ -2833,7 +2895,34 @@ async def key_usage(request: Request) -> Response:
         options = _usage_query_options(request.query_params)
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": {"message": str(exc), "type": "invalid_request_error", "code": "invalid_usage_window"}})
-    return JSONResponse(content=_key_usage_snapshot(viewer=f"consumer:{caller}", key_sha256=str(auth.get("digest")), caller=caller, options=options))
+    if (limited := await _consumer_rate_limited(caller, auth)) is not None:
+        return limited
+    # Postgres reads + per-row pricing: off the event loop.
+    snap = await asyncio.to_thread(_key_usage_snapshot, viewer=f"consumer:{caller}",
+                                   key_sha256=str(auth.get("digest")), caller=caller, options=options)
+    return JSONResponse(content=snap)
+
+
+# Opaque client-chosen session ids (opencode `ses_...`, UUIDs, `tenant:x:y`);
+# never a bare dot segment, which would re-target the upstream path.
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_:-][A-Za-z0-9_.:-]{0,127}")
+
+
+async def _consumer_rate_limited(caller: str, auth: dict[str, Any]) -> JSONResponse | None:
+    """The caller's request rate limit, shared with proxied traffic, for the
+    consumer read endpoints (/v1/usage, /v1/session)."""
+    result = await asyncio.to_thread(_rate_ok, caller, auth.get("meta") or {})
+    allowed, store_ok, retry_after_s = result if isinstance(result, tuple) else (bool(result), True, 0.0)
+    if not store_ok:
+        _metric_store_error("rate_limit")
+        return JSONResponse(status_code=503, content={"error": {
+            "message": "caller rate-limit state is temporarily unavailable",
+            "type": "server_error", "code": "caller_rate_limit_unavailable"}})
+    if not allowed:
+        return JSONResponse(status_code=429, headers={"Retry-After": str(max(1, math.ceil(retry_after_s)))},
+                            content={"error": {"message": "caller rate limit exceeded",
+                                               "type": "rate_limit_error", "code": "caller_rate_limit"}})
+    return None
 
 
 @app.get("/v1/session/{sid}")
@@ -2857,9 +2946,13 @@ async def session_view(sid: str, request: Request) -> Response:
     # answers 404 (not 403) for a sid this caller does not own, so the endpoint
     # never confirms that someone else's sid exists.
     caller = str(auth.get("caller") or "")
+    if not _SESSION_ID_RE.fullmatch(sid):
+        return JSONResponse(status_code=400, content={"error": {"message": "invalid session id", "type": "invalid_request_error", "code": "invalid_session_id"}})
+    if (limited := await _consumer_rate_limited(caller, auth)) is not None:
+        return limited
     try:
-        r = await _client.get(f"{UPSTREAM}/x/session/{sid}", timeout=5.0,
-                              headers={"x-llm-router-caller": caller})
+        r = await _client.get(f"{UPSTREAM}/x/session/{quote(sid, safe='')}", timeout=5.0,
+                              headers=_router_admin_headers({"x-llm-router-caller": caller}))
         return JSONResponse(status_code=r.status_code, content=r.json())
     except Exception as exc:
         return JSONResponse(status_code=502, content={"error": {"message": f"upstream: {exc}", "type": "api_error", "code": "upstream_error"}})
@@ -2880,7 +2973,9 @@ async def dashboard_update_consumer(consumer: str, request: Request) -> Response
         return JSONResponse(status_code=400, content={"error": {"message": str(exc), "type": "invalid_request_error", "code": "invalid_consumer"}})
     except Exception:
         return JSONResponse(status_code=400, content={"error": {"message": "invalid JSON body", "type": "invalid_request_error", "code": "invalid_json"}})
-    records = _issued_consumer_records()
+    records = _writable_consumer_records()
+    if records is None:
+        return _consumer_store_unavailable()
     meta = records.get(consumer, _normalize_consumer_record(consumer, {}))
     if "status" in data:
         status = str(data.get("status") or "").strip().lower()
@@ -2919,7 +3014,9 @@ async def dashboard_revoke_key(request: Request) -> Response:
         return JSONResponse(status_code=400, content={"error": {"message": str(exc), "type": "invalid_request_error", "code": "invalid_key"}})
     except Exception:
         return JSONResponse(status_code=400, content={"error": {"message": "invalid JSON body", "type": "invalid_request_error", "code": "invalid_json"}})
-    records = _issued_consumer_records()
+    records = _writable_consumer_records()
+    if records is None:
+        return _consumer_store_unavailable()
     meta = records.get(consumer, _normalize_consumer_record(consumer, {}))
     now = int(time.time())
     found = False
@@ -2982,9 +3079,11 @@ async def dashboard_add_provider(request: Request) -> Response:
     try:
         from provider_overlay import load_overlay, save_overlay, validate_entry
         catalog = _load_policy_config()   # includes existing overlay entries
-        errors = validate_entry(pid, entry, catalog)
+        errors = validate_entry(pid, entry, catalog, key_supplied=bool(key))
         if not key:
             errors.append("key is required")
+        elif (env_error := _provider_env_error(auth_env, key)) is not None:
+            errors.append(env_error)
         if errors:
             return JSONResponse(status_code=400, content={"error": {"message": "; ".join(errors), "type": "invalid_request", "code": "provider_add"}})
         _upsert_env_line(Path(DASHBOARD_KEY_ENV_PATH), auth_env, key)
@@ -3002,7 +3101,7 @@ async def dashboard_add_provider(request: Request) -> Response:
         if _client is not None:
             r = await _client.post(f"{UPSTREAM}/x/providers", json={
                 "id": pid, **{k: v for k, v in entry.items() if k != "added_at"},
-                "key": key}, timeout=10.0)
+                "key": key}, timeout=10.0, headers=_router_admin_headers())
             applied_live = r.status_code == 200
             if not applied_live:
                 apply_error = f"router /x/providers returned {r.status_code}"
@@ -3046,6 +3145,8 @@ async def dashboard_update_provider_key(request: Request) -> Response:
     auth_env = str(provider.get("auth_env") or "").strip()
     if not auth_env:
         return JSONResponse(status_code=400, content={"error": {"message": f"provider {pid!r} has no auth_env (e.g. oauth/codex); use the Codex account flow instead", "type": "invalid_request", "code": "provider_no_auth_env"}})
+    if (env_error := _provider_env_error(auth_env, key)) is not None:
+        return JSONResponse(status_code=400, content={"error": {"message": env_error, "type": "invalid_request", "code": "provider_update"}})
     try:
         _upsert_env_line(Path(DASHBOARD_KEY_ENV_PATH), auth_env, key)
     except Exception as exc:
@@ -3057,7 +3158,8 @@ async def dashboard_update_provider_key(request: Request) -> Response:
     try:
         if _client is not None:
             r = await _client.post(f"{UPSTREAM}/x/provider-key", json={
-                "provider": pid, "auth_env": auth_env, "key": key}, timeout=10.0)
+                "provider": pid, "auth_env": auth_env, "key": key}, timeout=10.0,
+                headers=_router_admin_headers())
             applied_live = r.status_code == 200
             if not applied_live:
                 apply_error = f"router /x/provider-key returned {r.status_code}"
@@ -3084,7 +3186,8 @@ async def _wallet_proxy(request: Request, op: str, *, body: dict | None = None,
         return JSONResponse(status_code=502, content={"error": {
             "message": "router client unavailable", "type": "wallet_error", "code": "wallet"}})
     try:
-        r = await _client.post(f"{UPSTREAM}/x/wallet/{op}", json=(body or {}), timeout=timeout)
+        r = await _client.post(f"{UPSTREAM}/x/wallet/{op}", json=(body or {}), timeout=timeout,
+                               headers=_router_admin_headers())
     except Exception as exc:
         return JSONResponse(status_code=502, content={"error": {
             "message": f"router /x/wallet/{op} unreachable: {exc}",
@@ -3156,7 +3259,7 @@ async def dashboard_wallet_get(request: Request) -> Response:
         return JSONResponse(status_code=502, content={"error": {
             "message": "router client unavailable", "type": "wallet_error", "code": "wallet"}})
     try:
-        r = await _client.get(f"{UPSTREAM}/x/wallet", timeout=10.0)
+        r = await _client.get(f"{UPSTREAM}/x/wallet", timeout=10.0, headers=_router_admin_headers())
         return JSONResponse(status_code=r.status_code, content=r.json())
     except Exception as exc:
         return JSONResponse(status_code=502, content={"error": {
@@ -3242,7 +3345,7 @@ async def _reload_codex_router() -> tuple[bool, str | None]:
                 headers = {"authorization": f"Bearer {CODEX_BROKER_TOKEN}"}
             else:
                 url = f"{UPSTREAM}/x/codex/reload"
-                headers = None
+                headers = _router_admin_headers()
             r = await _client.post(url, headers=headers, timeout=10.0)
             if r.status_code == 200:
                 return True, None
@@ -3671,7 +3774,8 @@ async def dashboard_set_config(request: Request) -> Response:
     note = None
     try:
         if _client is not None:
-            r = await _client.post(f"{UPSTREAM}/x/config/reload", timeout=10.0)
+            r = await _client.post(f"{UPSTREAM}/x/config/reload", timeout=10.0,
+                                     headers=_router_admin_headers())
             applied_live = r.status_code == 200
             if not applied_live:
                 note = f"router /x/config/reload returned {r.status_code}"
@@ -3769,7 +3873,9 @@ async def dashboard_create_key(request: Request) -> Response:
     now = int(time.time())
     token = f"{DASHBOARD_KEY_PREFIX}_{secrets.token_urlsafe(32)}"
     token_hash = hashlib.sha256(token.encode()).hexdigest()
-    records = _issued_consumer_records()
+    records = _writable_consumer_records()
+    if records is None:
+        return _consumer_store_unavailable()
     meta = records.get(consumer, _normalize_consumer_record(consumer, {}))
     if rotate:
         # With sha256_prefix, rotation targets ONLY that active key; without it,
@@ -3838,7 +3944,9 @@ async def dashboard_create_key_batch(request: Request) -> Response:
             "message": "invalid JSON body", "type": "invalid_request_error",
             "code": "invalid_json"}})
 
-    records = _issued_consumer_records()
+    records = _writable_consumer_records()
+    if records is None:
+        return _consumer_store_unavailable()
     collisions = [consumer for _, consumer in members if consumer in records]
     if collisions:
         return JSONResponse(status_code=409, content={"error": {
@@ -3978,10 +4086,33 @@ async def _synthetic_probe_loop() -> None:
             await _synthetic_probe_once(route)
         await asyncio.sleep(max(SYNTHETIC_PROBE_INTERVAL_S, 1.0))
 
+_PROXY_SEGMENT_RE = re.compile(r"[A-Za-z0-9_.:@+~-]+")
+_PROXY_PROFILE_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _proxy_path(request: Request) -> str | None:
+    """The consumer API path to forward (`v1/...`, `<profile>/v1/...`, `api/...`),
+    or None. An allowlist over the DECODED path, with dot/empty segments and
+    encoded separators refused outright: the router would otherwise resolve
+    `/v1/..%2fx/calls` (or `%2e%2e`, `./x`, `//x`) to its internal /x/* API."""
+    raw = (request.scope.get("raw_path") or b"").decode("latin-1").split("?", 1)[0].lower()
+    if "%2f" in raw or "%5c" in raw or "\\" in raw:
+        return None
+    segs = str(request.scope.get("path") or "").split("/")[1:]
+    if not segs or any(s in (".", "..") or not _PROXY_SEGMENT_RE.fullmatch(s) for s in segs):
+        return None
+    if (segs[0] in ("v1", "api") and len(segs) > 1) or (
+            len(segs) > 2 and segs[1] == "v1" and segs[0] != "x" and _PROXY_PROFILE_RE.fullmatch(segs[0])):
+        return "/".join(segs)
+    return None
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def proxy(path: str, request: Request) -> Response:
-    if path == "x" or path.startswith("x/"):
-        # Router-internal diagnostics (/x/runtime): never proxied to callers.
+    path = _proxy_path(request)
+    if path is None:
+        # Router-internal diagnostics (/x/*) and anything off the consumer API
+        # surface: never proxied to callers.
         return JSONResponse(status_code=404, content={"error": {"message": "not found", "type": "invalid_request_error", "code": None}})
     started = time.perf_counter()
     token = _extract_token(request)
@@ -4294,53 +4425,110 @@ async def proxy(path: str, request: Request) -> Response:
                 upstream_closed = True
                 await r.aclose()
 
-            async def _passthrough():
+            # The upstream is read by a pump task, not by the client-facing
+            # generator: a client that disconnects before the final event would
+            # otherwise record the call at $0 and walk past budget_usd. After a
+            # disconnect the pump keeps draining (bounded in time and bytes).
+            queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+            client_gone_at: float | None = None
+            drain_complete = pump_finished = False
+
+            def _account(tail: bytes) -> None:
                 nonlocal provider, model_family, served_model_id, served_by, \
                     tokens_in, tokens_out, tokens_total, tokens_cached, cost_usd, \
                     cost_basis, decision_trace, error_type, error_code, error_message
+                try:
+                    meta = _parse_stream_tail(tail)
+                    xr = meta.get("x_router") or {}
+                    if xr:
+                        provider = xr.get("provider")
+                        model_family = xr.get("model_family")
+                        served_model_id = xr.get("served_model_id")
+                        served_by = xr.get("served_by")
+                        decision_trace = xr.get("decision_trace") if isinstance(xr.get("decision_trace"), dict) else None
+                        if isinstance(xr.get("cost_usd"), (int, float)):
+                            cost_usd = float(xr["cost_usd"])
+                        cost_basis = xr.get("cost_basis")
+                        if isinstance(xr.get("tokens_cached"), int):
+                            tokens_cached = xr["tokens_cached"]
+                    usage = meta.get("usage")
+                    if isinstance(usage, dict):
+                        tokens_in = int(usage.get("prompt_tokens") or 0)
+                        tokens_out = int(usage.get("completion_tokens") or 0)
+                        tokens_total = int(usage.get("total_tokens") or (tokens_in + tokens_out))
+                    err = meta.get("error")
+                    if isinstance(err, dict):
+                        error_type = err.get("type")
+                        error_code = err.get("code")
+                        error_message = err.get("message")
+                except Exception:
+                    pass
+                if client_gone_at is not None and not drain_complete and cost_usd is None and status < 400:
+                    # Cut off before the usage event: never book a served call
+                    # as free. Same floor Cloud key budgets reserve per call.
+                    cost_usd, cost_basis = CLOUD_BUDGET_RESERVATION_USD, "estimated_disconnect"
+
+            def _client_left() -> None:
+                nonlocal client_gone_at
+                if client_gone_at is not None or pump_finished:
+                    return
+                client_gone_at = time.monotonic()
+                while not queue.empty():
+                    queue.get_nowait()
+                asyncio.get_running_loop().call_later(STREAM_DRAIN_TIMEOUT_S, pump.cancel)
+
+            async def _pump() -> None:
+                nonlocal drain_complete, pump_finished
                 tail = bytearray()
+                drained = 0
+                failure: BaseException | None = None
                 try:
                     async for chunk in r.aiter_raw():
                         tail.extend(chunk)
                         _trim_sse_tail(tail)
-                        yield chunk
+                        if client_gone_at is None:
+                            try:
+                                # A reader that stalls this long is treated as gone.
+                                await asyncio.wait_for(queue.put(chunk), STREAM_DRAIN_TIMEOUT_S)
+                                continue
+                            except asyncio.TimeoutError:
+                                _client_left()
+                        drained += len(chunk)
+                        if drained > STREAM_DRAIN_MAX_BYTES:
+                            break
+                    else:
+                        drain_complete = True
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:  # noqa: BLE001
+                    failure = exc
                 finally:
                     await _close_upstream_stream()
-                    try:
-                        meta = _parse_stream_tail(bytes(tail))
-                        xr = meta.get("x_router") or {}
-                        if xr:
-                            provider = xr.get("provider")
-                            model_family = xr.get("model_family")
-                            served_model_id = xr.get("served_model_id")
-                            served_by = xr.get("served_by")
-                            decision_trace = xr.get("decision_trace") if isinstance(xr.get("decision_trace"), dict) else None
-                            if isinstance(xr.get("cost_usd"), (int, float)):
-                                cost_usd = float(xr["cost_usd"])
-                            cost_basis = xr.get("cost_basis")
-                            if isinstance(xr.get("tokens_cached"), int):
-                                tokens_cached = xr["tokens_cached"]
-                        usage = meta.get("usage")
-                        if isinstance(usage, dict):
-                            tokens_in = int(usage.get("prompt_tokens") or 0)
-                            tokens_out = int(usage.get("completion_tokens") or 0)
-                            tokens_total = int(usage.get("total_tokens") or (tokens_in + tokens_out))
-                        err = meta.get("error")
-                        if isinstance(err, dict):
-                            error_type = err.get("type")
-                            error_code = err.get("code")
-                            error_message = err.get("message")
-                    except Exception:
-                        pass
+                    _account(bytes(tail))
                     _finish()
+                    pump_finished = True
+                    if client_gone_at is None:
+                        with contextlib.suppress(asyncio.TimeoutError):   # None = end of stream
+                            await asyncio.wait_for(queue.put(failure), STREAM_DRAIN_TIMEOUT_S)
+
+            pump = asyncio.create_task(_pump())
+            _stream_pumps.add(pump)
+            pump.add_done_callback(_stream_pumps.discard)
+
+            async def _passthrough():
+                try:
+                    while (item := await queue.get()) is not None:
+                        if isinstance(item, BaseException):
+                            raise item
+                        yield item
+                finally:
+                    _client_left()
 
             async def _stream_background() -> None:
-                # Starlette normally closes the async generator on disconnect.
-                # The background fallback also covers a client that disconnects
-                # before the first iteration, so neither the upstream socket nor
-                # the admission permit can leak indefinitely.
-                await _close_upstream_stream()
-                _finish()
+                # Also covers a client that disconnects before the first
+                # iteration: the pump switches to bounded draining, and it —
+                # not the client — releases the upstream socket and the permit.
+                _client_left()
 
             return StreamingResponse(
                 _passthrough(), status_code=status, media_type=content_type,
@@ -4419,6 +4607,11 @@ def _read_usage_history(*, since: int | None = None, caller: str | None = None,
 
 
 _SSE_TAIL_HARD_CAP = 4 * 1024 * 1024  # 4 MiB backstop if no event boundary appears
+
+
+STREAM_DRAIN_TIMEOUT_S = max(1.0, float(os.getenv("STREAM_DRAIN_TIMEOUT_S", "120")))
+STREAM_DRAIN_MAX_BYTES = max(1, int(os.getenv("STREAM_DRAIN_MAX_BYTES", str(32 * 1024 * 1024))))
+_stream_pumps: set[asyncio.Task] = set()   # strong refs: a drain outlives its request
 
 
 def _trim_sse_tail(tail: bytearray) -> None:
@@ -4886,8 +5079,7 @@ def _usage_events_for_key(digest: str, caller: str | None,
     prefix = digest[:12]
     with _stats_lock:
         memory_rows = [dict(r) for r in _stats["recent"] if r.get("key_sha256_prefix") == prefix]
-    history_rows = [dict(r) for r in _read_usage_history(since=since, caller=caller)
-                    if r.get("key_sha256") == digest or r.get("key_sha256_prefix") == prefix]
+    history_rows = host_store.key_usage_rows(digest, since_ts=since, caller=caller)
     rows_by_id: dict[str, dict[str, Any]] = {}
     anonymous_rows: list[dict[str, Any]] = []
     for row in history_rows + memory_rows:
@@ -5283,7 +5475,9 @@ def _aggregate_usage_rows(rows: list[dict[str, Any]], *, selected: str | None = 
 
 
 def _stats_snapshot(*, viewer: str, upstream_status: int, upstream_health: dict[str, Any], consumer: str | None = None, timeframe: str = "recent", key_sha256: str | None = None, viewer_role: str = "admin", provider: str | None = None, model: str | None = None) -> dict[str, Any]:
-    selected = consumer if consumer in _consumers() else None
+    # A consumer viewer is always scoped to itself, even if the consumer store
+    # read failed and its name is missing from _consumers().
+    selected = consumer if (viewer_role != "admin" or consumer in _consumers()) else None
     provider = (provider or "").strip() or None
     model = (model or "").strip() or None
     key_sha256 = str(key_sha256 or "").strip().lower()

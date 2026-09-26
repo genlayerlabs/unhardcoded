@@ -356,7 +356,9 @@ class AntSeedSource:
             try:
                 url = cfg.get('base_url', '').rstrip('/') + '/models?type=decisions'
                 async def fetch(client):
-                    response = await client.get(url, timeout=5, follow_redirects=False)
+                    token = os.getenv('ANTSEED_PROXY_TOKEN')   # sidecar public-proxy.js
+                    response = await client.get(url, timeout=5, follow_redirects=False,
+                                                headers={'Authorization': 'Bearer ' + token} if token else None)
                     response.raise_for_status()
                     return response.json()
                 if self._decision_client is not None:

@@ -73,7 +73,7 @@ async def stream_codex(
 
     body = build_codex_body(request)
     headers = build_codex_headers(token, auth.account_id(), extra_headers)
-    url = (request.get("base_url") or base_url or CODEX_BASE_URL).rstrip("/") + "/responses"
+    url = (base_url or CODEX_BASE_URL).rstrip("/") + "/responses"  # never request["base_url"]
     timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
 
     owns_client = client is None
