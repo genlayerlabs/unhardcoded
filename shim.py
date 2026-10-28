@@ -42,6 +42,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 import control_plane_client
 from env_coerce import env_int
+from llm_router_host import attempt_log
 import host_store
 from policy_templates import (
     PolicyTemplateError,
@@ -297,6 +298,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         so an expired request does not leave an orphan fallback chain running
         after the HTTP response has finished.
         """
+        attempts: list = []
+        log_token = attempt_log.set(attempts)
         deadline = asyncio.timeout(request_deadline_s)
         try:
             async with deadline:
@@ -306,21 +309,29 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             # timeout context's own expiry is the outer request deadline.
             if not deadline.expired():
                 raise
+            decision_path = _deadline_decision_path(attempts, request_deadline_ms)
+            waiting_on = [
+                f"{e.get('provider_id') or '?'}/{e.get('model_family') or '?'}"
+                for e in decision_path if e.get("in_flight")
+            ]
             _log.warning(
-                "router request deadline exceeded after %d ms",
-                request_deadline_ms,
+                "router request deadline exceeded after %d ms (%d attempts, waiting on %s)",
+                request_deadline_ms, len(decision_path),
+                ", ".join(waiting_on) or "no provider",
             )
             return {
                 "ok": False,
                 "error": "timeout",
                 "trace": {
-                    "decision_path": [],
+                    "decision_path": decision_path,
                     "request_deadline_exceeded": True,
                     "request_deadline_ms": request_deadline_ms,
                     "total_latency_ms": request_deadline_ms,
                     **automatic_trace(),
                 },
             }
+        finally:
+            attempt_log.reset(log_token)
 
     from saas_routes import ScopedHost, automatic_trace, install as install_saas
     host = ScopedHost(host)
@@ -2067,6 +2078,37 @@ def _attempt_summary(trace: dict) -> str | None:
     return "; ".join(parts) or None
 
 
+def _deadline_decision_path(attempts: list, deadline_ms: int) -> list:
+    """Rebuild decision_path for a run the outer request deadline cancelled,
+    from the host's attempt log. An attempt still waiting at the deadline is
+    reported as an in-flight timeout, so the error names the route that hung."""
+    now = time.monotonic()
+    path: list[dict] = []
+    for number, attempt in enumerate(attempts, 1):
+        event = {
+            "event": "attempted",
+            "provider_id": attempt.get("provider_id"),
+            "model_family": attempt.get("model_family"),
+            "attempt": number,
+        }
+        if "ok" not in attempt:
+            event.update({
+                "error_kind": "timeout",
+                "in_flight": True,
+                "latency_ms": int((now - attempt["started"]) * 1000),
+                "error_message": f"no response before the {deadline_ms} ms request deadline",
+            })
+        else:
+            event["latency_ms"] = attempt.get("latency_ms")
+            if not attempt.get("ok"):
+                event["error_kind"] = attempt.get("error_kind") or "unknown"
+                event["http_status"] = attempt.get("http_status")
+                if attempt.get("error_message") is not None:
+                    event["error_message"] = str(attempt["error_message"])[:300]
+        path.append({k: v for k, v in event.items() if v is not None})
+    return path
+
+
 def _openai_error_from_router(result: dict) -> JSONResponse:
     error_kind = str(result.get("error") or "unknown")
 
@@ -2087,18 +2129,27 @@ def _openai_error_from_router(result: dict) -> JSONResponse:
     elif kind in ("bad_request", "context_overflow"):
         status = 400
     elif kind == "timeout":
-        status = 504  # upstream (or a flow node's seller) timed out — Gateway Timeout
+        # Upstream (or a flow node's seller) timed out, or the request deadline
+        # expired. Not 504: Cloudflare in front of the public router replaces an
+        # origin 502/504 body with its own plain-text page, and the caller loses
+        # this JSON error. error.code still carries "timeout".
+        status = 503
     else:
         status = 502
 
+    trace = result.get("trace") or {}
     # router's error strings already start with "exhausted: " when candidates
     # were tried — don't double-prefix.
-    message = error_kind if error_kind.startswith("exhausted:") else f"router: {error_kind}"
+    if trace.get("request_deadline_exceeded"):
+        message = f"router: request deadline of {trace.get('request_deadline_ms')} ms exceeded"
+    elif error_kind.startswith("exhausted:"):
+        message = error_kind
+    else:
+        message = f"router: {error_kind}"
 
     # Surface the per-attempt detail: append a provider-by-provider summary to
     # the message and ship the full trace in x_router (same field the ingress
     # proxy already extracts and the dashboard stores as decision_trace).
-    trace = result.get("trace") or {}
     summary = _attempt_summary(trace)
     if summary:
         message = f"{message} — {summary}"

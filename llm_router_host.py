@@ -16,6 +16,7 @@ Dependencies:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import time
@@ -87,6 +88,12 @@ Clock = Callable[[], int]
 _AUTH_UNCONFIGURED = "auth_unconfigured"
 # Host-side backstop for the engine's per-execution cap (core DEFAULTS).
 _MAX_PROVIDER_ATTEMPTS = 32
+# Provider attempts of the current request, recorded host-side. The engine's
+# decision_path dies with a run the shim's outer deadline cancels; this list
+# survives it, so a deadline error can still name the route it waited on. The
+# shim sets a list per request; the default None records nothing.
+attempt_log: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "router_attempt_log", default=None)
 _SECRET_PLACEHOLDERS = {"", "CHANGE_ME", "TODO", "TODO_CHANGE_ME", "PLACEHOLDER"}
 
 
@@ -687,7 +694,17 @@ end
                 if (contract.get("first_token_timeout_ms") is not None
                         and req.get("first_token_timeout_ms") is None):
                     req["first_token_timeout_ms"] = contract["first_token_timeout_ms"]
+                log = attempt_log.get()
+                entry = None
+                if log is not None and len(log) < _MAX_PROVIDER_ATTEMPTS:
+                    entry = {"provider_id": req.get("provider_id"),
+                             "model_family": req.get("model_family"),
+                             "started": time.monotonic()}
+                    log.append(entry)
                 resp = await self._resolve_call_async(req, call_override, session=session)
+                if entry is not None:
+                    entry.update({key: resp.get(key) for key in (
+                        "ok", "error_kind", "http_status", "error_message", "latency_ms")})
                 diagnostic = bounded_diagnostics(resp.get("diagnostics"))
                 if diagnostic and len(provider_diagnostics) < 32:
                     diagnostic.update(bounded_diagnostics({
