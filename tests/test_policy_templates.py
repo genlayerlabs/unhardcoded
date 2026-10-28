@@ -398,6 +398,48 @@ def test_live_default_profile_is_exactly_the_published_default_template():
     assert configured_pairs[0] == ("openai_codex", "gpt-5.5")
 
 
+def test_live_default_profile_bounds_first_output_so_fallback_fits_the_deadline():
+    import asyncio
+
+    host = LLMRouterHost(
+        router_path=ROOT / "core" / "router.lua",
+        config_path=ROOT / "config.live.lua",
+        metrics_path=ROOT / "metrics.live.lua",
+        env={
+            "OPENAI_API_KEY": "test",
+            "OPENROUTER_API_KEY": "test",
+        },
+        now_ms=lambda: 1_000,
+        enforce_provider_auth=False,
+    )
+    host.init()
+    _, intent = build_policy_template("default")
+    assert intent["first_token_timeout_ms"] == 15_000
+
+    seen = []
+
+    async def override(request):
+        seen.append(request)
+        if len(seen) == 1:
+            return {"ok": False, "error_kind": "timeout", "latency_ms": 1}
+        return {
+            "ok": True,
+            "latency_ms": 1,
+            "response": {"text": "fallback", "finish_reason": "stop"},
+        }
+
+    result = asyncio.run(host.execute_async({
+        "prompt": "hi",
+        "profile": "default",
+    }, call_override=override))
+    assert result["ok"] and result["response"]["text"] == "fallback"
+    assert len(seen) == 2
+    assert all(req["first_token_timeout_ms"] == 15_000 for req in seen)
+    # Only the first output is bounded; the whole attempt keeps the engine's
+    # 30 s default.
+    assert all(req["timeout_ms"] == 30_000 for req in seen)
+
+
 def test_live_agent_profile_is_exactly_the_published_agent_template():
     import asyncio
 
