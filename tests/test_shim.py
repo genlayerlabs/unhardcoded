@@ -76,7 +76,7 @@ def test_healthz(client):
     assert r.json() == {"ok": True, "initialized": True}
 
 
-def test_request_deadline_returns_504_and_cancels_host(host, monkeypatch):
+def test_request_deadline_returns_503_and_cancels_host(host, monkeypatch):
     import asyncio
 
     cancelled = []
@@ -94,13 +94,61 @@ def test_request_deadline_returns_504_and_cancels_host(host, monkeypatch):
     r = deadline_client.post("/v1/chat/completions", json={
         "model": "", "messages": [{"role": "user", "content": "hi"}]})
 
-    assert r.status_code == 504
+    # Not 504: Cloudflare replaces an origin 502/504 body with plain text.
+    assert r.status_code == 503
     body = r.json()
     assert body["error"]["code"] == "timeout"
+    assert body["error"]["message"] == "router: request deadline of 10 ms exceeded"
     trace = body["x_router"]["decision_trace"]
     assert trace["request_deadline_exceeded"] is True
     assert trace["request_deadline_ms"] == 10
+    assert trace["decision_path"] == []
     assert cancelled == [True]
+
+
+def test_request_deadline_names_the_route_it_was_waiting_on():
+    import asyncio
+
+    host = LLMRouterHost(
+        router_path=ROOT / "core" / "router.lua",
+        config_path=ROOT / "core" / "config.example.lua",
+        metrics_path=ROOT / "core" / "metrics.example.lua",
+        now_ms=lambda: 1_000_000,
+        enforce_provider_auth=False,
+    )
+    host.init()
+    calls = []
+
+    async def call(req):
+        calls.append(req)
+        if len(calls) == 1:
+            return {"ok": False, "error_kind": "timeout", "http_status": 504,
+                    "latency_ms": 1, "error_message": "upstream timed out"}
+        await asyncio.sleep(60)
+
+    host.set_async_call_hook(call)
+    deadline_client = TestClient(create_app(
+        host, default_profile="default", request_deadline_ms=1_000))
+
+    r = deadline_client.post("/v1/chat/completions", json={
+        "model": "", "messages": [{"role": "user", "content": "hi"}]})
+
+    assert r.status_code == 503
+    assert len(calls) == 2
+    body = r.json()
+    path = body["x_router"]["decision_trace"]["decision_path"]
+    assert [e["attempt"] for e in path] == [1, 2]
+    failed, hung = path
+    assert failed["provider_id"] == calls[0]["provider_id"]
+    assert failed["error_kind"] == "timeout"
+    assert failed["http_status"] == 504
+    assert "in_flight" not in failed
+    assert hung["provider_id"] == calls[1]["provider_id"]
+    assert hung["model_family"] == calls[1]["model_family"]
+    assert hung["error_kind"] == "timeout" and hung["in_flight"] is True
+    message = body["error"]["message"]
+    assert message.startswith("router: request deadline of 1000 ms exceeded — ")
+    assert f"{calls[1]['provider_id']}/{calls[1]['model_family']}=timeout" in message
 
 
 # ---- wallet control endpoints ------------------------------------------

@@ -160,7 +160,7 @@ def test_http_trace_retains_provider_evidence_on_success_and_failure(host, monke
     host.set_async_call_hook(call)
     response = TestClient(create_app(host)).post("/v1/chat/completions", json={
         "policy_ir": _PIN, "messages": [{"role": "user", "content": "fixture"}]})
-    assert response.status_code == (504 if failed else 200)
+    assert response.status_code == (503 if failed else 200)
     data = response.json()
     d = data["x_router"]["decision_trace"]["provider_diagnostics"][0]
     assert d["upstream_id"] == "gen-proof" and d["attempt"] == 1

@@ -299,9 +299,10 @@ def test_flow_node_sees_full_conversation_context():
     assert "HAS_SECRET" in r.json()["choices"][0]["message"]["content"]
 
 
-def test_flow_node_timeout_maps_to_504_not_502():
-    """A flow node whose seller times out must surface a clean 504, not the
-    generic 502 catch-all (the observed flow 502 was a node timeout)."""
+def test_flow_node_timeout_maps_to_503_not_502():
+    """A flow node whose seller times out must surface a clean timeout (503,
+    since Cloudflare rewrites origin 502/504 bodies), not the generic 502
+    catch-all (the observed flow 502 was a node timeout)."""
     async def backend(req):
         sys_txt = " ".join(m.get("content") or "" for m in (req.get("messages") or [])
                            if m.get("role") == "system")
@@ -315,7 +316,8 @@ def test_flow_node_timeout_maps_to_504_not_502():
         "model": "", "flow_ir": MOA(),
         "messages": [{"role": "user", "content": "hi"}],
     })
-    assert r.status_code == 504, r.text
+    assert r.status_code == 503, r.text
+    assert r.json()["error"]["code"].endswith("timeout"), r.text
 
 
 def test_flow_with_multi_turn_conversation_succeeds():
