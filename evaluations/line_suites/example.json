@@ -1,0 +1,25 @@
+{
+  "name": "example-ticket-triage",
+  "description": "Sample suite: classify a support ticket. Replace with your own workload's prompt templates.",
+  "request": {
+    "temperature": 0.7,
+    "max_tokens": 1000,
+    "response_format": {"type": "json_object"},
+    "first_token_timeout_ms": 7000,
+    "timeout_ms": 22000
+  },
+  "expect": {
+    "type": "json",
+    "required": {
+      "label": {"enum": ["bug", "billing", "other"]},
+      "confidence": {"type": "integer", "min": 0, "max": 100},
+      "summary": {"type": "string"}
+    }
+  },
+  "repeats": 1,
+  "prompts": [
+    "Classify this support ticket.\n\nTicket: The export button returns a blank CSV since yesterday's update. Other pages work.\n\nReturn a JSON object with exactly: {\"label\": \"bug\" or \"billing\" or \"other\", \"confidence\": integer 0-100, \"summary\": \"one sentence\"}",
+    "Classify this support ticket.\n\nTicket: I was charged twice for the March invoice and need one of the charges refunded.\n\nReturn a JSON object with exactly: {\"label\": \"bug\" or \"billing\" or \"other\", \"confidence\": integer 0-100, \"summary\": \"one sentence\"}",
+    "Classify this support ticket.\n\nTicket: Do you have an office in Lisbon? I would like to visit next month.\n\nReturn a JSON object with exactly: {\"label\": \"bug\" or \"billing\" or \"other\", \"confidence\": integer 0-100, \"summary\": \"one sentence\"}"
+  ]
+}

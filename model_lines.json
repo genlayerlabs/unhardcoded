@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "defaults": {
+    "max_cost_ratio": 1.1,
+    "max_latency_ms": 15000,
+    "max_latency_ratio": 1.25,
+    "min_pass_rate": 0.9,
+    "consecutive_passes": 2,
+    "max_candidates": 2
+  },
+  "lines": {
+    "openai_sol": {
+      "description": "OpenAI general flagship (the -sol tier).",
+      "head": "gpt-6.1-sol",
+      "match": "^gpt-(\\d(?:\\.\\d+)?)-sol$"
+    },
+    "anthropic_sonnet": {
+      "description": "Anthropic Claude Sonnet.",
+      "head": "claude-sonnet-5.5",
+      "match": "^claude-sonnet-(\\d(?:\\.\\d+)?)$"
+    },
+    "gemini_flash_lite": {
+      "description": "Google Gemini Flash-Lite.",
+      "head": "gemini-3.5-flash-lite",
+      "match": "^gemini-(\\d(?:\\.\\d+)?)-flash-lite$"
+    },
+    "deepseek_flash": {
+      "description": "DeepSeek Flash, dated snapshots.",
+      "head": "deepseek-v4.1-flash-1017",
+      "match": "^deepseek-v(\\d(?:\\.\\d+)?)-flash-(\\d{4})$"
+    },
+    "gpt_oss": {
+      "description": "OpenAI open-weights gpt-oss. No version series to follow: moved by an operator only.",
+      "head": "gpt-oss-120b",
+      "match": null
+    },
+    "grok": {
+      "description": "xAI Grok.",
+      "head": "grok-4.3",
+      "match": "^grok-(\\d\\.\\d+)$"
+    },
+    "mistral_large": {
+      "description": "Mistral Large, date-coded snapshots (YYMM).",
+      "head": "mistral-large-2512",
+      "match": "^mistral-large-(\\d{4})$"
+    },
+    "kimi_code": {
+      "description": "Moonshot Kimi, the -code tier.",
+      "head": "kimi-k2.7-code",
+      "match": "^kimi-k(\\d(?:\\.\\d+)?)-code$"
+    },
+    "qwen_27b": {
+      "description": "Alibaba Qwen, the 27b open-weights size.",
+      "head": "qwen3.8-27b",
+      "match": "^qwen(\\d(?:\\.\\d+)?)-27b$"
+    },
+    "glm": {
+      "description": "Z.ai GLM base model.",
+      "head": "glm-5.3",
+      "match": "^glm-(\\d(?:\\.\\d+)?)$"
+    },
+    "minimax": {
+      "description": "MiniMax M series base model.",
+      "head": "minimax-m3",
+      "match": "^minimax-m(\\d(?:\\.\\d+)?)$"
+    },
+    "minimax_flash": {
+      "description": "MiniMax M series, the -flash tier.",
+      "head": "minimax-m3.1-flash",
+      "match": "^minimax-m(\\d(?:\\.\\d+)?)-flash$"
+    },
+    "gemma": {
+      "description": "Google Gemma instruction-tuned, dense.",
+      "head": "gemma-4-31b-it",
+      "match": "^gemma-(\\d)-(\\d+)b-it$"
+    },
+    "gemma_efficient": {
+      "description": "Google Gemma instruction-tuned, the active-parameter (aNb) variant.",
+      "head": "gemma-4-26b-a4b-it",
+      "match": "^gemma-(\\d)-(\\d+)b-a\\d+b-it$"
+    }
+  }
+}

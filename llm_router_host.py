@@ -24,6 +24,7 @@ from typing import Callable
 
 import host_store
 import route_reliability as _route_reliability
+import model_lines as _model_lines
 from byo_http import is_byo_buyer
 from provider_adapters.anthropic import make_anthropic_async_call_provider
 from provider_adapters.bedrock import make_bedrock_async_call_provider
@@ -216,6 +217,47 @@ function(cfg)
     }
 end
 """)(self.config)
+        self._inject_model_line_fields()
+
+    def _inject_model_line_fields(self) -> None:
+        """Declare one model-group Bool per model line: `line_<name>` is true for
+        the family currently qualified as that line's head (see model_lines.py).
+
+        Same extension seam as `cache_hot`. The set of fields is fixed by the
+        definitions file, so a policy naming an undeclared line fails admission.
+        Which family a line points at lives in this runtime's `host_line_heads`
+        table, so the getter is one native table lookup per candidate — it runs
+        for every candidate of every request and must not cross into Python.
+        model_lines republishes that table to every live engine when a head
+        moves (tenant children and flow nodes included), so a promotion needs no
+        engine rebuild. A name the catalog already declares is left alone."""
+        lines = _model_lines.definitions()
+        if not lines:
+            return
+        self.lua.execute("host_line_heads = {}")
+        declare = self.lua.eval("""
+function(cfg, line, field)
+    cfg.fields = cfg.fields or {}
+    if cfg.fields[field] ~= nil then return false end
+    cfg.fields[field] = {
+        sort = "Bool", default = false, group = "model",
+        get = function(c)
+            local fam = c.model_family
+            return fam ~= nil and host_line_heads[line] == fam
+        end,
+    }
+    return true
+end
+""")
+        for name in lines:
+            declare(self.config, name, _model_lines.field_name(name))
+        _model_lines.subscribe(self)
+
+    def sync_model_line_heads(self, heads: dict[str, str]) -> None:
+        """Replace this runtime's line -> head table. Called by model_lines on
+        subscribe and on every head move; rebinding one global is atomic to any
+        Lua code running between attempts."""
+        self.lua.globals().host_line_heads = self.lua.table_from(heads)
 
     # ---- public API -----------------------------------------------------
 
