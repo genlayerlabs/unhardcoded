@@ -116,6 +116,9 @@ def test_text_and_regex_expectations():
     ({"name": "s", "prompts": ["p"], "request": {"policy_ir": []}}, "may only set"),
     ({"name": "s", "prompts": ["p"], "expect": {"type": "xml"}}, "expect.type"),
     ({"name": "s", "prompts": ["p"], "expect": {"type": "regex", "pattern": "("}}, "bad expect.pattern"),
+    # no pattern would compile to "match anything", a refusal included
+    ({"name": "s", "prompts": ["p"], "expect": {"type": "regex"}}, "non-empty string"),
+    ({"name": "s", "prompts": ["p"], "expect": {"type": "regex", "pattern": ""}}, "non-empty string"),
     ({"name": "s", "prompts": ["p"], "repeats": 9}, "repeats"),
 ])
 def test_invalid_suites_are_refused(doc, message):
@@ -160,6 +163,26 @@ def test_probe_failures_are_counted_not_raised():
     assert summary["passed"] == 0 and summary["pass_rate"] == 0.0
     assert summary["errors"] == {"memories:ConnectionError": 3}
     assert summary["mean_cost_usd"] is None and summary["latency_p95_ms"] is None
+    # the network failed, not the model: nothing may be concluded from it
+    assert summary["inconclusive"] == 3 and not q.conclusive(summary)
+
+
+@pytest.mark.parametrize("status, code, inconclusive", [
+    (429, "caller_rate_limit", True),        # our own key, before any provider
+    (402, "key_budget_exhausted", True),
+    (503, "router_overloaded", True),
+    (401, "consumer_auth", True),
+    (502, "upstream", True),
+    (429, "exhausted", False),               # the provider's limit: the route's problem
+    (504, "timeout", False),
+    (400, "invalid_request_error", False),
+])
+def test_ingress_rejections_are_inconclusive_model_failures_are_not(status, code, inconclusive):
+    router = FakeRouter(["m-1"], {"m-1": {"status": status, "code": code}})
+    summary = q.probe_family(router.post, "m-1", [SUITE], "x")
+    assert summary["passed"] == 0
+    assert (summary["inconclusive"] == 3) is inconclusive
+    assert q.conclusive(summary) is (not inconclusive)
 
 
 def test_exhausted_output_budget_is_reported_as_truncated():
@@ -176,7 +199,7 @@ def test_answer_from_another_family_does_not_credit_the_candidate():
     assert summary["errors"] == {"memories:served_other_family": 3}
 
 
-def test_cost_is_unknown_unless_every_passing_probe_reported_one():
+def test_cost_is_unknown_unless_every_answered_probe_reported_one():
     results = [{"suite": "s", "status": 200, "latency_ms": 10, "valid": True, "cost_usd": 0.002},
                {"suite": "s", "status": 200, "latency_ms": 30, "valid": True, "cost_usd": None}]
     assert q.summarize("m", results)["mean_cost_usd"] is None
@@ -195,13 +218,15 @@ def test_p90_ignores_the_single_slowest_probe_of_a_run():
 
 # ---- gates ---------------------------------------------------------------------
 
-DEF = {"min_pass_rate": 0.9, "max_latency_ms": 15000, "max_latency_ratio": 1.25,
-       "max_cost_ratio": 1.1}
+DEF = {"min_pass_rate": 0.9, "min_suite_pass_rate": 0.5, "max_latency_ms": 15000,
+       "max_latency_ratio": 1.25, "max_cost_ratio": 1.1}
 
 
-def _summary(pass_rate=1.0, p90=5000, cost=0.001, probes=16):
+def _summary(pass_rate=1.0, p90=5000, cost=0.001, probes=16, suites=None):
+    passed = round(pass_rate * probes)
     return {"probes": probes, "pass_rate": pass_rate, "latency_p90_ms": p90,
-            "mean_cost_usd": cost}
+            "mean_cost_usd": cost, "costs": [cost] * probes, "inconclusive": 0,
+            "suites": suites or {"s": {"probes": probes, "passed": passed}}}
 
 
 @pytest.mark.parametrize("candidate, head, qualified, failing", [
@@ -233,15 +258,62 @@ def test_gates_fail_closed(candidate, head, qualified, failing):
         assert verdict["gates"][failing]["ok"] is False
 
 
+def test_whole_suite_failure_cannot_hide_behind_the_aggregate():
+    # 9 general prompts pass, the single specialist prompt fails: 90% overall
+    candidate = _summary(pass_rate=0.9, probes=10, suites={
+        "general": {"probes": 9, "passed": 9}, "specialist": {"probes": 1, "passed": 0}})
+    verdict = q.judge(candidate, _summary(probes=10), DEF)
+    assert verdict["qualified"] is False
+    assert verdict["gates"]["answers"]["suites"] == {"general": 1.0, "specialist": 0.0}
+    # the same overall rate spread across suites is just noise
+    spread = _summary(pass_rate=0.9, probes=10, suites={
+        "general": {"probes": 6, "passed": 5}, "specialist": {"probes": 4, "passed": 4}})
+    assert q.judge(spread, _summary(probes=10), DEF)["qualified"] is True
+
+
+def test_cost_is_compared_over_the_same_probes_and_counts_unusable_answers():
+    # Nine prompts cost both sides $0.001. On the tenth the head answers for
+    # $0.01 and the candidate charges $0.02 for an answer that is not valid.
+    head = _summary(probes=10)
+    head["costs"] = [0.001] * 9 + [0.01]
+    candidate = _summary(pass_rate=0.9, probes=10)
+    candidate["costs"] = [0.001] * 9 + [0.02]
+    cost = q.judge(candidate, head, DEF)["gates"]["cost"]
+    assert cost["ok"] is False and cost["paired"] == 10
+    assert cost["ratio"] == round(0.029 / 0.019, 4)
+
+
+def test_cost_pairs_only_probes_both_sides_reported():
+    head = _summary(probes=4)
+    head["costs"] = [0.004, None, 0.004, 0.004]        # one head probe had no response
+    candidate = _summary(probes=4)
+    candidate["costs"] = [0.004, 0.5, 0.004, 0.004]    # its cost there has no counterpart
+    cost = q.judge(candidate, head, DEF)["gates"]["cost"]
+    assert cost["ok"] is True and cost["paired"] == 3 and cost["ratio"] == 1.0
+    # too few pairs to say anything: fail closed
+    head["costs"] = [0.004, None, None, None]
+    assert q.judge(candidate, head, DEF)["gates"]["cost"]["reason"] == "no_head_baseline"
+
+
 def test_consecutive_passes_stop_at_the_first_failure():
-    events = [{"family": "m-2", "kind": "candidate_passed"},
-              {"family": "m-3", "kind": "candidate_failed"},     # another family
-              {"family": "m-2", "kind": "candidate_passed"},
-              {"family": "m-2", "kind": "candidate_failed"},
-              {"family": "m-2", "kind": "candidate_passed"}]
-    assert q.consecutive_passes(events, "m-2") == 2
-    assert q.consecutive_passes(events, "m-3") == 0
-    assert q.consecutive_passes(events, "m-9") == 0
+    def ev(family, kind, head="m-1"):
+        return {"family": family, "kind": kind, "previous_family": head}
+    events = [ev("m-2", "candidate_passed"),
+              ev("m-3", "candidate_failed"),          # another family
+              ev("m-2", "candidate_passed"),
+              ev("m-2", "candidate_failed"),
+              ev("m-2", "candidate_passed")]
+    assert q.consecutive_passes(events, "m-2", "m-1") == 2
+    assert q.consecutive_passes(events, "m-3", "m-1") == 0
+    assert q.consecutive_passes(events, "m-9", "m-1") == 0
+
+
+def test_passes_against_an_earlier_head_do_not_count():
+    def ev(head):
+        return {"family": "m-3", "kind": "candidate_passed", "previous_family": head}
+    events = [ev("m-2"), ev("m-1"), ev("m-1")]        # newest first
+    assert q.consecutive_passes(events, "m-3", "m-2") == 1
+    assert q.consecutive_passes(events, "m-3", "m-1") == 0   # newest is vs another head
 
 
 # ---- runs ----------------------------------------------------------------------
@@ -341,7 +413,7 @@ def test_unhealthy_head_blocks_promotion_and_is_flagged(lines):
 
 def test_degraded_head_is_flagged_and_can_still_be_replaced(lines):
     store = lines(alpha=_line("m-1", consecutive_passes=1))
-    router = FakeRouter(["m-1", "m-2"], {"m-1": {"fail_on": ["p2", "p3"]}})   # 1/3 pass
+    router = FakeRouter(["m-1", "m-2"], {"m-1": {"fail_on": ["p3"]}})         # 2/3 pass
     report = router.run("auto")
     assert report["unhealthy_heads"] == ["alpha"]
     assert report["lines"]["alpha"]["head_summary"]["pass_rate"] < 0.9
@@ -379,6 +451,101 @@ def test_propose_mode_never_rolls_back(lines):
     router.behaviour["m-2"] = {"status": 504}
     assert router.run("propose")["moves"] == []
     assert model_lines.head_of("alpha") == "m-2"
+
+
+def test_streak_restarts_when_the_head_changes_under_the_candidate(lines):
+    lines(alpha=_line("m-1"))
+    router = FakeRouter(["m-1", "m-2", "m-3"], {"m-2": {"cost": 0.01}})   # m-2 never qualifies
+    assert router.run("auto")["moves"] == []          # m-3: one pass, against m-1
+    # an operator moves the line to m-2: m-3's pass was measured against m-1
+    assert model_lines.promote("alpha", "m-2", actor="op")["ok"]
+    router.behaviour["m-2"] = {}
+    report = router.run("auto")
+    assert report["moves"] == []
+    assert report["lines"]["alpha"]["candidates"][0]["streak"] == 1
+    assert router.run("auto")["moves"] == [{"line": "alpha", "from": "m-2", "to": "m-3"}]
+
+
+def test_inconclusive_head_freezes_the_line(lines):
+    store = lines(alpha=_line("m-1", consecutive_passes=1))
+    router = FakeRouter(["m-1", "m-2"], {"m-1": {"status": 429, "code": "caller_rate_limit"}})
+    report = router.run("auto")
+    assert report["inconclusive_lines"] == ["alpha"]
+    assert report["unhealthy_heads"] == [] and report["moves"] == []
+    assert report["lines"]["alpha"]["head_healthy"] is None
+    assert store.model_line_events("alpha") == []     # nothing judged, nothing recorded
+
+
+def test_inconclusive_head_is_never_rolled_back(lines):
+    lines(alpha=_line("m-1", consecutive_passes=1))
+    router = FakeRouter(["m-1", "m-2"], {})
+    assert router.run("auto")["moves"] == [{"line": "alpha", "from": "m-1", "to": "m-2"}]
+    # our own key is rate limited while probing the new head; the old one answers
+    router.behaviour["m-2"] = {"status": 429, "code": "key_rate_limit"}
+    assert router.run("auto")["moves"] == []
+    assert model_lines.head_of("alpha") == "m-2"
+
+
+def test_inconclusive_candidate_neither_extends_nor_breaks_its_streak(lines):
+    store = lines(alpha=_line("m-1"))
+    router = FakeRouter(["m-1", "m-2"], {})
+    router.run("auto")                                               # streak 1
+    router.behaviour["m-2"] = {"status": 503, "code": "router_overloaded"}
+    report = router.run("auto")
+    assert report["moves"] == []
+    assert report["lines"]["alpha"]["candidates"][0]["inconclusive"] is True
+    assert len(store.model_line_events("alpha")) == 1                # no event for it
+    router.behaviour["m-2"] = {}
+    assert router.run("auto")["moves"] == [{"line": "alpha", "from": "m-1", "to": "m-2"}]
+
+
+def test_run_stops_when_a_result_cannot_be_recorded(lines, monkeypatch):
+    store = lines(alpha=_line("m-1"))
+    router = FakeRouter(["m-1", "m-2"], {})
+    router.run("auto")                                               # streak 1
+    router.behaviour["m-2"] = {"text": "refused"}                    # this run fails...
+    monkeypatch.setattr(store, "add_model_line_event", lambda *a, **k: False)
+    with pytest.raises(RuntimeError, match="audit write failed"):    # ...and cannot be recorded
+        router.run("auto")
+    assert model_lines.head_of("alpha") == "m-1"
+
+
+def test_auto_does_not_undo_its_own_rollback(lines):
+    store = lines(alpha=_line("m-1", consecutive_passes=1))
+    router = FakeRouter(["m-1", "m-2"], {})
+    router.run("auto")                                               # m-1 -> m-2
+    router.behaviour["m-2"] = {"text": "refused"}
+    assert router.run("auto")["moves"] == [{"line": "alpha", "from": "m-2", "to": "m-1"}]
+    # now m-1 fails too, and m-2 answers again but at 5x the cost: it must not
+    # come back on answer rate alone just because it is the "previous" head
+    router.behaviour = {"m-1": {"status": 504}, "m-2": {"cost": 0.005}}
+    report = router.run("auto")
+    assert report["moves"] == [] and model_lines.head_of("alpha") == "m-1"
+    assert store.model_line_events("alpha")[0]["kind"] == "head_unhealthy"
+
+
+def test_rollback_is_skipped_when_the_line_moved_during_the_probes(lines, monkeypatch):
+    store = lines(alpha=_line("m-1", consecutive_passes=1))
+    router = FakeRouter(["m-1", "m-2", "m-3"], {"m-3": {"cost": 0.01}})
+    router.run("auto")                                               # m-1 -> m-2
+    router.behaviour["m-2"] = {"text": "refused"}
+    real_post = router.post
+    moved = []
+
+    def post(body):
+        # an operator promotes m-3 while the qualifier is still probing
+        if not moved:
+            moved.append(model_lines.promote("alpha", "m-3", actor="op")["ok"])
+        return real_post(body)
+
+    report = q.run(post=post, get=router.get, suites=[SUITE], mode="auto", workers=1)
+    assert moved == [True]
+    # m-2 did fail its probes, but it is no longer the move to undo: the latest
+    # move is the operator's, so the qualifier only records what it saw
+    assert report["moves"] == []
+    assert "rolled_back" not in report["lines"]["alpha"]["head_action"]
+    assert store.get_model_line_heads()["alpha"]["family"] == "m-3"   # the operator's move stands
+    assert store.model_line_events("alpha", kinds=("rolled_back",)) == []
 
 
 def test_run_refuses_to_decide_without_the_store(lines, monkeypatch):

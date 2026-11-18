@@ -832,6 +832,48 @@ def set_model_line_head(line: str, family: str, *, seed_family: "str | None",
         return {"ok": False, "reason": "store_unavailable"}
 
 
+def rollback_model_line_head(line: str, *, seed_family: "str | None", actor: str,
+                             detail: "dict[str, Any] | None" = None,
+                             expected_current: "str | None" = None,
+                             expected_previous: "str | None" = None) -> dict[str, Any]:
+    """Swap a line back to the head it had before its last move, atomically.
+
+    The current and previous heads are read INSIDE the locked transaction, so
+    the target is the predecessor of the move that is actually current — not of
+    one the caller read earlier. `expected_current` / `expected_previous` turn
+    it into a compare-and-set on that move. Returns {ok, family,
+    previous_family} or {ok: False, reason, family}."""
+    try:
+        now = int(time.time())
+        with _get_pool().connection() as conn:
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                         ("model_line:" + line,))
+            row = conn.execute(
+                "SELECT family, previous_family FROM model_line_heads WHERE line=%s",
+                (line,)).fetchone()
+            current = row[0] if row else seed_family
+            previous = row[1] if row else None
+            if expected_current is not None and current != expected_current:
+                return {"ok": False, "reason": "conflict", "family": current}
+            if not previous or previous == current:
+                return {"ok": False, "reason": "no_previous", "family": current}
+            if expected_previous is not None and previous != expected_previous:
+                return {"ok": False, "reason": "conflict", "family": current}
+            conn.execute(
+                "UPDATE model_line_heads SET family=%s, previous_family=%s,"
+                " updated_at=%s, updated_by=%s WHERE line=%s",
+                (previous, current, now, actor, line))
+            conn.execute(
+                "INSERT INTO model_line_events(ts, line, kind, family,"
+                " previous_family, actor, detail) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (now, line, "rolled_back", previous, current, actor,
+                 json.dumps(detail) if detail is not None else None))
+        return {"ok": True, "family": previous, "previous_family": current}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store rollback_model_line_head failed: %s", exc)
+        return {"ok": False, "reason": "store_unavailable"}
+
+
 def add_model_line_event(line: str, kind: str, *, family: "str | None" = None,
                          previous_family: "str | None" = None, actor: str = "",
                          detail: "dict[str, Any] | None" = None) -> bool:

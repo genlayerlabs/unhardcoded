@@ -32,14 +32,17 @@ import serve  # noqa: E402
 class _RecordingRouter:
     """Stands in for the ingress's upstream client and records what it was sent."""
 
-    def __init__(self, status=200, body=None):
+    def __init__(self, status=200, body=None, raises=None):
         self.calls: list[dict] = []
         self.status = status
         self.body = body if body is not None else {"ok": True}
+        self.raises = raises
 
     async def request(self, method, url, json=None, headers=None, timeout=None):
         self.calls.append({"method": method, "url": url, "json": json,
                            "headers": dict(headers or {})})
+        if self.raises is not None:
+            raise self.raises
         return httpx.Response(self.status, json=self.body)
 
 
@@ -97,6 +100,25 @@ def test_dashboard_relays_router_conflicts_and_rejects_bad_input(monkeypatch):
                        content=b"[1]", headers={"content-type": "application/json"}
                        ).status_code == 400
     assert len(router.calls) == 1      # nothing malformed reached the router
+
+
+def test_dashboard_says_when_a_move_may_have_been_applied(monkeypatch):
+    client = _admin(monkeypatch)
+    # sent, no answer: the router may have committed the move
+    monkeypatch.setattr(auth_proxy, "_client",
+                        _RecordingRouter(raises=httpx.ReadTimeout("slow")))
+    r = client.post("/dashboard/api/lines/alpha/rollback", json={})
+    assert r.status_code == 504
+    assert r.json()["error"]["code"] == "model_line_outcome_unknown"
+    # never connected: nothing happened, a plain retry is safe
+    monkeypatch.setattr(auth_proxy, "_client",
+                        _RecordingRouter(raises=httpx.ConnectError("refused")))
+    r = client.post("/dashboard/api/lines/alpha/rollback", json={})
+    assert r.status_code == 502 and r.json()["error"]["code"] == "upstream"
+    # a read has no outcome to be unsure about
+    monkeypatch.setattr(auth_proxy, "_client",
+                        _RecordingRouter(raises=httpx.ReadTimeout("slow")))
+    assert client.get("/dashboard/api/lines").status_code == 502
 
 
 # ---- replica refresh -----------------------------------------------------------

@@ -201,6 +201,10 @@ class ModelLineMoveRequest(BaseModel):
 class ModelLineRollbackRequest(BaseModel):
     """Body of POST /x/lines/{line}/rollback."""
     actor: str = Field(default="", max_length=120)
+    # Compare-and-set on the move being undone: send the head you saw. A retry
+    # after a lost response then conflicts instead of undoing the rollback.
+    expected_current: str | None = Field(default=None, max_length=128)
+    expected_previous: str | None = Field(default=None, max_length=128)
     detail: dict | None = None
 
 
@@ -460,8 +464,10 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     def model_line_rollback(line: str, body: ModelLineRollbackRequest):
         import model_lines
         try:
-            result = model_lines.rollback(line, actor=body.actor or "operator",
-                                          detail=body.detail)
+            result = model_lines.rollback(
+                line, actor=body.actor or "operator", detail=body.detail,
+                expected_current=body.expected_current,
+                expected_previous=body.expected_previous)
         except model_lines.ModelLineError as exc:
             return JSONResponse(status_code=400, content={"error": {
                 "message": str(exc), "type": "invalid_request_error",

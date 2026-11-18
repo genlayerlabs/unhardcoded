@@ -98,6 +98,7 @@ def test_shipped_definitions_are_valid_and_self_consistent():
     (_doc(a=_line("other-1", r"^m-(\d+)$")), "does not match its own"),
     (_doc(a=_line("m-1", None, max_cost_ratio=0)), "positive number"),
     (_doc(a=_line("m-1", None, min_pass_rate=1.5)), "must be <= 1"),
+    (_doc(a=_line("m-1", None, min_suite_pass_rate=2)), "must be <= 1"),
     (_doc(a=_line("m-1", None, surprise=1)), "unknown key"),
     ({"version": 1, "defaults": {"nope": 1}, "lines": {}}, "unknown default knob"),
 ])
@@ -236,6 +237,35 @@ def test_engine_that_fails_to_sync_does_not_block_the_others(lines_file, monkeyp
     assert _ranked_families(healthy, policy) == {"hermes-3-405b"}
     assert _ranked_families(broken, policy) == {"deepseek-v3"}   # kept its last table
 
+    # once it accepts updates again, the next store read heals it even though
+    # nothing moved in between
+    monkeypatch.undo()
+    _replica_sees(monkeypatch, alpha="hermes-3-405b")
+    assert _ranked_families(broken, policy) == {"hermes-3-405b"}
+
+
+def test_older_store_read_cannot_replace_a_newer_one(lines_file, monkeypatch):
+    import host_store
+    lines_file(_doc(alpha=_line("deepseek-v3")))
+    host = _host()
+    row = lambda fam: {"alpha": {"family": fam, "previous_family": None,   # noqa: E731
+                                 "updated_at": 1, "updated_by": "t"}}
+    calls = []
+
+    def slow_read():
+        # The timer's read returns the OLD head, but only after a promotion's
+        # reload — started later — has read the new one and installed it.
+        calls.append(1)
+        if len(calls) == 1:
+            assert model_lines.reload() is True
+            return row("hermes-3-405b")           # stale by the time it lands
+        return row("llama-3.3-70b")               # what the later read saw
+
+    monkeypatch.setattr(host_store, "get_model_line_heads", slow_read)
+    assert model_lines.reload() is True
+    assert model_lines.head_of("alpha") == "llama-3.3-70b"
+    assert _ranked_families(host, _policy("alpha")) == {"llama-3.3-70b"}
+
 
 def test_head_absent_from_catalog_ranks_nothing(lines_file):
     lines_file(_doc(alpha=_line("not-a-real-family")))
@@ -307,6 +337,33 @@ def test_promote_refuses_families_outside_the_line_unless_forced(
     assert model_lines.promote("alpha", "other-9", actor="t", force=True)["ok"]
 
 
+def test_rollback_target_is_chosen_inside_the_store(host_store_clean, lines_file):
+    lines_file(_doc(alpha=_line("m-1", r"^m-(\d+)$")))
+    assert model_lines.promote("alpha", "m-2", actor="t")["ok"]       # m-1 -> m-2
+    # A caller read "current m-2, previous m-1". Then the line went m-2 -> m-3 ->
+    # m-2: the head is m-2 again, but undoing its LAST move leads to m-3.
+    assert model_lines.promote("alpha", "m-3", actor="t")["ok"]
+    assert model_lines.promote("alpha", "m-2", actor="t", force=True)["ok"]
+    stale = model_lines.rollback("alpha", actor="t", expected_current="m-2",
+                                 expected_previous="m-1")
+    assert stale == {"ok": False, "reason": "conflict", "family": "m-2"}
+    assert model_lines.head_of("alpha") == "m-2"
+    # without the stale expectation the store undoes the move that is current
+    assert model_lines.rollback("alpha", actor="t") == {
+        "ok": True, "family": "m-3", "previous_family": "m-2"}
+
+
+def test_retried_rollback_conflicts_instead_of_undoing_itself(host_store_clean, lines_file):
+    lines_file(_doc(alpha=_line("m-1", r"^m-(\d+)$")))
+    model_lines.promote("alpha", "m-2", actor="t")
+    first = model_lines.rollback("alpha", actor="t", expected_current="m-2")
+    assert first["ok"] and model_lines.head_of("alpha") == "m-1"
+    # the response was lost and the operator retries the same request
+    retry = model_lines.rollback("alpha", actor="t", expected_current="m-2")
+    assert retry == {"ok": False, "reason": "conflict", "family": "m-1"}
+    assert model_lines.head_of("alpha") == "m-1"
+
+
 def test_rollback_without_a_previous_head(host_store_clean, lines_file):
     lines_file(_doc(alpha=_line("m-1")))
     assert model_lines.rollback("alpha", actor="t") == {
@@ -355,7 +412,11 @@ def test_lines_endpoints_move_heads_and_report_conflicts(host_store_clean, lines
     assert r.status_code == 400 and r.json()["error"]["code"] == "model_line"
     assert client.post("/x/lines/nope/rollback", json={}).status_code == 400
 
-    r = client.post("/x/lines/alpha/rollback", json={"actor": "op"})
+    r = client.post("/x/lines/alpha/rollback",
+                    json={"actor": "op", "expected_current": "deepseek-v9"})
+    assert r.status_code == 409                       # not the move the caller saw
+    r = client.post("/x/lines/alpha/rollback",
+                    json={"actor": "op", "expected_current": "deepseek-v4"})
     assert r.status_code == 200 and r.json()["family"] == "deepseek-v3"
 
 

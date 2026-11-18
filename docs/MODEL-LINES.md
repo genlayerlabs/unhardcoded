@@ -87,16 +87,21 @@ Fail-safe directions:
 ```
 GET  /x/lines                      every line, head, seed, source, recent events
 POST /x/lines/{line}/promote       {"family", "expected_current"?, "force"?, "detail"?}
-POST /x/lines/{line}/rollback      back to the head before the last move
+POST /x/lines/{line}/rollback      {"expected_current"?, "expected_previous"?, "detail"?}
 ```
 
 These are operator surfaces behind the router's internal secret. The dashboard
 exposes the same three to an authenticated admin as `/dashboard/api/lines…` and
 stamps the audit actor from the session, never from the request body.
 
-`expected_current` makes a promotion a compare-and-set: it is refused with 409
-if the line no longer points where the caller thought. A family outside the
-line's own pattern is refused unless `force` is set.
+Both moves are compare-and-set when you say what you saw. `expected_current`
+refuses the move with 409 if the line no longer points there. Send it on a
+rollback too: the store picks the rollback target inside its own transaction,
+and a rollback retried after a lost response then conflicts instead of undoing
+itself. If the dashboard answers 504 `model_line_outcome_unknown`, the request
+reached the router and may have been applied: read `/dashboard/api/lines`
+before retrying. A family outside the line's own pattern is refused unless
+`force` is set.
 
 ## Qualification
 
@@ -116,23 +121,46 @@ run on a schedule, outside the request-serving pods:
 
    | Gate | Passes when | Knob |
    |---|---|---|
-   | answers | share of valid answers inside the deadlines ≥ | `min_pass_rate` (0.9) |
+   | answers | share of valid answers inside the deadlines ≥ the overall bar, **and** ≥ the per-suite bar in every suite | `min_pass_rate` (0.9), `min_suite_pass_rate` (0.5) |
    | latency | p90 of successful probes ≤ the absolute bound, **or** ≤ head's p90 × ratio | `max_latency_ms` (15000), `max_latency_ratio` (1.25) |
-   | cost | measured mean cost per probe ≤ head's × | `max_cost_ratio` (1.1) |
+   | cost | measured cost ≤ head's × ratio, summed over the probes both reported | `max_cost_ratio` (1.1) |
 
-   Cost is the cost the router **measured** for those calls, not a list price:
-   marketplace routes make list prices a poor predictor of what a call costs.
-   Every gate fails closed. An unknown cost, or a head with no successful
-   probe to compare against, qualifies nobody. A head that is merely degraded
-   still serves as the baseline: it is the one most worth replacing. `min_pass_rate` is also the bar a head
-   must clear to count as healthy; it is below 1 because one transient provider
-   error in a run is noise, and `consecutive_passes` is what guards against a
-   lucky run.
-4. A candidate that qualified on `consecutive_passes` runs in a row (2) is
-   promoted or proposed, newest first.
+   - Cost is what the router **measured** for those calls, not a list price:
+     marketplace routes make list prices a poor predictor of what a call costs.
+     It is compared over the same probes on both sides, and a probe that
+     returned an unusable answer still counts what it charged.
+   - Every gate fails closed. An unknown cost, or too few probes with a cost on
+     both sides, qualifies nobody.
+   - A head that is merely degraded still serves as the baseline: it is the one
+     most worth replacing.
+   - `min_pass_rate` is also the bar a head must clear to count as healthy. It is
+     below 1 because one transient provider error in a run is noise;
+     `consecutive_passes` is what guards against a lucky run, and the per-suite
+     bar is what stops a model that fails one whole workload from hiding behind
+     the others. Give a one-prompt suite `repeats` if a single miss should not
+     decide it.
+4. A candidate that qualified on `consecutive_passes` runs in a row (2), all of
+   them against the head that is current now, is promoted or proposed, newest
+   first. A pass measured against an earlier head does not count.
 5. A head that stops passing is always recorded. It is rolled back only in
-   `auto`, only if this qualifier put it there, and only if the head it replaced
-   still passes. A head an operator chose is never moved automatically.
+   `auto`, only if the move that made it current is this qualifier's own
+   promotion, and only if the head it replaced still passes. A head an operator
+   chose is never moved automatically, and the qualifier never undoes its own
+   rollback.
+6. A probe stopped by the ingress or the network — the qualifier's own rate
+   limit or budget, an overloaded or unreachable router — is **inconclusive**,
+   not failed. A family with any such probe is not judged on that run: a
+   candidate keeps its streak, and a line whose head was affected is left
+   alone.
+
+The run stops with a non-zero exit if the store is unreachable or an audit
+event cannot be written: the streak a promotion rests on is read from those
+events.
+
+The qualifier reads the same definitions file as the router and writes to the
+same store. Run it from the router's image with the same `MODEL_LINES_FILE` (or
+none on both). A job with different knobs would promote into the shared store
+by its own rules.
 
 Modes (`--mode` / `LINE_QUALIFIER_MODE`):
 

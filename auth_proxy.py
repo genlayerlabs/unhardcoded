@@ -2328,10 +2328,22 @@ async def _router_lines_call(method: str, path: str,
                                   headers=_router_admin_headers(), timeout=10.0)
         return Response(content=r.content, status_code=r.status_code,
                         media_type="application/json")
-    except Exception:
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        # Never reached the router: nothing happened, safe to retry.
         return JSONResponse(status_code=502, content={"error": {
             "message": f"router {path} unavailable", "type": "router_error",
             "code": "upstream"}})
+    except Exception:
+        # Sent, but no answer came back. A head move may have committed: say so
+        # rather than inviting a blind retry that would undo it.
+        if method == "GET":
+            return JSONResponse(status_code=502, content={"error": {
+                "message": f"router {path} unavailable", "type": "router_error",
+                "code": "upstream"}})
+        return JSONResponse(status_code=504, content={"error": {
+            "message": "no response from the router: the move may or may not "
+                       "have been applied. Read /dashboard/api/lines before retrying.",
+            "type": "router_error", "code": "model_line_outcome_unknown"}})
 
 
 @app.get("/dashboard/api/lines")

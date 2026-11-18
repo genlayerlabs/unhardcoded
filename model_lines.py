@@ -29,6 +29,7 @@ must stay native); `subscribe` hands it over and every move republishes it.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import os
@@ -65,6 +66,10 @@ QUALIFY_DEFAULTS: dict[str, float] = {
     # the bar a head must clear to count as healthy. Below 1 on purpose: one
     # transient provider error in a run is noise, not a regression.
     "min_pass_rate": 0.9,
+    # ... and the share that must pass inside EACH suite, so a model that fails
+    # one whole workload cannot hide behind the others. Lower than the overall
+    # bar because a suite can be a handful of prompts.
+    "min_suite_pass_rate": 0.5,
     # Qualifying runs in a row (on separate runs) before a promotion.
     "consecutive_passes": 2,
     # Newest candidates probed per line per run.
@@ -76,7 +81,14 @@ class ModelLineError(ValueError):
     """A definitions file or a head move is not acceptable."""
 
 
+# _lock guards the module's own state and is never held across I/O or a call
+# into an engine. _install_lock orders "install a set of heads + deliver it to
+# the engines"; it is held across engine deliveries (a table assignment each),
+# never across a store read.
 _lock = threading.Lock()
+_install_lock = threading.RLock()
+_tickets = itertools.count(1)
+_installed_ticket = 0
 _definitions: "dict[str, dict[str, Any]] | None" = None
 _heads: dict[str, str] = {}
 _rows: dict[str, dict[str, Any]] = {}
@@ -136,8 +148,9 @@ def parse_definitions(data: Any) -> dict[str, dict[str, Any]]:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
                 raise ModelLineError(f"line {name}: `{knob}` must be a positive number")
             knobs[knob] = value
-        if knobs["min_pass_rate"] > 1:
-            raise ModelLineError(f"line {name}: `min_pass_rate` must be <= 1")
+        for rate in ("min_pass_rate", "min_suite_pass_rate"):
+            if knobs[rate] > 1:
+                raise ModelLineError(f"line {name}: `{rate}` must be <= 1")
         extra = set(raw) - {"head", "match", "description"} - set(QUALIFY_DEFAULTS)
         if extra:
             raise ModelLineError(f"line {name}: unknown key(s) {sorted(extra)}")
@@ -159,18 +172,20 @@ def configure(path: "str | Path | None" = None) -> dict[str, dict[str, Any]]:
     """(Re)load the definitions and reset every head to its seed. An invalid file
     declares NO lines and logs why — a policy naming one then fails admission
     loudly instead of the host serving a partial set."""
-    global _definitions, _heads, _rows, _store_ok
+    global _definitions, _heads, _rows, _store_ok, _installed_ticket
     try:
         defs = load_definitions(path)
     except (OSError, ValueError) as exc:
         _log.error("model lines disabled: %s", exc)
         defs = {}
-    with _lock:
-        _definitions = defs
-        _heads = {name: d["head"] for name, d in defs.items()}
-        _rows = {}
-        _store_ok = None
-    _publish()
+    with _install_lock:
+        _installed_ticket = next(_tickets)    # outdates any store read in flight
+        with _lock:
+            _definitions = defs
+            _heads = {name: d["head"] for name, d in defs.items()}
+            _rows = {}
+            _store_ok = None
+        _publish_locked()
     return defs
 
 
@@ -201,17 +216,22 @@ def head_of(line: str) -> "str | None":
 
 def subscribe(engine: Any) -> None:
     """Give `engine` the current heads now and on every later move. The engine
-    exposes `sync_model_line_heads(dict)`; it is held weakly."""
-    with _lock:
-        _subscribers.add(engine)
-        current = dict(_heads)
-    engine.sync_model_line_heads(current)
+    exposes `sync_model_line_heads(dict)`; it is held weakly. Registered and
+    served under the install lock, so the first delivery can never land after a
+    newer one."""
+    with _install_lock:
+        with _lock:
+            _subscribers.add(engine)
+            current = dict(_heads)
+        engine.sync_model_line_heads(current)
 
 
-def _publish() -> None:
-    """Push the current heads to every live engine. Never raises: one engine
-    that cannot be updated must not stop the others, and it keeps its last
-    table — the same fail-safe direction as an unreachable store."""
+def _publish_locked() -> None:
+    """Push the current heads to every live engine. Caller holds _install_lock,
+    which is what orders deliveries: two publishers cannot interleave, so an
+    engine never ends on an older table than the module's. Never raises: one
+    engine that cannot be updated must not stop the others; it keeps its last
+    table and is retried on the next successful store read."""
     with _lock:
         engines = list(_subscribers)
         current = dict(_heads)
@@ -225,9 +245,16 @@ def _publish() -> None:
 def reload() -> bool:
     """Re-read the heads from the store. Returns False — and changes nothing —
     when the store is unreachable. A stored head for an undeclared line is
-    ignored, and one that is not a plausible family name falls back to the seed."""
-    global _heads, _rows, _store_ok
+    ignored, and one that is not a plausible family name falls back to the seed.
+
+    Concurrent reloads are ordered by a ticket taken BEFORE the store read: a
+    read that finishes after a later-started one has installed is discarded,
+    because the later one necessarily saw every commit the earlier could have.
+    The store read itself runs outside every lock, so a slow or unreachable
+    store never stalls an engine being built for a request."""
+    global _heads, _rows, _store_ok, _installed_ticket
     defs = definitions()
+    ticket = next(_tickets)
     stored = host_store.get_model_line_heads()
     if stored is None:
         with _lock:
@@ -243,16 +270,23 @@ def reload() -> bool:
             rows[name] = row
         else:
             new_heads[name] = d["head"]
-    with _lock:
-        moved = {n: (old, new_heads[n]) for n, old in _heads.items()
-                 if n in new_heads and new_heads[n] != old}
-        _heads = new_heads
-        _rows = rows
-        _store_ok = True
+    with _install_lock:
+        if ticket < _installed_ticket:
+            return True          # a newer read is already installed
+        _installed_ticket = ticket
+        with _lock:
+            if _definitions is not defs:
+                return True      # reconfigured while reading: not our lines
+            moved = {n: (old, new_heads[n]) for n, old in _heads.items()
+                     if n in new_heads and new_heads[n] != old}
+            _heads = new_heads
+            _rows = rows
+            _store_ok = True
+        # Publish on every successful read, moved or not: it is 14 table slots
+        # per engine, and it is what heals an engine whose last sync failed.
+        _publish_locked()
     for name, (old, new) in moved.items():
         _log.info("model line %s head: %s -> %s", name, old, new)
-    if moved:
-        _publish()
     return True
 
 
@@ -272,10 +306,10 @@ def promote(line: str, family: str, *, actor: str,
             detail: "dict[str, Any] | None" = None,
             expected_current: "str | None" = None,
             force: bool = False, kind: str = "promoted") -> dict[str, Any]:
-    """Point `line` at `family`. Reads the store first so the recorded previous
-    head is the real one even on a replica that has not refreshed yet."""
+    """Point `line` at `family`. The store resolves the current head inside its
+    own transaction, so the recorded previous head is the real one even on a
+    replica that has not refreshed yet."""
     d = _check_move(line, family, force=force)
-    reload()
     result = host_store.set_model_line_head(
         line, family, seed_family=d["head"], actor=actor, kind=kind,
         detail=detail, expected_current=expected_current)
@@ -285,21 +319,19 @@ def promote(line: str, family: str, *, actor: str,
 
 
 def rollback(line: str, *, actor: str,
-             detail: "dict[str, Any] | None" = None) -> dict[str, Any]:
-    """Point `line` back at the head it had before its last move."""
+             detail: "dict[str, Any] | None" = None,
+             expected_current: "str | None" = None,
+             expected_previous: "str | None" = None) -> dict[str, Any]:
+    """Point `line` back at the head it had before its last move. The store
+    picks the target inside its transaction; `expected_current` /
+    `expected_previous` make it a compare-and-set on the move the caller saw, so
+    a retried or late rollback cannot undo a different move."""
     d = definitions().get(line)
     if d is None:
         raise ModelLineError(f"unknown line {line!r}")
-    reload()
-    with _lock:
-        row = _rows.get(line) or {}
-        current = _heads.get(line)
-    previous = row.get("previous_family")
-    if not previous:
-        return {"ok": False, "reason": "no_previous", "family": current}
-    result = host_store.set_model_line_head(
-        line, previous, seed_family=d["head"], actor=actor, kind="rolled_back",
-        detail=detail, expected_current=current)
+    result = host_store.rollback_model_line_head(
+        line, seed_family=d["head"], actor=actor, detail=detail,
+        expected_current=expected_current, expected_previous=expected_previous)
     if result.get("ok"):
         reload()
     return result
