@@ -61,6 +61,8 @@ docs/METRICS.md        -- the metrics seed: format, codex≈0, regeneration (it'
 docs/PROVIDERS.md      -- per-provider auth + the AntSeed node
 docs/OPENAI-CODEX.md   -- the ChatGPT-subscription provider (unofficial / ToS-risky)
 docs/USAGE_ENDPOINTS.md -- per-key usage stats API endpoints and auth behavior
+model_lines.py / model_lines.json -- model lines: `line_<name>` fields that follow the qualified head of a model series (docs/MODEL-LINES.md)
+scripts/qualify_model_lines.py -- the job: probes successors with prompt suites and promotes or proposes them
 live_smoke.py          -- drive real providers end-to-end
 tests/                 -- the full host unit-test suite
 features/              -- BDD user-flow suite (behave); user_flows.json is the spec
@@ -136,6 +138,11 @@ vocabulary it filters/scores over includes live fields (`price_in`/`price_out`,
 benchmarks/modalities/capabilities (`bench_intelligence`, `in_image`,
 `cap_tools`, …). See the core's `core/docs/SIGMA-POL.md` for the algebra;
 `config.live.lua` declares the host fields and the `default` policy.
+
+To keep a policy from going stale when a model's successor ships, name a
+**model line** instead of an exact family: `["is", "line_openai_sol"]` follows
+whichever family is currently qualified as that series' head. See
+[model lines](docs/MODEL-LINES.md).
 
 ### Blessed policy templates
 

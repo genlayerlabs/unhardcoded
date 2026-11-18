@@ -187,6 +187,27 @@ class FlowNormalizeRequest(BaseModel):
     flow_ir: list
 
 
+class ModelLineMoveRequest(BaseModel):
+    """Body of POST /x/lines/{line}/promote."""
+    family: str = Field(min_length=1, max_length=128)
+    actor: str = Field(default="", max_length=120)
+    # Compare-and-set: refuse the move unless the line still points here.
+    expected_current: str | None = Field(default=None, max_length=128)
+    # Accept a family outside the line's own name pattern (operator judgement).
+    force: bool = False
+    detail: dict | None = None
+
+
+class ModelLineRollbackRequest(BaseModel):
+    """Body of POST /x/lines/{line}/rollback."""
+    actor: str = Field(default="", max_length=120)
+    # Compare-and-set on the move being undone: send the head you saw. A retry
+    # after a lost response then conflicts instead of undoing the rollback.
+    expected_current: str | None = Field(default=None, max_length=128)
+    expected_previous: str | None = Field(default=None, max_length=128)
+    detail: dict | None = None
+
+
 class PolicyBuildRequest(BaseModel):
     """Body of POST /x/policy/build — the declarative surface the dashboard
     builder collects; lowered by the core's elaborate, never host-side."""
@@ -413,6 +434,45 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         import host_store
         return {"calls": host_store.recent_calls(min(max(int(limit), 1), 1000)),
                 "total": host_store.count()}
+
+    # ---- model lines (operator view + head moves) ------------------------------
+    # A line is a named pointer to the family currently qualified as the head of
+    # a model series (model_lines.py); policies observe it as `line_<name>`.
+    # Admin-gated like the other operator surfaces: moving a head re-routes every
+    # caller whose policy names the line.
+    @app.get("/x/lines")
+    def model_lines_state(events: int = 20):
+        import model_lines
+        model_lines.reload()
+        return model_lines.snapshot(events=min(max(int(events), 0), 200))
+
+    @app.post("/x/lines/{line}/promote")
+    def model_line_promote(line: str, body: ModelLineMoveRequest):
+        import model_lines
+        try:
+            result = model_lines.promote(
+                line, body.family, actor=body.actor or "operator",
+                detail=body.detail, expected_current=body.expected_current,
+                force=body.force)
+        except model_lines.ModelLineError as exc:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": str(exc), "type": "invalid_request_error",
+                "code": "model_line"}})
+        return _model_line_move_response(result)
+
+    @app.post("/x/lines/{line}/rollback")
+    def model_line_rollback(line: str, body: ModelLineRollbackRequest):
+        import model_lines
+        try:
+            result = model_lines.rollback(
+                line, actor=body.actor or "operator", detail=body.detail,
+                expected_current=body.expected_current,
+                expected_previous=body.expected_previous)
+        except model_lines.ModelLineError as exc:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": str(exc), "type": "invalid_request_error",
+                "code": "model_line"}})
+        return _model_line_move_response(result)
 
     # ---- AntSeed buyer hot-wallet control (dashboard self-service) -----------
     # Proxy deposit/withdraw/refresh to the sidecar control server, then refresh
@@ -1702,7 +1762,21 @@ def _request_to_contract(
 
 
 _ROUTER_ADMIN_PATHS = ("/x/wallet", "/x/providers", "/x/provider-key", "/x/config/",
-                       "/x/codex/", "/x/calls", "/x/sessions", "/x/session/")
+                       "/x/codex/", "/x/calls", "/x/sessions", "/x/session/",
+                       "/x/lines")
+
+
+def _model_line_move_response(result: dict):
+    """A head move's outcome as HTTP: a lost compare-and-set or a no-op is the
+    caller's conflict (409), an unreachable store is ours (503)."""
+    if result.get("ok"):
+        return result
+    reason = result.get("reason")
+    status = 503 if reason == "store_unavailable" else 409
+    return JSONResponse(status_code=status, content={"error": {
+        "message": f"model line not moved: {reason}",
+        "type": "router_error" if status == 503 else "invalid_request_error",
+        "code": f"model_line_{reason}", "family": result.get("family")}})
 
 
 def _router_admin_ok(request: Request) -> bool:

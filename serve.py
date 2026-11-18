@@ -61,6 +61,15 @@ def main() -> None:
     import settings
     settings.reload()
 
+    # Model lines: load the definitions and pull the current heads before the
+    # engine is built, so the first request already sees promoted heads rather
+    # than the seeds. Best-effort: with the store down the seeds serve.
+    import model_lines
+    lines = model_lines.configure()
+    if lines:
+        print(f"model lines: {len(lines)} declared, heads from "
+              f"{'store' if model_lines.reload() else 'seeds (store unavailable)'}")
+
     # Operator-managed provider keys persisted by the dashboard live on the PVC
     # (.env.secrets) and are the source of truth. Load them over the container
     # env BEFORE LLMRouterHost snapshots os.environ, so dashboard edits to
@@ -255,6 +264,35 @@ def make_discover_hook(registry):
     return hook
 
 
+def start_model_lines_refresh():
+    """Background task re-reading the model line heads from the store. Returns
+    None when no lines are declared or the refresh is disabled. Call from an
+    async context. A failed read keeps the last-known heads (model_lines.reload
+    is fail-soft), so the loop only has to keep going."""
+    import asyncio
+    import os
+    import random
+
+    import model_lines
+
+    try:
+        interval = float(os.getenv("MODEL_LINES_REFRESH_S", "30"))
+    except ValueError:
+        interval = 30.0
+    if interval <= 0 or not model_lines.definitions():
+        return None
+
+    async def loop():
+        while True:
+            await asyncio.sleep(interval * (0.9 + 0.2 * random.random()))
+            try:
+                await asyncio.to_thread(model_lines.reload)
+            except Exception as exc:  # noqa: BLE001 — never kill the refresher
+                print(f"model lines refresh failed: {type(exc).__name__}: {exc}")
+
+    return asyncio.create_task(loop())
+
+
 def _enabled(name: str, default: bool = True) -> bool:
     import os
     fallback = "1" if default else "0"
@@ -302,6 +340,12 @@ def attach_sources(app, host, catalog=None, registry=None,
                       if _enabled("RUN_WALLET_KEEPER") else None)
             if keeper is not None:
                 tasks.append(keeper)
+            # Every replica follows line promotions on its own short timer: the
+            # heads live in the shared store, so there is no reload fan-out to
+            # coordinate. MODEL_LINES_REFRESH_S=0 pins the boot-time heads.
+            lines_task = start_model_lines_refresh()
+            if lines_task is not None:
+                tasks.append(lines_task)
             try:
                 yield
             finally:
