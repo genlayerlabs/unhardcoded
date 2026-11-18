@@ -243,7 +243,11 @@ function(cfg, line, field)
         sort = "Bool", default = false, group = "model",
         get = function(c)
             local fam = c.model_family
-            return fam ~= nil and host_line_heads[line] == fam
+            if fam ~= nil and host_line_heads[line] == fam then return true end
+            -- nil, not false: the engine applies the field default (false), and
+            -- model_meta()/the Market view list a line only on its head instead
+            -- of one false per line on every family in the catalog.
+            return nil
         end,
     }
     return true

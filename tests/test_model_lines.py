@@ -252,7 +252,8 @@ def test_model_meta_exposes_line_membership(lines_file):
     lines_file(_doc(alpha=_line("deepseek-v3")))
     meta = _host().model_meta()
     assert meta["deepseek-v3"]["line_alpha"] is True
-    assert meta["hermes-3-405b"]["line_alpha"] is False
+    # only the head carries the mark; other families are not padded with false
+    assert "line_alpha" not in meta["hermes-3-405b"]
 
 
 def test_no_lines_declared_adds_no_fields(lines_file):
