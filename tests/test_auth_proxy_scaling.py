@@ -46,6 +46,21 @@ def test_background_ledger_preserves_cost_provenance(host_store_clean, monkeypat
         (cost, basis, source) for cost, basis, _, source in rows]
 
 
+def test_background_ledger_preserves_applied_rates(host_store_clean, monkeypatch):
+    store = host_store_clean
+    monkeypatch.setattr(store, "_SYNC_WRITES", False)
+    scope = {"project_id": 1, "environment_id": 2}
+    rates = {"input_usd_per_million": 0.0, "output_usd_per_million": 2.5}
+    row = {"caller": "rate-test", "decision_trace": scope}
+    store.insert_call_async(row)
+    store.insert_call_async({**row, **rates})
+    store._write_q.join()
+
+    priced, unknown = store.recent_calls(caller="rate-test", **scope, strict=True)
+    assert {field: priced[field] for field in rates} == rates
+    assert all(unknown[field] is None for field in rates)
+
+
 def test_dashboard_issued_digest_resolves_without_local_key(host_store_clean):
     token = "only-known-by-the-shared-store"
     digest = hashlib.sha256(token.encode()).hexdigest()

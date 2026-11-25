@@ -404,6 +404,45 @@ def test_internal_usage_recent_scopes_to_caller():
     assert calls[0]["latency_ms"] == 100.0
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_scoped_recent_usage_exposes_applied_token_rates(monkeypatch, host_store_clean, streaming):
+    scope = {"project_id": 1, "environment_id": 2}
+    rates = {"input_usd_per_million": 0.0, "output_usd_per_million": 2.5}
+    payload = {"x_router": {"provider": "p", "cost_basis": "computed", "cost_usd": 0.01,
+                            **rates}}
+    body = json.dumps(payload).encode()
+
+    class Response(_FakeUpstreamResp):
+        headers = {"content-type": "text/event-stream" if streaming else "application/json"}
+
+        async def aread(self):
+            return body
+
+        async def aiter_raw(self):
+            yield b"data: " + body + b"\n\ndata: [DONE]\n\n"
+
+    async def send(*args, **kwargs):
+        return Response()
+
+    async def route(*args, **kwargs):
+        return {"revision": 2, "policy_id": "a" * 64, "policy_ir": ["policy"]}
+
+    _cp(monkeypatch, [{"active": True, "consumer": "acme", "tenant_id": 7,
+                       "scope_version": 2, **scope}])
+    monkeypatch.setattr(cpc, "resolve_route", route)
+    monkeypatch.setattr(_upstream(monkeypatch), "send", send)
+    client = TestClient(auth_proxy.app)
+    host_store_clean.insert_call({"caller": "acme", "decision_trace": scope})
+    assert _post_chat(client, "tok-scoped").status_code == 200
+
+    response = client.get("/internal/usage/recent", params={"caller": "acme", **scope},
+                          headers={"x-internal-secret": "s3cret"})
+    assert response.status_code == 200
+    priced, unknown = response.json()["calls"]
+    assert {field: priced[field] for field in rates} == rates
+    assert all(unknown[field] is None for field in rates)
+
+
 def test_internal_usage_is_not_proxied_upstream(monkeypatch):
     """Regression: the /internal router must match BEFORE the catch-all proxy."""
     upstream = _upstream(monkeypatch)

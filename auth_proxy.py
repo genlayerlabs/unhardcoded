@@ -4432,6 +4432,7 @@ async def proxy(path: str, request: Request) -> Response:
     tokens_cached = None
     cost_usd = None
     cost_basis = None
+    input_usd_per_million = output_usd_per_million = None
     decision_trace = None
     error_type = error_code = error_message = None
     record_in_finally = True
@@ -4474,7 +4475,16 @@ async def proxy(path: str, request: Request) -> Response:
                     int(auth["environment_id"]) if auth.get("scope_version") == 2 else 0,
                     requested_route, outcome_ts, outcome, fallback, first_token_ms,
                     latency_ms if outcome == "success" else None)
-            _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
+            _record_request(
+                caller=caller, method=request.method, path="/" + path, status=status,
+                latency_ms=latency_ms, provider=provider, model_family=model_family,
+                served_model_id=served_model_id, served_by=served_by, requested_model=requested_model,
+                session=session_id, tokens_in=tokens_in, tokens_out=tokens_out,
+                tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd,
+                cost_basis=cost_basis, input_usd_per_million=input_usd_per_million,
+                output_usd_per_million=output_usd_per_million, decision_trace=decision_trace,
+                error_type=error_type, error_code=error_code, error_message=error_message,
+                key_sha256=auth.get("digest"))
             _metric_request(status, latency_ms)
             _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
         finally:
@@ -4561,7 +4571,8 @@ async def proxy(path: str, request: Request) -> Response:
             def _account(tail: bytes) -> None:
                 nonlocal provider, model_family, served_model_id, served_by, \
                     tokens_in, tokens_out, tokens_total, tokens_cached, cost_usd, \
-                    cost_basis, decision_trace, error_type, error_code, error_message
+                    cost_basis, input_usd_per_million, output_usd_per_million, \
+                    decision_trace, error_type, error_code, error_message
                 nonlocal first_token_ms, incomplete_stream, responses_stream_outcome, upstream_error
                 try:
                     meta = _parse_stream_tail(tail)
@@ -4583,6 +4594,8 @@ async def proxy(path: str, request: Request) -> Response:
                         if isinstance(xr.get("cost_usd"), (int, float)):
                             cost_usd = float(xr["cost_usd"])
                         cost_basis = xr.get("cost_basis")
+                        input_usd_per_million = xr.get("input_usd_per_million")
+                        output_usd_per_million = xr.get("output_usd_per_million")
                         if isinstance(xr.get("tokens_cached"), int):
                             tokens_cached = xr["tokens_cached"]
                     usage = meta.get("usage")
@@ -4688,6 +4701,8 @@ async def proxy(path: str, request: Request) -> Response:
                     if isinstance(xr.get("cost_usd"), (int, float)):
                         cost_usd = float(xr["cost_usd"])
                     cost_basis = xr.get("cost_basis")
+                    input_usd_per_million = xr.get("input_usd_per_million")
+                    output_usd_per_million = xr.get("output_usd_per_million")
                     if isinstance(xr.get("tokens_cached"), int):
                         tokens_cached = xr["tokens_cached"]
                 usage = parsed.get("usage") if isinstance(parsed, dict) else None

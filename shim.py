@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import math
 import os
 import re
 import time
@@ -2005,23 +2006,8 @@ def _cost_basis(result: dict, subscription_providers=frozenset()) -> "str | None
     return None
 
 
-def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> float | None:
-    """Dollars actually spent on THIS request, accurate across providers, tiered by
-    _cost_basis: (1) subscription backends (codex) cost $0; (2) the provider's OWN
-    reported cost (e.g. OpenRouter `usage.cost`) — authoritative, net of prompt-cache
-    discounts; (3) computed from the ranked price, billing cache-read tokens at a
-    fraction. None when uncomputable (read-time estimator is the fallback)."""
-    basis = _cost_basis(result, subscription_providers)
-    resp = result.get("response") or {}
-    precision = 12 if resp.get('decision') is not None else 6
-    if basis == "subscription":
-        return 0.0
-    if basis == "reported":
-        return round(float(resp["cost_reported"]), precision)
-    if basis != "computed":
-        return None
-    # (3) compute from the raw price, discounting cache-read input tokens
-    chosen = result.get("chosen") or {}
+def _computed_token_rates(chosen: dict) -> tuple[float | None, float | None]:
+    """Base USD per million tokens used by the computed cost fallback."""
     pin = chosen.get("raw_price_in", chosen.get("price_in"))
     pout = chosen.get("raw_price_out", chosen.get("price_out"))
     # Back-compat with engine versions that only returned the ranking price:
@@ -2036,6 +2022,26 @@ def _executed_cost_usd(result: dict, subscription_providers=frozenset()) -> floa
         if mult and mult > 0:
             pin = pin / mult if pin is not None else pin
             pout = pout / mult if pout is not None else pout
+    return pin, pout
+
+
+def _executed_cost_usd(result: dict, subscription_providers=frozenset(), *,
+                       computed_rates: tuple[float | None, float | None] | None = None) -> float | None:
+    """Dollars actually spent on THIS request, accurate across providers, tiered by
+    _cost_basis: (1) subscription backends (codex) cost $0; (2) the provider's OWN
+    reported cost (e.g. OpenRouter `usage.cost`) — authoritative, net of prompt-cache
+    discounts; (3) computed from the ranked price, billing cache-read tokens at a
+    fraction. None when uncomputable (read-time estimator is the fallback)."""
+    basis = _cost_basis(result, subscription_providers)
+    resp = result.get("response") or {}
+    precision = 12 if resp.get('decision') is not None else 6
+    if basis == "subscription":
+        return 0.0
+    if basis == "reported":
+        return round(float(resp["cost_reported"]), precision)
+    if basis != "computed":
+        return None
+    pin, pout = computed_rates if computed_rates is not None else _computed_token_rates(result.get("chosen") or {})
     tin = resp.get("tokens_in") or 0
     cached = resp.get("tokens_cached") or 0
     uncached = max(0, tin - cached)
@@ -2079,6 +2085,8 @@ def _build_x_router(result: dict, subscription_providers=frozenset(),
     `session_acc` is attached. Idempotent per request — call once per response."""
     resp = result.get("response") or {}
     chosen = result.get("chosen") or {}
+    basis = _cost_basis(result, subscription_providers)
+    computed_rates = _computed_token_rates(chosen) if basis == "computed" else None
     x_router = {
         "provider": chosen.get("provider_id"),
         "model_family": chosen.get("model_family"),
@@ -2088,13 +2096,17 @@ def _build_x_router(result: dict, subscription_providers=frozenset(),
         "served_by": chosen.get("served_by"),
         "price_in": chosen.get("price_in"),
         "price_out": chosen.get("price_out"),
-        "cost_usd": _executed_cost_usd(result, subscription_providers),
-        "cost_basis": _cost_basis(result, subscription_providers),
+        "cost_usd": _executed_cost_usd(result, subscription_providers, computed_rates=computed_rates),
+        "cost_basis": basis,
         "tokens_cached": resp.get("tokens_cached"),
         "policy_fingerprint": (result.get("trace") or {}).get("policy_fingerprint"),
         "decision_trace": _trim_trace(result.get("trace")),
         "compact": _compact_suggested(resp),
     }
+    if computed_rates is not None:
+        for field, rate in zip(("input_usd_per_million", "output_usd_per_million"), computed_rates):
+            if rate is not None and rate >= 0 and math.isfinite(rate):
+                x_router[field] = rate
     automatic = (result.get("trace") or {}).get("automatic")
     if isinstance(automatic, dict):
         inference_cost = x_router["cost_usd"]
