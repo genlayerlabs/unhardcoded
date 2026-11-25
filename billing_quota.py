@@ -10,6 +10,12 @@ import uuid
 
 import host_store
 
+METER_EVENT_NAME = "unhardcoded_requests_202609_v2"
+
+
+class InvalidQuota(ValueError):
+    """The control plane returned a missing or invalid quota contract."""
+
 
 def _pending_max_age() -> int:
     try:
@@ -44,18 +50,18 @@ def expire_pending(now: int) -> None:
 
 def reserve(tenant_id: int, quota: object) -> str | None:
     if not isinstance(quota, dict):
-        raise ValueError('Monthly quota is required')
+        raise InvalidQuota('Monthly quota is required')
     start, end, limit = [quota.get(k) for k in ('period_start', 'period_end', 'limit')]
     if any(type(v) is not int for v in (tenant_id, start, end, limit)):
-        raise ValueError('Invalid quota contract')
+        raise InvalidQuota('Invalid quota contract')
     now = int(time.time())
     if tenant_id <= 0 or limit < 0 or not start <= now < end:
-        raise ValueError('Expired or invalid quota contract')
+        raise InvalidQuota('Expired or invalid quota contract')
     overage = quota.get('overage_enabled') is True
     customer, meter = quota.get('stripe_customer_id'), quota.get('meter_event_name')
     if overage and (not isinstance(customer, str) or not customer.startswith('cus_')
-                    or meter != 'unhardcoded_requests_202609_v2'):
-        raise ValueError('Metered usage requires a configured billing destination')
+                    or meter != METER_EVENT_NAME):
+        raise InvalidQuota('Metered usage requires a configured billing destination')
     if limit == 0 and not overage:
         return None
     ticket = uuid.uuid4().hex

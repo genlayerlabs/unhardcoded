@@ -1,6 +1,7 @@
 """Monthly quota integration tests against disposable PostgreSQL."""
 import time
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import Mock
 
 import pytest
 
@@ -97,3 +98,12 @@ def test_sweep_expires_pending_in_inactive_periods(monkeypatch):
             "SELECT id, state FROM cloud_quota_reservations"
         ).fetchall()) == {pending: "expired", successful: "success"}
         assert conn.execute("SELECT used FROM cloud_quota_periods").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("flag,expected_calls", [("0", 0), ("1", 1)])
+def test_prune_sweeps_only_when_quotas_enabled(monkeypatch, flag, expected_calls):
+    monkeypatch.setenv("CLOUD_MONTHLY_QUOTAS_REQUIRED", flag)
+    sweep = Mock()
+    monkeypatch.setattr(billing_quota, "expire_pending", sweep)
+    host_store._prune()
+    assert sweep.call_count == expected_calls

@@ -586,6 +586,7 @@ def _prune() -> None:
             conn.execute("DELETE FROM subject_budget_reservations"
                          " WHERE released AND expires_at < %s", (now - 86400,))
         if os.getenv("CLOUD_MONTHLY_QUOTAS_REQUIRED") == "1":
+            # Terminal quota rows remain available for the billing reporter.
             from billing_quota import expire_pending
             expire_pending(int(now))
     except Exception as exc:  # noqa: BLE001
