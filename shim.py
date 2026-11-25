@@ -340,6 +340,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
 
     from saas_routes import ScopedHost, automatic_trace, install as install_saas
     from internal_api import fact_router
+    from connection_check import install as install_connection_check
 
     facts = getattr(host, "provider_facts", None)
     host = ScopedHost(host)
@@ -372,6 +373,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
 
     app = FastAPI(title="llm-router shim", docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=lifespan)
+    install_connection_check(app, host.base)
     if facts is not None:
         app.state.provider_facts = facts
         app.include_router(fact_router)
