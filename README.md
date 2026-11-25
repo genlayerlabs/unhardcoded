@@ -137,6 +137,8 @@ benchmarks/modalities/capabilities (`bench_intelligence`, `in_image`,
 `cap_tools`, …). See the core's `core/docs/SIGMA-POL.md` for the algebra;
 `config.live.lua` declares the host fields and the `default` policy.
 
+See [provider facts](docs/PROVIDER-FACTS.md) for routing on external observations.
+
 ### Blessed policy templates
 
 Most callers should not write raw weights. `GET /x/policy/templates` lists the

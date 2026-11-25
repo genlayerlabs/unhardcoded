@@ -157,7 +157,7 @@ CALLER_KEY_HASHES.update(_load_caller_map(
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(message)s")
 log = logging.getLogger("llm-router-auth-proxy")
 app = FastAPI(title="llm-router auth proxy", docs_url=None, redoc_url=None)
-# Control-plane metering surface (/internal/usage[/recent]). Registered before
+# Control-plane surface (/internal/*). Registered before
 # any route definition below so Starlette matches it ahead of the catch-all
 # proxy; hidden (404) unless CONTROL_PLANE_INTERNAL_SECRET is configured.
 app.include_router(internal_api.router)
