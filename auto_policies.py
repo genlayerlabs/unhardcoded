@@ -39,7 +39,7 @@ def validate_constraints(value):
                 "reliability_floor": .8, "timeout_seconds": 8,
                 "max_output_tokens": 2048, "priority": "cost",
                 "required_capabilities": [], "allowed_models": []}
-    if set(value) - set(defaults):
+    if set(value) - set(defaults) - {"provider_order"}:
         raise ValueError("Unknown routing limit")
     out = {**defaults, **deepcopy(value)}
     for name, low, high in (("max_price_in", 0, 1000), ("max_price_out", 0, 1000),
@@ -61,6 +61,14 @@ def validate_constraints(value):
             any(not isinstance(m, str) or len(m) > 240 or m.count("|") != 1
                 or not all(m.split("|")) for m in models)):
         raise ValueError("Invalid model restrictions")
+    providers = out.get("provider_order", [])
+    if (not isinstance(providers, list) or len(providers) > 16 or
+            any(not isinstance(p, str) or not 1 <= len(p) <= 120 or
+                any(c.isspace() for c in p) or "|" in p for p in providers) or
+            len(set(providers)) != len(providers)):
+        raise ValueError("provider_order must be an array of up to 16 distinct provider identifiers")
+    if not providers:
+        out.pop("provider_order", None)
     return out
 
 
@@ -94,7 +102,11 @@ def compile_policy(policy_id, constraints=None):
     for reason in ("timeout", "server_error", "network_error", "rate_limit", "auth_error",
                    "payment_required", "model_unavailable", "context_overflow"):
         failure = ["override", failure, reason, {"action": "next_candidate"}]
-    return ["policy", gates, score, ["prefer", ["not", ["is", "breaker_open"]], ["argmax"]],
+    selector = ["argmax"]
+    for provider in reversed(limits.get("provider_order", [])):
+        selector = ["prefer", ["provider_eq", provider], selector]
+    selector = ["prefer", ["not", ["is", "breaker_open"]], selector]
+    return ["policy", gates, score, selector,
             ["set_param", "timeout_ms", limits["timeout_seconds"] * 1000], failure]
 
 

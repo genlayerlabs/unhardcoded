@@ -7,7 +7,7 @@ import pytest
 
 from decision_providers import DecisionError, DecisionResult
 from llm_router_host import LLMRouterHost
-from policy_selection import compile_automatic, project_task, select_policy
+from policy_selection import compile_automatic, project_task, select_policy, validate_config
 from route_contract import apply_contract
 from shim import create_app, _build_x_router
 
@@ -107,6 +107,69 @@ async def test_mutated_policy_or_description_is_rejected_before_network(automati
     with pytest.raises(ValueError, match="identity"):
         await select_policy(automatic_host, {}, execution, provider=provider)
     assert not provider.calls
+
+
+def test_provider_order_versions_and_rebuild(automatic_host):
+    legacy = compile_automatic(automatic_host, intent())["execution"]["automatic"]
+    assert legacy["version"] == 1
+    assert "provider_order" not in validate_config(automatic_host, legacy)
+    assert legacy == compile_automatic(
+        automatic_host, intent(constraints={"provider_order": []}))["execution"]["automatic"]
+
+    ordered = compile_automatic(automatic_host, intent(
+        constraints={"provider_order": ["openai", "anthropic"]}))["execution"]["automatic"]
+    assert ordered["version"] == 2
+    assert validate_config(automatic_host, ordered)["provider_order"] == ["openai", "anthropic"]
+    with pytest.raises(ValueError, match="version does not match"):
+        validate_config(automatic_host, {**ordered, "version": 1})
+
+    tampered = deepcopy(ordered)
+    tampered["constraints"]["provider_order"].reverse()
+    with pytest.raises(ValueError, match="identity"):
+        validate_config(automatic_host, tampered)
+
+
+@pytest.mark.asyncio
+async def test_preview_and_test_route_return_provider_order_and_follow_it(automatic_host, monkeypatch):
+    import control_plane_client as cp
+    import policy_selection
+
+    monkeypatch.setattr(cp, "CONTROL_PLANE_URL", "http://cp.test")
+    monkeypatch.setattr(cp, "CONTROL_PLANE_INTERNAL_SECRET", "secret")
+
+    async def credentials(*args, **kwargs):
+        return {"OPENAI_API_KEY": "test", "ANTHROPIC_API_KEY": "test",
+                "OPENROUTER_API_KEY": "test"}, {}
+
+    monkeypatch.setattr(cp, "tenant_connections", credentials)
+    monkeypatch.setattr(policy_selection, "JevDecisionProvider", lambda *a, **kw: Choose())
+    calls = []
+
+    async def inference(request):
+        calls.append(request["provider_id"])
+        if request["provider_id"] == "openai":
+            return {"ok": False, "error_kind": "auth_error", "latency_ms": 1}
+        return {"ok": True, "latency_ms": 1, "response": {
+            "text": "done", "tokens_in": 1, "tokens_out": 1, "finish_reason": "stop"}}
+
+    automatic_host.set_async_call_hook(inference)
+    ordered = intent(constraints={"provider_order": ["openai", "anthropic"],
+                                  "allowed_models": ["openai|primary", "anthropic|backup"]})
+    headers = {"x-llm-router-tenant": "7", "x-internal-secret": "secret",
+               "x-unhardcoded-scope-version": "2", "x-unhardcoded-project": "2",
+               "x-unhardcoded-environment": "3"}
+    app = create_app(automatic_host)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        preview = await client.post("/x/saas/preview", json=ordered, headers=headers)
+        tested = await client.post("/x/saas/test", json={"intent": ordered, "prompt": "Fix a bug"},
+                                   headers=headers)
+
+    assert preview.status_code == tested.status_code == 200, (preview.text, tested.text)
+    assert [r["provider"] for r in preview.json()["ranked"]] == ["openai", "anthropic"]
+    trace = tested.json()["x_router"]["decision_trace"]
+    assert trace["automatic"]["selected_id"] == "coding-agent"
+    assert [r["provider_id"] for r in trace["ranked"]] == ["openai", "anthropic"]
+    assert calls == ["openai", "anthropic"]
 
 
 def test_projection_omits_system_history_tools_and_images():
