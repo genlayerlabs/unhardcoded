@@ -37,7 +37,7 @@ import uuid
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 import control_plane_client
@@ -1203,11 +1203,16 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         # Tenant context is established and verified once by SaaS middleware.
         pass
 
+    async def _until_disconnect(request: Request, handler, *args, **kwargs):
+        # The body is parsed. Release receive before returning the response.
+        done, result = await _race_disconnect(request.receive, handler(*args, **kwargs))
+        return result if done else Response(status_code=499)
+
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest, request: Request):
         _session_from_header(req, request)
         await _activate_tenant(request)
-        return await _handle_chat(req)
+        return await _until_disconnect(request, _handle_chat, req)
 
     @app.post("/v1/decisions")
     @app.post("/v1/systemone")
@@ -1263,7 +1268,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         """
         _session_from_header(req, request)
         await _activate_tenant(request)
-        return await _handle_chat(req, profile_name=profile_name)
+        return await _until_disconnect(request, _handle_chat, req, profile_name=profile_name)
 
     def _session_from_header(req: ChatRequest, request: Request) -> None:
         """Fallback the conversation id from the X-Unhardcoded-Session header when
@@ -1292,14 +1297,14 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     async def responses(req: ResponsesRequest, request: Request):
         _session_from_header(req, request)
         await _activate_tenant(request)
-        return await _handle_responses(req)
+        return await _until_disconnect(request, _handle_responses, req)
 
     @app.post("/{profile_name}/v1/responses")
     async def responses_profiled(profile_name: str, req: ResponsesRequest,
                                  request: Request):
         _session_from_header(req, request)
         await _activate_tenant(request)
-        return await _handle_responses(req, profile_name=profile_name)
+        return await _until_disconnect(request, _handle_responses, req, profile_name=profile_name)
 
     def _responses_object_with_router(result: dict, req: ResponsesRequest,
                                       response_id: str | None = None) -> dict:
@@ -1353,8 +1358,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         import responses_api as _rapi
         task = asyncio.create_task(
             _execute_with_deadline(host.execute_async(contract)))
-        done, _ = await asyncio.wait({task}, timeout=_EARLY_FAIL_S,
-                                     return_when=asyncio.FIRST_COMPLETED)
+        done = await _wait_for_stream(task, timeout=_EARLY_FAIL_S)
         if task in done:
             try:
                 result = task.result()
@@ -1398,7 +1402,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             obj = _responses_object_with_router(result, req, response_id=rid)
             for ev in _rapi.responses_sse_events(obj):
                 yield ev
-        return StreamingResponse(gen_running(), media_type="text/event-stream")
+        return _ActiveStreamResponse(gen_running(), task, media_type="text/event-stream")
 
     async def _handle_chat(req: ChatRequest, profile_name: str | None = None):
         if profile_name is None and (msg := _policy_model_without_ir(req)):
@@ -1433,8 +1437,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             # flow runs (flows have no token stream, so without this they sat
             # silent ~60s and the idle timeout cut them into an empty 200).
             task = asyncio.create_task(_execute_with_deadline(host.execute_flow_async(req.flow_ir, contract)))
-            done, _ = await asyncio.wait({task}, timeout=_EARLY_FAIL_S,
-                                         return_when=asyncio.FIRST_COMPLETED)
+            done = await _wait_for_stream(task, timeout=_EARLY_FAIL_S)
             if task in done:
                 try:
                     result = task.result()
@@ -1447,8 +1450,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                     return _openai_error_from_router(result)
                 return StreamingResponse(_pseudo_stream(result, req),
                                          media_type="text/event-stream")
-            return StreamingResponse(_flow_stream(task, req),
-                                     media_type="text/event-stream")
+            return _ActiveStreamResponse(_flow_stream(task, req), task,
+                                         media_type="text/event-stream")
 
         if not req.stream:
             # Async driver: the Lua VM is touched only between awaits, so one
@@ -1493,9 +1496,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         # error. Only a Σ_flow runs long enough (N routed nodes) to need the
         # heartbeat, so only it commits to SSE early.
         is_flow = bool(contract.get("flow_ir"))
-        wait_kwargs = ({"timeout": _EARLY_FAIL_S} if is_flow else {})
-        done, _ = await asyncio.wait({commit, task}, return_when=asyncio.FIRST_COMPLETED,
-                                     **wait_kwargs)
+        done = await _wait_for_stream(task, commit, timeout=_EARLY_FAIL_S if is_flow else None)
 
         # Committed (deltas flowing) -> stream. Still running past the flow's brief
         # grace window -> stream too (the SSE generator flushes a first byte at
@@ -1504,8 +1505,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         # Activity rows). Only a completed-without-commit result is answered
         # synchronously (JSON error, or pseudo-stream of a finished body).
         if commit.done() or task not in done:
-            return StreamingResponse(_sse_gen(queue, task, req),
-                                     media_type="text/event-stream")
+            return _ActiveStreamResponse(_sse_gen(queue, task, req), task,
+                                         media_type="text/event-stream")
         try:
             result = task.result()
         except Exception as exc:
@@ -1549,15 +1550,11 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         # Activity and to the client instead of nothing.
         stream_id = _streaming.new_stream_id()
         model = req.model or ""
-        try:
-            yield _streaming.encode_role_chunk(stream_id, model)
-            while not task.done():
-                await asyncio.wait({task}, timeout=_HEARTBEAT_S)
-                if not task.done():
-                    yield _streaming.HEARTBEAT
-        finally:
-            if not task.done():   # client went away: stop spending on its flow
-                task.cancel()
+        yield _streaming.encode_role_chunk(stream_id, model)
+        while not task.done():
+            await asyncio.wait({task}, timeout=_HEARTBEAT_S)
+            if not task.done():
+                yield _streaming.HEARTBEAT
         try:
             result = task.result()
         except Exception as exc:
@@ -1584,24 +1581,20 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         stream_id = _streaming.new_stream_id()
         model = req.model or ""
         streamed_any = False
-        try:
-            yield _streaming.encode_role_chunk(stream_id, model)  # first byte, now
-            while True:
-                getter = asyncio.create_task(queue.get())
-                kind, payload = await _await_delta_or_beat(getter, task, _HEARTBEAT_S)
-                if kind == "delta":
+        yield _streaming.encode_role_chunk(stream_id, model)  # first byte, now
+        while True:
+            getter = asyncio.create_task(queue.get())
+            kind, payload = await _await_delta_or_beat(getter, task, _HEARTBEAT_S)
+            if kind == "delta":
+                streamed_any = True
+                yield _streaming.encode_text_chunk(stream_id, model, payload)
+                continue
+            if kind == "done":
+                while not queue.empty():
                     streamed_any = True
-                    yield _streaming.encode_text_chunk(stream_id, model, payload)
-                    continue
-                if kind == "done":
-                    while not queue.empty():
-                        streamed_any = True
-                        yield _streaming.encode_text_chunk(stream_id, model, queue.get_nowait())
-                    break
-                yield _streaming.HEARTBEAT  # 'beat' — keep the line warm
-        finally:
-            if not task.done():   # client went away: cancel the run
-                task.cancel()
+                    yield _streaming.encode_text_chunk(stream_id, model, queue.get_nowait())
+                break
+            yield _streaming.HEARTBEAT  # 'beat' — keep the line warm
         result = task.result()
         if result.get("ok"):
             resp, usage, x_router = _final_chunk_parts(result, req.session, req.caller)
@@ -1797,6 +1790,57 @@ _EARLY_FAIL_S = 1.5
 _HEARTBEAT_S = 15.0
 
 
+async def _race_disconnect(receive, work):
+    async def disconnected():
+        while (await receive())["type"] != "http.disconnect":
+            pass
+
+    task = asyncio.create_task(work)
+    watcher = asyncio.create_task(disconnected())
+    try:
+        done, _ = await asyncio.wait({task, watcher}, return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            return True, task.result()
+        watcher.result()
+        return False, None
+    finally:
+        watcher.cancel()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(watcher, task, return_exceptions=True)
+
+
+async def _wait_for_stream(task, *signals, timeout=None):
+    try:
+        done, _ = await asyncio.wait({task, *signals}, timeout=timeout,
+                                     return_when=asyncio.FIRST_COMPLETED)
+        return done
+    except asyncio.CancelledError:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+
+
+class _ActiveStreamResponse(StreamingResponse):
+    """Own the provider task even if sending fails before the iterator resumes."""
+
+    def __init__(self, content, task, **kwargs):
+        super().__init__(content, **kwargs)
+        self.task = task
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await _race_disconnect(receive, self.stream_response(send))
+        except OSError:
+            # ASGI servers can report a disconnect through send as well.
+            pass
+        finally:
+            if not self.task.done():
+                self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+            await self.body_iterator.aclose()
+
+
 async def _await_delta_or_beat(getter: "asyncio.Task", task: "asyncio.Task",
                                timeout: float) -> tuple:
     """One step of the streaming loop: wait for the next delta, the task to
@@ -1804,11 +1848,13 @@ async def _await_delta_or_beat(getter: "asyncio.Task", task: "asyncio.Task",
     None), or ('beat', None). A 'beat' means the task is still running and no
     delta arrived in `timeout`s — the caller emits a keepalive so an idle hop
     (the 60s ALB) can't cut a slow flow mid-run."""
-    await asyncio.wait({getter, task}, timeout=timeout,
-                       return_when=asyncio.FIRST_COMPLETED)
-    if getter.done():
-        return ("delta", getter.result())
-    getter.cancel()
+    try:
+        await asyncio.wait({getter, task}, timeout=timeout,
+                           return_when=asyncio.FIRST_COMPLETED)
+        if getter.done():
+            return ("delta", getter.result())
+    finally:
+        getter.cancel()
     if task.done():
         return ("done", None)
     return ("beat", None)
