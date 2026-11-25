@@ -8,6 +8,7 @@ between concurrent tenants. The control plane is faked at the HTTP boundary.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -214,6 +215,10 @@ def test_streaming_request_carries_tenant_env(host, monkeypatch):
                           "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 200
     assert "sk-tenant" in seen
+    events = [json.loads(line[6:]) for line in r.text.splitlines()
+              if line.startswith("data: {")]
+    timing = next(event["x_router"]["first_token_ms"] for event in events if "x_router" in event)
+    assert timing >= 0
 
 
 def test_adapter_authorization_header_uses_tenant_key(monkeypatch):
