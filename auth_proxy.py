@@ -163,6 +163,8 @@ app = FastAPI(title="llm-router auth proxy", docs_url=None, redoc_url=None)
 # proxy; hidden (404) unless CONTROL_PLANE_INTERNAL_SECRET is configured.
 app.include_router(internal_api.router)
 _client: httpx.AsyncClient | None = None
+_connection_check_client: httpx.AsyncClient | None = None
+_connection_check_slots = asyncio.Semaphore(2)
 
 
 async def _forward_provider_fact(provider_id: str, name: str, body: bytes) -> Response:
@@ -183,6 +185,25 @@ async def _forward_provider_fact(provider_id: str, name: str, body: bytes) -> Re
     return JSONResponse({"error": "provider_fact_store_unavailable"}, status_code=503)
 
 
+async def _forward_connection_check(tenant_id: str, provider_id: str, scope: dict) -> Response:
+    if _connection_check_client is None or _connection_check_slots.locked():
+        return JSONResponse({"error": "connection_check_unavailable"}, status_code=503)
+
+    path = internal_api.CONNECTION_CHECK_PATH.format(tenant_id=tenant_id, provider_id=provider_id)
+    async with _connection_check_slots:
+        try:
+            async with asyncio.timeout(7):
+                response = await _connection_check_client.post(
+                    UPSTREAM + path, params=scope, headers=_router_admin_headers(),
+                )
+        except (httpx.RequestError, TimeoutError):
+            return JSONResponse({"error": "connection_check_unavailable"}, status_code=503)
+    headers = {"Retry-After": response.headers["retry-after"]} if "retry-after" in response.headers else {}
+    return Response(response.content, status_code=response.status_code,
+                    headers=headers, media_type="application/json")
+
+
+app.state.forward_connection_check = _forward_connection_check
 app.state.forward_provider_fact = _forward_provider_fact
 _probe_task: asyncio.Task[None] | None = None
 _started_wall = time.time()
@@ -1394,7 +1415,7 @@ _backfill_task: "asyncio.Task | None" = None
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _client, _probe_task, _backfill_task, _capacity
+    global _client, _connection_check_client, _probe_task, _backfill_task, _capacity
     # The ingress is the owner of the operational store (consumer keys, the ledger,
     # operator-config writes); all operator state lives in Postgres now (the legacy
     # JSON backfill was retired once prod confirmed the tables were populated).
@@ -1405,6 +1426,7 @@ async def startup() -> None:
         limits=httpx.Limits(
             max_connections=UPSTREAM_MAX_CONNECTIONS,
             max_keepalive_connections=UPSTREAM_MAX_KEEPALIVE_CONNECTIONS))
+    _connection_check_client = httpx.AsyncClient(timeout=7.0, limits=httpx.Limits(max_connections=2))
     digests_ok = await asyncio.to_thread(
         host_store.upsert_consumer_key_digests,
         _exact_consumer_key_digests())
@@ -1421,7 +1443,7 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global _probe_task
+    global _connection_check_client, _probe_task
     await asyncio.to_thread(drain_settles)
     if _probe_task:
         _probe_task.cancel()
@@ -1430,6 +1452,9 @@ async def shutdown() -> None:
         _probe_task = None
     if _client:
         await _client.aclose()
+    if _connection_check_client is not None:
+        await _connection_check_client.aclose()
+        _connection_check_client = None
     await control_plane_client.close()
 
 

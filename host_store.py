@@ -231,6 +231,11 @@ _SCHEMA_STATEMENTS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_consumer_key_digests_consumer"
     " ON consumer_key_digests(consumer)",
+    """CREATE TABLE IF NOT EXISTS connection_check_limits (
+        tenant_id BIGINT PRIMARY KEY,
+        next_check TIMESTAMPTZ NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_connection_check_expiry ON connection_check_limits(next_check)",
     # A PostgreSQL-backed token bucket is the global admission authority.  The
     # old deque lived in one Python process, so N replicas multiplied every
     # caller's quota by N.  One row per consumer keeps sustained rate + burst
@@ -1153,6 +1158,26 @@ def consumer_for_digest(digest: str) -> "tuple[str | None, bool]":
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store consumer_for_digest failed: %s", exc)
         return None, False
+
+
+def reserve_connection_check(tenant_id: int, interval: int) -> bool:
+    """Claim one check for this tenant across replicas using the database clock."""
+    with _get_pool().connection(timeout=0.3) as conn:
+        conn.execute("SET LOCAL statement_timeout = '500ms'")
+        # Bound cleanup work even after a quiet period or a burst of new tenants.
+        conn.execute("""DELETE FROM connection_check_limits WHERE tenant_id IN (
+            SELECT tenant_id FROM connection_check_limits
+             WHERE next_check < statement_timestamp() - interval '1 hour'
+             ORDER BY next_check LIMIT 32 FOR UPDATE SKIP LOCKED
+        )""")
+        row = conn.execute("""
+            INSERT INTO connection_check_limits(tenant_id, next_check)
+            VALUES (%s, statement_timestamp() + make_interval(secs => %s))
+            ON CONFLICT (tenant_id) DO UPDATE SET next_check = EXCLUDED.next_check
+            WHERE connection_check_limits.next_check <= statement_timestamp()
+            RETURNING tenant_id
+        """, (tenant_id, interval)).fetchone()
+    return row is not None
 
 
 def consume_rate_token(consumer: str, rate_per_min: int, burst: int, *,
@@ -2989,7 +3014,7 @@ def truncate_all_for_tests() -> None:
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, ingress_refusals, route_outcome_hours, settings_overrides, provider_overlays,"
                      " provider_facts, provider_relays,"
-                     " consumer_keys, consumer_key_digests, consumer_rate_buckets,"
+                     " consumer_keys, consumer_key_digests, consumer_rate_buckets, connection_check_limits,"
                      " peer_concurrency_leases,"
                      " consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
                      " login_history, provider_prices, wallet_ops,"

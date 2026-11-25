@@ -63,12 +63,11 @@ class BuyerSnapshot:
         return []
 
 
-async def _buyer(host):
+async def buyer_snapshot(url, token):
     from byo_http import buyer_client
-    from sources.antseed import AntSeedSource, STALE_AFTER_S
     async with buyer_client() as client:
-        async with client.stream('GET', host._env['ANTSEED_BYO_URL'].rstrip('/') + '/snapshot',
-                                 headers={'Authorization': 'Bearer ' + host._env['ANTSEED_BYO_TOKEN']}) as response:
+        async with client.stream('GET', url.rstrip('/') + '/snapshot',
+                                 headers={'Authorization': 'Bearer ' + token}) as response:
             response.raise_for_status()
             body = bytearray()
             async for chunk in response.aiter_bytes():
@@ -78,7 +77,12 @@ async def _buyer(host):
             data = json.loads(body)
     if not isinstance(data, dict) or not isinstance(data.get('peer_offers'), list):
         raise ValueError('Invalid buyer snapshot')
-    store = BuyerSnapshot(data)
+    return BuyerSnapshot(data)
+
+
+async def _buyer(host):
+    from sources.antseed import AntSeedSource, STALE_AFTER_S
+    store = await buyer_snapshot(host._env['ANTSEED_BYO_URL'], host._env['ANTSEED_BYO_TOKEN'])
     status = store.buyer_status('antseed') or {}
     stamp = float(status.get('fetched_at') or 0)
     credits = float(status.get('deposits_available') or 0)

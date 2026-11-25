@@ -206,3 +206,31 @@ login + local proxy path works, and OpenAI may close it (as Anthropic and Google
 closed their equivalents in 2026). Use a normal OpenAI API key
 (`auth_env = "OPENAI_API_KEY"`, `api_kind = "openai_compatible"`) if you want a
 supported path instead.
+
+## Check a tenant connection
+
+Send a POST to `/internal/tenants/{tenant_id}/provider-connections/{provider_id}/check`
+with `x-internal-secret`. Use the exact catalog provider ID, so two entries
+sharing a key can be checked at their respective destinations. For a scoped
+connection, pass both `project_id` and `environment_id` as query parameters.
+The router loads the current credentials for that scope and honors its runtime
+relay snapshot. The request takes no body.
+
+A probe returns `working`, `reason`, `message`, `model_count` and `elapsed_ms`.
+Reasons are `ok`, `bad_credential`, `expired`, `unreachable`, `unfunded`,
+`rate_limited` and `unknown`. The message is a recognized, trimmed upstream
+message or a fixed explanation. Arbitrary upstream text can contain credential
+fragments and is discarded.
+
+For HTTP providers, the count covers the first model-list response. AWS counts
+the returned foundation-model catalog. A buyer check uses the gateway's own
+fresh funding status and counts distinct advertised services with recent
+offers. An HTTP provider without a list can receive a one-token generation
+request on a catalog model. The count is null when no list was obtained.
+The check is limited to tenant-owned credentials.
+
+Credential lookup and probing share a four-second deadline. Across replicas,
+each tenant can start one check every 12 seconds. A router-imposed limit returns
+HTTP 429 with `Retry-After`. A provider-imposed limit returns HTTP 200 with
+`reason: rate_limited`. Temporary router overload or a rate-store failure
+returns HTTP 503. These checks do not contribute to traffic circuit breakers.
