@@ -34,6 +34,7 @@ import os
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -323,8 +324,28 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             }
 
     from saas_routes import ScopedHost, automatic_trace, install as install_saas
+    from internal_api import fact_router
+
+    facts = getattr(host, "provider_facts", None)
     host = ScopedHost(host)
-    app = FastAPI(title="llm-router shim", docs_url=None, redoc_url=None, openapi_url=None)
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        if facts is None:
+            yield
+            return
+        task = asyncio.create_task(facts.run())
+        try:
+            yield
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    app = FastAPI(title="llm-router shim", docs_url=None, redoc_url=None,
+                  openapi_url=None, lifespan=lifespan)
+    if facts is not None:
+        app.state.provider_facts = facts
+        app.include_router(fact_router)
 
     @app.middleware("http")
     async def router_admin_auth(request: Request, call_next):

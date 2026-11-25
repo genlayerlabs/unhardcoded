@@ -110,3 +110,27 @@ def test_prometheus_surface_has_autoscaling_and_availability_metrics(monkeypatch
     assert 'llm_router_requests_total{status="200"}' in response.text
     assert 'llm_router_rejections_total{reason="router_overloaded"}' in response.text
     assert 'llm_router_store_errors_total{kind="rate_limit"}' in response.text
+
+
+
+def test_fact_policy_adds_no_database_queries(host_store_clean, monkeypatch):
+    from test_provider_facts import NOW, chat, make_router_client
+
+    client, attempts, _ = make_router_client()
+    host_store_clean.upsert_provider_fact("comput3", "eu_hosted", True, NOW)
+    client.app.state.provider_facts.refresh()
+
+    checkouts = []
+
+    def unavailable():
+        checkouts.append(1)
+        raise RuntimeError("database offline")
+
+    monkeypatch.setattr(host_store, "_get_pool", unavailable)
+    assert chat(client).status_code == 200
+    baseline = len(checkouts)
+    checkouts.clear()
+    attempts.clear()
+    assert chat(client, "fact:eu_hosted").status_code == 200
+    assert len(checkouts) == baseline
+    assert attempts == ["comput3"]

@@ -37,3 +37,18 @@ of seconds (default 300). Missing, false, stale, or unavailable observations
 evaluate to false. If no candidate passes the filter, the router reports
 `no_candidates`. Retries use only candidates admitted at ranking time. Policies
 that do not refer to facts perform no fact lookup.
+
+Ranking reads a local snapshot. Until its first successful refresh, or once the
+snapshot exceeds the same maximum age, all facts evaluate to false. A failed
+refresh retains the previous snapshot until it expires.
+
+The router starts refreshes at most `ROUTER_PROVIDER_FACT_REFRESH_S` seconds
+apart under normal operation (default 5, with up to 20% downward jitter). A
+successful PUT updates the receiving router's snapshot before responding. Other
+replicas see the observation on their next successful refresh, normally within
+one interval plus the query time. Configure the same internal secret on ingress
+and its router so the ingress can forward writes.
+
+Each refresh loads up to 10,000 true facts in fact-name and provider-ID order and
+logs when it reaches the limit. Facts outside the snapshot evaluate to false.
+A successful local write can temporarily displace a cached fact at capacity.
