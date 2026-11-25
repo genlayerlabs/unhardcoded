@@ -68,6 +68,7 @@ BURST = int(os.getenv("BURST", "200"))
 MAX_INFLIGHT_REQUESTS = max(0, int(os.getenv("MAX_INFLIGHT_REQUESTS", "0")))
 MAX_PENDING_REQUESTS = max(0, int(os.getenv("MAX_PENDING_REQUESTS", "0")))
 CAPACITY_QUEUE_TIMEOUT_S = max(0.0, float(os.getenv("CAPACITY_QUEUE_TIMEOUT_S", "2")))
+REQUEST_ALLOWANCES_ENABLED = os.getenv("REQUEST_ALLOWANCES_ENABLED") == "1"
 
 
 def _reservation_usd() -> float:
@@ -4362,6 +4363,40 @@ async def proxy(path: str, request: Request) -> Response:
                 "message": "router capacity is temporarily exhausted; retry shortly",
                 "type": "server_error", "code": "router_overloaded"}})
 
+    allowance_id = None
+    if REQUEST_ALLOWANCES_ENABLED and published_route is not None and "request_allowance" in published_route:
+        headers = None
+        try:
+            allowance_id, period_end = await asyncio.to_thread(
+                host_store.reserve_request_allowance, auth["tenant_id"], published_route["request_allowance"])
+        except host_store.InvalidRequestAllowance:
+            rejection = (503, "request_allowance_unavailable", "Request allowance is unavailable")
+        except Exception:
+            _metric_store_error("request_allowance")
+            rejection = (503, "request_allowance_unavailable", "Request allowance is unavailable")
+        except BaseException:
+            _settle_reservation(None)
+            _capacity_release()
+            raise
+        else:
+            rejection = None
+            if allowance_id is None:
+                rejection = (429, "request_allowance_exhausted", "Tenant request allowance exhausted")
+                headers = {"Retry-After": str(max(1, math.ceil(period_end - time.time())))}
+        if rejection:
+            _settle_reservation(None)
+            _capacity_release()
+            reject_status, code, message = rejection
+            _record_reject(reason=code, path="/" + path, caller=caller, status=reject_status,
+                           route=requested_route)
+            return JSONResponse(status_code=reject_status, headers=headers, content={"error": {
+                "message": message, "code": code,
+                "type": "rate_limit_error" if reject_status == 429 else "server_error",
+            }})
+
+    response_served = False
+    upstream_error = False
+
     status = 502
     provider = None
     model_family = None
@@ -4426,6 +4461,9 @@ async def proxy(path: str, request: Request) -> Response:
                 _settle_reservation(cost_usd if cost_usd is not None or status >= 400
                                     else reservation["amount"] if reservation else None)
             finally:
+                if allowance_id is not None:
+                    host_store.settle_request_allowance_async(
+                        allowance_id, response_served and 200 <= status < 300 and not upstream_error)
                 _capacity_release()
 
     try:
@@ -4499,10 +4537,13 @@ async def proxy(path: str, request: Request) -> Response:
                 nonlocal provider, model_family, served_model_id, served_by, \
                     tokens_in, tokens_out, tokens_total, tokens_cached, cost_usd, \
                     cost_basis, decision_trace, error_type, error_code, error_message
-                nonlocal first_token_ms, incomplete_stream, responses_stream_outcome
+                nonlocal first_token_ms, incomplete_stream, responses_stream_outcome, upstream_error
                 try:
                     meta = _parse_stream_tail(tail)
-                    if responses_meta := meta.get("responses_outcome"):
+                    responses_meta = meta.get("responses_outcome")
+                    if allowance_id is not None:
+                        upstream_error = "error" in meta or bool(responses_meta and responses_meta[0])
+                    if responses_meta:
                         responses_stream_outcome = responses_meta
                         incomplete_stream = not drain_complete
                     xr = meta.get("x_router") or {}
@@ -4546,8 +4587,9 @@ async def proxy(path: str, request: Request) -> Response:
                 asyncio.get_running_loop().call_later(STREAM_DRAIN_TIMEOUT_S, pump.cancel)
 
             async def _pump() -> None:
-                nonlocal drain_complete, pump_finished, proxy_timeout
+                nonlocal drain_complete, pump_finished, proxy_timeout, response_served
                 tail = bytearray()
+                drain_cut_short = False
                 drained = 0
                 failure: BaseException | None = None
                 try:
@@ -4563,18 +4605,22 @@ async def proxy(path: str, request: Request) -> Response:
                                 _client_left()
                         drained += len(chunk)
                         if drained > STREAM_DRAIN_MAX_BYTES:
+                            drain_cut_short = True
                             break
                     else:
                         drain_complete = True
                 except asyncio.CancelledError:
-                    pass
+                    drain_cut_short = client_gone_at is not None
                 except Exception as exc:  # noqa: BLE001
                     failure = exc
                     proxy_timeout = isinstance(exc, httpx.TimeoutException)
                 finally:
-                    await _close_upstream_stream()
-                    _account(bytes(tail))
-                    _finish()
+                    try:
+                        await _close_upstream_stream()
+                        response_served = drain_complete or drain_cut_short
+                    finally:
+                        _account(bytes(tail))
+                        _finish()
                     pump_finished = True
                     if client_gone_at is None:
                         with contextlib.suppress(asyncio.TimeoutError):   # None = end of stream
@@ -4623,6 +4669,7 @@ async def proxy(path: str, request: Request) -> Response:
                 if isinstance(parsed, dict):
                     err = parsed.get("error")
                     if isinstance(err, dict):
+                        upstream_error = True
                         error_type = err.get("type")
                         error_code = err.get("code")
                         error_message = err.get("message")
@@ -4632,6 +4679,7 @@ async def proxy(path: str, request: Request) -> Response:
                     tokens_total = int(usage.get("total_tokens") or (tokens_in + tokens_out))
             except Exception:
                 pass
+        response_served = True
         return Response(status_code=status, content=content, media_type=content_type)
     except Exception as exc:
         error_type = "proxy_error"

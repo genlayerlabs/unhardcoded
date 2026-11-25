@@ -145,3 +145,143 @@ def test_fact_policy_adds_no_database_queries(host_store_clean, monkeypatch):
     assert chat(client, "fact:eu_hosted").status_code == 200
     assert len(checkouts) == baseline
     assert attempts == ["comput3"]
+
+
+def _allowance(start, end, count):
+    return {"period_start": start, "period_end": end, "request_count": count}
+
+
+def test_shared_request_allowance_admits_only_available_slots(host_store_clean):
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    store = host_store_clean
+    now = int(time.time())
+    allowance = _allowance(now - 1, now + 3600, 3)
+    ready = Barrier(8)
+
+    def reserve():
+        ready.wait(timeout=5)
+        return store.reserve_request_allowance(10, allowance)
+
+    # Independent concurrent transactions contend on the shared tenant row.
+    with ThreadPoolExecutor(8) as replicas:
+        results = list(replicas.map(lambda _: reserve(), range(8)))
+    reservations = {reservation for reservation, _ in results if reservation}
+    assert len(reservations) == 3
+    assert sum(reservation is not None for reservation, _ in results) == 3
+    assert {end for _, end in results} == {now + 3600}
+    assert store.reserve_request_allowance(11, allowance)[0] is not None
+
+
+def test_request_allowance_expiry_and_rollover(host_store_clean, monkeypatch):
+    from types import SimpleNamespace
+
+    store = host_store_clean
+    clock = SimpleNamespace(time=lambda: now)
+    monkeypatch.setattr(store, "time", clock)
+    now = 100
+    allowance = _allowance(100, 8000, 1)
+    abandoned, _ = store.reserve_request_allowance(10, allowance)
+    assert abandoned
+    now = 3699
+    assert store.reserve_request_allowance(10, allowance) == (None, 8000)
+    now = 3700
+    replacement, _ = store.reserve_request_allowance(10, allowance)
+    assert replacement and replacement != abandoned
+
+    # A late release cannot return the replacement's slot.
+    store.settle_request_allowance_async(abandoned, False)
+    store.settle_request_allowance_async(replacement, True)
+    assert store.reserve_request_allowance(10, allowance) == (None, 8000)
+
+    now = 8000
+    with pytest.raises(store.InvalidRequestAllowance):
+        store.reserve_request_allowance(10, allowance)
+    assert store.reserve_request_allowance(10, _allowance(8000, 9000, 1))[0]
+
+
+@pytest.fixture
+def tenant_allowance_route(host_store_clean, monkeypatch):
+    import time
+
+    import control_plane_client as cpc
+    from test_auth_proxy_control_plane import _cp
+
+    cpc.reset_for_tests()
+    monkeypatch.setattr(cpc, "CONTROL_PLANE_URL", "http://cp.test")
+    monkeypatch.setattr(cpc, "CONTROL_PLANE_INTERNAL_SECRET", "local-test")
+    monkeypatch.setattr(auth_proxy, "REQUEST_ALLOWANCES_ENABLED", True)
+    cp = _cp(monkeypatch, [{"active": True, "consumer": "allowance-test", "tenant_id": 7}])
+    now = int(time.time())
+    metadata = {"request_allowance": _allowance(now - 1, now + 3600, 1)}
+    get = cp.get
+
+    async def get_with_allowance(url, **kwargs):
+        response = await get(url, **kwargs)
+        if "/routes/" in url:
+            import httpx
+
+            return httpx.Response(200, request=response.request, json={**response.json(), **metadata})
+        return response
+
+    monkeypatch.setattr(cp, "get", get_with_allowance)
+    yield metadata
+    cpc.reset_for_tests()
+
+
+@pytest.mark.parametrize("failure", ["http", "chat_stream", "responses_stream"])
+def test_failed_upstream_releases_tenant_slot(tenant_allowance_route, failure, monkeypatch):
+    from test_auth_proxy_control_plane import _FakeUpstreamResp, _post_chat, _upstream
+
+    upstream = _upstream(monkeypatch)
+    client = TestClient(auth_proxy.app)
+    if failure == "http":
+        monkeypatch.setattr(_FakeUpstreamResp, "status_code", 502)
+    else:
+        async def stream(_self):
+            if failure == "chat_stream":
+                yield b'data: {"error":{"message":"failed"}}\n\n'
+            else:
+                yield b'data: {"type":"response.failed","response":{"status":"failed"}}\n\n'
+
+        monkeypatch.setattr(_FakeUpstreamResp, "headers", {"content-type": "text/event-stream"})
+        monkeypatch.setattr(_FakeUpstreamResp, "aiter_raw", stream, raising=False)
+
+    assert _post_chat(client, "allowance-token").status_code == (502 if failure == "http" else 200)
+    monkeypatch.setattr(_FakeUpstreamResp, "status_code", 200)
+    monkeypatch.setattr(_FakeUpstreamResp, "headers", {"content-type": "application/json"})
+    assert _post_chat(client, "allowance-token").status_code == 200
+    refused = _post_chat(client, "allowance-token")
+    assert refused.status_code == 429
+    assert refused.json()["error"]["code"] == "request_allowance_exhausted"
+    assert 3590 <= int(refused.headers["Retry-After"]) <= 3600
+    assert len(upstream.requests) == 2
+
+
+@pytest.mark.parametrize("enabled,include_allowance", [(False, True), (True, False), (True, True)])
+def test_tenant_allowance_only_checks_store_when_configured(
+        tenant_allowance_route, enabled, include_allowance, monkeypatch):
+    from test_auth_proxy_control_plane import _post_chat, _upstream
+
+    upstream = _upstream(monkeypatch)
+    monkeypatch.setattr(auth_proxy, "REQUEST_ALLOWANCES_ENABLED", enabled)
+    checks = []
+
+    def store_unavailable(*args):
+        checks.append(args)
+        raise RuntimeError("database unavailable")
+
+    if not include_allowance:
+        tenant_allowance_route.clear()
+    monkeypatch.setattr(host_store, "reserve_request_allowance", store_unavailable)
+    response = _post_chat(TestClient(auth_proxy.app), "allowance-token")
+    assert len(checks) == int(enabled and include_allowance)
+    if enabled and include_allowance:
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "request_allowance_unavailable"
+        assert not upstream.requests
+    else:
+        assert response.status_code == 200
+        assert len(upstream.requests) == 1

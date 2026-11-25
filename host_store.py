@@ -38,6 +38,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from bisect import bisect_left
 from typing import Any
 
@@ -112,6 +113,25 @@ _SCHEMA_STATEMENTS = [
         PRIMARY KEY (tenant_id, environment_id, route, hour_ts)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_route_outcome_hours_hour ON route_outcome_hours (hour_ts)",
+    """CREATE TABLE IF NOT EXISTS request_allowance_periods (
+        tenant_id BIGINT NOT NULL,
+        period_start BIGINT NOT NULL,
+        period_end BIGINT NOT NULL,
+        used BIGINT NOT NULL DEFAULT 0 CHECK (used >= 0),
+        PRIMARY KEY (tenant_id, period_start)
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_request_allowance_period_end
+       ON request_allowance_periods (period_end)""",
+    """CREATE TABLE IF NOT EXISTS request_allowance_reservations (
+        id TEXT PRIMARY KEY,
+        tenant_id BIGINT NOT NULL,
+        period_start BIGINT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        FOREIGN KEY (tenant_id, period_start)
+            REFERENCES request_allowance_periods (tenant_id, period_start) ON DELETE CASCADE
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_request_allowance_expiry
+       ON request_allowance_reservations (tenant_id, period_start, expires_at)""",
     """CREATE TABLE IF NOT EXISTS calls (
         id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         ts              BIGINT NOT NULL,
@@ -577,6 +597,8 @@ def _prune() -> None:
             # Swept reservations only wait for a late settle; a day is plenty.
             conn.execute("DELETE FROM subject_budget_reservations"
                          " WHERE released AND expires_at < %s", (now - 86400,))
+            conn.execute("DELETE FROM request_allowance_periods WHERE period_end <= %s",
+                         (int(now),))
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store prune failed: %s", exc)
 
@@ -1945,7 +1967,90 @@ def usage_export(caller: str, after_id: int = 0, limit: int = 1000, *, project_i
             "next_after_id": next_after_id, "watermark_ts": watermark}
 
 
+# ---- tenant request allowances -------------------------------------------------
+
+
+class InvalidRequestAllowance(ValueError):
+    """The resolved allowance does not describe an active period."""
+
+
+_REQUEST_ALLOWANCE_RESERVATION_TTL_S = 3600
+
+
+def reserve_request_allowance(tenant_id: int, allowance: object) -> tuple[str | None, int]:
+    """Reserve a slot, or return no reservation and the period end if full."""
+    if not isinstance(allowance, dict):
+        raise InvalidRequestAllowance()
+    start, end, count = (allowance.get(key) for key in
+                         ("period_start", "period_end", "request_count"))
+    now = int(time.time())
+    if (any(type(value) is not int or not 0 <= value < 2**63
+            for value in (tenant_id, start, end, count))
+            or tenant_id == 0 or not start <= now < end):
+        raise InvalidRequestAllowance()
+    if count == 0:
+        return None, end
+
+    with _get_pool().connection(timeout=2.0) as conn:
+        conn.execute("SET LOCAL statement_timeout = 2000")
+        # Serialize expiry, admission and settlement by locking the period
+        # first. Other tenants and periods use independent rows.
+        period = conn.execute("""
+            INSERT INTO request_allowance_periods (tenant_id, period_start, period_end)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (tenant_id, period_start) DO UPDATE
+                SET period_end = EXCLUDED.period_end
+                WHERE request_allowance_periods.period_end = EXCLUDED.period_end
+            RETURNING used
+        """, (tenant_id, start, end)).fetchone()
+        now = int(time.time())
+        if period is None or now >= end:
+            raise InvalidRequestAllowance()
+        expired = conn.execute("""
+            DELETE FROM request_allowance_reservations
+            WHERE tenant_id = %s AND period_start = %s AND expires_at <= %s
+        """, (tenant_id, start, now)).rowcount
+        used = period[0] - expired
+        reservation_id = uuid.uuid4().hex if used < count else None
+        if expired or reservation_id is not None:
+            conn.execute("""
+                UPDATE request_allowance_periods SET used = %s
+                WHERE tenant_id = %s AND period_start = %s
+            """, (used + int(reservation_id is not None), tenant_id, start))
+        if reservation_id is not None:
+            conn.execute("""
+                INSERT INTO request_allowance_reservations
+                    (id, tenant_id, period_start, expires_at)
+                VALUES (%s, %s, %s, %s)
+            """, (reservation_id, tenant_id, start, now + _REQUEST_ALLOWANCE_RESERVATION_TTL_S))
+    return reservation_id, end
+
+
+def _settle_request_allowance(reservation_id: str, success: bool) -> None:
+    with _get_pool().connection(timeout=2.0) as conn:
+        conn.execute("SET LOCAL statement_timeout = 2000")
+        period = conn.execute("""
+            SELECT p.tenant_id, p.period_start FROM request_allowance_periods p
+            JOIN request_allowance_reservations r USING (tenant_id, period_start)
+            WHERE r.id = %s FOR UPDATE OF p
+        """, (reservation_id,)).fetchone()
+        if period is None:
+            return
+        deleted = conn.execute("DELETE FROM request_allowance_reservations WHERE id = %s",
+                               (reservation_id,)).rowcount
+        if deleted and not success:
+            conn.execute("""
+                UPDATE request_allowance_periods SET used = used - 1
+                WHERE tenant_id = %s AND period_start = %s
+            """, period)
+
+
+def settle_request_allowance_async(reservation_id: str, success: bool) -> None:
+    _enqueue(lambda: _settle_request_allowance(reservation_id, success))
+
+
 # ---- per-subject monthly budgets (control-plane key limits) ---------------------
+
 
 def reserve_subject_budget(tenant_id: int, subject: str, period: str, limit_usd: float,
                            amount_usd: float, reservation_id: str, ttl_s: float = 900.0, *,
@@ -2876,7 +2981,8 @@ def truncate_all_for_tests() -> None:
                      " peer_concurrency_leases,"
                      " consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
                      " login_history, provider_prices, wallet_ops,"
-                     " subject_budget_usage, subject_budget_reservations")
+                     " subject_budget_usage, subject_budget_reservations,"
+                     " request_allowance_periods, request_allowance_reservations")
 
 
 def key_usage_rows(consumer_sha: str, since_ts: "int | None" = None,
