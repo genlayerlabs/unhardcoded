@@ -1614,10 +1614,21 @@ def cost_by_route(window_s: int = 86_400) -> list[dict[str, Any]]:
 
 # ---- usage rows + dashboard logins, from the store (#5) -------------------------
 
+# Existing provenance also covers legacy rows and startup cost backfills.
+# A composite total can include router-calculated costs even when the winning
+# inference reported its own amount.
+_COST_SOURCE_SQL = (
+    "CASE WHEN cost_usd IS NULL THEN 'none'"
+    " WHEN cost_basis = 'reported' AND provider_id IS DISTINCT FROM 'flow'"
+    " AND NOT (COALESCE(routing_summary, '{}'::jsonb) ? 'automatic') THEN 'reported'"
+    " ELSE 'estimated' END AS cost_source"
+)
+
 _USAGE_COLS = ("ts", "caller", "provider_id", "model_family", "served_model_id",
                "served_by", "status", "error_type", "tokens_in", "tokens_out",
                "tokens_total", "tokens_cached", "cost_usd", "requested_model",
-               "consumer_sha", "usage_event_id")
+               "consumer_sha", "usage_event_id", "cost_source")
+_USAGE_SELECT = ", ".join(_USAGE_COLS[:-1] + (_COST_SOURCE_SQL,))
 
 
 def _usage_where(since_ts: "int | None" = None, caller: "str | None" = None,
@@ -1667,7 +1678,8 @@ def _map_usage_row(r: tuple) -> dict[str, Any]:
         "status": d["status"], "error_type": d["error_type"],
         "tokens_in": d["tokens_in"], "tokens_out": d["tokens_out"],
         "tokens_total": d["tokens_total"], "tokens_cached": d["tokens_cached"],
-        "cost_usd": d["cost_usd"], "requested_model": d["requested_model"],
+        "cost_usd": d["cost_usd"], "cost_source": d["cost_source"],
+        "requested_model": d["requested_model"],
         "key_sha256": d["consumer_sha"],
         "key_sha256_prefix": (d["consumer_sha"] or "")[:12] or None,
         "usage_event_id": d.get("usage_event_id")}
@@ -1682,7 +1694,7 @@ def usage_rows(since_ts: "int | None" = None,
         where, params = _usage_where(since_ts=since_ts, caller=caller)
         with _get_pool().connection() as conn:
             cur = conn.execute(
-                f"SELECT {', '.join(_USAGE_COLS)} FROM calls{where} ORDER BY ts",
+                f"SELECT {_USAGE_SELECT} FROM calls{where} ORDER BY ts",
                 params)
             return [_map_usage_row(r) for r in cur.fetchall()]
     except Exception as exc:  # noqa: BLE001
@@ -1706,7 +1718,7 @@ def usage_rows_page(since_ts: "int | None" = None, caller: "str | None" = None,
         with _get_pool().connection() as conn:
             _set_dashboard_statement_timeout(conn)
             cur = conn.execute(
-                f"SELECT {', '.join(_USAGE_COLS)} FROM calls{where}"
+                f"SELECT {_USAGE_SELECT} FROM calls{where}"
                 " ORDER BY ts DESC, id ASC LIMIT %s", params + [int(limit)])
             return [_map_usage_row(r) for r in cur.fetchall()]
     except Exception as exc:  # noqa: BLE001
@@ -1909,7 +1921,7 @@ def usage_groups(group_by: str, since_ts: "int | None" = None, caller: "str | No
 
 _EXPORT_COLS = ("id", "ts", "key_sha256", "subject", "route", "model_family", "provider",
                 "status", "tokens_in", "tokens_out", "tokens_cached", "tokens_total",
-                "cost_usd", "cost_basis")
+                "cost_usd", "cost_basis", "cost_source")
 
 
 def usage_export(caller: str, after_id: int = 0, limit: int = 1000, *, project_id=None,
@@ -1930,7 +1942,7 @@ def usage_export(caller: str, after_id: int = 0, limit: int = 1000, *, project_i
     sql = ("SELECT id, ts, consumer_sha, routing_summary->>'subject',"
            " COALESCE(NULLIF(routing_summary->>'route',''),requested_model),"
            " model_family, provider_id, status, tokens_in, tokens_out, tokens_cached,"
-           f" {_TOKENS_TOTAL_SQL}, cost_usd, cost_basis FROM calls{where}"
+           f" {_TOKENS_TOTAL_SQL}, cost_usd, cost_basis, {_COST_SOURCE_SQL} FROM calls{where}"
            " AND id > %s AND COALESCE(recorded_at,0) <= %s ORDER BY id LIMIT %s")
     with _get_pool().connection() as conn:
         _set_dashboard_statement_timeout(conn)
@@ -2890,7 +2902,7 @@ def key_usage_rows(consumer_sha: str, since_ts: "int | None" = None,
         with _get_pool().connection() as conn:
             _set_dashboard_statement_timeout(conn)
             cur = conn.execute(
-                f"SELECT {', '.join(_USAGE_COLS)} FROM calls{where}"
+                f"SELECT {_USAGE_SELECT} FROM calls{where}"
                 " ORDER BY ts DESC, id ASC LIMIT %s", params + [max(1, int(limit))])
             return [_map_usage_row(r) for r in cur.fetchall()]
     except Exception as exc:  # noqa: BLE001

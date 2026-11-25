@@ -4521,8 +4521,8 @@ async def proxy(path: str, request: Request) -> Response:
                             tokens_cached = xr["tokens_cached"]
                     usage = meta.get("usage")
                     if isinstance(usage, dict):
-                        tokens_in = int(usage.get("prompt_tokens") or 0)
-                        tokens_out = int(usage.get("completion_tokens") or 0)
+                        tokens_in = int(usage.get("prompt_tokens", usage.get("input_tokens")) or 0)
+                        tokens_out = int(usage.get("completion_tokens", usage.get("output_tokens")) or 0)
                         tokens_total = int(usage.get("total_tokens") or (tokens_in + tokens_out))
                     err = meta.get("error")
                     if isinstance(err, dict):
@@ -4719,7 +4719,7 @@ def _parse_stream_tail(tail: bytes) -> dict[str, Any]:
     The shim's final chat.completion.chunk carries usage and x_router
     together; an aborted stream emits a single error event. Scans data lines
     newest-first and stops once both usage and x_router are found. Responses
-    terminal frames contribute only their error code and route decision trace."""
+    terminal frames carry these fields inside the response object."""
     out: dict[str, Any] = {}
     lines = tail.decode("utf-8", "replace").splitlines()
     for line in reversed(lines):
@@ -4747,7 +4747,9 @@ def _parse_stream_tail(tail: bytes) -> dict[str, Any]:
                 xr = response.get("x_router")
                 trace = xr.get("decision_trace") if isinstance(xr, dict) else None
                 out["responses_outcome"] = (code, trace if isinstance(trace, dict) else None)
-            continue
+                payload = response
+            else:
+                continue
         if "usage" not in out and isinstance(payload.get("usage"), dict):
             out["usage"] = payload["usage"]
         if "x_router" not in out and isinstance(payload.get("x_router"), dict):

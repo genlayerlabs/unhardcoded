@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,30 @@ os.environ.setdefault("CALLER_KEYS_BOOTSTRAP_JSON", "{}")
 
 import auth_proxy  # noqa: E402
 import host_store  # noqa: E402
+
+
+def test_background_ledger_preserves_cost_provenance(host_store_clean, monkeypatch):
+    store = host_store_clean
+    monkeypatch.setattr(store, "_SYNC_WRITES", False)
+    rows = [
+        (0.0, "reported", "openrouter", "reported"),
+        (0.01, "computed", "openai", "estimated"),
+        (0.0, "subscription", "codex", "estimated"),
+        (0.02, None, "openai", "estimated"),
+        (0.03, "reported", "flow", "estimated"),
+        (None, None, "openai", "none"),
+    ]
+    now = int(time.time())
+    for offset, (cost, basis, provider, _) in enumerate(rows):
+        store.insert_call_async({"caller": "cost-test", "ts": now + offset,
+                                 "cost_usd": cost, "cost_basis": basis, "provider": provider})
+    store._write_q.join()
+    usage = store.usage_rows(caller="cost-test")
+    assert [(row["cost_usd"], row["cost_source"]) for row in usage] == [
+        (cost, source) for cost, _, _, source in rows]
+    exported = store.usage_export("cost-test", now=now + 3600)["rows"]
+    assert [(row["cost_usd"], row["cost_basis"], row["cost_source"]) for row in exported] == [
+        (cost, basis, source) for cost, basis, _, source in rows]
 
 
 def test_dashboard_issued_digest_resolves_without_local_key(host_store_clean):
