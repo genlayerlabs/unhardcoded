@@ -131,7 +131,8 @@ def _sse(data: dict) -> str:
 
 
 @pytest.mark.asyncio
-async def test_anthropic_native_handler_translates_openai_shape():
+@pytest.mark.parametrize("origin", ["https://api.anthropic.com", "http://127.0.0.1:8765"])
+async def test_anthropic_native_handler_translates_openai_shape(origin):
     client = FakeClient(FakeResponse(200, {
         "model": "claude-sonnet-4-6",
         "stop_reason": "tool_use",
@@ -152,7 +153,7 @@ async def test_anthropic_native_handler_translates_openai_shape():
         "provider_id": "anthropic",
         "api_kind": "anthropic",
         "auth_env": "ANTHROPIC_TEST_KEY",
-        "base_url": "https://api.anthropic.com/v1/",
+        "base_url": f"{origin}/v1/",
         "served_model_id": "claude-sonnet-4-6",
         "offer": {"wire_model_id": "claude-sonnet-4-6"},
         "messages": [
@@ -173,7 +174,7 @@ async def test_anthropic_native_handler_translates_openai_shape():
     }
 
     req = client.requests[0]
-    assert req["url"] == "https://api.anthropic.com/v1/messages"
+    assert req["url"] == f"{origin}/v1/messages"
     assert req["headers"]["x-api-key"] == "anth-key"
     assert req["headers"]["anthropic-version"] == "2023-06-01"
     assert req["timeout"] == 12
@@ -188,7 +189,8 @@ async def test_anthropic_native_handler_translates_openai_shape():
 
 
 @pytest.mark.asyncio
-async def test_google_native_handler_translates_openai_shape():
+@pytest.mark.parametrize("origin", ["https://generativelanguage.googleapis.com", "http://127.0.0.1:8765"])
+async def test_google_native_handler_translates_openai_shape(origin):
     client = FakeClient(FakeResponse(200, {
         "modelVersion": "gemini-3.1-pro-preview",
         "candidates": [{
@@ -214,7 +216,7 @@ async def test_google_native_handler_translates_openai_shape():
         "provider_id": "gemini",
         "api_kind": "google",
         "auth_env": "GEMINI_TEST_KEY",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "base_url": f"{origin}/v1beta",
         "served_model_id": "gemini-3.1-pro-preview",
         "messages": [
             {"role": "system", "content": "Be terse."},
@@ -237,7 +239,7 @@ async def test_google_native_handler_translates_openai_shape():
 
     req = client.requests[0]
     assert req["url"] == (
-        "https://generativelanguage.googleapis.com/v1beta/"
+        f"{origin}/v1beta/"
         "models/gemini-3.1-pro-preview:generateContent"
     )
     # The key authenticates via header, never the URL query (§3).
@@ -306,7 +308,8 @@ async def test_bedrock_native_handler_translates_openai_shape():
 
 
 @pytest.mark.asyncio
-async def test_anthropic_native_stream_emits_and_aggregates():
+@pytest.mark.parametrize("origin", ["https://api.anthropic.com", "http://127.0.0.1:8765"])
+async def test_anthropic_native_stream_emits_and_aggregates(origin):
     deltas = []
     client = FakeStreamClient(FakeStreamResponse(200, [
         _sse({"type": "message_start", "message": {
@@ -331,6 +334,7 @@ async def test_anthropic_native_stream_emits_and_aggregates():
     result = await stream_anthropic({
         "provider_id": "anthropic",
         "api_kind": "anthropic",
+        "base_url": f"{origin}/v1",
         "auth_env": "ANTHROPIC_TEST_KEY",
         "served_model_id": "claude-sonnet-4-6",
         "messages": [{"role": "user", "content": "hi"}],
@@ -348,9 +352,13 @@ async def test_anthropic_native_stream_emits_and_aggregates():
     }
     assert client.requests[0]["json"]["stream"] is True
 
+    assert client.requests[0]["url"] == f"{origin}/v1/messages"
+    assert client.requests[0]["headers"]["x-api-key"] == "anth-key"
+
 
 @pytest.mark.asyncio
-async def test_google_native_stream_emits_and_aggregates():
+@pytest.mark.parametrize("origin", ["https://generativelanguage.googleapis.com", "http://127.0.0.1:8765"])
+async def test_google_native_stream_emits_and_aggregates(origin):
     deltas = []
     client = FakeStreamClient(FakeStreamResponse(200, [
         _sse({"modelVersion": "gemini-3.1-pro-preview",
@@ -373,6 +381,7 @@ async def test_google_native_stream_emits_and_aggregates():
     result = await stream_google({
         "provider_id": "gemini",
         "api_kind": "google",
+        "base_url": f"{origin}/v1beta",
         "auth_env": "GEMINI_TEST_KEY",
         "served_model_id": "gemini-3.1-pro-preview",
         "messages": [{"role": "user", "content": "hi"}],
@@ -389,8 +398,9 @@ async def test_google_native_stream_emits_and_aggregates():
         "name": "lookup",
         "arguments": '{"id": "abc"}',
     }
-    assert client.requests[0]["url"].endswith(
-        "/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse")
+    assert client.requests[0]["url"] == (
+        f"{origin}/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse")
+    assert client.requests[0]["headers"]["x-goog-api-key"] == "gem-key"
 
 
 @pytest.mark.asyncio

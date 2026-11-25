@@ -11,6 +11,8 @@ itself is auth-agnostic: each provider declares how it authenticates and the
 | `{ kind = "none" }`                      | *(none)*                   | antseed              |
 | `{ kind = "oauth", provider = "codex" }` | `Authorization: Bearer <refreshed token>` | openai (codex) |
 
+For a local HTTP relay, see [provider forwarding](PROVIDER-FORWARDING.md).
+
 ## Bearer providers (heurist, io.net, openrouter)
 
 Standard OpenAI-compatible gateways. Put the key in the shim's process
