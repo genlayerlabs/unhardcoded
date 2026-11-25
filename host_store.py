@@ -2710,6 +2710,7 @@ def reset() -> None:
 
 def truncate_all_for_tests() -> None:
     """Test helper: wipe every table for isolation against a shared Postgres."""
+    _refusal_q.join()
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, ingress_refusals, settings_overrides, provider_overlays,"
                      " consumer_keys, consumer_key_digests, consumer_rate_buckets,"
