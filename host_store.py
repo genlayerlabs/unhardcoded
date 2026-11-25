@@ -31,13 +31,14 @@ crashloop).
 from __future__ import annotations
 
 import json
-import math
 import logging
+import math
 import os
 import queue
 import re
 import threading
 import time
+from bisect import bisect_left
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -51,7 +52,9 @@ _SCHEMA_LOCK_KEY = 0x686F7374_73746F72
 
 _PRUNE_EVERY = 500          # run a retention sweep once per this many inserts
 _WRITE_QUEUE_MAX = 10_000   # cap the background ledger-write backlog
-REFUSAL_BUCKET_SECONDS = 3600
+HOUR_SECONDS = 3600
+REFUSAL_BUCKET_SECONDS = HOUR_SECONDS
+ROUTE_LATENCY_BOUNDS_MS = (100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000)
 
 
 def _set_dashboard_statement_timeout(conn: Any) -> None:
@@ -94,6 +97,21 @@ _SCHEMA_STATEMENTS = [
         PRIMARY KEY (tenant_id, hour_ts, subject, reason)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_ingress_refusals_hour ON ingress_refusals (hour_ts)",
+    """CREATE TABLE IF NOT EXISTS route_outcome_hours (
+        tenant_id BIGINT NOT NULL,
+        environment_id BIGINT NOT NULL,
+        route VARCHAR(86) NOT NULL,
+        hour_ts BIGINT NOT NULL,
+        calls BIGINT NOT NULL,
+        successes BIGINT NOT NULL,
+        upstream_errors BIGINT NOT NULL,
+        timeouts BIGINT NOT NULL,
+        fallbacks BIGINT NOT NULL,
+        first_token_ms BIGINT[] NOT NULL,
+        full_answer_ms BIGINT[] NOT NULL,
+        PRIMARY KEY (tenant_id, environment_id, route, hour_ts)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_route_outcome_hours_hour ON route_outcome_hours (hour_ts)",
     """CREATE TABLE IF NOT EXISTS calls (
         id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         ts              BIGINT NOT NULL,
@@ -550,7 +568,9 @@ def _prune() -> None:
             conn.execute("DELETE FROM login_history WHERE ts < %s",
                          (int(now) - _RETENTION_DAYS * 86400,))
             conn.execute("DELETE FROM ingress_refusals WHERE hour_ts < %s",
-                         (_refusal_retention_floor(int(now)),))
+                         (_hourly_retention_floor(int(now)),))
+            conn.execute("DELETE FROM route_outcome_hours WHERE hour_ts < %s",
+                         (_hourly_retention_floor(int(now)),))
             # Swept reservations only wait for a late settle; a day is plenty.
             conn.execute("DELETE FROM subject_budget_reservations"
                          " WHERE released AND expires_at < %s", (now - 86400,))
@@ -564,8 +584,9 @@ def _prune() -> None:
 # backlog — best-effort telemetry, so a dropped row is acceptable. The queue holds
 # thunks so it serves both the call ledger and the per-attempt route observations.
 _write_q: "queue.Queue" = queue.Queue(maxsize=_WRITE_QUEUE_MAX)
-# Give refusal bursts their own backlog so they cannot displace ledger writes.
+# Isolate both rollup backlogs from each other and from ledger writes.
 _refusal_q: "queue.Queue" = queue.Queue(maxsize=1000)
+_route_outcome_q: "queue.Queue" = queue.Queue(maxsize=1000)
 # Call timestamps of ledger rows queued OR being written by this process's
 # writer (ts -> count). The ledger is incomplete at the oldest of them, which
 # bounds ledger_watermark(); a job leaves only after its write returned.
@@ -603,6 +624,7 @@ def _writer_loop(jobs: queue.Queue) -> None:
 
 threading.Thread(target=_writer_loop, args=(_write_q,), name="host-store-writer", daemon=True).start()
 threading.Thread(target=_writer_loop, args=(_refusal_q,), name="host-store-refusals", daemon=True).start()
+threading.Thread(target=_writer_loop, args=(_route_outcome_q,), name="host-store-route-outcomes", daemon=True).start()
 
 
 # Tests set HOST_STORE_SYNC_WRITES=1 so every write runs INLINE (no background
@@ -641,13 +663,13 @@ def insert_call_async(row: dict[str, Any]) -> None:
     _enqueue(lambda: insert_call(snap), snap["ts"])
 
 
-def _refusal_retention_floor(now: int) -> int:
-    return now // REFUSAL_BUCKET_SECONDS * REFUSAL_BUCKET_SECONDS - _RETENTION_DAYS * 86400
+def _hourly_retention_floor(now: int) -> int:
+    return now // HOUR_SECONDS * HOUR_SECONDS - _RETENTION_DAYS * 86400
 
 
 def _insert_ingress_refusal(tenant_id: int, subject: str, reason: str, ts: int) -> None:
     hour_ts = ts // REFUSAL_BUCKET_SECONDS * REFUSAL_BUCKET_SECONDS
-    if hour_ts < _refusal_retention_floor(int(time.time())):
+    if hour_ts < _hourly_retention_floor(int(time.time())):
         return
     with _get_pool().connection() as conn:
         conn.execute(
@@ -667,7 +689,7 @@ def insert_ingress_refusal_async(tenant_id: int, subject: str | None, reason: st
 
 
 def ingress_refusals(tenant_id: int, since_ts: int, until_ts: int) -> list[dict[str, Any]]:
-    since_ts = max(since_ts, _refusal_retention_floor(int(time.time())))
+    since_ts = max(since_ts, _hourly_retention_floor(int(time.time())))
     with _get_pool().connection() as conn:
         _set_dashboard_statement_timeout(conn)
         rows = conn.execute(
@@ -678,6 +700,66 @@ def ingress_refusals(tenant_id: int, since_ts: int, until_ts: int) -> list[dict[
     return [{"subject": subject or None, "reason": reason, "count": int(count),
              "first_ts": first_ts, "last_ts": last_ts}
             for subject, reason, count, first_ts, last_ts in rows]
+
+
+def _latency_sample(ms: float | None) -> list[int]:
+    bins = [0] * (len(ROUTE_LATENCY_BOUNDS_MS) + 1)
+    if type(ms) in (int, float) and 0 <= ms < math.inf:
+        bins[bisect_left(ROUTE_LATENCY_BOUNDS_MS, ms)] = 1
+    return bins
+
+
+def _insert_route_outcome(tenant_id: int, environment_id: int, route: str, hour_ts: int,
+                          outcome: str, fallback: bool, first_token_ms: float | None,
+                          full_answer_ms: float | None) -> None:
+    if hour_ts < _hourly_retention_floor(int(time.time())):
+        return
+    with _get_pool().connection() as conn:
+        conn.execute("""
+            INSERT INTO route_outcome_hours AS h
+                (tenant_id, environment_id, route, hour_ts, calls, successes, upstream_errors,
+                 timeouts, fallbacks, first_token_ms, full_answer_ms)
+            VALUES (%s, %s, %s, %s, 1, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (tenant_id, environment_id, route, hour_ts) DO UPDATE SET
+                calls = h.calls + 1,
+                successes = h.successes + EXCLUDED.successes,
+                upstream_errors = h.upstream_errors + EXCLUDED.upstream_errors,
+                timeouts = h.timeouts + EXCLUDED.timeouts,
+                fallbacks = h.fallbacks + EXCLUDED.fallbacks,
+                first_token_ms = ARRAY(
+                    SELECT a + b FROM unnest(h.first_token_ms, EXCLUDED.first_token_ms)
+                    WITH ORDINALITY AS bins(a, b, n) ORDER BY n),
+                full_answer_ms = ARRAY(
+                    SELECT a + b FROM unnest(h.full_answer_ms, EXCLUDED.full_answer_ms)
+                    WITH ORDINALITY AS bins(a, b, n) ORDER BY n)
+            """, (tenant_id, environment_id, route, hour_ts, int(outcome == "success"),
+                  int(outcome == "upstream_error"), int(outcome == "timeout"), int(fallback),
+                  _latency_sample(first_token_ms), _latency_sample(full_answer_ms)))
+    _maybe_prune()
+
+
+def insert_route_outcome_async(tenant_id: int, environment_id: int, route: str, ts: int,
+                               outcome: str, fallback: bool, first_token_ms: float | None,
+                               full_answer_ms: float | None) -> None:
+    hour_ts = ts // HOUR_SECONDS * HOUR_SECONDS
+    _enqueue(lambda: _insert_route_outcome(tenant_id, environment_id, route, hour_ts,
+                                           outcome, fallback, first_token_ms, full_answer_ms),
+             jobs=_route_outcome_q)
+
+
+def route_outcomes(tenant_id: int, environment_id: int, route: str,
+                   since_ts: int, until_ts: int) -> list[dict[str, Any]]:
+    since_ts = max(since_ts, _hourly_retention_floor(int(time.time())))
+    with _get_pool().connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        _set_dashboard_statement_timeout(conn)
+        return cur.execute("""
+            SELECT hour_ts, calls, successes, upstream_errors, timeouts, fallbacks,
+                   first_token_ms, full_answer_ms
+            FROM route_outcome_hours
+            WHERE tenant_id = %s AND environment_id = %s AND route = %s
+              AND hour_ts >= %s AND hour_ts < %s
+            ORDER BY hour_ts
+            """, (tenant_id, environment_id, route, since_ts, until_ts)).fetchall()
 
 
 def _watermark_lag_s() -> float:
@@ -2747,6 +2829,7 @@ def reset() -> None:
     # writer holds a connection races and flakes test isolation.
     _write_q.join()
     _refusal_q.join()
+    _route_outcome_q.join()
     with _pool_lock:
         if _pool is not None:
             _pool.close()
@@ -2758,8 +2841,9 @@ def reset() -> None:
 def truncate_all_for_tests() -> None:
     """Test helper: wipe every table for isolation against a shared Postgres."""
     _refusal_q.join()
+    _route_outcome_q.join()
     with _get_pool().connection() as conn:
-        conn.execute("TRUNCATE calls, ingress_refusals, settings_overrides, provider_overlays,"
+        conn.execute("TRUNCATE calls, ingress_refusals, route_outcome_hours, settings_overrides, provider_overlays,"
                      " provider_facts,"
                      " consumer_keys, consumer_key_digests, consumer_rate_buckets,"
                      " peer_concurrency_leases,"

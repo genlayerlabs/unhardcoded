@@ -1397,7 +1397,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             if not result.get("ok"):
                 err = str(result.get("error") or "router error")
                 yield _rapi.responses_failed_event(
-                    rid, err, str(result.get("error") or "error"), seq=1)
+                    rid, err, str(result.get("error") or "error"), seq=1,
+                    x_router={"decision_trace": _trim_trace(result.get("trace"))})
                 return
             obj = _responses_object_with_router(result, req, response_id=rid)
             for ev in _rapi.responses_sse_events(obj):
@@ -1479,12 +1480,13 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         queue: asyncio.Queue = asyncio.Queue()
         commit: asyncio.Future = asyncio.get_running_loop().create_future()
 
+        started = time.perf_counter()
         override = None
         if streaming_call is not None:
             async def override(request):
                 async def emit(delta: str) -> None:
                     if not commit.done():
-                        commit.set_result(True)
+                        commit.set_result((time.perf_counter() - started) * 1000)
                     await queue.put(delta)
                 return await streaming_call(request, emit)
 
@@ -1505,7 +1507,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         # Activity rows). Only a completed-without-commit result is answered
         # synchronously (JSON error, or pseudo-stream of a finished body).
         if commit.done() or task not in done:
-            return _ActiveStreamResponse(_sse_gen(queue, task, req), task,
+            return _ActiveStreamResponse(_sse_gen(queue, task, req, commit), task,
                                          media_type="text/event-stream")
         try:
             result = task.result()
@@ -1577,7 +1579,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             yield _streaming.encode_error_event(err, err)
         yield _streaming.DONE_EVENT
 
-    async def _sse_gen(queue: "asyncio.Queue", task: "asyncio.Task", req: ChatRequest):
+    async def _sse_gen(queue: "asyncio.Queue", task: "asyncio.Task", req: ChatRequest,
+                       commit: asyncio.Future):
         stream_id = _streaming.new_stream_id()
         model = req.model or ""
         streamed_any = False
@@ -1596,8 +1599,10 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 break
             yield _streaming.HEARTBEAT  # 'beat' — keep the line warm
         result = task.result()
+        resp, usage, x_router = _final_chunk_parts(result, req.session, req.caller)
+        if commit.done():
+            x_router["first_token_ms"] = commit.result()
         if result.get("ok"):
-            resp, usage, x_router = _final_chunk_parts(result, req.session, req.caller)
             fmodel = resp.get("raw_model") or model
             # A flow that never committed a delta (its result was assembled, not
             # streamed) still owes the client its text before the final chunk.
@@ -1612,7 +1617,6 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             # is VISIBLE in Activity (provider + trace recorded) instead of an
             # empty 200 with no trace, THEN surface the error to the client so
             # opencode sees a reason rather than silently nothing.
-            _resp, usage, x_router = _final_chunk_parts(result, req.session, req.caller)
             err = str(result.get("error") or "stream failed")
             yield _streaming.encode_final_chunk(stream_id, model, "error", None,
                                                 usage, x_router)

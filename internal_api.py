@@ -8,6 +8,8 @@ the surface does not exist on operator-only deployments.
   GET /internal/usage?caller=<slug>&since_ts=<epoch>[&until_ts=<epoch>]
       [&bucket=day][&group_by=key|model|route|day|hour]
   GET /internal/usage/recent?caller=<slug>&limit=<n<=500>
+  GET /internal/usage/route-outcomes?tenant_id=<id>&route=route:<slug>
+      &since_ts=<hour>&until_ts=<hour>[&environment_id=<id>]
   GET /internal/usage/refusals?tenant_id=<id>&since_ts=<hour>&until_ts=<hour>
   GET /internal/usage/export?caller=<slug>&after_id=<id>&limit=<n<=5000>
   GET /internal/budgets?tenant_id=<id>&period=YYYY-MM&subject=<g:N|k:N>...
@@ -20,8 +22,17 @@ filter by the recorded routing scope BEFORE aggregating or paging. Windows are
 half-open: since_ts <= ts < until_ts. Usage and export responses carry
 `watermark_ts` (host_store.ledger_watermark): the ledger is complete below it.
 
-Rows come from the `calls` ledger, which only records LLM calls that reached
-the router — ingress-level rejects (401/402/429) are not counted here.
+Route outcomes return sparse UTC hours for admitted published-route calls,
+keyed by tenant, environment (0 for legacy traffic), and route slug. The window
+is half-open and hour-aligned, with the same retention as refusal counts.
+Successes, upstream errors and timeouts describe the terminal outcome. A call
+counts once toward fallbacks when its execution trace records another candidate. Full-answer
+latency measures successful calls at ingress. First-token latency is sampled
+when the shim observes a live output delta and reports its timing. Histogram
+counts are disjoint and aligned with inclusive upper bounds (null for overflow).
+Rollups are best-effort and may lag or drop samples under backpressure.
+
+The usage ledger (`calls`) only records LLM calls that reached the router.
 """
 from __future__ import annotations
 
@@ -195,6 +206,30 @@ async def internal_usage_refusals(request: Request, tenant_id: int = 0,
     return JSONResponse({"tenant_id": tenant_id,
                          "window": {"since_ts": since_ts, "until_ts": until_ts},
                          "groups": groups})
+
+
+@router.get("/internal/usage/route-outcomes")
+async def internal_route_outcomes(request: Request, tenant_id: int = 0,
+                                  environment_id: int = 0, route: str = "",
+                                  since_ts: int = -1, until_ts: int = -1) -> JSONResponse:
+    denied = _gate(request)
+    if denied is not None:
+        return denied
+    if not (0 < tenant_id <= 2**63 - 1 and 0 <= environment_id <= 2**63 - 1
+            and re.fullmatch(r"route:[a-z0-9][a-z0-9-]{0,79}", route)):
+        return JSONResponse({"error": "invalid_route_scope"}, status_code=400)
+    if (not 0 <= since_ts < until_ts <= _MAX_TS
+            or since_ts % host_store.HOUR_SECONDS or until_ts % host_store.HOUR_SECONDS):
+        return JSONResponse({"error": "invalid_window"}, status_code=400)
+    try:
+        hours = await asyncio.to_thread(
+            host_store.route_outcomes, tenant_id, environment_id, route, since_ts, until_ts)
+    except Exception:
+        return JSONResponse({"error": "route_outcome_store_unavailable"}, status_code=503)
+    return JSONResponse({"tenant_id": tenant_id, "environment_id": environment_id, "route": route,
+                         "window": {"since_ts": since_ts, "until_ts": until_ts},
+                         "latency_upper_bounds_ms": [*host_store.ROUTE_LATENCY_BOUNDS_MS, None],
+                         "hours": hours})
 
 
 @router.get("/internal/usage/recent")

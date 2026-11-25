@@ -262,9 +262,12 @@ def responses_created_event(obj: dict, seq: int = 0) -> str:
 
 
 def responses_failed_event(response_id: str, message: str,
-                           code: str | None = None, seq: int = 0) -> str:
+                           code: str | None = None, seq: int = 0,
+                           x_router: dict | None = None) -> str:
     response = {"id": response_id, "object": "response", "status": "failed",
                 "error": {"message": message, "code": code}}
+    if x_router is not None:
+        response["x_router"] = x_router
     return _sse("response.failed", {"type": "response.failed",
                                     "sequence_number": seq, "response": response})
 

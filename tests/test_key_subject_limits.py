@@ -788,3 +788,108 @@ def test_ingress_refusal_retention(monkeypatch):
     host_store.insert_ingress_refusal_async(5, "g:7", "key_rate_limit", expired)
     with host_store._get_pool().connection() as conn:
         assert conn.execute("SELECT hour_ts FROM ingress_refusals").fetchall() == [(hour,)]
+
+
+def test_published_route_outcomes(monkeypatch, host_store_clean):
+    hour = int(time.time()) // 3600 * 3600
+    monkeypatch.setattr(auth_proxy.time, "time", lambda: hour + 60)
+
+    class StreamWithFallback(_StreamResp):
+        async def aiter_raw(self):
+            yield b'data: {"choices":[]}\n\n'
+            meta = {"x_router": {"first_token_ms": 250, "decision_trace": {"decision_path": [
+                {"event": "attempted", "attempt": 1, "error_kind": "timeout"},
+                {"event": "attempted", "attempt": 1},
+            ]}}}
+            yield f"data: {json.dumps(meta)}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+
+    client = TestClient(auth_proxy.app)
+    _saas(monkeypatch, limits={}, upstream=_Upstream(StreamWithFallback))
+    assert _post(client).status_code == 200
+    _saas(monkeypatch, limits={}, upstream=_Upstream(lambda: _JsonResp(status_code=504)))
+    assert _post(client).status_code == 504
+    _saas(monkeypatch, limits={}, upstream=_Upstream(lambda: httpx.ReadError("reset")))
+    assert _post(client).status_code == 502
+    # A disconnect advances the admitted-call count without adding a latency sample.
+    _saas(monkeypatch, limits={}, upstream=_Upstream(lambda: _JsonResp(status_code=499)))
+    assert _post(client).status_code == 499
+
+    for _ in range(20):
+        host_store.insert_route_outcome_async(
+            5, 0, ROUTE["route"], hour + 80, "success", False, None, 60001)
+    host_store.insert_route_outcome_async(5, 3, ROUTE["route"], hour, "success", False, None, 1)
+    host_store.insert_route_outcome_async(5, 0, ROUTE["route"], hour + 3600, "other", False, None, None)
+    host_store.insert_route_outcome_async(6, 0, ROUTE["route"], hour, "other", False, None, None)
+    host_store.insert_route_outcome_async(5, 0, "route:other", hour, "other", False, None, None)
+
+    path = "/internal/usage/route-outcomes"
+    params = {"tenant_id": 5, "route": ROUTE["route"], "since_ts": hour, "until_ts": hour + 3600}
+    assert client.get(path, params=params).status_code == 403
+    assert client.get(path, params={**params, "since_ts": hour + 1}, headers=SECRET).status_code == 400
+    read = client.get(path, params=params, headers=SECRET)
+    assert read.status_code == 200
+    data = read.json()
+    assert len(data["hours"]) == 1
+    row = data["hours"][0]
+    assert [row[k] for k in ("hour_ts", "calls", "successes", "upstream_errors", "timeouts",
+                             "fallbacks")] == [hour, 24, 21, 1, 1, 1]
+    assert len(row["first_token_ms"]) == len(data["latency_upper_bounds_ms"])
+    assert row["first_token_ms"][data["latency_upper_bounds_ms"].index(250)] == 1
+    assert sum(row["first_token_ms"]) == 1
+    assert sum(row["full_answer_ms"]) == 21
+    assert row["full_answer_ms"][-1] == 20
+    monkeypatch.setattr(cpc, "CONTROL_PLANE_INTERNAL_SECRET", "")
+    assert client.get(path, params=params, headers=SECRET).status_code == 404
+
+
+def test_route_outcome_retention(monkeypatch, host_store_clean):
+    hour = int(time.time()) // 3600 * 3600
+    expired = hour - 25 * 3600
+    host_store.insert_route_outcome_async(5, 0, ROUTE["route"], expired, "success", False, 1, 1)
+    monkeypatch.setattr(host_store, "_RETENTION_DAYS", 1)
+    monkeypatch.setattr(host_store, "_PRUNE_EVERY", 1)
+
+    assert host_store.route_outcomes(5, 0, ROUTE["route"], expired, hour) == []
+    for ts in (hour, expired):
+        host_store.insert_route_outcome_async(5, 0, ROUTE["route"], ts, "success", False, 1, 1)
+    with host_store._get_pool().connection() as conn:
+        assert conn.execute("SELECT hour_ts FROM route_outcome_hours").fetchall() == [(hour,)]
+
+
+def test_route_outcome_queue_drops_overflow(monkeypatch):
+    import queue
+
+    pending = queue.Queue(maxsize=1)
+    monkeypatch.setattr(host_store, "_route_outcome_q", pending)
+    monkeypatch.setattr(host_store, "_SYNC_WRITES", False)
+    for _ in range(5):
+        host_store.insert_route_outcome_async(
+            5, 0, ROUTE["route"], int(time.time()), "success", False, 1, 1)
+    assert pending.qsize() == 1
+
+
+def test_route_outcomes_for_responses_stream(monkeypatch, host_store_clean):
+    class ResponsesStream(_StreamResp):
+        async def aiter_raw(self):
+            for event in (
+                {"type": "response.created", "response": {"status": "in_progress"}},
+                {"type": "response.completed", "response": {
+                    "x_router": {"decision_trace": {"decision_path": [
+                        {"event": "attempted", "attempt": 1, "error_kind": "rate_limit"},
+                        {"event": "attempted", "attempt": 2},
+                    ]}},
+                }},
+            ):
+                yield f"data: {json.dumps(event)}\n\n".encode()
+
+    _saas(monkeypatch, limits={}, upstream=_Upstream(ResponsesStream))
+    client = TestClient(auth_proxy.app)
+    response = client.post("/v1/responses", headers={"Authorization": "Bearer tok-a"},
+                           json={"model": ROUTE["route"], "input": "hello", "stream": True})
+    assert response.status_code == 200
+    hour = int(time.time()) // 3600 * 3600
+    row, = host_store.route_outcomes(5, 0, ROUTE["route"], hour, hour + 3600)
+    assert (row["calls"], row["successes"], row["fallbacks"]) == (1, 1, 0)
+    assert sum(row["first_token_ms"]) == 0
+    assert sum(row["full_answer_ms"]) == 1

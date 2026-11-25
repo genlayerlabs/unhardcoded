@@ -4107,6 +4107,25 @@ def _proxy_path(request: Request) -> str | None:
     return None
 
 
+def _published_route_outcome(status: int, error_type: str | None, error_code: str | None,
+                             trace: dict | None, incomplete_stream: bool) -> tuple[str, bool]:
+    attempts = [step for step in (trace or {}).get("decision_path") or []
+                if isinstance(step, dict) and step.get("event") == "attempted"]
+    # The engine resets the attempt index when it advances to another candidate.
+    fallback = any(step.get("attempt") == 1 for step in attempts[1:])
+    if status == 504 or (isinstance(error_code, str)
+                         and error_code.removeprefix("exhausted: ") == "timeout"):
+        return "timeout", fallback
+    failed = status >= 400 or bool(error_type or error_code)
+    gateway_error = status in (502, 503) and error_code not in ("no_candidates", "exhausted: no_candidates")
+    if incomplete_stream or gateway_error or error_type == "proxy_error" or (
+            failed and any(step.get("error_kind") for step in attempts)):
+        return "upstream_error", fallback
+    if 200 <= status < 300 and not failed:
+        return "success", fallback
+    return "other", fallback
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def proxy(path: str, request: Request) -> Response:
     path = _proxy_path(request)
@@ -4336,6 +4355,11 @@ async def proxy(path: str, request: Request) -> Response:
     error_type = error_code = error_message = None
     record_in_finally = True
     capacity_released = False
+    outcome_ts = int(time.time())
+    first_token_ms = None
+    incomplete_stream = False
+    proxy_timeout = False
+    responses_stream_outcome = None
     # The per-session meter DERIVES from this ledger (host_store.calls.session):
     # without the sid recorded here, /v1/session/{sid} answers 404 for everyone
     # even though the shim pinned the session fine. Same precedence as the shim:
@@ -4359,6 +4383,16 @@ async def proxy(path: str, request: Request) -> Response:
                     decision_trace.update(project_id=auth['project_id'], environment_id=auth['environment_id'])
                 if key_identity:
                     decision_trace.update(key_id=key_identity['id'], subject=key_identity['subject'])
+            if published_route:
+                route_error, route_trace = responses_stream_outcome or (error_code, decision_trace)
+                outcome, fallback = _published_route_outcome(
+                    status, error_type, "timeout" if proxy_timeout else route_error,
+                    route_trace, incomplete_stream)
+                host_store.insert_route_outcome_async(
+                    int(auth["tenant_id"]),
+                    int(auth["environment_id"]) if auth.get("scope_version") == 2 else 0,
+                    requested_route, outcome_ts, outcome, fallback, first_token_ms,
+                    latency_ms if outcome == "success" else None)
             _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
             _metric_request(status, latency_ms)
             _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
@@ -4416,6 +4450,7 @@ async def proxy(path: str, request: Request) -> Response:
         status = r.status_code
         content_type = r.headers.get("content-type", "application/json")
         if content_type.startswith("text/event-stream"):
+            incomplete_stream = True
             # SSE pass-through: forward chunks unbuffered while teeing a tail
             # buffer. The shim's final chat.completion.chunk carries usage and
             # x_router (incl. the executed cost_usd), so the request is
@@ -4443,10 +4478,16 @@ async def proxy(path: str, request: Request) -> Response:
                 nonlocal provider, model_family, served_model_id, served_by, \
                     tokens_in, tokens_out, tokens_total, tokens_cached, cost_usd, \
                     cost_basis, decision_trace, error_type, error_code, error_message
+                nonlocal first_token_ms, incomplete_stream, responses_stream_outcome
                 try:
                     meta = _parse_stream_tail(tail)
+                    if responses_meta := meta.get("responses_outcome"):
+                        responses_stream_outcome = responses_meta
+                        incomplete_stream = not drain_complete
                     xr = meta.get("x_router") or {}
                     if xr:
+                        incomplete_stream = not drain_complete
+                        first_token_ms = xr.get("first_token_ms")
                         provider = xr.get("provider")
                         model_family = xr.get("model_family")
                         served_model_id = xr.get("served_model_id")
@@ -4484,7 +4525,7 @@ async def proxy(path: str, request: Request) -> Response:
                 asyncio.get_running_loop().call_later(STREAM_DRAIN_TIMEOUT_S, pump.cancel)
 
             async def _pump() -> None:
-                nonlocal drain_complete, pump_finished
+                nonlocal drain_complete, pump_finished, proxy_timeout
                 tail = bytearray()
                 drained = 0
                 failure: BaseException | None = None
@@ -4508,6 +4549,7 @@ async def proxy(path: str, request: Request) -> Response:
                     pass
                 except Exception as exc:  # noqa: BLE001
                     failure = exc
+                    proxy_timeout = isinstance(exc, httpx.TimeoutException)
                 finally:
                     await _close_upstream_stream()
                     _account(bytes(tail))
@@ -4572,6 +4614,7 @@ async def proxy(path: str, request: Request) -> Response:
         return Response(status_code=status, content=content, media_type=content_type)
     except Exception as exc:
         error_type = "proxy_error"
+        proxy_timeout = isinstance(exc, httpx.TimeoutException)
         error_code = "upstream"
         error_message = str(exc)
         return JSONResponse(status_code=502, content={"error": {"message": f"upstream proxy error: {exc}", "type": "proxy_error", "code": "upstream"}})
@@ -4654,7 +4697,8 @@ def _parse_stream_tail(tail: bytes) -> dict[str, Any]:
     """Extract usage / x_router / error from the tail of a shim SSE stream.
     The shim's final chat.completion.chunk carries usage and x_router
     together; an aborted stream emits a single error event. Scans data lines
-    newest-first and stops once both usage and x_router are found."""
+    newest-first and stops once both usage and x_router are found. Responses
+    terminal frames contribute only their error code and route decision trace."""
     out: dict[str, Any] = {}
     lines = tail.decode("utf-8", "replace").splitlines()
     for line in reversed(lines):
@@ -4669,6 +4713,19 @@ def _parse_stream_tail(tail: bytes) -> dict[str, Any]:
         except ValueError:
             continue
         if not isinstance(payload, dict):
+            continue
+        if payload.get("type") in ("response.completed", "response.failed"):
+            if "responses_outcome" in out:
+                continue
+            response = payload.get("response")
+            if isinstance(response, dict):
+                error = response.get("error")
+                code = error.get("code") if isinstance(error, dict) else None
+                if payload["type"] == "response.failed":
+                    code = code or "response_failed"
+                xr = response.get("x_router")
+                trace = xr.get("decision_trace") if isinstance(xr, dict) else None
+                out["responses_outcome"] = (code, trace if isinstance(trace, dict) else None)
             continue
         if "usage" not in out and isinstance(payload.get("usage"), dict):
             out["usage"] = payload["usage"]
