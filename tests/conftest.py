@@ -63,6 +63,7 @@ def require_host_store():
         # after this truncate; don't close the pool (the background writer shares
         # it — closing it mid-write races and flakes isolation).
         host_store._write_q.join()
+        host_store._refusal_q.join()
         host_store.truncate_all_for_tests()
     except Exception as exc:  # noqa: BLE001
         _HOST_STORE_UNAVAILABLE = str(exc)

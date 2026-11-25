@@ -696,3 +696,95 @@ def test_failed_settle_is_retried(monkeypatch):
     _saas(monkeypatch, limits={"monthly_budget_usd": "1.00", "rate_per_min": None, "burst": None})
     assert _post(TestClient(auth_proxy.app)).status_code == 200
     assert _budget()["spent_usd"] == 0.02 and len(calls) == 3
+
+
+def test_ingress_refusals_by_tenant_subject_and_reason(monkeypatch):
+    require_host_store()
+    hour = int(time.time()) // 3600 * 3600
+    monkeypatch.setattr(auth_proxy.time, "time", lambda: hour + 60)
+    client = TestClient(auth_proxy.app)
+    up = _saas(monkeypatch, limits={"monthly_budget_usd": "0.05"},
+               upstream=_Upstream(lambda: _JsonResp(cost=0.05)))
+    assert _post(client).status_code == 200
+    auth_proxy.drain_settles()
+    for _ in range(10):
+        assert _post(client).status_code == 402
+    assert len(up.requests) == 1
+
+    _saas(monkeypatch, limits={"rate_per_min": 1}, key={**KEY, "subject": "k:43"})
+    assert _post(client).status_code == 200
+    for _ in range(10):
+        assert _post(client).status_code == 429
+
+    # A second hour for the same subject and reason folds into the API group.
+    host_store.insert_ingress_refusal_async(5, "g:7", "key_budget_exhausted", hour + 3601)
+    host_store.insert_ingress_refusal_async(6, "g:7", "key_budget_exhausted", hour + 1)
+    with host_store._get_pool().connection() as conn:
+        assert conn.execute("SELECT count(*) FROM ingress_refusals").fetchone()[0] == 4
+
+    path = "/internal/usage/refusals"
+    params = {"tenant_id": 5, "since_ts": hour, "until_ts": hour + 7200}
+    assert client.get(path, params=params).status_code == 403
+    assert client.get(path, params={**params, "since_ts": hour + 1}, headers=SECRET).status_code == 400
+    response = client.get(path, params=params, headers=SECRET)
+    assert response.status_code == 200
+    assert response.json()["groups"] == [
+        {"subject": "g:7", "reason": "key_budget_exhausted", "count": 11,
+         "first_ts": hour + 60, "last_ts": hour + 3601},
+        {"subject": "k:43", "reason": "key_rate_limit", "count": 10,
+         "first_ts": hour + 60, "last_ts": hour + 60},
+    ]
+    first_hour = client.get(path, params={**params, "until_ts": hour + 3600}, headers=SECRET)
+    assert first_hour.json()["groups"][0]["count"] == 10
+    monkeypatch.setattr(cpc, "CONTROL_PLANE_INTERNAL_SECRET", "")
+    assert client.get(path, params=params, headers=SECRET).status_code == 404
+
+
+def test_ingress_refusal_does_not_wait_for_failed_write(monkeypatch):
+    _saas(monkeypatch, limits={"rate_per_min": 1})
+    monkeypatch.setattr(auth_proxy, "_rate_ok", lambda *args: (True, True, 0))
+    monkeypatch.setattr(host_store, "consume_rate_token", lambda *args: (False, True, 1))
+    monkeypatch.setattr(host_store, "_SYNC_WRITES", False)
+    started = threading.Event()
+    finish = threading.Event()
+    timed_out = threading.Event()
+
+    def unavailable():
+        started.set()
+        if not finish.wait(5):
+            timed_out.set()
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(host_store, "_get_pool", unavailable)
+    client = TestClient(auth_proxy.app)
+    try:
+        response = _post(client)
+        assert response.status_code == 429
+        assert response.json()["error"]["code"] == "key_rate_limit"
+        assert started.wait(5)
+        assert not timed_out.is_set()
+        hour = int(time.time()) // 3600 * 3600
+        # Let both the writer and the API read fail against the same store.
+        finish.set()
+        read = client.get("/internal/usage/refusals", headers=SECRET, params={
+            "tenant_id": 5, "since_ts": hour, "until_ts": hour + 3600})
+        assert read.status_code == 503
+        assert read.json()["error"] == "refusal_store_unavailable"
+    finally:
+        finish.set()
+        host_store._refusal_q.join()
+
+
+def test_ingress_refusal_retention(monkeypatch):
+    require_host_store()
+    hour = int(time.time()) // 3600 * 3600
+    expired = hour - 25 * 3600
+    host_store.insert_ingress_refusal_async(5, "g:7", "key_rate_limit", expired)
+    monkeypatch.setattr(host_store, "_RETENTION_DAYS", 1)
+    monkeypatch.setattr(host_store, "_PRUNE_EVERY", 1)
+
+    # A refusal-only workload sweeps old rows and discards stale queued jobs.
+    host_store.insert_ingress_refusal_async(5, "g:7", "key_rate_limit", hour)
+    host_store.insert_ingress_refusal_async(5, "g:7", "key_rate_limit", expired)
+    with host_store._get_pool().connection() as conn:
+        assert conn.execute("SELECT hour_ts FROM ingress_refusals").fetchall() == [(hour,)]

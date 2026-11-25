@@ -8,6 +8,7 @@ the surface does not exist on operator-only deployments.
   GET /internal/usage?caller=<slug>&since_ts=<epoch>[&until_ts=<epoch>]
       [&bucket=day][&group_by=key|model|route|day|hour]
   GET /internal/usage/recent?caller=<slug>&limit=<n<=500>
+  GET /internal/usage/refusals?tenant_id=<id>&since_ts=<hour>&until_ts=<hour>
   GET /internal/usage/export?caller=<slug>&after_id=<id>&limit=<n<=5000>
   GET /internal/budgets?tenant_id=<id>&period=YYYY-MM&subject=<g:N|k:N>...
 
@@ -110,6 +111,27 @@ async def internal_usage(request: Request, caller: str = "",
         out["group_by"] = group_by
         out["groups"] = groups
     return JSONResponse(out)
+
+
+@router.get("/internal/usage/refusals")
+async def internal_usage_refusals(request: Request, tenant_id: int = 0,
+                                  since_ts: int = -1, until_ts: int = -1) -> JSONResponse:
+    denied = _gate(request)
+    if denied is not None:
+        return denied
+    if not 0 < tenant_id <= 2**63 - 1:
+        return JSONResponse({"error": "invalid_tenant"}, status_code=400)
+    if (not 0 <= since_ts < until_ts <= _MAX_TS
+            or since_ts % host_store.REFUSAL_BUCKET_SECONDS
+            or until_ts % host_store.REFUSAL_BUCKET_SECONDS):
+        return JSONResponse({"error": "invalid_window"}, status_code=400)
+    try:
+        groups = await asyncio.to_thread(host_store.ingress_refusals, tenant_id, since_ts, until_ts)
+    except Exception:
+        return JSONResponse({"error": "refusal_store_unavailable"}, status_code=503)
+    return JSONResponse({"tenant_id": tenant_id,
+                         "window": {"since_ts": since_ts, "until_ts": until_ts},
+                         "groups": groups})
 
 
 @router.get("/internal/usage/recent")
