@@ -38,6 +38,7 @@ import control_plane_client
 import host_store
 
 router = APIRouter()
+fact_router = APIRouter()
 
 _RECENT_LIMIT_MAX = 500
 _EXPORT_LIMIT_MAX = 5000
@@ -76,7 +77,7 @@ def _fact_gate(request: Request, provider_id: str, name: str) -> JSONResponse | 
     return None
 
 
-@router.get(_FACT_PATH)
+@fact_router.get(_FACT_PATH)
 async def internal_get_provider_fact(request: Request, provider_id: str, name: str) -> JSONResponse:
     denied = _fact_gate(request, provider_id, name)
     if denied is not None:
@@ -90,11 +91,14 @@ async def internal_get_provider_fact(request: Request, provider_id: str, name: s
     return JSONResponse(row)
 
 
-@router.put(_FACT_PATH)
+@fact_router.put(_FACT_PATH)
 async def internal_put_provider_fact(request: Request, provider_id: str, name: str) -> JSONResponse:
     denied = _fact_gate(request, provider_id, name)
     if denied is not None:
         return denied
+    forward = getattr(request.app.state, "forward_provider_fact", None)
+    if forward is not None:
+        return await forward(provider_id, name, await request.body())
     try:
         observation = _FactObservation.model_validate_json(await request.body())
         if observation.observed_at_ms > int(time.time() * 1000):
@@ -102,9 +106,10 @@ async def internal_put_provider_fact(request: Request, provider_id: str, name: s
         response = JSONResponse({"provider_id": provider_id, "name": name, **observation.model_dump()})
     except ValueError:
         return JSONResponse({"error": "invalid_observation"}, status_code=400)
+    facts = request.app.state.provider_facts
     try:
         saved = await asyncio.to_thread(
-            host_store.upsert_provider_fact, provider_id, name, observation.value,
+            facts.write, provider_id, name, observation.value,
             observation.observed_at_ms, observation.detail,
         )
     except Exception:
@@ -284,3 +289,6 @@ async def internal_budgets(request: Request, tenant_id: int | None = None,
     except Exception:
         return JSONResponse({"error": "budget_store_unavailable"}, status_code=503)
     return JSONResponse({"tenant_id": tenant_id, "period": period, "subjects": rows})
+
+
+router.include_router(fact_router)

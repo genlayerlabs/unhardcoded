@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable
 
 import host_store
+from provider_facts import ProviderFacts
 import route_reliability as _route_reliability
 from byo_http import is_byo_buyer
 from provider_adapters.anthropic import make_anthropic_async_call_provider
@@ -150,6 +151,7 @@ class LLMRouterHost:
         now_ms: Clock | None = None,
         logger: Logger | None = None,
         enforce_provider_auth: bool | None = None,
+        provider_facts: ProviderFacts | None = None,
     ):
         self._source_paths = (router_path, config_path, metrics_path)
         self._tenant_id = None
@@ -164,6 +166,12 @@ class LLMRouterHost:
         self._async_call_hook: AsyncCallProviderHook | None = call_provider_async
         self._discover_hook: DiscoverHook | None = discover
         self._env: dict[str, str] = env if env is not None else dict(os.environ)
+        self.provider_facts = provider_facts if provider_facts is not None else ProviderFacts()
+        try:
+            fact_max_age_s = int(self._env.get(_PROVIDER_FACT_MAX_AGE_ENV, "300"))
+        except ValueError:
+            fact_max_age_s = 0
+        self._fact_max_age_ms = fact_max_age_s * 1000 if 0 < fact_max_age_s < 2**31 else 0
         self._now_ms: Clock = now_ms or (lambda: int(time.time() * 1000))
         self._logger: Logger = logger or _noop_logger
         self._mock_responses: dict[tuple[str, str], dict] = {}
@@ -223,9 +231,8 @@ end
         # Resolve fact names without registering them from storage or retaining
         # arbitrary names supplied by policy authors.
         self.lua.eval("""
-function(fields, providers_with_fact)
+function(fields, fact_is_true)
     local build_schema = fields.schema
-    local snapshots = setmetatable({}, { __mode = "k" })
     fields.schema = function(opts)
         local schema = build_schema(opts)
         for name in pairs(schema.decls) do
@@ -243,33 +250,18 @@ function(fields, providers_with_fact)
                 end
                 return { sort = "Bool", default = false, source = "host", get = function(c, ctx)
                     if not c.provider_id or not ctx or not ctx.now_ms then return false end
-                    local snapshot = snapshots[ctx]
-                    if not snapshot then
-                        snapshot = {}
-                        snapshots[ctx] = snapshot
-                    end
-                    if not snapshot[name] then
-                        snapshot[name] = providers_with_fact(name, ctx.now_ms)
-                    end
-                    return snapshot[name][c.provider_id] == true
+                    return fact_is_true(name, c.provider_id, ctx.now_ms)
                 end }
             end,
         })
         return schema
     end
 end
-""")(self.router.ir.fields, self._providers_with_fact)
+""")(self.router.ir.fields, self._fact_is_true)
 
-    def _providers_with_fact(self, name: str, now_ms: int):
-        try:
-            max_age_s = int(self._env.get(_PROVIDER_FACT_MAX_AGE_ENV, "300"))
-            if not 0 < max_age_s < 2**31:
-                raise ValueError("provider fact maximum age out of range")
-            providers = host_store.providers_with_fact(name, max_age_s * 1000, now_ms)
-        except Exception:
-            self._logger("warn", "provider_facts_unavailable", {})
-            providers = []
-        return self.lua.table_from({provider_id: True for provider_id in providers})
+    def _fact_is_true(self, name: str, provider_id: str, now_ms: int) -> bool:
+        return self._fact_max_age_ms > 0 and self.provider_facts.is_true(
+            name, provider_id, now_ms, self._fact_max_age_ms)
 
     # ---- public API -----------------------------------------------------
 
@@ -369,7 +361,7 @@ end
         child = type(self)(*self._source_paths, env=scoped_env, now_ms=self._now_ms,
                            call_provider_async=self._async_call_hook,
                            call_provider=self._call_hook, discover=self._discover_hook,
-                           enforce_provider_auth=True)
+                           enforce_provider_auth=True, provider_facts=self.provider_facts)
         # Include runtime-added providers/models, not just the initial files.
         child.config.providers = _to_lua(child.lua, catalog.get('providers') or {})
         child.config.models = _to_lua(child.lua, catalog.get('models') or {})
