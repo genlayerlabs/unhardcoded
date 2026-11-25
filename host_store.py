@@ -1951,8 +1951,10 @@ def usage_groups(group_by: str, since_ts: "int | None" = None, caller: "str | No
                  until_ts: "int | None" = None, project_id=None, environment_id=None) -> list[dict[str, Any]]:
     """Window usage per `group_by` (key|model|route|day|hour), ordered by key.
     The scope filter is part of the WHERE, so it applies before aggregation.
+    Key groups include `last_call_ts`, the latest retained call in the window.
     Raises on a store error (metering reads must not answer a false zero)."""
     expr = _USAGE_GROUPS[group_by]
+    last_call = "max(ts)" if group_by == "key" else "NULL"
     where, params = _usage_where(since_ts=since_ts, caller=caller, project_id=project_id,
                                  environment_id=environment_id, until_ts=until_ts)
     sql = (f"SELECT {expr} AS k, count(*),"
@@ -1960,13 +1962,14 @@ def usage_groups(group_by: str, since_ts: "int | None" = None, caller: "str | No
            " COALESCE(sum(COALESCE(tokens_in,0)),0), COALESCE(sum(COALESCE(tokens_out,0)),0),"
            f" COALESCE(sum(COALESCE(tokens_cached,0)),0), COALESCE(sum({_TOKENS_TOTAL_SQL}),0),"
            " round(COALESCE(sum(GREATEST(cost_usd,0)),0)::numeric,6)::float8"
-           f" FROM calls{where} GROUP BY 1 ORDER BY 1")
+           f", {last_call} FROM calls{where} GROUP BY 1 ORDER BY 1")
     with _get_pool().connection() as conn:
         _set_dashboard_statement_timeout(conn)
         rows = conn.execute(sql, params).fetchall()
     return [{"key": k, "runs": int(n), "errors": int(e), "tokens_in": int(ti),
              "tokens_out": int(to), "tokens_cached": int(tc), "tokens_total": int(tt),
-             "cost_usd": float(c)} for k, n, e, ti, to, tc, tt, c in rows]
+             "cost_usd": float(c), **({"last_call_ts": ts} if ts is not None else {})}
+            for k, n, e, ti, to, tc, tt, c, ts in rows]
 
 
 _EXPORT_COLS = ("id", "ts", "key_sha256", "subject", "route", "model_family", "provider",

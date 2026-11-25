@@ -21,6 +21,8 @@ The usage endpoints accept project_id+environment_id (both, positive) and then
 filter by the recorded routing scope BEFORE aggregating or paging. Windows are
 half-open: since_ts <= ts < until_ts. Usage and export responses carry
 `watermark_ts` (host_store.ledger_watermark): the ledger is complete below it.
+Each `group_by=key` row includes `last_call_ts`, the latest retained call's Unix
+timestamp in seconds within the requested scope and window.
 
 Route outcomes return sparse UTC hours for admitted published-route calls,
 keyed by tenant, environment (0 for legacy traffic), and route slug. The window
