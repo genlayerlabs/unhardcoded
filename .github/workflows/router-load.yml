@@ -2,6 +2,8 @@ name: Router load check
 
 on:
   workflow_dispatch:
+  push:
+    branches: [legatus/unh-29]
 
 permissions:
   contents: read
@@ -18,9 +20,15 @@ jobs:
       - run: docker build -t unhardcoded:load .
       - run: docker pull postgres:16
       - run: docker pull nginx:alpine
-      - run: python3 scripts/router-load-check.py unhardcoded:load --compare unhardcoded:load > load.json
+      - name: Single run and two same-image comparisons
+        run: |
+          status=0
+          python3 scripts/router-load-check.py unhardcoded:load > load-single.json || status=1
+          python3 scripts/router-load-check.py unhardcoded:load --compare unhardcoded:load > load-repeat-1.json || status=1
+          python3 scripts/router-load-check.py unhardcoded:load --compare unhardcoded:load > load-repeat-2.json || status=1
+          exit "$status"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: router-load
-          path: load.json
+          path: load-*.json
