@@ -4388,7 +4388,8 @@ async def proxy(path: str, request: Request) -> Response:
             _capacity_release()
             reject_status, code, message = rejection
             _record_reject(reason=code, path="/" + path, caller=caller, status=reject_status,
-                           route=requested_route)
+                           route=requested_route, tenant_id=tenant_id, subject=subject,
+                           refusal_code=code if reject_status == 429 else None)
             return JSONResponse(status_code=reject_status, headers=headers, content={"error": {
                 "message": message, "code": code,
                 "type": "rate_limit_error" if reject_status == 429 else "server_error",
