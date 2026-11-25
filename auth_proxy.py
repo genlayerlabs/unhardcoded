@@ -4183,6 +4183,9 @@ async def proxy(path: str, request: Request) -> Response:
         _record_reject(reason="route_not_allowed", path="/" + path, caller=caller, status=403, route=requested_route)
         _log({"event": "reject", "reason": "route_not_allowed", "caller": caller, "path": "/" + path, "route": requested_route})
         return JSONResponse(status_code=403, content={"error": {"message": "caller is not allowed to use this route", "type": "auth_error", "code": "caller_route_not_allowed"}})
+    tenant_id = auth.get("tenant_id")
+    key_identity = (published_route or {}).get("key")
+    subject = key_identity["subject"] if key_identity else None
     rate_result = await asyncio.to_thread(_rate_ok, caller, consumer_meta)
     # Compatibility for embedders/tests that supplied the pre-HA boolean hook.
     if isinstance(rate_result, tuple):
@@ -4197,7 +4200,8 @@ async def proxy(path: str, request: Request) -> Response:
             "message": "caller rate-limit state is temporarily unavailable",
             "type": "server_error", "code": "caller_rate_limit_unavailable"}})
     if not rate_allowed:
-        _record_reject(reason="rate_limit", path="/" + path, caller=caller, status=429)
+        _record_reject(reason="rate_limit", path="/" + path, caller=caller, status=429,
+                       tenant_id=tenant_id, subject=subject, refusal_code="caller_rate_limit")
         _log({"event": "reject", "reason": "rate_limit", "caller": caller, "path": "/" + path})
         return JSONResponse(
             status_code=429,
@@ -4207,7 +4211,6 @@ async def proxy(path: str, request: Request) -> Response:
     # Control-plane key limits ride the (uncached) route resolution. A subject
     # (`g:<group>` / `k:<key>`) may span keys, so its bucket and budget are
     # shared by every key in it, inside this caller's namespace.
-    key_identity = (published_route or {}).get("key")
     key_limits = ((published_route or {}).get("limits") or {}) if key_identity else {}
     if key_limits.get("rate_per_min"):
         subject_rate = int(key_limits["rate_per_min"])
@@ -4222,7 +4225,8 @@ async def proxy(path: str, request: Request) -> Response:
                 "message": "key rate-limit state is temporarily unavailable",
                 "type": "server_error", "code": "key_rate_limit_unavailable"}})
         if not rate_allowed:
-            _record_reject(reason="key_rate_limit", path="/" + path, caller=caller, status=429)
+            _record_reject(reason="key_rate_limit", path="/" + path, caller=caller, status=429,
+                           tenant_id=tenant_id, subject=subject, refusal_code="key_rate_limit")
             _log({"event": "reject", "reason": "key_rate_limit", "caller": caller, "path": "/" + path})
             return JSONResponse(
                 status_code=429,
@@ -4252,7 +4256,8 @@ async def proxy(path: str, request: Request) -> Response:
                 "type": "server_error", "code": "consumer_budget_unavailable"}})
         if spent_usd >= budget_usd:
             _record_reject(reason="budget_exhausted", path="/" + path,
-                           caller=caller, status=402, route=requested_route)
+                           caller=caller, status=402, route=requested_route,
+                           tenant_id=tenant_id, subject=subject, refusal_code="consumer_budget_exhausted")
             return JSONResponse(status_code=402, content={"error": {
                 "message": "consumer budget exhausted", "type": "budget_error",
                 "code": "consumer_budget_exhausted",
@@ -4286,7 +4291,8 @@ async def proxy(path: str, request: Request) -> Response:
                 "type": "server_error", "code": "key_budget_unavailable"}})
         if not allowed:
             _record_reject(reason="key_budget_exhausted", path="/" + path,
-                           caller=caller, status=402, route=requested_route)
+                           caller=caller, status=402, route=requested_route,
+                           tenant_id=tenant_id, subject=subject, refusal_code="key_budget_exhausted")
             return JSONResponse(status_code=402, content={"error": {
                 "message": "key budget exhausted", "type": "budget_error",
                 "code": "key_budget_exhausted",
@@ -4574,12 +4580,12 @@ async def proxy(path: str, request: Request) -> Response:
             _finish()
 
 
-def _record_reject(**event: Any) -> None:
-    # #5: a reject (auth fail / rate limit) is NOT an LLM call, so it does NOT go
-    # into the `calls` ledger — it lives in the runtime recent feed only. (Before,
-    # rejects were dual-written to usage-history; with that file retired, the
-    # persistent stats are per-LLM-call and rejects are a runtime view.)
-    stored = {"ts": int(time.time()), "event": "reject", **event}
+def _record_reject(*, tenant_id: int | None = None, subject: str | None = None,
+                   refusal_code: str | None = None, **event: Any) -> None:
+    ts = int(time.time())
+    stored = {"ts": ts, "event": "reject", **event}
+    if tenant_id is not None and refusal_code is not None:
+        host_store.insert_ingress_refusal_async(tenant_id, subject, refusal_code, ts)
     _metric_reject(str(event.get("reason") or "unknown"))
     with _stats_lock:
         _stats["total_rejects"] += 1

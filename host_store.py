@@ -50,6 +50,7 @@ _SCHEMA_LOCK_KEY = 0x686F7374_73746F72
 
 _PRUNE_EVERY = 500          # run a retention sweep once per this many inserts
 _WRITE_QUEUE_MAX = 10_000   # cap the background ledger-write backlog
+REFUSAL_BUCKET_SECONDS = 3600
 
 
 def _set_dashboard_statement_timeout(conn: Any) -> None:
@@ -81,6 +82,17 @@ def _retention_days() -> int:
 _RETENTION_DAYS = _retention_days()
 
 _SCHEMA_STATEMENTS = [
+    """CREATE TABLE IF NOT EXISTS ingress_refusals (
+        tenant_id BIGINT NOT NULL,
+        hour_ts BIGINT NOT NULL,
+        subject TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        count BIGINT NOT NULL,
+        first_ts BIGINT NOT NULL,
+        last_ts BIGINT NOT NULL,
+        PRIMARY KEY (tenant_id, hour_ts, subject, reason)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_ingress_refusals_hour ON ingress_refusals (hour_ts)",
     """CREATE TABLE IF NOT EXISTS calls (
         id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         ts              BIGINT NOT NULL,
@@ -460,7 +472,6 @@ def routing_summary(trace) -> dict | None:
 def insert_call(row: dict[str, Any]) -> None:
     """Record one call into the ledger from a usage-history-shaped row. Fail-soft:
     never raises into the request path. Best-effort telemetry."""
-    global _inserts_since_prune
     try:
         provider = row.get("provider")
         family = row.get("model_family")
@@ -503,15 +514,19 @@ def insert_call(row: dict[str, Any]) -> None:
                     " spent_usd=consumer_budget_usage.spent_usd+EXCLUDED.spent_usd,"
                     " updated_at=EXCLUDED.updated_at",
                     [str(caller), float(cost), int(time.time())])
-        with _prune_lock:
-            _inserts_since_prune += 1
-            due = _inserts_since_prune >= _PRUNE_EVERY
-            if due:
-                _inserts_since_prune = 0
-        if due:
-            _prune()
+        _maybe_prune()
     except Exception as exc:  # noqa: BLE001 — the ledger must never break a request
         _log.warning("host_store insert_call failed: %s", exc)
+
+
+def _maybe_prune() -> None:
+    global _inserts_since_prune
+    with _prune_lock:
+        _inserts_since_prune += 1
+        if _inserts_since_prune < _PRUNE_EVERY:
+            return
+        _inserts_since_prune = 0
+    _prune()
 
 
 def _prune() -> None:
@@ -525,6 +540,8 @@ def _prune() -> None:
                          (int(now * 1000) - _RETENTION_DAYS * 86400 * 1000,))
             conn.execute("DELETE FROM login_history WHERE ts < %s",
                          (int(now) - _RETENTION_DAYS * 86400,))
+            conn.execute("DELETE FROM ingress_refusals WHERE hour_ts < %s",
+                         (_refusal_retention_floor(int(now)),))
             # Swept reservations only wait for a late settle; a day is plenty.
             conn.execute("DELETE FROM subject_budget_reservations"
                          " WHERE released AND expires_at < %s", (now - 86400,))
@@ -538,6 +555,8 @@ def _prune() -> None:
 # backlog — best-effort telemetry, so a dropped row is acceptable. The queue holds
 # thunks so it serves both the call ledger and the per-attempt route observations.
 _write_q: "queue.Queue" = queue.Queue(maxsize=_WRITE_QUEUE_MAX)
+# Give refusal bursts their own backlog so they cannot displace ledger writes.
+_refusal_q: "queue.Queue" = queue.Queue(maxsize=1000)
 # Call timestamps of ledger rows queued OR being written by this process's
 # writer (ts -> count). The ledger is incomplete at the oldest of them, which
 # bounds ledger_watermark(); a job leaves only after its write returned.
@@ -561,19 +580,20 @@ def _pending_done(ts: "int | None") -> None:
                 _pending_ts.pop(ts, None)
 
 
-def _writer_loop() -> None:
+def _writer_loop(jobs: queue.Queue) -> None:
     while True:
-        job, ts = _write_q.get()
+        job, ts = jobs.get()
         try:
             job()
         except Exception as exc:  # noqa: BLE001 — a bad row must not kill the writer
             _log.warning("host_store background write failed: %s", exc)
         finally:
             _pending_done(ts)
-            _write_q.task_done()
+            jobs.task_done()
 
 
-threading.Thread(target=_writer_loop, name="host-store-writer", daemon=True).start()
+threading.Thread(target=_writer_loop, args=(_write_q,), name="host-store-writer", daemon=True).start()
+threading.Thread(target=_writer_loop, args=(_refusal_q,), name="host-store-refusals", daemon=True).start()
 
 
 # Tests set HOST_STORE_SYNC_WRITES=1 so every write runs INLINE (no background
@@ -584,7 +604,7 @@ threading.Thread(target=_writer_loop, name="host-store-writer", daemon=True).sta
 _SYNC_WRITES = bool(os.getenv("HOST_STORE_SYNC_WRITES"))
 
 
-def _enqueue(job, ts: "int | None" = None) -> None:
+def _enqueue(job, ts: "int | None" = None, *, jobs: queue.Queue = _write_q) -> None:
     if _SYNC_WRITES:
         try:
             job()
@@ -593,10 +613,10 @@ def _enqueue(job, ts: "int | None" = None) -> None:
         return
     _pending_add(ts)
     try:
-        _write_q.put_nowait((job, ts))
+        jobs.put_nowait((job, ts))
     except queue.Full:
         _pending_done(ts)
-        _log.warning("host_store: write queue full (%d); dropping row", _WRITE_QUEUE_MAX)
+        _log.warning("host_store: write queue full (%d); dropping row", jobs.maxsize)
     except Exception as exc:  # noqa: BLE001 — never break a request
         _pending_done(ts)
         _log.warning("host_store enqueue failed: %s", exc)
@@ -610,6 +630,45 @@ def insert_call_async(row: dict[str, Any]) -> None:
     # watermark bound and the stored row agree on the call time.
     snap["ts"] = int(snap.get("ts") or time.time())
     _enqueue(lambda: insert_call(snap), snap["ts"])
+
+
+def _refusal_retention_floor(now: int) -> int:
+    return now // REFUSAL_BUCKET_SECONDS * REFUSAL_BUCKET_SECONDS - _RETENTION_DAYS * 86400
+
+
+def _insert_ingress_refusal(tenant_id: int, subject: str, reason: str, ts: int) -> None:
+    hour_ts = ts // REFUSAL_BUCKET_SECONDS * REFUSAL_BUCKET_SECONDS
+    if hour_ts < _refusal_retention_floor(int(time.time())):
+        return
+    with _get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO ingress_refusals (tenant_id, hour_ts, subject, reason, count, first_ts, last_ts)"
+            " VALUES (%s, %s, %s, %s, 1, %s, %s)"
+            " ON CONFLICT (tenant_id, hour_ts, subject, reason) DO UPDATE SET"
+            " count = ingress_refusals.count + 1,"
+            " first_ts = LEAST(ingress_refusals.first_ts, EXCLUDED.first_ts),"
+            " last_ts = GREATEST(ingress_refusals.last_ts, EXCLUDED.last_ts)",
+            (tenant_id, hour_ts, subject, reason, ts, ts))
+    _maybe_prune()
+
+
+def insert_ingress_refusal_async(tenant_id: int, subject: str | None, reason: str, ts: int) -> None:
+    _enqueue(lambda: _insert_ingress_refusal(tenant_id, subject or "", reason, ts),
+             jobs=_refusal_q)
+
+
+def ingress_refusals(tenant_id: int, since_ts: int, until_ts: int) -> list[dict[str, Any]]:
+    since_ts = max(since_ts, _refusal_retention_floor(int(time.time())))
+    with _get_pool().connection() as conn:
+        _set_dashboard_statement_timeout(conn)
+        rows = conn.execute(
+            "SELECT subject, reason, SUM(count), MIN(first_ts), MAX(last_ts)"
+            " FROM ingress_refusals WHERE tenant_id = %s AND hour_ts >= %s AND hour_ts < %s"
+            " GROUP BY subject, reason ORDER BY subject, reason",
+            (tenant_id, since_ts, until_ts)).fetchall()
+    return [{"subject": subject or None, "reason": reason, "count": int(count),
+             "first_ts": first_ts, "last_ts": last_ts}
+            for subject, reason, count, first_ts, last_ts in rows]
 
 
 def _watermark_lag_s() -> float:
@@ -2640,6 +2699,7 @@ def reset() -> None:
     # Drain pending async writes first: closing the pool while the background
     # writer holds a connection races and flakes test isolation.
     _write_q.join()
+    _refusal_q.join()
     with _pool_lock:
         if _pool is not None:
             _pool.close()
@@ -2650,8 +2710,9 @@ def reset() -> None:
 
 def truncate_all_for_tests() -> None:
     """Test helper: wipe every table for isolation against a shared Postgres."""
+    _refusal_q.join()
     with _get_pool().connection() as conn:
-        conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
+        conn.execute("TRUNCATE calls, ingress_refusals, settings_overrides, provider_overlays,"
                      " consumer_keys, consumer_key_digests, consumer_rate_buckets,"
                      " peer_concurrency_leases,"
                      " consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
