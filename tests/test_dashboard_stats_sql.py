@@ -125,14 +125,15 @@ def _assert_bundle_equal(got, exp):
         for key in e:
             _assert_counters_equal(g[key], e[key], f"{bucket}[{key}]")
     assert got["agg"]["by_status"] == exp["agg"]["by_status"]
-    # recent: same events, same order, same fields — except cost_usd, which the
-    # backfill intentionally stamps onto previously-unpriced rows.
+    # The backfill stamps costs and changes their source from none to estimated.
     g_recent, e_recent = got["agg"]["recent"], exp["agg"]["recent"]
     assert [r.get("usage_event_id") for r in g_recent] == [r.get("usage_event_id") for r in e_recent]
     for g, e in zip(g_recent, e_recent):
         assert set(g) == set(e)
         for k in e:
-            if k != "cost_usd":
+            if k == "cost_source" and e["cost_usd"] is None and g["cost_usd"] is not None:
+                assert e[k] == "none" and g[k] == "estimated"
+            elif k != "cost_usd":
                 assert g[k] == e[k], (k, g[k], e[k])
         assert "key_sha256" not in g
     assert [d["date"] for d in got["daily_totals"]] == [d["date"] for d in exp["daily_totals"]]

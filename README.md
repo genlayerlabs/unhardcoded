@@ -61,6 +61,7 @@ docs/METRICS.md        -- the metrics seed: format, codex≈0, regeneration (it'
 docs/PROVIDERS.md      -- per-provider auth + the AntSeed node
 docs/OPENAI-CODEX.md   -- the ChatGPT-subscription provider (unofficial / ToS-risky)
 docs/USAGE_ENDPOINTS.md -- per-key usage stats API endpoints and auth behavior
+docs/REQUEST-ALLOWANCES.md -- optional tenant request allowances
 live_smoke.py          -- drive real providers end-to-end
 tests/                 -- the full host unit-test suite
 features/              -- BDD user-flow suite (behave); user_flows.json is the spec
