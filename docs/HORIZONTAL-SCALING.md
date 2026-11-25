@@ -125,30 +125,33 @@ python3 scripts/router-load-check.py unhardcoded:main \
 ```
 
 Use `--compare unhardcoded:main` with the same baseline tag to measure
-run-to-run variation on your machine. The **Router load check** workflow runs
-this same-image comparison when started manually.
+run-to-run variation on your machine. The manual **Router load check** workflow
+runs a standalone check and two same-image comparisons, checks the margin in
+both directions, and uploads the JSON.
 
 Each run starts two replicas behind round-robin nginx on an internal Docker
 network with no published ports or image pulls. The harness uses the baseline
 image's Python dependencies for both runs. PostgreSQL and the fake provider
 are fresh for each image, and the script removes the containers and data at
-the end. The defaults are five seconds of warmup and 30 seconds of measurement
-per image, eight concurrent clients, and 40 ms before the fake provider
-replies. Adjust measurement with `--duration`, `--concurrency`, and
-`--latency-ms`. The workload repeats ten requests at a time with four valid
-buffered calls, four valid streaming calls, one call using an exhausted
-rate-limited key, and one with an invalid key. The limited key refills once a
-minute and can occasionally succeed.
+the end. The defaults are ten seconds of warmup and 45 seconds of measurement
+per image, up to eight concurrent clients, 80 requests per second, and 40 ms
+before the fake provider replies. Adjust these settings with `--duration`,
+`--concurrency`, `--rate`, and `--latency-ms`. The driver evenly spaces request
+starts and skips missed slots if requests take too long. The workload repeats
+ten requests at a time with four valid buffered calls, four valid streaming
+calls, one call using an exhausted rate-limited key, and one with an invalid
+key. The limited key refills once a minute and can occasionally succeed.
 
 The summary table goes to stderr and JSON goes to stdout. Overhead is
 successful valid-key request time through nginx, less the configured fake
 provider delay. It includes the local proxy and fixture processing. Stream
 latency measures time until the first SSE chunk carrying a content token.
-Memory and connections are sampled peaks. The connection report includes
-both total open and active router sessions. The PostgreSQL statement count
-uses the change in `pg_stat_statements` for the router role, including
-transaction control and background writes observed through a one-second
-drain period, divided by all completed requests.
+Memory and connections are sampled peaks. Docker stats samples take roughly
+a second or longer, so short spikes can fall between samples. The connection
+report includes both total open and active router sessions. The PostgreSQL
+statement count uses the change in `pg_stat_statements` for the router role,
+including transaction control and background writes observed through a
+one-second drain period, divided by all completed requests.
 
 Compare mode exits nonzero if p99 overhead, queries per request, or either
 replica's peak memory increases by more than the margin (30% by default).

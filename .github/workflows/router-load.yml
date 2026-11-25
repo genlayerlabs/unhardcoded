@@ -2,8 +2,6 @@ name: Router load check
 
 on:
   workflow_dispatch:
-  push:
-    branches: [legatus/unh-29]
 
 permissions:
   contents: read
