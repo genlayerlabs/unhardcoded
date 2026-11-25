@@ -143,3 +143,24 @@ aggregation or paging):
   the lag.
 * `GET /internal/budgets?tenant_id=&period=YYYY-MM&subject=...` (repeatable, at
   most 500) returns `spent_usd` and live `reserved_usd` per subject.
+
+`GET /internal/usage/refusals?tenant_id=<id>&since_ts=<epoch>&until_ts=<epoch>`
+uses the same `x-internal-secret` as usage. Both timestamps are required and
+must fall on UTC hour boundaries. The range includes the start hour and
+excludes the end hour. The response includes `tenant_id`, the requested
+`window`, and `groups` with `subject`, `reason`, `count`, `first_ts`,
+and `last_ts`. The timestamps in a group are the first and last refusal
+times in epoch seconds.
+
+For authenticated SaaS tenants, the reason is the response error code
+(`key_budget_exhausted`, `key_rate_limit`, `consumer_budget_exhausted`,
+or `caller_rate_limit`). A tenant-level limit without a resolved key
+subject appears with `subject: null`. Unauthorized requests lack a
+verified tenant and appear only in the existing reason-level
+`llm_router_rejections_total` metric.
+
+PostgreSQL keeps one counter per tenant, subject, reason, and UTC hour.
+The read covers retained hours (`ROUTER_DB_RETENTION_DAYS`, default 30),
+and an unavailable store returns 503 `refusal_store_unavailable`.
+Recording is best effort. Counts can arrive late or be dropped during
+an outage or when the bounded background queue fills.
