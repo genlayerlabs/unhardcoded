@@ -153,6 +153,11 @@ def connection_check_scope(request: Request, tenant_id: str, provider_id: str) -
             if len(values) != 1 or not _POSITIVE_ID.fullmatch(values[0]):
                 return None
             scope[name] = int(values[0])
+    refs = request.query_params.getlist("connection_ref")
+    if refs:
+        if scope or len(refs) != 1 or not control_plane_client.CONNECTION_REF_RE.fullmatch(refs[0]):
+            return None
+        return {"connection_ref": refs[0]}
     return scope if len(scope) in (0, 2) else None
 
 

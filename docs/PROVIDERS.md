@@ -234,3 +234,28 @@ each tenant can start one check every 12 seconds. A router-imposed limit returns
 HTTP 429 with `Retry-After`. A provider-imposed limit returns HTTP 200 with
 `reason: rate_limited`. Temporary router overload or a rate-store failure
 returns HTTP 503. These checks do not contribute to traffic circuit breakers.
+
+### Checking a saved connection
+
+A control plane can send an authenticated
+`POST /internal/tenants/{tenant_id}/provider-connections/{provider_id}/check?connection_ref={ref}`
+to test one saved connection before assigning it to a project environment.
+The reference is a non-secret, case-sensitive identifier of 1–128 ASCII letters,
+digits, underscores or hyphens. It cannot be repeated or combined with
+`project_id` or `environment_id`. Without a reference, the existing tenant-wide
+and project/environment checks apply.
+
+For a reference check the router sends a fresh authenticated
+`POST /internal/tenants/{tenant_id}/provider-connections/probe-credentials`
+to the configured control plane with JSON fields `provider_id` (the catalog ID)
+and `connection_ref`. The control plane must resolve the reference within the
+requested tenant and verify compatibility with the catalog provider, regardless
+of assignment. A successful JSON response echoes the integer `tenant_id`, the
+`provider_id` and the `connection_ref`, and supplies `env` and optional
+`connections` in the same format as the provider-env contract. For a structured
+connection, send an empty `env` and the selected entry in `connections`.
+
+The router uses only the selected provider's credential field or structured
+connection and applies its existing provider destination and transport rules.
+A failed lookup or mismatched response ends the probe without a fallback.
+This credential lookup is only used by the internal check.
