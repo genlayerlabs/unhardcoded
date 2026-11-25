@@ -285,6 +285,36 @@ def test_failed_upstream_releases_tenant_slot(tenant_allowance_route, failure, m
     assert len(upstream.requests) == 2
 
 
+@pytest.mark.parametrize("subject", [None, "k:42"])
+def test_exhausted_tenant_allowance_is_reported_in_refusal_feed(
+        tenant_allowance_route, subject, monkeypatch):
+    from test_auth_proxy_control_plane import _post_chat, _upstream
+
+    if subject is not None:
+        tenant_allowance_route["key"] = {"id": 42, "subject": subject}
+    _upstream(monkeypatch)
+    client = TestClient(auth_proxy.app)
+    assert _post_chat(client, "allowance-token").status_code == 200
+
+    monkeypatch.setattr(host_store, "_SYNC_WRITES", False)
+    hour = int(time.time()) // 3600 * 3600
+    assert _post_chat(client, "allowance-token").status_code == 429
+    host_store._refusal_q.join()
+
+    # Read through a separate client using the shared store.
+    reader = TestClient(auth_proxy.app)
+    params = {"tenant_id": 7, "since_ts": hour, "until_ts": hour + 7200}
+    headers = {"x-internal-secret": "local-test"}
+    response = reader.get("/internal/usage/refusals", params=params, headers=headers)
+    assert response.status_code == 200
+    assert [(group["subject"], group["reason"], group["count"])
+            for group in response.json()["groups"]] == [(subject, "request_allowance_exhausted", 1)]
+    other_tenant = reader.get("/internal/usage/refusals", params={**params, "tenant_id": 8},
+                              headers=headers)
+    assert other_tenant.status_code == 200
+    assert other_tenant.json()["groups"] == []
+
+
 @pytest.mark.parametrize("enabled,include_allowance", [(False, True), (True, False), (True, True)])
 def test_tenant_allowance_only_checks_store_when_configured(
         tenant_allowance_route, enabled, include_allowance, monkeypatch):
