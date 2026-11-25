@@ -43,9 +43,37 @@ def test_new_candidates_can_qualify_without_changing_policy(template_host):
     assert template_host.normalize_policy(term, admit=True) == before
 
 
+def test_provider_order_respects_breakers_and_preserves_unlisted_scores(template_host):
+    models = [f"{provider}|family-a" for provider in
+              ("openai_codex", "antseed", "bedrock", "openrouter")]
+    limits = {"allowed_models": models, "max_price_in": 5,
+              "required_capabilities": ["supports_tools"]}
+
+    def providers(constraints):
+        ranked, _ = template_host.rank({"policy_ir": compile_policy("general", constraints)})
+        return [row["candidate"]["provider_id"] for row in ranked]
+
+    baseline = providers(limits)
+    assert set(baseline) == {"openai_codex", "antseed", "bedrock", "openrouter"}
+    preferred = baseline[-2:][::-1]
+    ordered = {**limits, "provider_order": ["unpriced", *preferred]}
+    assert providers(ordered) == preferred + baseline[:-2]
+    assert providers({**ordered, "max_price_in": 2}) == baseline[:2]
+    assert providers({**ordered, "required_capabilities": ["supports_vision"]}) == []
+
+    state = template_host.dump_state()
+    state["circuit_breakers"] = {preferred[0]: {
+        "open": True, "opened_at_ms": 1000, "consecutive_failures": 4}}
+    template_host.restore_state(state)
+    assert providers(ordered) == [preferred[1], *baseline[:-2], preferred[0]]
+
+
 @pytest.mark.parametrize("limits", [{"max_price_in": float("nan")}, {"max_price_out": -1},
     {"timeout_seconds": True}, {"priority": "ignore"}, {"required_capabilities": ["shell"]},
-    {"allowed_models": ["invalid"]}, {"unknown": 1}, [], False, 0, ""])
+    {"allowed_models": ["invalid"]}, {"unknown": 1}, [], False, 0, "",
+    {"provider_order": "openai"}, {"provider_order": ["openai", "openai"]},
+    {"provider_order": [42]}, {"provider_order": [""]}, {"provider_order": ["a|b"]},
+    {"provider_order": [str(i) for i in range(17)]}])
 def test_invalid_limits_rejected(limits):
     with pytest.raises(ValueError):
         compile_policy("general", limits)

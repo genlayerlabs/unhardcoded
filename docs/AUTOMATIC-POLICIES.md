@@ -17,6 +17,18 @@ remain last-resort fallbacks. Optional exact model restrictions are hard filters
 otherwise new live candidates may qualify without changing the policy bytes.
 Timeout/refusal/stream failure behavior uses the existing sequence algebra.
 
+Set `constraints.provider_order` to an array of up to 16 distinct provider IDs
+to try listed providers in order within each breaker-state group. Hard model,
+price and capability filters still apply. Existing score order breaks ties
+within a provider and ranks unlisted providers after listed ones. Unknown
+provider IDs have no effect until an eligible candidate uses that ID.
+Preview returns the general policy's order in `ranked`. A route test returns
+the selected policy's order in `x_router.decision_trace.ranked`, subject to the
+standard trace limit, and records actual attempts in `decision_path`.
+Omitting the list or passing an empty list preserves contract version 1 and its
+policy identities. A nonempty list publishes contract version 2, which older
+routers reject as an unsupported automatic contract.
+
 Published contracts must store the normalized terms, engine identities, catalog
 version and descriptions together. Existing revisions must never resolve a
 policy by an unversioned mutable name. General is a mandatory fallback; if it
