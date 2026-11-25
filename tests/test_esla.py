@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+import host_store
 from esla_routing import InvalidUpstreamPath, load_routes, upstream_url
 from llm_router_host import LLMRouterHost, make_async_call_provider
 from provider_adapters.openai_compatible import stream_openai_compatible
@@ -87,7 +88,7 @@ def esla_demo(tmp_path):
         "address": AGREEMENT, "client_key": cli("keygen", "-out", client_key),
         "provider_key": cli("keygen", "-out", provider_key),
         "start": int(time.time()) - 5, "window_seconds": 3600,
-        "commit_grace_seconds": 600, "slow_ms": 10000,
+        "commit_grace_seconds": 600, "slow_ms": 300,
     }))
     upstream, proxy, caller = (local_address() for _ in range(3))
     routes = tmp_path / "routes.json"
@@ -107,20 +108,24 @@ def esla_demo(tmp_path):
                  provider_key, "-db", provider_db, "-upstream", f"http://{upstream}"):
         with service(binary, caller, "caller", "-routes", str(routes), "-key",
                      client_key, "-db", caller_db):
+            print(f"Caller at {caller}, provider proxy at {proxy}, fake provider at {upstream}")
             yield (
                 f"http://{caller}",
-                lambda errors: service(binary, upstream, "fake-upstream", "-error-rate", str(errors)),
+                lambda errors, latency="5ms": service(
+                    binary, upstream, "fake-upstream", "-error-rate", str(errors), "-latency", latency),
                 lambda: (commitment("caller", client_key, caller_db),
                          commitment("provider", provider_key, provider_db)),
             )
 
 
 @pytest.mark.asyncio
-async def test_esla_window_matches_router_attempts(esla_demo, host_store_clean):
+async def test_esla_window_matches_router_attempts(esla_demo):
+    host_store.truncate_all_for_tests()
     caller, fake_upstream, commitments = esla_demo
     env = {"ESLA_ROUTES": route_config(caller), "COMPUT3_API_KEY": "test"}
     host = LLMRouterHost(ROOT / "core/router.lua", ROOT / "core/config.example.lua",
                          env=env, call_provider_async=make_async_call_provider(env.get))
+    host.config.retry_policies.balanced.server_error.action = "next_candidate"
     host.init()
 
     async def stream(request, emit):
@@ -131,25 +136,30 @@ async def test_esla_window_matches_router_attempts(esla_demo, host_store_clean):
             "messages": [{"role": "user", "content": "say hello"}]}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
                                  base_url="http://router") as client:
-        with fake_upstream(0):
+        print(f"Router sending requests via ESLA caller {caller}")
+        with fake_upstream(0, "500ms"):
             response = await client.post("/v1/chat/completions", json=body)
             assert response.status_code == 200, response.text
             assert "Bonded providers" in response.json()["choices"][0]["message"]["content"]
+            print(f"Buffered call: HTTP {response.status_code} (slow upstream)")
+        with fake_upstream(0):
             response = await client.post("/v1/chat/completions", json={**body, "stream": True})
             assert response.status_code == 200, response.text
             assert "Bonded " in response.text and "data: [DONE]" in response.text
+            print(f"Streaming call: HTTP {response.status_code}, received [DONE]")
         with fake_upstream(1):
             response = await client.post("/v1/chat/completions", json=body)
             assert response.status_code >= 500, response.text
+            print(f"Failing call: HTTP {response.status_code}")
 
-    with host_store_clean._get_pool().connection() as conn:
+    with host_store._get_pool().connection() as conn:
         calls, errors, slow = conn.execute(
             "SELECT count(*), count(*) FILTER (WHERE NOT ok), "
-            "count(*) FILTER (WHERE latency_ms > 10000) FROM route_observations "
+            "count(*) FILTER (WHERE latency_ms > 300) FROM route_observations "
             "WHERE provider_id = 'comput3'"
         ).fetchone()
     expected = {"calls": calls, "errors": errors, "slow": slow}
-    assert calls >= 3 and calls - errors == 2
+    assert expected == {"calls": 3, "errors": 1, "slow": 1}
 
     # The caller seals and acknowledges asynchronously after forwarding the response.
     deadline = time.monotonic() + 5
@@ -163,6 +173,48 @@ async def test_esla_window_matches_router_attempts(esla_demo, host_store_clean):
         await asyncio.sleep(.05)
     assert json.loads(caller_window["summary"]) == expected
     assert json.loads(provider_window["summary"]) == expected
+    print(f"Router attempts and both ESLA summaries: {expected}; root {caller_window['root']}")
+
+    # Leave after a real content delta. The sidecar should finish the signed
+    # call even though the router stops consuming the response.
+    first_delta = asyncio.Event()
+    sent = []
+    request_body = json.dumps({**body, "stream": True}).encode()
+    received = False
+
+    async def receive():
+        nonlocal received
+        if not received:
+            received = True
+            return {"type": "http.request", "body": request_body}
+        await first_delta.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        chunk = message.get("body", b"")
+        sent.append(chunk)
+        if b"Bonded " in chunk:
+            first_delta.set()
+
+    with fake_upstream(0):
+        await asyncio.wait_for(app({
+            "type": "http", "method": "POST", "path": "/v1/chat/completions",
+            "headers": [(b"content-type", b"application/json")], "query_string": b"",
+        }, receive, send), timeout=3)
+        assert first_delta.is_set() and b"[DONE]" not in b"".join(sent)
+        deadline = time.monotonic() + 5
+        while True:
+            caller_window, provider_window = commitments()
+            if (caller_window["pending"] == "0"
+                    and caller_window["root"] == provider_window["root"]
+                    and json.loads(provider_window["summary"])["calls"] == 4):
+                break
+            if time.monotonic() >= deadline:
+                pytest.fail(f"abandoned stream did not settle: {caller_window}, {provider_window}")
+            await asyncio.sleep(.05)
+    assert json.loads(caller_window["summary"]) == {"calls": 4, "errors": 1, "slow": 1}
+    print(f"Abandoned stream settled at both ends; root {caller_window['root']}")
+
 
 
 def configured_host(http, env):
@@ -179,13 +231,19 @@ async def test_sidecar_outage_falls_back_without_calling_mapped_provider(monkeyp
     async def send(request):
         seen.append(request.url)
         if request.url.host == "caller":
-            raise httpx.ConnectError("caller unavailable", request=request)
+            raise httpx.ConnectError(f"caller unavailable at {request.url}", request=request)
         assert request.url.host == "api.mor.org"
         return httpx.Response(200, json={"choices": [{"message": {"content": "fallback"}}]})
 
     env = {"COMPUT3_API_KEY": "test", "MORPHEUS_API_KEY": "test",
            "ESLA_ROUTES": route_config("http://caller")}
-    monkeypatch.setattr("llm_router_host._fold_route_outcome", lambda *args, **kwargs: None)
+    def observe(request, result, **kwargs):
+        assert "_esla_sidecar_url" not in request
+        if result.get("error_kind") == "network_error":
+            assert "http://caller" not in result["error_message"]
+            assert "[ESLA caller]" in result["error_message"]
+
+    monkeypatch.setattr("llm_router_host._fold_route_outcome", observe)
     async with httpx.AsyncClient(transport=httpx.MockTransport(send)) as http:
         host = configured_host(http, env)
         result = await host.execute_async({
@@ -259,4 +317,39 @@ async def test_cancel_mapped_attempt_before_response(stream, stop, monkeypatch):
                     "stream": stream,
                 })
                 assert response.status_code == 504
+        assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_deadline_cancels_mapped_attempt_after_first_delta():
+    cancelled = asyncio.Event()
+
+    class StalledStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"first token"}}]}\n\n'
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+    async def send(request):
+        assert request.url.host == "caller"
+        return httpx.Response(200, stream=StalledStream())
+
+    env = {"COMPUT3_API_KEY": "test", "ESLA_ROUTES": route_config("http://caller")}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(send)) as http:
+        host = configured_host(http, env)
+
+        async def stream(request, emit):
+            return await stream_openai_compatible(request, emit, env_get=env.get, client=http)
+
+        app = create_app(host, streaming_call=stream, request_deadline_ms=500)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://router") as client:
+            response = await client.post("/v1/chat/completions", json={
+                "model": "pin:comput3/hermes-3-405b", "stream": True,
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+        assert response.status_code == 200
+        assert "first token" in response.text and "timeout" in response.text
         assert cancelled.is_set()

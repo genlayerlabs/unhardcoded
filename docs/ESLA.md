@@ -81,3 +81,18 @@ their call, error, and slow counts against the router's persisted attempts.
 The test uses no chain or provider account. With `ESLA_BIN` unset, pytest skips
 the binary-dependent test and still runs configuration, fallback, and
 cancellation coverage.
+
+To watch the same setup as a demo, point `DATABASE_URL` at a disposable test
+database. The demo truncates the router's test tables in that database.
+
+```bash
+ESLA_BIN=/absolute/path/to/esla/sdk/go/bin/esla scripts/demo-esla.sh
+```
+
+The demo prints the outcome of each call, the matched counters and root, and
+the result of disconnecting after the first streamed delta. The caller and
+provider should still settle the abandoned stream.
+
+Run the binary-backed acceptance check manually. Router CI has no ESLA binary
+because the SDK is in a separate private repository. The regular suite still
+checks fallback, cancellation, and configuration with local HTTP mocks.

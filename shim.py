@@ -1232,8 +1232,9 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                                          return_when=asyncio.FIRST_COMPLETED)
             return done
         except asyncio.CancelledError:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            if getattr(host, "_esla_routes", None):
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
             raise
 
     @app.post("/v1/chat/completions")

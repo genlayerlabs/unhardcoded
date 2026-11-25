@@ -745,12 +745,13 @@ end
                 result = _err("network_error", 0, 0,
                               "ESLA route requires an operator-managed HTTP adapter and a fixed upstream")
             elif hook is not None:
-                if sidecar is not None:
-                    request = {**request, "_esla_sidecar_url": sidecar}
+                outbound = {**request, "_esla_sidecar_url": sidecar} if sidecar else request
                 try:
-                    result = await hook(request)
+                    result = await hook(outbound)
                 except esla_routing.InvalidUpstreamPath:
                     result = _err("bad_request", 0, 0, "Invalid upstream path for ESLA route")
+                if sidecar and isinstance(message := result.get("error_message"), str):
+                    result = {**result, "error_message": message.replace(sidecar, "[ESLA caller]")}
             else:
                 result = self._call_hook(request)
         # Record the outcome here (not in the hook) so the streaming/override path —
