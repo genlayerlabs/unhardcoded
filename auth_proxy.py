@@ -26,6 +26,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
+import billing_quota
 import control_plane_client
 import host_store
 import internal_api
@@ -4362,6 +4363,31 @@ async def proxy(path: str, request: Request) -> Response:
                 "message": "router capacity is temporarily exhausted; retry shortly",
                 "type": "server_error", "code": "router_overloaded"}})
 
+    quota_ticket = None
+    if auth.get("tenant_id") is not None and os.getenv("CLOUD_MONTHLY_QUOTAS_REQUIRED") == "1":
+        try:
+            quota_ticket = await asyncio.to_thread(
+                billing_quota.reserve, auth["tenant_id"], (published_route or {}).get("billing_quota"))
+        except Exception:
+            _metric_store_error("billing_quota")
+            quota_error = (503, "quota_unavailable", "Quota accounting is temporarily unavailable")
+        except BaseException:
+            _settle_reservation(None)
+            _capacity_release()
+            raise
+        else:
+            quota_error = None if quota_ticket else (
+                429, "monthly_quota_exceeded", "Your organization has reached its monthly request allowance")
+        if quota_error:
+            _settle_reservation(None)
+            _capacity_release()
+            reject_status, code, message = quota_error
+            _record_reject(reason=code, path="/" + path, caller=caller,
+                           status=reject_status, route=requested_route)
+            return JSONResponse(status_code=reject_status, content={"error": {"message": message, "code": code}})
+
+    response_complete = False
+    upstream_error = False
     status = 502
     provider = None
     model_family = None
@@ -4388,7 +4414,7 @@ async def proxy(path: str, request: Request) -> Response:
     # X-Unhardcoded-Session header covers header-only clients (opencode plugin).
     session_id = request.headers.get("x-unhardcoded-session")
 
-    def _finish():
+    async def _finish():
         nonlocal capacity_released, decision_trace
         if capacity_released:
             return
@@ -4414,7 +4440,7 @@ async def proxy(path: str, request: Request) -> Response:
                     int(auth["environment_id"]) if auth.get("scope_version") == 2 else 0,
                     requested_route, outcome_ts, outcome, fallback, first_token_ms,
                     latency_ms if outcome == "success" else None)
-            _record_request(caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
+            _record_request(usage_event_id=quota_ticket, caller=caller, method=request.method, path="/" + path, status=status, latency_ms=latency_ms, provider=provider, model_family=model_family, served_model_id=served_model_id, served_by=served_by, requested_model=requested_model, session=session_id, tokens_in=tokens_in, tokens_out=tokens_out, tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd, cost_basis=cost_basis, decision_trace=decision_trace, error_type=error_type, error_code=error_code, error_message=error_message, key_sha256=auth.get("digest"))
             _metric_request(status, latency_ms)
             _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
         finally:
@@ -4426,7 +4452,15 @@ async def proxy(path: str, request: Request) -> Response:
                 _settle_reservation(cost_usd if cost_usd is not None or status >= 400
                                     else reservation["amount"] if reservation else None)
             finally:
-                _capacity_release()
+                try:
+                    if quota_ticket:
+                        await asyncio.to_thread(
+                            billing_quota.settle, quota_ticket,
+                            response_complete and 200 <= status < 300 and not upstream_error)
+                except Exception:
+                    _metric_store_error("billing_quota_settlement")
+                finally:
+                    _capacity_release()
 
     try:
         # Built inside the try so a failure here still reaches _finish, which
@@ -4498,7 +4532,7 @@ async def proxy(path: str, request: Request) -> Response:
             def _account(tail: bytes) -> None:
                 nonlocal provider, model_family, served_model_id, served_by, \
                     tokens_in, tokens_out, tokens_total, tokens_cached, cost_usd, \
-                    cost_basis, decision_trace, error_type, error_code, error_message
+                    cost_basis, decision_trace, error_type, error_code, error_message, upstream_error
                 nonlocal first_token_ms, incomplete_stream, responses_stream_outcome
                 try:
                     meta = _parse_stream_tail(tail)
@@ -4526,6 +4560,7 @@ async def proxy(path: str, request: Request) -> Response:
                         tokens_total = int(usage.get("total_tokens") or (tokens_in + tokens_out))
                     err = meta.get("error")
                     if isinstance(err, dict):
+                        upstream_error = True
                         error_type = err.get("type")
                         error_code = err.get("code")
                         error_message = err.get("message")
@@ -4546,7 +4581,7 @@ async def proxy(path: str, request: Request) -> Response:
                 asyncio.get_running_loop().call_later(STREAM_DRAIN_TIMEOUT_S, pump.cancel)
 
             async def _pump() -> None:
-                nonlocal drain_complete, pump_finished, proxy_timeout
+                nonlocal drain_complete, pump_finished, proxy_timeout, response_complete
                 tail = bytearray()
                 drained = 0
                 failure: BaseException | None = None
@@ -4572,9 +4607,12 @@ async def proxy(path: str, request: Request) -> Response:
                     failure = exc
                     proxy_timeout = isinstance(exc, httpx.TimeoutException)
                 finally:
-                    await _close_upstream_stream()
-                    _account(bytes(tail))
-                    _finish()
+                    try:
+                        await _close_upstream_stream()
+                    finally:
+                        _account(bytes(tail))
+                        response_complete = drain_complete
+                        await _finish()
                     pump_finished = True
                     if client_gone_at is None:
                         with contextlib.suppress(asyncio.TimeoutError):   # None = end of stream
@@ -4623,6 +4661,7 @@ async def proxy(path: str, request: Request) -> Response:
                 if isinstance(parsed, dict):
                     err = parsed.get("error")
                     if isinstance(err, dict):
+                        upstream_error = True
                         error_type = err.get("type")
                         error_code = err.get("code")
                         error_message = err.get("message")
@@ -4632,6 +4671,7 @@ async def proxy(path: str, request: Request) -> Response:
                     tokens_total = int(usage.get("total_tokens") or (tokens_in + tokens_out))
             except Exception:
                 pass
+        response_complete = True
         return Response(status_code=status, content=content, media_type=content_type)
     except Exception as exc:
         error_type = "proxy_error"
@@ -4641,7 +4681,7 @@ async def proxy(path: str, request: Request) -> Response:
         return JSONResponse(status_code=502, content={"error": {"message": f"upstream proxy error: {exc}", "type": "proxy_error", "code": "upstream"}})
     finally:
         if record_in_finally:
-            _finish()
+            await _finish()
 
 
 def _record_reject(*, tenant_id: int | None = None, subject: str | None = None,

@@ -112,6 +112,17 @@ _SCHEMA_STATEMENTS = [
         PRIMARY KEY (tenant_id, environment_id, route, hour_ts)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_route_outcome_hours_hour ON route_outcome_hours (hour_ts)",
+    '''CREATE TABLE IF NOT EXISTS cloud_quota_periods (
+       tenant_id BIGINT NOT NULL, period_start BIGINT NOT NULL, period_end BIGINT NOT NULL,
+       used BIGINT NOT NULL DEFAULT 0 CHECK (used >= 0),
+       PRIMARY KEY (tenant_id, period_start))''',
+    '''CREATE TABLE IF NOT EXISTS cloud_quota_reservations (
+       id TEXT PRIMARY KEY, tenant_id BIGINT NOT NULL, period_start BIGINT NOT NULL,
+       state TEXT NOT NULL DEFAULT 'pending', created_at BIGINT NOT NULL,
+       stripe_customer_id TEXT, meter_event_name TEXT,
+       FOREIGN KEY (tenant_id, period_start) REFERENCES cloud_quota_periods(tenant_id, period_start))''',
+    """CREATE INDEX IF NOT EXISTS cloud_quota_pending ON cloud_quota_reservations
+       (tenant_id, period_start, created_at) WHERE state = 'pending'""",
     """CREATE TABLE IF NOT EXISTS calls (
         id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         ts              BIGINT NOT NULL,
@@ -574,6 +585,9 @@ def _prune() -> None:
             # Swept reservations only wait for a late settle; a day is plenty.
             conn.execute("DELETE FROM subject_budget_reservations"
                          " WHERE released AND expires_at < %s", (now - 86400,))
+        if os.getenv("CLOUD_MONTHLY_QUOTAS_REQUIRED") == "1":
+            from billing_quota import expire_pending
+            expire_pending(int(now))
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store prune failed: %s", exc)
 
