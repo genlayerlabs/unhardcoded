@@ -139,6 +139,14 @@ Cost values are estimates, rounded to six decimals, and include `priced_events`,
 
 `recent` rows include sanitized recorded fields such as timestamp, method, path, status, latency, requested model, provider, model family, served model, token counts, cost estimate, error code/type/message, and decision trace when recorded. Raw bearer tokens, full SHA-256 digests, and obvious provider key patterns are redacted from nested detail.
 
+### Ledger export cost source
+
+Each row from `GET /internal/usage/export` includes `cost_source` alongside the existing `cost_usd` and `cost_basis` fields.
+
+- `reported` means the provider supplied the amount, including an explicit zero. OpenRouter can supply it in completed usage, including the final usage frame of a chat stream.
+- `estimated` means an amount is available from a router calculation or default, a composite total, or a legacy row whose provider provenance is unknown.
+- `none` means the row has no recorded amount.
+
 ## Dashboard lookup
 
 ```http
