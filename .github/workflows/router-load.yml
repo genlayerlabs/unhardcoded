@@ -1,0 +1,26 @@
+name: Router load check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: python3 -m unittest discover -s scripts/router-load
+      - run: docker build -t unhardcoded:load .
+      - run: docker pull postgres:16
+      - run: docker pull nginx:alpine
+      - run: python3 scripts/router-load-check.py unhardcoded:load --compare unhardcoded:load > load.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: router-load
+          path: load.json

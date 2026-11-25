@@ -1,0 +1,82 @@
+x-replica: &replica
+  image: ${LOAD_ROUTER_IMAGE:?}
+  pull_policy: never
+  environment:
+    DATABASE_URL: postgresql://router:load-test@postgres/router_load
+    ROUTER_UPSTREAM: http://127.0.0.1:18080
+    DASHBOARD_SYNTHETIC_PROBES_ENABLED: "0"
+    RUN_COST_BACKFILL: "0"
+    RUN_WALLET_KEEPER: "0"
+    RUN_SOURCE_REFRESHERS: "0"
+    MODEL_META_REFRESH: "0"
+    LOG_LEVEL: WARNING
+  volumes:
+    - ./catalog.lua:/load/catalog.lua:ro
+    - ./driver.py:/load/driver.py:ro
+  command:
+    - sh
+    - -ec
+    - |
+      python serve.py --config /load/catalog.lua --default-profile default --port 18080 &
+      exec uvicorn auth_proxy:app --host 0.0.0.0 --port 8080 --no-access-log --log-level warning
+  depends_on:
+    postgres:
+      condition: service_healthy
+    upstream:
+      condition: service_started
+  healthcheck:
+    test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/healthz', timeout=2)"]
+    interval: 1s
+    timeout: 3s
+    retries: 60
+
+services:
+  postgres:
+    image: postgres:16
+    pull_policy: never
+    environment:
+      POSTGRES_PASSWORD: load-test
+      POSTGRES_DB: router_load
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
+    volumes:
+      - ./postgres.sql:/docker-entrypoint-initdb.d/01-load.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-d", "router_load", "-U", "postgres"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  upstream:
+    image: ${LOAD_HARNESS_IMAGE:?}
+    pull_policy: never
+    environment:
+      LOAD_LATENCY_MS: ${LOAD_LATENCY_MS:?}
+    volumes:
+      - ./upstream.py:/load/upstream.py:ro
+    command: ["uvicorn", "upstream:app", "--app-dir", "/load", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+
+  replica-a: *replica
+  replica-b: *replica
+
+  proxy:
+    image: nginx:alpine
+    pull_policy: never
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      replica-a:
+        condition: service_healthy
+      replica-b:
+        condition: service_healthy
+
+  driver:
+    image: ${LOAD_HARNESS_IMAGE:?}
+    pull_policy: never
+    profiles: ["driver"]
+    volumes:
+      - ./driver.py:/load/driver.py:ro
+    entrypoint: ["python", "/load/driver.py"]
+
+networks:
+  default:
+    internal: true
