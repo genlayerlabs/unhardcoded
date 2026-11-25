@@ -1,4 +1,4 @@
-"""Internal metering API for an external control plane.
+"""Internal API for an external control plane.
 
 Served by the ingress, gated by the same shared secret the control-plane
 client sends outbound (`x-internal-secret`); see control_plane_client for the
@@ -10,6 +10,8 @@ the surface does not exist on operator-only deployments.
   GET /internal/usage/recent?caller=<slug>&limit=<n<=500>
   GET /internal/usage/export?caller=<slug>&after_id=<id>&limit=<n<=5000>
   GET /internal/budgets?tenant_id=<id>&period=YYYY-MM&subject=<g:N|k:N>...
+  GET /internal/provider-agreements/{provider_id}
+  PUT /internal/provider-agreements/{provider_id}
 
 The usage endpoints accept project_id+environment_id (both, positive) and then
 filter by the recorded routing scope BEFORE aggregating or paging. Windows are
@@ -24,10 +26,11 @@ from __future__ import annotations
 import re
 import time
 import asyncio
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ValidationError
 
 import control_plane_client
 import host_store
@@ -48,6 +51,60 @@ def _gate(request: Request) -> JSONResponse | None:
     if not control_plane_client.internal_secret_ok(request.headers):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     return None
+
+
+_AgreementText = Annotated[str, Field(strict=True, max_length=256, pattern=r"^[^\s\x00]+$")]
+
+
+class _AgreementObservation(BaseModel):
+    agreement_address: _AgreementText | None = None
+    network: _AgreementText | None = None
+    bond_amount: str = Field(strict=True, pattern=r"^(0|[1-9][0-9]{0,77})$")
+    status: Literal["active", "exiting", "defaulted", "none"]
+    checked_at_ms: int = Field(strict=True, ge=0)
+
+
+@router.get("/internal/provider-agreements/{provider_id}")
+async def internal_get_provider_agreement(request: Request, provider_id: str) -> JSONResponse:
+    denied = _gate(request)
+    if denied is not None:
+        return denied
+    if len(provider_id) > 256 or not re.fullmatch(r"[^\s\x00]+", provider_id):
+        return JSONResponse({"error": "invalid_provider_id"}, status_code=400)
+    try:
+        row = await asyncio.to_thread(host_store.get_provider_agreement, provider_id)
+    except Exception:
+        return JSONResponse({"error": "agreement_store_unavailable"}, status_code=503)
+    if row is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return JSONResponse(row)
+
+
+@router.put("/internal/provider-agreements/{provider_id}")
+async def internal_put_provider_agreement(request: Request, provider_id: str) -> JSONResponse:
+    denied = _gate(request)
+    if denied is not None:
+        return denied
+    if len(provider_id) > 256 or not re.fullmatch(r"[^\s\x00]+", provider_id):
+        return JSONResponse({"error": "invalid_provider_id"}, status_code=400)
+    try:
+        observation = _AgreementObservation.model_validate_json(await request.body())
+    except ValidationError:
+        return JSONResponse({"error": "invalid_agreement"}, status_code=400)
+    amount = int(observation.bond_amount)
+    if (amount >= 2**256 or observation.checked_at_ms > int(time.time() * 1000)
+            or (observation.status != "none" and not (observation.agreement_address and observation.network))):
+        return JSONResponse({"error": "invalid_agreement"}, status_code=400)
+    try:
+        saved = await asyncio.to_thread(
+            host_store.upsert_provider_agreement, provider_id, observation.agreement_address,
+            observation.network, amount, observation.status, observation.checked_at_ms,
+        )
+    except Exception:
+        return JSONResponse({"error": "agreement_store_unavailable"}, status_code=503)
+    if not saved:
+        return JSONResponse({"error": "older_observation"}, status_code=409)
+    return JSONResponse({"provider_id": provider_id, **observation.model_dump()})
 
 
 def _scope(project_id: int | None, environment_id: int | None) -> dict | None:

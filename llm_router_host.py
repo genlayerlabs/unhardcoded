@@ -53,6 +53,9 @@ from provider_adapters.openai_compatible import (
 import lupa
 from lupa import LuaRuntime
 
+_MIN_PROVIDER_BOND_ENV = "ROUTER_MIN_PROVIDER_BOND"
+_PROVIDER_BOND_MAX_AGE_ENV = "ROUTER_PROVIDER_BOND_MAX_AGE_S"
+
 __all__ = [
     "LLMRouterHost",
     "FlowAdmissionError",
@@ -179,29 +182,15 @@ class LLMRouterHost:
         self._inject_host_fields()
 
     def _inject_host_fields(self) -> None:
-        """Declare host-universal observation fields that every catalog gets for
-        free because they denote a HOST measurement, not catalog data — currently
-        the per-session cache-affinity Bool `cache_hot`. Done here (once, after the
-        config loads, before router.init and the flow schema read cfg.fields) so no
-        catalog .lua repeats the getter and the field exists for example/live/any
-        config alike.
-
-        Zero engine change: this is the fields.lua extension seam
-        (`schema{ extensions }`). The getter builds each candidate's route key
-        through the SAME `route_reliability.route_key` that `_fold_route_outcome`
-        uses — bridged into Lua as the `host_route_key` global, so the
-        serialization (`provider|family|peer`, peer falling back to provider for
-        peerless routes) has exactly one source and cannot drift across the
-        Python/Lua boundary. It compares that key to the hot route the host
-        resolved into `ctx.request.cache_hot_route` per request (see
-        `host_store.hot_route`). The algebra observes only the Bool; the route
-        key never enters the signature."""
+        """Declare host observations before the engine and flow schemas load."""
         # One source of truth for the route-key serialization: the getter must
         # build a candidate's key identically to the fold, or affinity is silently
         # lost. Bridge the host's route_key into Lua instead of re-serializing.
         self.lua.globals().host_route_key = _route_reliability.route_key
         self.lua.eval("""
-function(cfg)
+function(cfg, bonded_providers)
+    -- Take one snapshot per engine context, only if a policy observes bonded.
+    local snapshots = setmetatable({}, { __mode = "k" })
     cfg.fields = cfg.fields or {}
     cfg.fields.cache_hot = {
         sort = "Bool", default = false, group = "route",
@@ -214,8 +203,32 @@ function(cfg)
             return host_route_key(pid, fam, peer) == hot
         end,
     }
+    cfg.fields.bonded = {
+        sort = "Bool", default = false, group = "route", source = "host",
+        get = function(c, ctx)
+            if c.provider_id == nil or ctx == nil then return false end
+            local snapshot = snapshots[ctx]
+            if snapshot == nil then
+                snapshot = bonded_providers(ctx.now_ms)
+                snapshots[ctx] = snapshot
+            end
+            return snapshot[c.provider_id] == true
+        end,
+    }
 end
-""")(self.config)
+""")(self.config, self._bonded_providers)
+
+    def _bonded_providers(self, now_ms: int):
+        try:
+            min_bond = int(self._env.get(_MIN_PROVIDER_BOND_ENV, "1000000000000000000"))
+            max_age_s = int(self._env.get(_PROVIDER_BOND_MAX_AGE_ENV, "300"))
+            if not 0 < min_bond < 2**256 or not 0 < max_age_s <= 2**31 - 1:
+                raise ValueError("bond settings out of range")
+            providers = host_store.bonded_provider_ids(min_bond, max_age_s * 1000, now_ms)
+        except Exception:
+            self._logger("warn", "provider_agreements_unavailable", {})
+            providers = []
+        return self.lua.table_from({provider_id: True for provider_id in providers})
 
     # ---- public API -----------------------------------------------------
 
@@ -291,6 +304,10 @@ end
         catalog = self.catalog()
         managed = set(managed_providers).intersection(shared_provider_ids(catalog))
         scoped_env = dict(env)
+        for key in (_MIN_PROVIDER_BOND_ENV, _PROVIDER_BOND_MAX_AGE_ENV):
+            scoped_env.pop(key, None)
+            if key in self._env:
+                scoped_env[key] = self._env[key]
         scoped_env['SAAS_TENANT_SCOPE'] = str(tenant_id)
         if environment_id is not None:
             scoped_env['SAAS_TENANT_SCOPE'] = f"{tenant_id}:{project_id}:{environment_id}"

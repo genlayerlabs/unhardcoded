@@ -43,6 +43,8 @@ Builder.
 There are **no intelligence tiers**. When a caller sends no policy, a single
 declarative `default` policy (balanced quality/cost) is the fallback — itself a
 Σ_pol term with an identity, editable like any other.
+See [bonded-only routing](docs/BONDED-ROUTING.md) for a policy that requires
+a fresh provider agreement with sufficient bond.
 
 ## Layout
 

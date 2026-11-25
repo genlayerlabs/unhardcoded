@@ -150,6 +150,15 @@ _SCHEMA_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS settings_overrides (
         key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at BIGINT NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS provider_agreements (
+        provider_id TEXT PRIMARY KEY,
+        agreement_address TEXT,
+        network TEXT,
+        bond_amount NUMERIC(78, 0) NOT NULL CHECK (bond_amount >= 0),
+        status TEXT NOT NULL CHECK (status IN ('active', 'exiting', 'defaulted', 'none')),
+        checked_at_ms BIGINT NOT NULL CHECK (checked_at_ms >= 0),
+        CHECK (status = 'none' OR (agreement_address IS NOT NULL AND network IS NOT NULL))
+    )""",
     """CREATE TABLE IF NOT EXISTS provider_overlays (
         provider_id TEXT PRIMARY KEY, entry TEXT NOT NULL, added_at BIGINT NOT NULL
     )""",
@@ -707,6 +716,50 @@ def set_overrides(overrides: dict[str, Any]) -> bool:
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store set_overrides failed: %s", exc)
         return False
+
+
+# ---- provider agreements ------------------------------------------------------
+
+def get_provider_agreement(provider_id: str) -> dict[str, Any] | None:
+    with _get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            return cur.execute(
+                "SELECT provider_id, agreement_address, network, bond_amount::text,"
+                " status, checked_at_ms FROM provider_agreements WHERE provider_id = %s",
+                (provider_id,),
+            ).fetchone()
+
+
+def upsert_provider_agreement(provider_id: str, agreement_address: str | None,
+                              network: str | None, bond_amount: int, status: str,
+                              checked_at_ms: int) -> bool:
+    """An older observation cannot replace a newer one."""
+    with _get_pool().connection() as conn:
+        return conn.execute(
+            """INSERT INTO provider_agreements
+                   (provider_id, agreement_address, network, bond_amount, status, checked_at_ms)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT (provider_id) DO UPDATE SET
+                   agreement_address = EXCLUDED.agreement_address,
+                   network = EXCLUDED.network,
+                   bond_amount = EXCLUDED.bond_amount,
+                   status = EXCLUDED.status,
+                   checked_at_ms = EXCLUDED.checked_at_ms
+               WHERE provider_agreements.checked_at_ms <= EXCLUDED.checked_at_ms""",
+            (provider_id, agreement_address, network, bond_amount, status, checked_at_ms),
+        ).rowcount == 1
+
+
+def bonded_provider_ids(min_bond: int, max_age_ms: int, now_ms: int) -> list[str]:
+    """Providers with a fresh, active agreement at the ranking snapshot."""
+    with _get_pool().connection() as conn:
+        rows = conn.execute(
+            """SELECT provider_id FROM provider_agreements
+               WHERE status = 'active' AND bond_amount >= %s
+                 AND checked_at_ms > %s AND checked_at_ms <= %s""",
+            (min_bond, now_ms - max_age_ms, now_ms),
+        ).fetchall()
+    return [provider_id for (provider_id,) in rows]
 
 
 # ---- provider_overlays (durable operator state) --------------------------------
@@ -2651,7 +2704,7 @@ def reset() -> None:
 def truncate_all_for_tests() -> None:
     """Test helper: wipe every table for isolation against a shared Postgres."""
     with _get_pool().connection() as conn:
-        conn.execute("TRUNCATE calls, settings_overrides, provider_overlays,"
+        conn.execute("TRUNCATE calls, settings_overrides, provider_overlays, provider_agreements,"
                      " consumer_keys, consumer_key_digests, consumer_rate_buckets,"
                      " peer_concurrency_leases,"
                      " consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
