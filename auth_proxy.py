@@ -162,6 +162,27 @@ app = FastAPI(title="llm-router auth proxy", docs_url=None, redoc_url=None)
 # proxy; hidden (404) unless CONTROL_PLANE_INTERNAL_SECRET is configured.
 app.include_router(internal_api.router)
 _client: httpx.AsyncClient | None = None
+
+
+async def _forward_provider_fact(provider_id: str, name: str, body: bytes) -> Response:
+    provider_path = quote(provider_id, safe="")
+    if provider_id in {".", ".."}:
+        # Preserve literal provider IDs through HTTP path normalization.
+        provider_path = provider_id.replace(".", "%2E")
+    if _client is not None:
+        try:
+            response = await _client.put(
+                f"{UPSTREAM}/internal/provider-facts/{provider_path}/{name}",
+                content=body, headers=_router_admin_headers(), timeout=10.0,
+            )
+            return Response(response.content, status_code=response.status_code,
+                            media_type="application/json")
+        except httpx.RequestError:
+            pass
+    return JSONResponse({"error": "provider_fact_store_unavailable"}, status_code=503)
+
+
+app.state.forward_provider_fact = _forward_provider_fact
 _probe_task: asyncio.Task[None] | None = None
 _started_wall = time.time()
 _stats_lock = RLock()

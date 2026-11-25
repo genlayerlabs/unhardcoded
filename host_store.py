@@ -887,14 +887,14 @@ def upsert_provider_fact(provider_id: str, name: str, value: bool,
         ).rowcount == 1
 
 
-def providers_with_fact(name: str, max_age_ms: int, now_ms: int) -> list[str]:
+def load_provider_facts(limit: int) -> list[tuple[str, str, int]]:
+    """Load ranking observations in one bounded query."""
     with _get_pool().connection() as conn:
-        rows = conn.execute(
-            """SELECT provider_id FROM provider_facts
-               WHERE name = %s AND value AND observed_at_ms BETWEEN %s AND %s""",
-            (name, now_ms - max_age_ms, now_ms),
+        return conn.execute(
+            """SELECT name, provider_id, observed_at_ms FROM provider_facts
+               WHERE value ORDER BY name, provider_id LIMIT %s""",
+            (limit,),
         ).fetchall()
-    return [provider_id for (provider_id,) in rows]
 
 
 # ---- provider_overlays (durable operator state) --------------------------------
