@@ -285,15 +285,16 @@ async def tenant_env(tenant_id: int) -> dict[str, str]:
     return env
 
 
-async def tenant_connections(tenant_id: int, allowed_env: set[str], *, project_id=None,
-                             environment_id=None, require_fresh=False) -> tuple[dict, dict]:
-    """Fresh closed credential scope and encrypted structured BYO connections.
+async def tenant_connections(
+    tenant_id: int, allowed_env: set[str], *, project_id=None, environment_id=None, require_fresh=False,
+) -> tuple[dict, dict, tuple[str, ...]]:
+    """Fresh credential scope with tenant credentials or explicit operator grants.
     The loaded catalog, not a second hardcoded list, declares credential names.
     An unavailable control plane grants nothing; no stale authorization."""
     if not enabled():
         if require_fresh or project_id is not None or environment_id is not None:
             raise RouteUnavailable("Scoped credentials unavailable.")
-        return {}, {}
+        return {}, {}, ()
     scoped = project_id is not None or environment_id is not None
     if scoped and any(type(value) is not int or value <= 0 for value in (project_id, environment_id)):
         raise RouteUnavailable("Invalid credential scope.")
@@ -310,12 +311,21 @@ async def tenant_connections(tenant_id: int, allowed_env: set[str], *, project_i
         raw, connections = data.get('env'), data.get('connections', {})
         if not isinstance(raw, dict) or not isinstance(connections, dict):
             raise ValueError('invalid connection scope')
+        managed = ()
+        if scoped:
+            grants = data.get('managed_providers', [])
+            if (not isinstance(grants, list) or len(grants) > 128
+                    or any(not isinstance(pid, str) or not pid for pid in grants)
+                    or len(set(grants)) != len(grants)
+                    or (grants and (raw or connections))):
+                raise ValueError('invalid managed provider authorization')
+            managed = tuple(grants)
         return ({k: v for k, v in raw.items() if k in allowed_env and isinstance(v, str) and v},
-                {p: c for p, c in connections.items() if p in {'bedrock', 'antseed'} and isinstance(c, dict)})
+                {p: c for p, c in connections.items() if p in {'bedrock', 'antseed'} and isinstance(c, dict)}, managed)
     except (httpx.HTTPError, ValueError, AttributeError) as exc:
         if scoped or require_fresh:
             raise RouteUnavailable("Scoped credentials unavailable.") from exc
-        return {}, {}
+        return {}, {}, ()
 
 
 def activate_tenant_env(env: dict[str, str] | None) -> contextvars.Token:

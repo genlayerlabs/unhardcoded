@@ -33,7 +33,7 @@ def router(monkeypatch):
         "bedrock": {"access_key_id": "tenant-access", "secret_access_key": TOKEN,
                     "session_token": "tenant-session", "region": "eu-west-1"},
         "antseed": {"gateway_url": "https://buyer.invalid", "token": TOKEN},
-    }))
+    }, ()))
     monkeypatch.setattr(cp, "tenant_connections", credentials)
     host = LLMRouterHost(ROOT / "core/router.lua", ROOT / "config.live.lua", env={})
     host.init()
@@ -232,3 +232,31 @@ def test_store_failure_prevents_probe(router):
     host_store.reserve_connection_check.side_effect = RuntimeError()
     assert client.post(PATH.format("openai"), headers=SECRET).status_code == 503
     credentials.assert_not_awaited()
+
+
+@pytest.mark.parametrize("grants, reason", [
+    (("openai",), "ok"),
+    (("openai", "anthropic"), "unreachable"),
+    ((), "bad_credential"),
+])
+def test_scoped_check_obeys_managed_grants(router, monkeypatch, grants, reason):
+    client, host, credentials = router
+    monkeypatch.setenv("SAAS_SHARED_PROVIDERS", "openai")
+    host.set_env("OPENAI_API_KEY", TOKEN)
+    host.set_provider_relays({"openai": "https://relay.invalid/v1"})
+    credentials.return_value = ({}, {}, grants)
+    seen = []
+
+    def upstream(request):
+        seen.append(str(request.url))
+        assert request.headers["authorization"] == "Bearer " + TOKEN
+        return httpx.Response(200, json={"data": [{"id": "test"}]})
+
+    fake_http(monkeypatch, upstream)
+    result = client.post(PATH.format("openai"), headers=SECRET,
+                         params={"project_id": 8, "environment_id": 9}).json()
+
+    assert result["reason"] == reason
+    assert result["working"] is (reason == "ok")
+    assert seen == (["https://relay.invalid/v1/models"] if reason == "ok" else [])
+    credentials.assert_awaited_once()

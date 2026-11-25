@@ -139,7 +139,7 @@ async def test_preview_and_test_route_return_provider_order_and_follow_it(automa
 
     async def credentials(*args, **kwargs):
         return {"OPENAI_API_KEY": "test", "ANTHROPIC_API_KEY": "test",
-                "OPENROUTER_API_KEY": "test"}, {}
+                "OPENROUTER_API_KEY": "test"}, {}, ()
 
     monkeypatch.setattr(cp, "tenant_connections", credentials)
     monkeypatch.setattr(policy_selection, "JevDecisionProvider", lambda *a, **kw: Choose())
@@ -210,7 +210,7 @@ async def test_both_api_surfaces_use_the_same_authorized_selection(automatic_hos
     monkeypatch.setattr(cp, "CONTROL_PLANE_INTERNAL_SECRET", "secret")
     async def credentials(*args, **kwargs):
         return {"OPENAI_API_KEY": "tenant-openai", "ANTHROPIC_API_KEY": "tenant-anthropic",
-                "OPENROUTER_API_KEY": "tenant-openrouter"}, {}
+                "OPENROUTER_API_KEY": "tenant-openrouter"}, {}, ()
     monkeypatch.setattr(cp, "tenant_connections", credentials)
     provider = Choose()
     def factory(key, **kwargs):
