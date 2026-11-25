@@ -67,8 +67,9 @@ class _StreamResp:
     status_code = 200
     headers = {"content-type": "text/event-stream"}
 
-    def __init__(self, cost=0.03, fail_mid_stream=False):
+    def __init__(self, cost=0.03, fail_mid_stream=False, cost_basis=None):
         self.cost, self.fail = cost, fail_mid_stream
+        self.cost_basis = cost_basis
         self.closed = False
 
     async def aiter_raw(self):
@@ -76,7 +77,8 @@ class _StreamResp:
         if self.fail:
             raise httpx.ReadError("upstream reset")
         yield ('data: ' + json.dumps({"usage": {"prompt_tokens": 1, "completion_tokens": 1},
-                                      "x_router": {"cost_usd": self.cost}}) + "\n\n").encode()
+                                      "x_router": {"cost_usd": self.cost,
+                                                   "cost_basis": self.cost_basis}}) + "\n\n").encode()
         yield b"data: [DONE]\n\n"
 
     async def aclose(self):
@@ -320,11 +322,14 @@ def test_reservation_released_when_request_building_raises(monkeypatch):
 def test_streaming_settles_after_stream_with_streamed_cost(monkeypatch):
     require_host_store()
     _saas(monkeypatch, limits={"monthly_budget_usd": "1", "rate_per_min": None, "burst": None},
-          upstream=_Upstream(lambda: _StreamResp(cost=0.03)))
+          upstream=_Upstream(lambda: _StreamResp(cost=0.03, cost_basis="reported")))
     r = _post(TestClient(auth_proxy.app))
     assert r.status_code == 200 and b"[DONE]" in r.content
     assert _live_reservations() == 0
     assert _budget()["spent_usd"] == pytest.approx(0.03)
+    (row,) = host_store.usage_export("app-a", now=time.time() + 3600)["rows"]
+    assert row["cost_usd"] == pytest.approx(0.03)
+    assert row["cost_source"] == "reported"
 
 
 def test_streaming_upstream_failure_mid_stream_releases(monkeypatch):
@@ -574,7 +579,7 @@ def test_export_cursor_pages_in_id_order_with_watermark(monkeypatch):
     row = page["rows"][0]
     assert set(row) == {"id", "ts", "key_sha256", "subject", "route", "model_family", "provider",
                         "status", "tokens_in", "tokens_out", "tokens_cached", "tokens_total",
-                        "cost_usd", "cost_basis"}
+                        "cost_usd", "cost_basis", "cost_source"}
     assert row["key_sha256"] == "a" * 64 and row["subject"] == "g:7" and row["route"] == "route:production"
     # The third scoped row (ts now-60) is not delivered yet, so the watermark
     # cannot pass it even though the lag is zero.
@@ -869,13 +874,15 @@ def test_route_outcome_queue_drops_overflow(monkeypatch):
     assert pending.qsize() == 1
 
 
-def test_route_outcomes_for_responses_stream(monkeypatch, host_store_clean):
+def test_route_outcomes_and_usage_for_responses_stream(monkeypatch, host_store_clean):
     class ResponsesStream(_StreamResp):
         async def aiter_raw(self):
             for event in (
                 {"type": "response.created", "response": {"status": "in_progress"}},
                 {"type": "response.completed", "response": {
-                    "x_router": {"decision_trace": {"decision_path": [
+                    "usage": {"input_tokens": 2, "output_tokens": 3},
+                    "x_router": {"cost_usd": 0.02, "cost_basis": "reported",
+                                 "decision_trace": {"decision_path": [
                         {"event": "attempted", "attempt": 1, "error_kind": "rate_limit"},
                         {"event": "attempted", "attempt": 2},
                     ]}},
@@ -893,3 +900,6 @@ def test_route_outcomes_for_responses_stream(monkeypatch, host_store_clean):
     assert (row["calls"], row["successes"], row["fallbacks"]) == (1, 1, 0)
     assert sum(row["first_token_ms"]) == 0
     assert sum(row["full_answer_ms"]) == 1
+    (usage,) = host_store.usage_export("app-a", now=time.time() + 3600)["rows"]
+    assert (usage["tokens_in"], usage["tokens_out"]) == (2, 3)
+    assert (usage["cost_usd"], usage["cost_source"]) == (0.02, "reported")
