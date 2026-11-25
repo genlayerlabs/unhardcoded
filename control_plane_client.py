@@ -285,12 +285,13 @@ async def tenant_env(tenant_id: int) -> dict[str, str]:
     return env
 
 
-async def tenant_connections(tenant_id: int, allowed_env: set[str], *, project_id=None, environment_id=None) -> tuple[dict, dict]:
+async def tenant_connections(tenant_id: int, allowed_env: set[str], *, project_id=None,
+                             environment_id=None, require_fresh=False) -> tuple[dict, dict]:
     """Fresh closed credential scope and encrypted structured BYO connections.
     The loaded catalog, not a second hardcoded list, declares credential names.
     An unavailable control plane grants nothing; no stale authorization."""
     if not enabled():
-        if project_id is not None or environment_id is not None:
+        if require_fresh or project_id is not None or environment_id is not None:
             raise RouteUnavailable("Scoped credentials unavailable.")
         return {}, {}
     scoped = project_id is not None or environment_id is not None
@@ -312,7 +313,7 @@ async def tenant_connections(tenant_id: int, allowed_env: set[str], *, project_i
         return ({k: v for k, v in raw.items() if k in allowed_env and isinstance(v, str) and v},
                 {p: c for p, c in connections.items() if p in {'bedrock', 'antseed'} and isinstance(c, dict)})
     except (httpx.HTTPError, ValueError, AttributeError) as exc:
-        if scoped:
+        if scoped or require_fresh:
             raise RouteUnavailable("Scoped credentials unavailable.") from exc
         return {}, {}
 

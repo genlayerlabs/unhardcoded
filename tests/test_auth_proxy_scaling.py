@@ -310,3 +310,16 @@ def test_tenant_allowance_only_checks_store_when_configured(
     else:
         assert response.status_code == 200
         assert len(upstream.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_connection_check_limit_is_atomic_across_database_sessions(host_store_clean):
+    reserve = host_store_clean.reserve_connection_check
+    results = await asyncio.gather(*(asyncio.to_thread(reserve, 91, 12) for _ in range(4)))
+    assert results.count(True) == 1
+    assert await asyncio.to_thread(reserve, 92, 12)
+    with host_store_clean._get_pool().connection() as conn:
+        conn.execute("UPDATE connection_check_limits SET next_check = now() - interval '2 hours'")
+    assert await asyncio.to_thread(reserve, 91, 12)
+    with host_store_clean._get_pool().connection() as conn:
+        assert conn.execute("SELECT tenant_id FROM connection_check_limits").fetchall() == [(91,)]

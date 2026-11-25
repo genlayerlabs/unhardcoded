@@ -340,15 +340,10 @@ end
             "policy_id": hashlib.sha256(encoded.encode()).hexdigest(),
         }
 
-    def for_tenant(self, tenant_id: int, env: dict, managed_providers=(), connections=None, *, project_id=None, environment_id=None):
-        """A request-local engine: credential failures cannot disable other tenants.
-
-        Reuses the same engine, catalog files, live discovery and HTTP adapters.
-        Only the Lua runtime and credential set are isolated. No tenant VM cache
-        retains secrets after the request finishes.
-        """
+    def tenant_provider_config(self, catalog, tenant_id, env, managed_providers=(),
+                               connections=None, *, project_id=None, environment_id=None):
+        """Resolve the same tenant credential scope for traffic and diagnostics."""
         from provider_connections import auth_env, shared_provider_ids
-        catalog = self.catalog()
         managed = set(managed_providers).intersection(shared_provider_ids(catalog))
         scoped_env = dict(env)
         scoped_env.pop(_PROVIDER_FACT_MAX_AGE_ENV, None)
@@ -372,6 +367,21 @@ end
         byo_ids = configure(catalog, scoped_env, byo)
         allowed.update(byo_ids)
         managed.difference_update(byo_ids)
+        return scoped_env, allowed, managed
+
+    def for_tenant(self, tenant_id: int, env: dict, managed_providers=(), connections=None, *, project_id=None, environment_id=None):
+        """A request-local engine: credential failures cannot disable other tenants.
+
+        Reuses the same engine, catalog files, live discovery and HTTP adapters.
+        Only the Lua runtime and credential set are isolated. No tenant VM cache
+        retains secrets after the request finishes.
+        """
+        catalog = self.catalog()
+        byo = connections or {}
+        scoped_env, allowed, managed = self.tenant_provider_config(
+            catalog, tenant_id, env, managed_providers, byo,
+            project_id=project_id, environment_id=environment_id,
+        )
         child = type(self)(*self._source_paths, env=scoped_env, now_ms=self._now_ms,
                            call_provider_async=self._async_call_hook,
                            call_provider=self._call_hook, discover=self._discover_hook,

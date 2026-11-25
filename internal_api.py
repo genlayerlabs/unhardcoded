@@ -51,6 +51,10 @@ import host_store
 router = APIRouter()
 fact_router = APIRouter()
 
+CONNECTION_CHECK_PATH = "/internal/tenants/{tenant_id}/provider-connections/{provider_id}/check"
+_CONNECTION_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+_POSITIVE_ID = re.compile(r"[1-9][0-9]{0,17}")
+
 _RECENT_LIMIT_MAX = 500
 _EXPORT_LIMIT_MAX = 5000
 _BUDGET_SUBJECTS_MAX = 500
@@ -137,6 +141,31 @@ def _scope(project_id: int | None, environment_id: int | None) -> dict | None:
     if project_id is None or environment_id is None or min(project_id, environment_id) <= 0:
         return None
     return {"project_id": project_id, "environment_id": environment_id}
+
+
+def connection_check_scope(request: Request, tenant_id: str, provider_id: str) -> dict | None:
+    if not _POSITIVE_ID.fullmatch(tenant_id) or not _CONNECTION_ID.fullmatch(provider_id):
+        return None
+    scope = {}
+    for name in ("project_id", "environment_id"):
+        values = request.query_params.getlist(name)
+        if values:
+            if len(values) != 1 or not _POSITIVE_ID.fullmatch(values[0]):
+                return None
+            scope[name] = int(values[0])
+    return scope if len(scope) in (0, 2) else None
+
+
+@router.post(CONNECTION_CHECK_PATH)
+async def internal_connection_check(request: Request, tenant_id: str, provider_id: str):
+    denied = _gate(request)
+    if denied is not None:
+        return denied
+    scope = connection_check_scope(request, tenant_id, provider_id)
+    if scope is None:
+        return JSONResponse({"error": "invalid_connection_check"}, status_code=400)
+    forward = request.app.state.forward_connection_check
+    return await forward(tenant_id, provider_id, scope)
 
 
 @router.get("/internal/usage")
