@@ -45,6 +45,17 @@ def test_dashboard_issued_digest_resolves_without_local_key(host_store_clean):
         auth_proxy.CALLER_KEY_HASHES.update(old_hashes)
 
 
+def test_provider_relay_updates_are_per_provider_and_reads_follow_catalog(host_store_clean):
+    store = host_store_clean
+    store.set_provider_relay("first", "http://relay.internal/v1")
+    store.set_provider_relay("second", "https://relay.example/v1")
+    store.set_provider_relay("first", "https://new-relay.example/v1")
+    assert store.get_provider_relays(["first"]) == {"first": "https://new-relay.example/v1"}
+    store.set_provider_relay("first", None)
+    store.set_provider_relay("first", None)
+    assert store.get_provider_relays(["first", "second"]) == {"second": "https://relay.example/v1"}
+
+
 @pytest.mark.asyncio
 async def test_capacity_queue_is_bounded_and_releases(monkeypatch):
     monkeypatch.setattr(auth_proxy, "MAX_PENDING_REQUESTS", 1)

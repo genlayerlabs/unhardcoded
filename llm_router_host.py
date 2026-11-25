@@ -21,6 +21,7 @@ import os
 import time
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 import host_store
 from provider_facts import ProviderFacts
@@ -91,6 +92,18 @@ _AUTH_UNCONFIGURED = "auth_unconfigured"
 # Host-side backstop for the engine's per-execution cap (core DEFAULTS).
 _MAX_PROVIDER_ATTEMPTS = 32
 _SECRET_PLACEHOLDERS = {"", "CHANGE_ME", "TODO", "TODO_CHANGE_ME", "PLACEHOLDER"}
+_RELAY_API_KINDS = frozenset({"openai_compatible", "anthropic", "google"})
+
+
+def _supports_relay(provider) -> bool:
+    if (provider.discovery != "static" or provider.api_kind not in _RELAY_API_KINDS
+            or not isinstance(provider.base_url, str)):
+        return False
+    try:
+        url = urlsplit(provider.base_url)
+        return url.scheme in {"http", "https"} and bool(url.hostname)
+    except ValueError:
+        return False
 
 
 def _operator_local(provider: dict) -> bool:
@@ -175,6 +188,7 @@ class LLMRouterHost:
         self._now_ms: Clock = now_ms or (lambda: int(time.time() * 1000))
         self._logger: Logger = logger or _noop_logger
         self._mock_responses: dict[tuple[str, str], dict] = {}
+        self._provider_relays: dict[str, str] = {}
         self.log_records: list[tuple[str, str, dict]] = []
 
         # Install host table BEFORE loading router (router.init logs to host.log).
@@ -374,6 +388,7 @@ end
         child._tenant_connections = byo
         child._tenant_offers = {}
         child._mock_responses = self._mock_responses
+        child._provider_relays = self._provider_relays
         child.init()
         # Copy model observations only; operator credential health is unrelated.
         state = child.dump_state()
@@ -766,7 +781,8 @@ end
             req[key] = _to_py(provider[key])
         offer = req.get("offer")
         req["base_url"] = ((offer.get("seller_endpoint") if isinstance(offer, dict) else None)
-                           if provider.discovery == "marketplace" else None) or provider.base_url
+                           if provider.discovery == "marketplace"
+                           else self._provider_relays.get(req["provider_id"])) or provider.base_url
         return req
 
     async def _resolve_call_async(self, request: dict, call_override=None,
@@ -898,6 +914,13 @@ end
     def catalog(self) -> dict:
         """The loaded config as plain Python (providers/models/profiles)."""
         return _to_py(self.config) or {}
+
+    def relay_provider_ids(self) -> list[str]:
+        return [pid for pid, provider in self.config.providers.items() if _supports_relay(provider)]
+
+    def set_provider_relays(self, relays: dict[str, str]) -> None:
+        # Replace the snapshot so request-local hosts can share it without copying.
+        self._provider_relays = relays
 
     def set_async_call_hook(self, hook: "AsyncCallProviderHook | None") -> None:
         """Replace the async provider-call hook (e.g. once provider rules

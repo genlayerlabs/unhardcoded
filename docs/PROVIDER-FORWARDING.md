@@ -30,3 +30,23 @@ own upstream connection.
 This configuration applies to static HTTP endpoints. Marketplace offers can
 supply their own seller endpoints, and adapters with fixed destinations have
 their own configuration.
+
+## Override an endpoint at runtime
+
+Send `PUT /x/providers/{provider_id}/relay` to the router's private admin
+interface using its normal admin authentication (`x-internal-secret` when
+configured). Set the override with `{"base_url":"http://relay.internal:8080/v1"}`
+or clear it with `{"base_url":null}` to restore the Lua catalog URL. The URL
+accepts HTTP or HTTPS and an optional API prefix. User information, query
+strings, and fragments are rejected.
+
+This operation applies to existing static OpenAI-compatible, Anthropic, and
+Google HTTP providers. It changes the destination for calls using the provider,
+including calls with scoped credentials. The adapter still supplies its normal
+credentials and request format. Use a relay authorized to receive those calls.
+
+A successful update is committed to the shared router database. Each replica
+loads the overrides at startup and refreshes them every five seconds after its
+last read. A failed refresh keeps the last successful snapshot. A replica
+starting with the database unavailable uses its catalog endpoints until it can
+read the overrides. A failed write returns HTTP 503.

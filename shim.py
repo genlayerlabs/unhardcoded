@@ -36,6 +36,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -51,6 +52,20 @@ from policy_templates import (
 )
 
 _log = logging.getLogger("unhardcoded.shim")
+_PROVIDER_RELAY_REFRESH_S = 5
+
+
+def _valid_relay_url(value: Any) -> bool:
+    if (not isinstance(value, str) or not 0 < len(value) <= 2048
+            or re.search(r"[\s\x00-\x1f\x7f\\?#]", value)):
+        return False
+    try:
+        url = urlsplit(value)
+        return (url.scheme in {"http", "https"} and bool(url.hostname)
+                and not any(c in url.netloc for c in "@%")
+                and (url.port is None or url.port > 0))
+    except ValueError:
+        return False
 
 
 # Profile name used when nothing else can be inferred. Replaced via
@@ -329,17 +344,31 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     facts = getattr(host, "provider_facts", None)
     host = ScopedHost(host)
 
+    async def refresh_provider_relays():
+        try:
+            relays = await asyncio.to_thread(host_store.get_provider_relays, host.relay_provider_ids())
+        except Exception as exc:
+            _log.warning("provider relay refresh failed (%s)", type(exc).__name__)
+            return
+        host.set_provider_relays({pid: url for pid, url in relays.items() if _valid_relay_url(url)})
+
+    async def poll_provider_relays():
+        while True:
+            await asyncio.sleep(_PROVIDER_RELAY_REFRESH_S)
+            await refresh_provider_relays()
+
     @asynccontextmanager
     async def lifespan(_app):
-        if facts is None:
-            yield
-            return
-        task = asyncio.create_task(facts.run())
+        await refresh_provider_relays()
+        tasks = [asyncio.create_task(poll_provider_relays())]
+        if facts is not None:
+            tasks.append(asyncio.create_task(facts.run()))
         try:
             yield
         finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     app = FastAPI(title="llm-router shim", docs_url=None, redoc_url=None,
                   openapi_url=None, lifespan=lifespan)
@@ -948,6 +977,26 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             }
             break
         return {"families": families, "wallet": wallet, "ts": int(time.time())}
+
+    @app.put("/x/providers/{provider_id}/relay")
+    def set_provider_relay(provider_id: str, body: dict):
+        """Persist an operator endpoint override for all router replicas."""
+        if provider_id not in host.relay_provider_ids():
+            return JSONResponse(status_code=404, content={"error": {
+                "message": "Provider does not support a runtime relay endpoint",
+                "type": "not_found", "code": "provider_relay_unsupported"}})
+        if set(body) != {"base_url"} or (body["base_url"] is not None and not _valid_relay_url(body["base_url"])):
+            return JSONResponse(status_code=400, content={"error": {
+                "message": "base_url must be an HTTP(S) origin and optional API prefix, or null",
+                "type": "invalid_request", "code": "provider_relay_invalid"}})
+        try:
+            host_store.set_provider_relay(provider_id, body["base_url"])
+        except Exception as exc:
+            _log.warning("provider relay update failed (%s)", type(exc).__name__)
+            return JSONResponse(status_code=503, content={"error": {
+                "message": "Provider relay settings are unavailable",
+                "type": "unavailable", "code": "provider_relay_store_unavailable"}})
+        return {"ok": True, "provider": provider_id, "overridden": body["base_url"] is not None}
 
     @app.post("/x/providers")
     def add_provider(body: dict):

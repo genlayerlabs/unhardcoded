@@ -192,6 +192,9 @@ _SCHEMA_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS provider_overlays (
         provider_id TEXT PRIMARY KEY, entry TEXT NOT NULL, added_at BIGINT NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS provider_relays (
+        provider_id TEXT PRIMARY KEY, base_url TEXT NOT NULL
+    )""",
     """CREATE TABLE IF NOT EXISTS consumer_keys (
         consumer TEXT PRIMARY KEY, record TEXT NOT NULL, updated_at BIGINT NOT NULL
     )""",
@@ -857,6 +860,30 @@ def set_overrides(overrides: dict[str, Any]) -> bool:
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store set_overrides failed: %s", exc)
         return False
+
+
+# ---- provider relays ---------------------------------------------------------
+
+def get_provider_relays(provider_ids: list[str]) -> dict[str, str]:
+    if not provider_ids:
+        return {}
+    with _get_pool().connection() as conn:
+        return dict(conn.execute(
+            "SELECT provider_id, base_url FROM provider_relays WHERE provider_id = ANY(%s)",
+            (provider_ids,),
+        ).fetchall())
+
+
+def set_provider_relay(provider_id: str, base_url: str | None) -> None:
+    with _get_pool().connection() as conn:
+        if base_url is None:
+            conn.execute("DELETE FROM provider_relays WHERE provider_id = %s", (provider_id,))
+        else:
+            conn.execute(
+                "INSERT INTO provider_relays(provider_id, base_url) VALUES (%s, %s)"
+                " ON CONFLICT (provider_id) DO UPDATE SET base_url = EXCLUDED.base_url",
+                (provider_id, base_url),
+            )
 
 
 # ---- provider facts ----------------------------------------------------------
@@ -2844,7 +2871,7 @@ def truncate_all_for_tests() -> None:
     _route_outcome_q.join()
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, ingress_refusals, route_outcome_hours, settings_overrides, provider_overlays,"
-                     " provider_facts,"
+                     " provider_facts, provider_relays,"
                      " consumer_keys, consumer_key_digests, consumer_rate_buckets,"
                      " peer_concurrency_leases,"
                      " consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
