@@ -53,6 +53,8 @@ from provider_adapters.openai_compatible import (
 import lupa
 from lupa import LuaRuntime
 
+_PROVIDER_FACT_MAX_AGE_ENV = "ROUTER_PROVIDER_FACT_MAX_AGE_S"
+
 __all__ = [
     "LLMRouterHost",
     "FlowAdmissionError",
@@ -217,6 +219,58 @@ function(cfg)
 end
 """)(self.config)
 
+        # Routing and flow admission share this runtime-local schema factory.
+        # Resolve fact names without registering them from storage or retaining
+        # arbitrary names supplied by policy authors.
+        self.lua.eval("""
+function(fields, providers_with_fact)
+    local build_schema = fields.schema
+    local snapshots = setmetatable({}, { __mode = "k" })
+    fields.schema = function(opts)
+        local schema = build_schema(opts)
+        for name in pairs(schema.decls) do
+            if name:sub(1, 5) == "fact:" then
+                error("fields: fact: is reserved for provider facts")
+            end
+        end
+        setmetatable(schema.decls, {
+            __index = function(_, field)
+                if type(field) ~= "string" or field:sub(1, 5) ~= "fact:" then return nil end
+                local name = field:sub(6)
+                -- Keep the name grammar aligned with the internal API.
+                if #name > 64 or not name:match("^[A-Za-z0-9_][A-Za-z0-9_.%-]*$") then
+                    return nil
+                end
+                return { sort = "Bool", default = false, source = "host", get = function(c, ctx)
+                    if not c.provider_id or not ctx or not ctx.now_ms then return false end
+                    local snapshot = snapshots[ctx]
+                    if not snapshot then
+                        snapshot = {}
+                        snapshots[ctx] = snapshot
+                    end
+                    if not snapshot[name] then
+                        snapshot[name] = providers_with_fact(name, ctx.now_ms)
+                    end
+                    return snapshot[name][c.provider_id] == true
+                end }
+            end,
+        })
+        return schema
+    end
+end
+""")(self.router.ir.fields, self._providers_with_fact)
+
+    def _providers_with_fact(self, name: str, now_ms: int):
+        try:
+            max_age_s = int(self._env.get(_PROVIDER_FACT_MAX_AGE_ENV, "300"))
+            if not 0 < max_age_s < 2**31:
+                raise ValueError("provider fact maximum age out of range")
+            providers = host_store.providers_with_fact(name, max_age_s * 1000, now_ms)
+        except Exception:
+            self._logger("warn", "provider_facts_unavailable", {})
+            providers = []
+        return self.lua.table_from({provider_id: True for provider_id in providers})
+
     # ---- public API -----------------------------------------------------
 
     def init(self) -> None:
@@ -291,6 +345,9 @@ end
         catalog = self.catalog()
         managed = set(managed_providers).intersection(shared_provider_ids(catalog))
         scoped_env = dict(env)
+        scoped_env.pop(_PROVIDER_FACT_MAX_AGE_ENV, None)
+        if _PROVIDER_FACT_MAX_AGE_ENV in self._env:
+            scoped_env[_PROVIDER_FACT_MAX_AGE_ENV] = self._env[_PROVIDER_FACT_MAX_AGE_ENV]
         scoped_env['SAAS_TENANT_SCOPE'] = str(tenant_id)
         if environment_id is not None:
             scoped_env['SAAS_TENANT_SCOPE'] = f"{tenant_id}:{project_id}:{environment_id}"

@@ -1,4 +1,4 @@
-"""Internal metering API for an external control plane.
+"""Internal API for an external control plane.
 
 Served by the ingress, gated by the same shared secret the control-plane
 client sends outbound (`x-internal-secret`); see control_plane_client for the
@@ -11,6 +11,9 @@ the surface does not exist on operator-only deployments.
   GET /internal/usage/refusals?tenant_id=<id>&since_ts=<hour>&until_ts=<hour>
   GET /internal/usage/export?caller=<slug>&after_id=<id>&limit=<n<=5000>
   GET /internal/budgets?tenant_id=<id>&period=YYYY-MM&subject=<g:N|k:N>...
+
+  GET /internal/provider-facts/{provider_id}/{name}
+  PUT /internal/provider-facts/{provider_id}/{name}
 
 The usage endpoints accept project_id+environment_id (both, positive) and then
 filter by the recorded routing scope BEFORE aggregating or paging. Windows are
@@ -29,6 +32,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 import control_plane_client
 import host_store
@@ -49,6 +53,65 @@ def _gate(request: Request) -> JSONResponse | None:
     if not control_plane_client.internal_secret_ok(request.headers):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     return None
+
+
+# Keep the name grammar aligned with the Lua policy field resolver.
+_FACT_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
+_PROVIDER_ID = re.compile(r"[^\s\x00]{1,256}")
+_FACT_PATH = "/internal/provider-facts/{provider_id}/{name}"
+
+
+class _FactObservation(BaseModel):
+    value: bool = Field(strict=True)
+    observed_at_ms: int = Field(strict=True, ge=0)
+    detail: Any = None
+
+
+def _fact_gate(request: Request, provider_id: str, name: str) -> JSONResponse | None:
+    denied = _gate(request)
+    if denied is not None:
+        return denied
+    if not _PROVIDER_ID.fullmatch(provider_id) or not _FACT_NAME.fullmatch(name):
+        return JSONResponse({"error": "invalid_provider_or_fact_name"}, status_code=400)
+    return None
+
+
+@router.get(_FACT_PATH)
+async def internal_get_provider_fact(request: Request, provider_id: str, name: str) -> JSONResponse:
+    denied = _fact_gate(request, provider_id, name)
+    if denied is not None:
+        return denied
+    try:
+        row = await asyncio.to_thread(host_store.get_provider_fact, provider_id, name)
+    except Exception:
+        return JSONResponse({"error": "provider_fact_store_unavailable"}, status_code=503)
+    if row is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return JSONResponse(row)
+
+
+@router.put(_FACT_PATH)
+async def internal_put_provider_fact(request: Request, provider_id: str, name: str) -> JSONResponse:
+    denied = _fact_gate(request, provider_id, name)
+    if denied is not None:
+        return denied
+    try:
+        observation = _FactObservation.model_validate_json(await request.body())
+        if observation.observed_at_ms > int(time.time() * 1000):
+            return JSONResponse({"error": "invalid_observation"}, status_code=400)
+        response = JSONResponse({"provider_id": provider_id, "name": name, **observation.model_dump()})
+    except ValueError:
+        return JSONResponse({"error": "invalid_observation"}, status_code=400)
+    try:
+        saved = await asyncio.to_thread(
+            host_store.upsert_provider_fact, provider_id, name, observation.value,
+            observation.observed_at_ms, observation.detail,
+        )
+    except Exception:
+        return JSONResponse({"error": "provider_fact_store_unavailable"}, status_code=503)
+    if not saved:
+        return JSONResponse({"error": "older_observation"}, status_code=409)
+    return response
 
 
 def _scope(project_id: int | None, environment_id: int | None) -> dict | None:

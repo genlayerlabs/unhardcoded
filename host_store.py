@@ -41,6 +41,7 @@ import time
 from typing import Any
 
 from psycopg.rows import dict_row
+from psycopg.types.json import Json
 from psycopg_pool import ConnectionPool
 
 _log = logging.getLogger("unhardcoded.host_store")
@@ -161,6 +162,14 @@ _SCHEMA_STATEMENTS = [
     "ALTER TABLE route_observations ADD COLUMN IF NOT EXISTS tool_calls_emitted BOOLEAN",
     """CREATE TABLE IF NOT EXISTS settings_overrides (
         key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at BIGINT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS provider_facts (
+        name TEXT NOT NULL,
+        provider_id TEXT NOT NULL,
+        value BOOLEAN NOT NULL,
+        observed_at_ms BIGINT NOT NULL CHECK (observed_at_ms >= 0),
+        detail JSON,
+        PRIMARY KEY (name, provider_id)
     )""",
     """CREATE TABLE IF NOT EXISTS provider_overlays (
         provider_id TEXT PRIMARY KEY, entry TEXT NOT NULL, added_at BIGINT NOT NULL
@@ -766,6 +775,44 @@ def set_overrides(overrides: dict[str, Any]) -> bool:
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store set_overrides failed: %s", exc)
         return False
+
+
+# ---- provider facts ----------------------------------------------------------
+
+def get_provider_fact(provider_id: str, name: str) -> dict[str, Any] | None:
+    with _get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            return cur.execute(
+                """SELECT provider_id, name, value, observed_at_ms, detail
+                   FROM provider_facts WHERE name = %s AND provider_id = %s""",
+                (name, provider_id),
+            ).fetchone()
+
+
+def upsert_provider_fact(provider_id: str, name: str, value: bool,
+                         observed_at_ms: int, detail: Any = None) -> bool:
+    """An older observation cannot replace a newer one."""
+    with _get_pool().connection() as conn:
+        return conn.execute(
+            """INSERT INTO provider_facts (name, provider_id, value, observed_at_ms, detail)
+               VALUES (%s, %s, %s, %s, %s)
+               ON CONFLICT (name, provider_id) DO UPDATE SET
+                   value = EXCLUDED.value,
+                   observed_at_ms = EXCLUDED.observed_at_ms,
+                   detail = EXCLUDED.detail
+               WHERE provider_facts.observed_at_ms <= EXCLUDED.observed_at_ms""",
+            (name, provider_id, value, observed_at_ms, Json(detail)),
+        ).rowcount == 1
+
+
+def providers_with_fact(name: str, max_age_ms: int, now_ms: int) -> list[str]:
+    with _get_pool().connection() as conn:
+        rows = conn.execute(
+            """SELECT provider_id FROM provider_facts
+               WHERE name = %s AND value AND observed_at_ms BETWEEN %s AND %s""",
+            (name, now_ms - max_age_ms, now_ms),
+        ).fetchall()
+    return [provider_id for (provider_id,) in rows]
 
 
 # ---- provider_overlays (durable operator state) --------------------------------
@@ -2713,6 +2760,7 @@ def truncate_all_for_tests() -> None:
     _refusal_q.join()
     with _get_pool().connection() as conn:
         conn.execute("TRUNCATE calls, ingress_refusals, settings_overrides, provider_overlays,"
+                     " provider_facts,"
                      " consumer_keys, consumer_key_digests, consumer_rate_buckets,"
                      " peer_concurrency_leases,"
                      " consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
