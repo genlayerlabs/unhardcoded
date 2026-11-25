@@ -11,6 +11,7 @@ Run from repo root:
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,63 @@ def host():
 def client(host):
     app = create_app(host, default_profile="default")
     return TestClient(app)
+
+
+def test_provider_relay_updates_running_replicas(host_store_clean, host, monkeypatch):
+    import control_plane_client
+    import shim
+
+    monkeypatch.setattr(control_plane_client, "CONTROL_PLANE_INTERNAL_SECRET", "operator-test")
+    monkeypatch.setattr(shim, "_PROVIDER_RELAY_REFRESH_S", 0.02)
+    other = LLMRouterHost(
+        router_path=ROOT / "core" / "router.lua",
+        config_path=ROOT / "core" / "config.example.lua",
+        metrics_path=ROOT / "core" / "metrics.example.lua",
+        env={"COMPUT3_API_KEY": "provider-test"},
+    )
+    other.init()
+    calls = []
+
+    async def call_provider(request):
+        calls.append(request)
+        return _ok_response()
+
+    other.set_async_call_hook(call_provider)
+    path = "/x/providers/comput3/relay"
+    headers = {"x-internal-secret": "operator-test"}
+    relay_url = "http://relay.internal:8080/api/v1"
+    catalog_url = host.catalog()["providers"]["comput3"]["base_url"]
+
+    def wait_for_url(expected):
+        for replica in (host, other):
+            deadline = time.monotonic() + 3
+            while replica._pin_route({"provider_id": "comput3"})["base_url"] != expected:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+
+    with TestClient(create_app(host)) as writer, TestClient(create_app(other)) as reader:
+        assert writer.put(path, json={"base_url": relay_url}).status_code == 403
+        for invalid in ({}, {"base_url": "ftp://relay/path"}, {"base_url": "https://user@relay"},
+                        {"base_url": "https://relay/path?q=x"}, {"base_url": "https://relay:bad"}):
+            assert writer.put(path, json=invalid, headers=headers).status_code == 400
+        for provider_id in ("missing", "antseed"):
+            assert writer.put(f"/x/providers/{provider_id}/relay", json={"base_url": relay_url},
+                              headers=headers).status_code == 404
+        response = writer.put(path, json={"base_url": relay_url}, headers=headers)
+        assert response.json() == {"ok": True, "provider": "comput3", "overridden": True}
+        wait_for_url(relay_url)
+        response = reader.post("/v1/chat/completions", json={
+            "model": "pin:comput3/deepseek-v3",
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+        assert response.status_code == 200, response.text
+        assert [(call["base_url"], call["api_kind"], call["served_model_id"], call["auth_env"])
+                for call in calls] == [
+            (relay_url, "openai_compatible", "deepseek-chat", "COMPUT3_API_KEY"),
+        ]
+        assert other.catalog()["providers"]["comput3"]["base_url"] == catalog_url
+        assert writer.put(path, json={"base_url": None}, headers=headers).json()["overridden"] is False
+        wait_for_url(catalog_url)
 
 
 # ---- liveness / introspection ------------------------------------------
