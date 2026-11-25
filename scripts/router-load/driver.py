@@ -44,7 +44,7 @@ def percentiles(values):
     } if ordered else None
 
 
-async def load(base_url, duration, concurrency, latency_ms):
+async def load(base_url, duration, concurrency, latency_ms, rate):
     import httpx
 
     mix = cycle(MIX)
@@ -57,8 +57,13 @@ async def load(base_url, duration, concurrency, latency_ms):
     ) as client:
         start = time.perf_counter()
 
-        async def worker():
-            while time.perf_counter() < start + duration:
+        async def worker(index):
+            interval = concurrency / rate
+            scheduled = start + index / rate
+            while scheduled < start + duration:
+                await asyncio.sleep(max(0, scheduled - time.perf_counter()))
+                if time.perf_counter() >= start + duration:
+                    break
                 name, stream = next(mix)
                 headers = {"Authorization": f"Bearer {KEYS[name]}"}
                 body = {
@@ -96,8 +101,13 @@ async def load(base_url, duration, concurrency, latency_ms):
                     overhead.append(max(0, (time.perf_counter() - sent) * 1000 - latency_ms))
                     if stream:
                         first_tokens.append(first_token)
+                # Skip missed slots instead of sending a burst to catch up.
+                scheduled += interval
+                now = time.perf_counter()
+                if scheduled < now:
+                    scheduled += math.ceil((now - scheduled) / interval) * interval
 
-        await asyncio.gather(*(worker() for _ in range(concurrency)))
+        await asyncio.gather(*(worker(index) for index in range(concurrency)))
         elapsed = time.perf_counter() - start
     total = sum(statuses.values(), Counter())
     requests = total.total()
@@ -132,5 +142,8 @@ if __name__ == "__main__":
         parser.add_argument("duration", type=float)
         parser.add_argument("concurrency", type=int)
         parser.add_argument("latency_ms", type=float)
+        parser.add_argument("rate", type=float)
         args = parser.parse_args()
-        print(json.dumps(asyncio.run(load(args.base_url, args.duration, args.concurrency, args.latency_ms))))
+        print(json.dumps(asyncio.run(load(
+            args.base_url, args.duration, args.concurrency, args.latency_ms, args.rate,
+        ))))

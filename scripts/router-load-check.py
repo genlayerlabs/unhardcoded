@@ -87,7 +87,7 @@ def benchmark(image, harness, args):
     def drive(seconds):
         return json.loads(compose(
             "run", "--rm", "-T", "--no-deps", "driver",
-            str(seconds), str(args.concurrency), str(args.latency_ms),
+            str(seconds), str(args.concurrency), str(args.latency_ms), str(args.rate),
             timeout=seconds + 30,
         ))
 
@@ -95,7 +95,7 @@ def benchmark(image, harness, args):
         print(f"Starting {image}", file=sys.stderr)
         compose("up", "-d", "--wait", "--wait-timeout", "75", timeout=90)
         compose("exec", "-T", "replica-a", "python", "/load/driver.py", "seed")
-        warmup = drive(5)
+        warmup = drive(10)
         if not valid_workload(warmup):
             raise RuntimeError(f"unexpected warmup responses: {warmup['statuses_by_key']}")
         time.sleep(1)
@@ -166,13 +166,16 @@ def main():
     parser.add_argument("baseline", help="local router image tag")
     parser.add_argument("--compare", metavar="IMAGE", help="local candidate image tag")
     parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--duration", type=float, default=30, help="measurement seconds per image")
+    parser.add_argument("--duration", type=float, default=45, help="measurement seconds per image")
+    parser.add_argument("--rate", type=float, default=80, help="target requests per second")
     parser.add_argument("--latency-ms", type=float, default=40)
     parser.add_argument("--margin-pct", type=float, default=30)
     args = parser.parse_args()
-    if (args.concurrency < 1 or args.duration < 1 or args.latency_ms < 0 or args.margin_pct < 0
-            or not all(map(math.isfinite, (args.duration, args.latency_ms, args.margin_pct)))):
-        parser.error("concurrency and duration must be at least 1, with finite nonnegative latency and margin")
+    if (args.concurrency < 1 or args.duration < 1 or args.rate <= 0
+            or args.latency_ms < 0 or args.margin_pct < 0
+            or not all(map(math.isfinite, (args.duration, args.rate, args.latency_ms, args.margin_pct)))):
+        parser.error("use finite settings with concurrency and duration at least 1, a positive rate, "
+                     "and nonnegative latency and margin")
 
     images = [args.baseline]
     if args.compare:
@@ -189,6 +192,7 @@ def main():
     print_table(results)
     print(json.dumps({
         "settings": {"duration_seconds": args.duration, "concurrency": args.concurrency,
+                     "target_requests_per_second": args.rate,
                      "upstream_latency_ms": args.latency_ms, "margin_pct": args.margin_pct},
         "runs": results, "invalid_workloads": invalid, "regressions": regressions,
     }, indent=2))
