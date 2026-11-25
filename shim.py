@@ -37,7 +37,7 @@ import uuid
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 import control_plane_client
@@ -1203,11 +1203,44 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         # Tenant context is established and verified once by SaaS middleware.
         pass
 
+    async def _until_disconnect(request: Request, handler, *args, **kwargs):
+        if not getattr(host, "_esla_routes", None):
+            return await handler(*args, **kwargs)
+
+        async def disconnected():
+            while (await request.receive())["type"] != "http.disconnect":
+                pass
+
+        # The body has been parsed. Watch for a disconnect until the response
+        # is ready, then let StreamingResponse own the receive channel.
+        task = asyncio.create_task(handler(*args, **kwargs))
+        watcher = asyncio.create_task(disconnected())
+        try:
+            done, _ = await asyncio.wait({task, watcher}, return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                return task.result()
+            return Response(status_code=499)
+        finally:
+            watcher.cancel()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(watcher, task, return_exceptions=True)
+
+    async def _wait_for_stream(task, *signals, timeout=None):
+        try:
+            done, _ = await asyncio.wait({task, *signals}, timeout=timeout,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            return done
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+
     @app.post("/v1/chat/completions")
     async def chat_completions(req: ChatRequest, request: Request):
         _session_from_header(req, request)
         await _activate_tenant(request)
-        return await _handle_chat(req)
+        return await _until_disconnect(request, _handle_chat, req)
 
     @app.post("/v1/decisions")
     @app.post("/v1/systemone")
@@ -1263,7 +1296,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         """
         _session_from_header(req, request)
         await _activate_tenant(request)
-        return await _handle_chat(req, profile_name=profile_name)
+        return await _until_disconnect(request, _handle_chat, req, profile_name=profile_name)
 
     def _session_from_header(req: ChatRequest, request: Request) -> None:
         """Fallback the conversation id from the X-Unhardcoded-Session header when
@@ -1292,14 +1325,14 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     async def responses(req: ResponsesRequest, request: Request):
         _session_from_header(req, request)
         await _activate_tenant(request)
-        return await _handle_responses(req)
+        return await _until_disconnect(request, _handle_responses, req)
 
     @app.post("/{profile_name}/v1/responses")
     async def responses_profiled(profile_name: str, req: ResponsesRequest,
                                  request: Request):
         _session_from_header(req, request)
         await _activate_tenant(request)
-        return await _handle_responses(req, profile_name=profile_name)
+        return await _until_disconnect(request, _handle_responses, req, profile_name=profile_name)
 
     def _responses_object_with_router(result: dict, req: ResponsesRequest,
                                       response_id: str | None = None) -> dict:
@@ -1353,8 +1386,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         import responses_api as _rapi
         task = asyncio.create_task(
             _execute_with_deadline(host.execute_async(contract)))
-        done, _ = await asyncio.wait({task}, timeout=_EARLY_FAIL_S,
-                                     return_when=asyncio.FIRST_COMPLETED)
+        done = await _wait_for_stream(task, timeout=_EARLY_FAIL_S)
         if task in done:
             try:
                 result = task.result()
@@ -1433,8 +1465,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             # flow runs (flows have no token stream, so without this they sat
             # silent ~60s and the idle timeout cut them into an empty 200).
             task = asyncio.create_task(_execute_with_deadline(host.execute_flow_async(req.flow_ir, contract)))
-            done, _ = await asyncio.wait({task}, timeout=_EARLY_FAIL_S,
-                                         return_when=asyncio.FIRST_COMPLETED)
+            done = await _wait_for_stream(task, timeout=_EARLY_FAIL_S)
             if task in done:
                 try:
                     result = task.result()
@@ -1493,9 +1524,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         # error. Only a Σ_flow runs long enough (N routed nodes) to need the
         # heartbeat, so only it commits to SSE early.
         is_flow = bool(contract.get("flow_ir"))
-        wait_kwargs = ({"timeout": _EARLY_FAIL_S} if is_flow else {})
-        done, _ = await asyncio.wait({commit, task}, return_when=asyncio.FIRST_COMPLETED,
-                                     **wait_kwargs)
+        done = await _wait_for_stream(task, commit, timeout=_EARLY_FAIL_S if is_flow else None)
 
         # Committed (deltas flowing) -> stream. Still running past the flow's brief
         # grace window -> stream too (the SSE generator flushes a first byte at

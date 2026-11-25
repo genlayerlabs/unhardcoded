@@ -7,6 +7,7 @@ import time
 from typing import Any, Callable
 from urllib.parse import quote
 
+from esla_routing import upstream_url
 from provider_adapters.common import (
     AsyncCallProviderHook,
     StreamAcc,
@@ -188,7 +189,7 @@ def _google_request(
         "x-goog-api-key": token,
         **extra_headers,
     }
-    return url, body, headers
+    return upstream_url(request, url), body, headers
 
 
 async def stream_google(

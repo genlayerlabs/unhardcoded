@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+import esla_routing
 import host_store
 import route_reliability as _route_reliability
 from byo_http import is_byo_buyer
@@ -162,6 +163,7 @@ class LLMRouterHost:
         self._async_call_hook: AsyncCallProviderHook | None = call_provider_async
         self._discover_hook: DiscoverHook | None = discover
         self._env: dict[str, str] = env if env is not None else dict(os.environ)
+        self._esla_routes = esla_routing.load_routes(self._env.get("ESLA_ROUTES"))
         self._now_ms: Clock = now_ms or (lambda: int(time.time() * 1000))
         self._logger: Logger = logger or _noop_logger
         self._mock_responses: dict[tuple[str, str], dict] = {}
@@ -316,6 +318,7 @@ end
         # Include runtime-added providers/models, not just the initial files.
         child.config.providers = _to_lua(child.lua, catalog.get('providers') or {})
         child.config.models = _to_lua(child.lua, catalog.get('models') or {})
+        child._esla_routes = self._esla_routes
         child._tenant_id = tenant_id
         child._tenant_byo_auth = frozenset(key for key, value in env.items() if value)
         child._project_id = project_id
@@ -710,6 +713,7 @@ end
     def _pin_route(self, req: dict) -> dict:
         """Where a call goes and which credential it carries come from the
         catalog, never from the engine's (policy-transformed) request."""
+        req.pop("_esla_sidecar_url", None)
         provider = self.config.providers[req["provider_id"]] if req.get("provider_id") else None
         if provider is None:
             return req  # per-call extra candidate: no catalog row to pin to
@@ -722,18 +726,33 @@ end
 
     async def _resolve_call_async(self, request: dict, call_override=None,
                                   session: "str | None" = None) -> dict:
-        """Resolve one provider call for the async driver: mock first (so the
-        same set_mock_response works for sync and async), then a per-run
-        override, then the async hook, then the sync hook as a last resort."""
+        """Resolve, optionally sidecar-route, and record one provider attempt."""
         key = (request.get("provider_id"), request.get("model_family"))
         if key in self._mock_responses:
             result = self._mock_responses[key]
-        elif call_override is not None:
-            result = await call_override(request)
-        elif self._async_call_hook is not None:
-            result = await self._async_call_hook(request)
         else:
-            result = self._call_hook(request)
+            hook = call_override or self._async_call_hook
+            sidecar = self._esla_routes.get(key[0])
+            if sidecar is not None and (
+                hook is None
+                or request.get("api_kind") not in {"openai_compatible", "anthropic", "google"}
+                or request.get("protocol") == "decisions"
+                or (request.get("offer") or {}).get("seller_endpoint")
+                or is_byo_buyer(request, self._env.get)
+                or (self._tenant_id is not None
+                    and key[0] not in (self._tenant_managed or ()))
+            ):
+                result = _err("network_error", 0, 0,
+                              "ESLA route requires an operator-managed HTTP adapter and a fixed upstream")
+            elif hook is not None:
+                if sidecar is not None:
+                    request = {**request, "_esla_sidecar_url": sidecar}
+                try:
+                    result = await hook(request)
+                except esla_routing.InvalidUpstreamPath:
+                    result = _err("bad_request", 0, 0, "Invalid upstream path for ESLA route")
+            else:
+                result = self._call_hook(request)
         # Record the outcome here (not in the hook) so the streaming/override path —
         # all of opencode's traffic, and every flow node — writes a route
         # observation too, the host-owned perf the algebra reads (derived) and the
@@ -917,6 +936,8 @@ end
         model = py_req.get("model_family")
         if (provider, model) in self._mock_responses:
             resp = self._mock_responses[(provider, model)]
+        elif provider in self._esla_routes:
+            resp = _err("network_error", 0, 0, "ESLA routes require async execution")
         else:
             resp = self._call_hook(py_req)
         return _to_lua(self.lua, resp)

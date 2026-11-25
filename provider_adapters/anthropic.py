@@ -6,6 +6,7 @@ import os
 import time
 from typing import Any, Callable
 
+from esla_routing import upstream_url
 from provider_adapters.common import (
     CACHE_CONTROL,
     AsyncCallProviderHook,
@@ -173,7 +174,7 @@ def _anthropic_request(request: dict, token: str, extra_headers: dict) -> tuple[
         (request.get("base_url") or "https://api.anthropic.com/v1").rstrip("/")
         + "/messages"
     )
-    return url, body, headers
+    return upstream_url(request, url), body, headers
 
 
 async def stream_anthropic(

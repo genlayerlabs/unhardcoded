@@ -9,6 +9,7 @@ import uuid
 from contextlib import AsyncExitStack, suppress
 from typing import Awaitable, Callable, Any
 
+from esla_routing import upstream_url
 from provider_adapters.common import (
     CACHE_CONTROL,
     CallProviderHook,
@@ -192,7 +193,7 @@ def _prepare_openai_call(
     if peer_id:
         headers["x-antseed-pin-peer"] = peer_id
     timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
-    return (url, body, headers, timeout), None
+    return (upstream_url(request, url), body, headers, timeout), None
 
 
 def make_http_call_provider(

@@ -17,6 +17,8 @@ Standard OpenAI-compatible gateways. Put the key in the shim's process
 environment under the provider's `auth_env` name. Clients hitting the shim do
 **not** carry these keys.
 
+For providers with an agreement, see [ESLA routing](ESLA.md).
+
 ## AntSeed (local node, no auth)
 
 > ⚠️ **Spends real money on-chain.** The AntSeed provider pays peers in **real
