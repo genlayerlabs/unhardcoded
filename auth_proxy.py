@@ -2314,6 +2314,79 @@ async def _router_post_json(path: str, payload: dict) -> Response:
             "code": "upstream"}})
 
 
+async def _router_lines_call(method: str, path: str,
+                             payload: dict | None = None) -> Response:
+    """Admin-dashboard passthrough to the router's model-line endpoints, which
+    sit behind the internal secret. Forwards status and body verbatim so a lost
+    compare-and-set (409) reaches the operator as such."""
+    if _client is None:
+        return JSONResponse(status_code=503, content={"error": {
+            "message": "router client not ready", "type": "router_error",
+            "code": "upstream"}})
+    try:
+        r = await _client.request(method, f"{UPSTREAM}{path}", json=payload,
+                                  headers=_router_admin_headers(), timeout=10.0)
+        return Response(content=r.content, status_code=r.status_code,
+                        media_type="application/json")
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        # Never reached the router: nothing happened, safe to retry.
+        return JSONResponse(status_code=502, content={"error": {
+            "message": f"router {path} unavailable", "type": "router_error",
+            "code": "upstream"}})
+    except Exception:
+        # Sent, but no answer came back. A head move may have committed: say so
+        # rather than inviting a blind retry that would undo it.
+        if method == "GET":
+            return JSONResponse(status_code=502, content={"error": {
+                "message": f"router {path} unavailable", "type": "router_error",
+                "code": "upstream"}})
+        return JSONResponse(status_code=504, content={"error": {
+            "message": "no response from the router: the move may or may not "
+                       "have been applied. Read /dashboard/api/lines before retrying.",
+            "type": "router_error", "code": "model_line_outcome_unknown"}})
+
+
+@app.get("/dashboard/api/lines")
+async def dashboard_model_lines(request: Request) -> Response:
+    """Every model line with its current head, seed and recent audit events."""
+    ctx, error = _require_admin_dashboard_auth(request)
+    if error:
+        return error
+    return await _router_lines_call("GET", "/x/lines")
+
+
+async def _dashboard_model_line_move(line: str, action: str,
+                                     request: Request) -> Response:
+    ctx, error = _require_admin_dashboard_auth(request)
+    if error:
+        return error
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,47}", line):
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "invalid line name", "type": "invalid_request_error",
+            "code": "model_line"}})
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "JSON body must be an object",
+            "type": "invalid_request_error", "code": "invalid_json"}})
+    # The audit actor is the authenticated dashboard viewer, never a body field.
+    body = {**body, "actor": str(ctx.get("viewer"))}
+    return await _router_lines_call("POST", f"/x/lines/{line}/{action}", body)
+
+
+@app.post("/dashboard/api/lines/{line}/promote")
+async def dashboard_model_line_promote(line: str, request: Request) -> Response:
+    return await _dashboard_model_line_move(line, "promote", request)
+
+
+@app.post("/dashboard/api/lines/{line}/rollback")
+async def dashboard_model_line_rollback(line: str, request: Request) -> Response:
+    return await _dashboard_model_line_move(line, "rollback", request)
+
+
 def _backtest_timeframe_options(value: Any) -> dict[str, Any]:
     timeframe = _dashboard_timeframe(value or "7d")
     if timeframe == "runtime":

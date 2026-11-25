@@ -358,6 +358,30 @@ _SCHEMA_STATEMENTS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_subject_budget_reservations_subject"
     " ON subject_budget_reservations(tenant_id, subject, period, expires_at)",
+    # Model lines (model_lines.py): the operator-visible pointer from a line name
+    # to the family currently qualified as its head. One row per line that has
+    # been moved off its seed; a line with no row reads its seed from
+    # model_lines.json. Operator state: never pruned by the retention sweep.
+    """CREATE TABLE IF NOT EXISTS model_line_heads (
+        line            TEXT PRIMARY KEY,
+        family          TEXT NOT NULL,
+        previous_family TEXT,
+        updated_at      BIGINT NOT NULL,
+        updated_by      TEXT
+    )""",
+    # Append-only audit of every line decision: promotions, rollbacks, proposals
+    # awaiting approval and qualification runs, each with its evidence.
+    """CREATE TABLE IF NOT EXISTS model_line_events (
+        id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        ts              BIGINT NOT NULL,
+        line            TEXT NOT NULL,
+        kind            TEXT NOT NULL,
+        family          TEXT,
+        previous_family TEXT,
+        actor           TEXT,
+        detail          JSONB
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_model_line_events_line ON model_line_events(line, id)",
 ]
 
 _pool_lock = threading.Lock()
@@ -803,6 +827,153 @@ def set_provider_overlays(providers: dict[str, Any]) -> bool:
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store set_provider_overlays failed: %s", exc)
         return False
+
+
+# ---- model lines (durable operator state) ---------------------------------------
+
+def get_model_line_heads() -> "dict[str, dict[str, Any]] | None":
+    """Every line moved off its seed: line -> {family, previous_family,
+    updated_at, updated_by}. None (NOT {}) when the store is unreachable, so the
+    caller keeps its last-known heads instead of snapping back to the seeds."""
+    try:
+        with _get_pool().connection() as conn:
+            cur = conn.execute(
+                "SELECT line, family, previous_family, updated_at, updated_by"
+                " FROM model_line_heads")
+            return {r[0]: {"family": r[1], "previous_family": r[2],
+                           "updated_at": r[3], "updated_by": r[4]}
+                    for r in cur.fetchall()}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store get_model_line_heads failed: %s", exc)
+        return None
+
+
+def set_model_line_head(line: str, family: str, *, seed_family: "str | None",
+                        actor: str, kind: str = "promoted",
+                        detail: "dict[str, Any] | None" = None,
+                        expected_current: "str | None" = None) -> dict[str, Any]:
+    """Move a line's head and append the audit event, atomically.
+
+    `seed_family` is the head a line with no row is currently serving, so the
+    first move records the right `previous_family`. `expected_current` makes the
+    move a compare-and-set: two qualifier runs (or a run and an operator) cannot
+    both promote from the same starting head. Returns {ok, family,
+    previous_family} or {ok: False, reason}."""
+    try:
+        now = int(time.time())
+        with _get_pool().connection() as conn:   # one transaction
+            # Serialize movers of this line even when it has no row yet.
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                         ("model_line:" + line,))
+            row = conn.execute(
+                "SELECT family FROM model_line_heads WHERE line=%s",
+                (line,)).fetchone()
+            current = row[0] if row else seed_family
+            if expected_current is not None and current != expected_current:
+                return {"ok": False, "reason": "conflict", "family": current}
+            if current == family:
+                return {"ok": False, "reason": "unchanged", "family": current}
+            conn.execute(
+                "INSERT INTO model_line_heads(line, family, previous_family,"
+                " updated_at, updated_by) VALUES (%s,%s,%s,%s,%s)"
+                " ON CONFLICT (line) DO UPDATE SET family=EXCLUDED.family,"
+                " previous_family=EXCLUDED.previous_family,"
+                " updated_at=EXCLUDED.updated_at, updated_by=EXCLUDED.updated_by",
+                (line, family, current, now, actor))
+            conn.execute(
+                "INSERT INTO model_line_events(ts, line, kind, family,"
+                " previous_family, actor, detail) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (now, line, kind, family, current, actor,
+                 json.dumps(detail) if detail is not None else None))
+        return {"ok": True, "family": family, "previous_family": current}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store set_model_line_head failed: %s", exc)
+        return {"ok": False, "reason": "store_unavailable"}
+
+
+def rollback_model_line_head(line: str, *, seed_family: "str | None", actor: str,
+                             detail: "dict[str, Any] | None" = None,
+                             expected_current: "str | None" = None,
+                             expected_previous: "str | None" = None) -> dict[str, Any]:
+    """Swap a line back to the head it had before its last move, atomically.
+
+    The current and previous heads are read INSIDE the locked transaction, so
+    the target is the predecessor of the move that is actually current — not of
+    one the caller read earlier. `expected_current` / `expected_previous` turn
+    it into a compare-and-set on that move. Returns {ok, family,
+    previous_family} or {ok: False, reason, family}."""
+    try:
+        now = int(time.time())
+        with _get_pool().connection() as conn:
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                         ("model_line:" + line,))
+            row = conn.execute(
+                "SELECT family, previous_family FROM model_line_heads WHERE line=%s",
+                (line,)).fetchone()
+            current = row[0] if row else seed_family
+            previous = row[1] if row else None
+            if expected_current is not None and current != expected_current:
+                return {"ok": False, "reason": "conflict", "family": current}
+            if not previous or previous == current:
+                return {"ok": False, "reason": "no_previous", "family": current}
+            if expected_previous is not None and previous != expected_previous:
+                return {"ok": False, "reason": "conflict", "family": current}
+            conn.execute(
+                "UPDATE model_line_heads SET family=%s, previous_family=%s,"
+                " updated_at=%s, updated_by=%s WHERE line=%s",
+                (previous, current, now, actor, line))
+            conn.execute(
+                "INSERT INTO model_line_events(ts, line, kind, family,"
+                " previous_family, actor, detail) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (now, line, "rolled_back", previous, current, actor,
+                 json.dumps(detail) if detail is not None else None))
+        return {"ok": True, "family": previous, "previous_family": current}
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store rollback_model_line_head failed: %s", exc)
+        return {"ok": False, "reason": "store_unavailable"}
+
+
+def add_model_line_event(line: str, kind: str, *, family: "str | None" = None,
+                         previous_family: "str | None" = None, actor: str = "",
+                         detail: "dict[str, Any] | None" = None) -> bool:
+    """Append one audit event that does not move a head (a proposal, a failed
+    candidate, a qualification run)."""
+    try:
+        with _get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO model_line_events(ts, line, kind, family,"
+                " previous_family, actor, detail) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (int(time.time()), line, kind, family, previous_family, actor,
+                 json.dumps(detail) if detail is not None else None))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store add_model_line_event failed: %s", exc)
+        return False
+
+
+def model_line_events(line: "str | None" = None, limit: int = 50,
+                      kinds: "tuple[str, ...] | None" = None) -> list[dict[str, Any]]:
+    """Newest-first audit events, optionally for one line and/or some kinds."""
+    try:
+        where, params = [], []
+        if line is not None:
+            where.append("line=%s")
+            params.append(line)
+        if kinds:
+            where.append("kind = ANY(%s)")
+            params.append(list(kinds))
+        sql = ("SELECT id, ts, line, kind, family, previous_family, actor, detail"
+               " FROM model_line_events"
+               + (" WHERE " + " AND ".join(where) if where else "")
+               + " ORDER BY id DESC LIMIT %s")
+        with _get_pool().connection() as conn:
+            cur = conn.execute(sql, params + [max(1, min(int(limit), 500))])
+            return [{"id": r[0], "ts": r[1], "line": r[2], "kind": r[3],
+                     "family": r[4], "previous_family": r[5], "actor": r[6],
+                     "detail": r[7]} for r in cur.fetchall()]
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store model_line_events failed: %s", exc)
+        return []
 
 
 # ---- consumer_keys (durable operator state, credentials) -----------------------
@@ -2717,7 +2888,8 @@ def truncate_all_for_tests() -> None:
                      " peer_concurrency_leases,"
                      " consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
                      " login_history, provider_prices, wallet_ops,"
-                     " subject_budget_usage, subject_budget_reservations")
+                     " subject_budget_usage, subject_budget_reservations,"
+                     " model_line_heads, model_line_events")
 
 
 def key_usage_rows(consumer_sha: str, since_ts: "int | None" = None,
