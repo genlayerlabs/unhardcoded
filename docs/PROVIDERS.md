@@ -223,10 +223,16 @@ message or a fixed explanation. Arbitrary upstream text can contain credential
 fragments and is discarded.
 
 For HTTP providers, the count covers the first model-list response. AWS counts
-the returned foundation-model catalog. A buyer check uses the gateway's own
-fresh funding status and counts distinct advertised services with recent
-offers. An HTTP provider without a list can receive a one-token generation
-request on a catalog model. The count is null when no list was obtained.
+the returned foundation-model catalog. An HTTP provider without a list can
+receive a one-token generation request on a catalog model. The count is null
+when no list was obtained.
+
+AntSeed also returns `buyer_reachable` (the gateway provided a fresh buyer
+status) and `funding_ready` (available escrow meets
+`antseed.min_available_usdc`, or null when escrow cannot be verified). For
+a fresh buyer, `model_count` counts distinct services with eligible offers
+even when escrow is below the threshold. All three checks must pass for
+`working` to be true.
 The check is limited to tenant-owned credentials.
 
 Credential lookup and probing share a four-second deadline. Across replicas,

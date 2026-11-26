@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import time
 
 import httpx
@@ -14,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 import control_plane_client as cp
 import host_store
+import settings
 from internal_api import CONNECTION_CHECK_PATH, _gate, connection_check_scope
 from llm_router_host import ManagedProviderUnavailable
 from provider_adapters.anthropic import _anthropic_request
@@ -23,7 +23,7 @@ from provider_adapters.google import _google_request
 from provider_adapters.openai_compatible import _prepare_openai_call
 from provider_connections import auth_env, credential_names
 from sources.openrouter import BASE_URL as OPENROUTER_URL
-from tenant_providers import buyer_snapshot
+from tenant_providers import BuyerSnapshot, buyer_snapshot
 
 TIMEOUT = 4
 INTERVAL = 12
@@ -183,8 +183,8 @@ def _bedrock_probe(env):
     return len(models)
 
 
-async def _buyer_probe(env):
-    from sources.antseed import STALE_AFTER_S
+async def _buyer_probe(env, catalog):
+    from sources.antseed import AntSeedSource, STALE_AFTER_S, as_float
 
     target = httpx.URL(env["ANTSEED_BYO_URL"])
     if target.query or target.username or target.password or target.fragment:
@@ -193,17 +193,30 @@ async def _buyer_probe(env):
         snapshot = await buyer_snapshot(str(target), env["ANTSEED_BYO_TOKEN"])
     except httpx.HTTPStatusError as exc:
         raise _provider_failure(exc.response.status_code, None) from None
-    status = snapshot.buyer_status("antseed") or {}
-    age = time.time() - float(status.get("fetched_at", 0)) / 1000
-    if not 0 <= age <= STALE_AFTER_S:
+    status = snapshot.buyer_status("antseed")
+    fetched_at = as_float(status.get("fetched_at")) if isinstance(status, dict) else None
+    if fetched_at is None or not 0 <= time.time() - fetched_at / 1000 <= STALE_AFTER_S:
         raise ProbeFailure("unreachable")
-    funds = float(status.get("deposits_available", 0))
-    if not math.isfinite(funds):
-        raise ProbeFailure("unknown")
-    if funds <= 0:
-        raise ProbeFailure("unfunded")
-    return len({row["service"] for row in snapshot.peer_offers(900_000)
-                if isinstance(row.get("service"), str) and row["service"]})
+
+    funds = as_float(status.get("deposits_available"))
+    funded = None if funds is None else funds >= float(settings.get("antseed.min_available_usdc"))
+
+    # Bypass the source's escrow gate for this read-only check while preserving
+    # its offer filters, including the buyer's session pin.
+    market = BuyerSnapshot({**snapshot.data, "buyer_status": {**status, "deposits_available": None}})
+    source = AntSeedSource(catalog, store=market)
+    offers = await asyncio.to_thread(source.offers_sync, "antseed")
+    count = len({offer["wire_model_id"] for offer in offers if offer["wire_model_id"]})
+    if funded is False:
+        reason, message = "unfunded", _MESSAGES["unfunded"]
+    elif funded is None:
+        reason, message = "unknown", _MESSAGES["unknown"]
+    elif not count:
+        reason, message = "unknown", "The buyer has no eligible models."
+    else:
+        reason, message = "ok", _MESSAGES["ok"]
+    return {"buyer_reachable": True, "funding_ready": funded, "model_count": count,
+            "reason": reason, "message": message}
 
 
 async def _probe(host, tenant_id, provider_id, scope):
@@ -232,9 +245,9 @@ async def _probe(host, tenant_id, provider_id, scope):
     if provider_id not in allowed:
         raise ProbeFailure("bad_credential")
     if provider.get("api_kind") == "bedrock":
-        return await asyncio.to_thread(_bedrock_probe, env)
+        return {"model_count": await asyncio.to_thread(_bedrock_probe, env)}
     if provider_id == "antseed":
-        return await _buyer_probe(env)
+        return await _buyer_probe(env, catalog)
     pin_request = {"provider_id": provider_id}
     if provider_id == "openrouter_market" and provider.get("discovery_id") == "openrouter_market":
         # Tenant discovery pins these offers to the source origin.
@@ -244,7 +257,7 @@ async def _probe(host, tenant_id, provider_id, scope):
                   for _, entry in sorted(catalog.get("models", {}).items())
                   for row in entry.get("served_by", [])
                   if row.get("provider") == provider_id and row.get("provider_model_id")), None)
-    return await _http_probe(pinned, env, model)
+    return {"model_count": await _http_probe(pinned, env, model)}
 
 
 def install(app, host):
@@ -269,17 +282,17 @@ def install(app, host):
                 return JSONResponse({"error": "rate_limited"}, status_code=429,
                                     headers={"Retry-After": str(INTERVAL)})
             started = time.monotonic()
-            count = None
-            reason = "ok"
-            message = _MESSAGES[reason]
+            result = {"model_count": None, "reason": "ok", "message": _MESSAGES["ok"]}
+            if provider_id == "antseed":
+                result.update(buyer_reachable=False, funding_ready=None)
             try:
                 async with asyncio.timeout(TIMEOUT):
-                    count = await _probe(host, int(tenant_id), provider_id, scope)
+                    result.update(await _probe(host, int(tenant_id), provider_id, scope))
             except ProbeFailure as exc:
-                reason, message = exc.reason, exc.message
+                result.update(reason=exc.reason, message=exc.message)
             except (httpx.RequestError, TimeoutError, cp.RouteUnavailable, ManagedProviderUnavailable):
-                reason, message = "unreachable", _MESSAGES["unreachable"]
+                result.update(reason="unreachable", message=_MESSAGES["unreachable"])
             except Exception:
-                reason, message = "unknown", _MESSAGES["unknown"]
-            return {"working": reason == "ok", "reason": reason, "message": message,
-                    "model_count": count, "elapsed_ms": round((time.monotonic() - started) * 1000)}
+                result.update(reason="unknown", message=_MESSAGES["unknown"])
+            return {**result, "working": result["reason"] == "ok",
+                    "elapsed_ms": round((time.monotonic() - started) * 1000)}
