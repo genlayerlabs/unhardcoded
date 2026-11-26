@@ -166,26 +166,43 @@ def test_bedrock_uses_tenant_region_and_credentials(router, monkeypatch, expired
     assert aws.call_args.kwargs["aws_session_token"] == "tenant-session"
 
 
-@pytest.mark.parametrize(("funds", "age", "reason"), [
-    (3, 0, "ok"), (0, 0, "unfunded"), (3, 900, "unreachable"),
+@pytest.mark.parametrize(("funds", "minimum", "age", "pin", "reason", "funded", "count"), [
+    ("1.1", 1.1, 0, None, "ok", True, 1),
+    (0, 1.1, 0, None, "unfunded", False, 1),
+    (1.09, 1.1, 0, None, "unfunded", False, 1),
+    (1.1, 2.0, 0, None, "unfunded", False, 1),
+    (3, 1.1, 0, "different-peer", "unknown", True, 0),
+    (0, 1.1, 0, "different-peer", "unfunded", False, 0),
+    ("NaN", 1.1, 0, None, "unknown", None, 1),
+    (3, 1.1, 900, None, "unreachable", None, None),
 ])
-def test_buyer_checks_own_snapshot(router, monkeypatch, funds, age, reason):
+def test_buyer_checks_own_snapshot(router, monkeypatch, funds, minimum, age, pin, reason, funded, count):
     client, _, _ = router
+    monkeypatch.setattr("settings._overrides", {"antseed.min_available_usdc": minimum})
     now_ms = time.time() * 1000
+    offer = {"service": "model", "peer_id": "seller", "observed_at": now_ms,
+             "price_in": 0.1, "price_out": 0.2}
+    offers = [offer, {**offer, "peer_id": "other-seller"},
+              {**offer, "service": "stale", "observed_at": now_ms - 900_000},
+              {**offer, "service": "invalid-price", "price_in": -1}]
 
     def upstream(request):
         assert str(request.url) == "https://buyer.invalid/snapshot"
         assert request.headers["authorization"] == "Bearer " + TOKEN
         return httpx.Response(200, json={
-            "buyer_status": {"deposits_available": funds, "fetched_at": now_ms - age * 1000},
-            "peer_offers": [{"service": "model", "observed_at": now_ms}] * 2,
+            "buyer_status": {"deposits_available": funds, "fetched_at": now_ms - age * 1000,
+                             "pinned_peer_id": pin},
+            "peer_offers": offers,
         })
 
     monkeypatch.setattr("byo_http.buyer_client",
                         lambda: httpx.AsyncClient(transport=httpx.MockTransport(upstream)))
     result = client.post(PATH.format("antseed"), headers=SECRET).json()
     assert result["reason"] == reason
-    assert result["model_count"] == (1 if reason == "ok" else None)
+    assert result["working"] is (reason == "ok")
+    assert result["buyer_reachable"] is (age == 0)
+    assert result["funding_ready"] is funded
+    assert result["model_count"] == count
 
 
 def test_timeout_and_unavailable_tenant_configuration(router, monkeypatch):
