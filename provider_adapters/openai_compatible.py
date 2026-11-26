@@ -835,3 +835,31 @@ def _parse_openai_response(
         err_msg = (resp.text or "")[:500]
     kind = _classify_from_map(err_msg, error_map) or _classify_status(status, err_msg)
     return _err(kind, status, latency, err_msg[:500])
+
+
+async def call_with_cost_allowance(request, allowance, client, env_get, prepared):
+    """Dispatch one constrained request without redirects or adapter subcalls."""
+    import httpx
+
+    url, body, bound = prepared
+    headers, err = _resolve_auth_headers(request, env_get)
+    if err is not None:
+        return err
+    allowance.dispatch(bound)
+    started = time.monotonic()
+    timeout = min(request.get("timeout_ms") or 30_000,
+                  request.get("first_token_timeout_ms") or 30_000) / 1000
+    try:
+        async with asyncio.timeout(timeout):
+            response = await _post_bounded(client, url, content=body,
+                                           headers={**headers, "Content-Type": "application/json"},
+                                           follow_redirects=False)
+        result = _parse_openai_response(response, _elapsed_ms(started))
+    except (TimeoutError, httpx.TimeoutException):
+        return _err("timeout", 0, _elapsed_ms(started), "provider request timed out")
+    except httpx.RequestError:
+        return _err("network_error", 0, _elapsed_ms(started), "provider request failed")
+    except ResponseTooLarge:
+        return _err("bad_response", 0, _elapsed_ms(started), "provider response exceeded cap")
+    allowance.reconcile(result, bound)
+    return result

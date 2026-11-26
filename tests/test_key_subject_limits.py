@@ -31,6 +31,7 @@ os.environ.setdefault("CALLER_KEYS_SHA256_JSON", "{}")
 import auth_proxy  # noqa: E402
 import control_plane_client as cpc  # noqa: E402
 import host_store  # noqa: E402
+import shared_cost  # noqa: E402
 
 from conftest import require_host_store  # noqa: E402
 
@@ -53,9 +54,11 @@ def _clean(monkeypatch):
 # ---- fakes -------------------------------------------------------------------
 
 class _JsonResp:
-    def __init__(self, cost=0.02, status_code=200):
+    def __init__(self, cost=0.02, status_code=200, shared_charge=0.02):
         self.status_code = status_code
         self.headers = {"content-type": "application/json"}
+        if shared_charge is not None:
+            self.headers[shared_cost.CHARGE_HEADER] = str(shared_charge)
         self._body = json.dumps({"ok": True, "x_router": {"cost_usd": cost, "provider": "p"}}).encode()
 
     async def aread(self):
@@ -92,7 +95,7 @@ class _Upstream:
         self.make, self.requests = make, []
 
     def build_request(self, method, url, content=None, headers=None):
-        self.requests.append({"headers": headers or {}, "body": content})
+        self.requests.append({"headers": headers or {}, "body": content, "url": url})
         return object()
 
     async def send(self, req, stream=True):
@@ -119,7 +122,7 @@ def _saas(monkeypatch, *, limits, key=KEY, upstream=None, tenant=5, caller="app-
 
 def _post(client, token="tok-a"):
     return client.post("/v1/chat/completions", headers={"Authorization": f"Bearer {token}"},
-                       json={"model": "route:production", "messages": []})
+                       json={"model": "route:production", "messages": [{"role": "user", "content": "Hi"}]})
 
 
 def _period():
@@ -317,6 +320,8 @@ def test_shared_budget_composes_and_updates_on_next_resolve(monkeypatch):
     key_limit = "0.10"
     assert _post(client).status_code == 200
     assert _budget("s:team")["spent_usd"] == _budget()["spent_usd"] == 0.02
+    assert up.requests[0]["url"].endswith(shared_cost.PATH)
+    assert up.requests[0]["headers"][shared_cost.LIMIT_HEADER] == "0.05"
 
     shared["monthly_budget_usd"] = "0"
     response = _post(client)
@@ -336,7 +341,7 @@ def test_shared_budget_unknown_cost_keeps_ceiling(monkeypatch, cost, status, exp
     _saas(monkeypatch, limits={"shared_budget": {
         "scope": "team", "monthly_budget_usd": Decimal("0.10"),
         "max_call_cost_usd": Decimal("0.05"),
-    }}, upstream=_Upstream(lambda: _JsonResp(cost=cost, status_code=status)))
+    }}, upstream=_Upstream(lambda: _JsonResp(cost=0.01, status_code=status, shared_charge=cost)))
     assert _post(TestClient(auth_proxy.app)).status_code == status
     assert _budget("s:team")["spent_usd"] == expected
 
@@ -1052,3 +1057,21 @@ def test_scoped_export_preserves_winning_cost_after_automatic_fallback(
     assert row["cost_source"] == "none"
     assert row["winning_inference_cost_usd"] == 0.01
     assert row["winning_inference_cost_basis"] == "reported"
+
+
+@pytest.mark.parametrize("options", [{"stream": True}, {"tools": [{"type": "function"}]},
+                                     {"max_tokens": True}])
+def test_shared_budget_rejects_unbounded_shapes_without_forwarding(monkeypatch, options):
+    require_host_store()
+    upstream = _saas(monkeypatch, limits={"shared_budget": {
+        "scope": "team", "monthly_budget_usd": Decimal("0.10"),
+        "max_call_cost_usd": Decimal("0.05"),
+    }})
+    response = TestClient(auth_proxy.app).post(
+        "/v1/chat/completions", headers={"Authorization": "Bearer token"},
+        json={"model": "route:production", "messages": [{"role": "user", "content": "Hi"}],
+              **options})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "shared_cost_unbounded"
+    assert upstream.requests == []
+    assert _budget("s:team")["spent_usd"] == 0

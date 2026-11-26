@@ -212,7 +212,7 @@ def main() -> None:
     app = create_app(host, default_profile=args.default_profile,
                      streaming_call=streaming_call,
                      default_max_tokens=args.default_max_tokens or None,
-                     codex_store=codex_store)
+                     codex_store=codex_store, shared_cost_http=provider_http)
     closeables = [provider_http]
     if remote_codex is not None:
         closeables.append(remote_codex)

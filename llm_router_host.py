@@ -724,7 +724,7 @@ end
             self._sync_provider_auth_state()
         return _to_py(self.router.execute(_to_lua(self.lua, contract)))
 
-    async def execute_async(self, contract: dict, call_override=None) -> dict:
+    async def execute_async(self, contract: dict, call_override=None, *, prepare_call=None) -> dict:
         """Drive router.execute_step cooperatively, awaiting provider HTTP off
         the Lua lock so one LuaRuntime can overlap many in-flight requests.
 
@@ -736,6 +736,8 @@ end
         `call_override` replaces the configured call hook for THIS run only
         (the streaming path uses it to thread a per-request delta channel);
         mock responses still take precedence per (provider, family) pair.
+        A prepare_call hook can supply an override for a pinned attempt or deny
+        the candidate before provider spend admission.
         """
         if self._should_enforce_provider_auth():
             self._sync_provider_auth_state()
@@ -777,6 +779,13 @@ end
                 if (contract.get("first_token_timeout_ms") is not None
                         and req.get("first_token_timeout_ms") is None):
                     req["first_token_timeout_ms"] = contract["first_token_timeout_ms"]
+                attempt_call = call_override
+                if prepare_call is not None:
+                    attempt_call = prepare_call(req)
+                    if attempt_call is None:
+                        self._skip_candidate(handle, req, "shared_cost_denied")
+                        step = self.router.execute_step(handle, None, None)
+                        continue
                 identity = self._provider_spend_identity(req)
                 day = None
                 if identity is not None:
@@ -789,10 +798,10 @@ end
                             _log.warning("Provider spend admission unavailable (%s)", type(exc).__name__)
                     if day is None:
                         spend_denials.add(identity)
-                        self._skip_spend_denial(handle, req)
+                        self._skip_candidate(handle, req, "provider_spend_denied")
                         step = self.router.execute_step(handle, None, None)
                         continue
-                resp = await self._resolve_call_async(req, call_override, session=session)
+                resp = await self._resolve_call_async(req, attempt_call, session=session)
                 if day is not None:
                     actual = provider_spend.actual_cost(resp)
                     if actual is not None:
@@ -829,16 +838,16 @@ end
             return identity
         return None
 
-    def _skip_spend_denial(self, handle, request):
+    def _skip_candidate(self, handle, request, reason):
         # The pinned engine's resumable driver advances when no response is
         # pending. Advance the same cursor as next_candidate without recording
         # an upstream failure or letting a caller's failure plan override admission.
         path = handle["trace"]["decision_path"]
         path[len(path) + 1] = _to_lua(self.lua, {
-            "event": "skipped", "reason": "provider_spend_denied",
+            "event": "skipped", "reason": reason,
             "provider_id": request.get("provider_id"), "model_family": request.get("model_family"),
         })
-        handle["last_error_kind"] = "provider_spend_denied"
+        handle["last_error_kind"] = reason
         handle["pending_cand"] = None
         handle["awaiting"] = None
         handle["cursor"] += 1
