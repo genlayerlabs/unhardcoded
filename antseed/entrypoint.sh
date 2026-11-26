@@ -74,6 +74,9 @@ node "$LIB/control.js" &
 # Separate inference + read-only discovery token; no wallet control authority.
 node "$LIB/byo-gateway.js" &
 
+# Separate read-only settlement feed. Disabled unless configured.
+node "$LIB/buyer-spend.js" &
+
 write_market() {
     raw="$MARKET_DIR/.market.raw.$$"
     timeout -k 5 "$CLI_TIMEOUT" antseed network browse --services --top "$TOP" --json > "$raw" 2>/dev/null || true
