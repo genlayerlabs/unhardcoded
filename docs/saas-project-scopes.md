@@ -118,17 +118,43 @@ After the plan rate check the ingress enforces, in order:
 3. the per-pod capacity permit.
 
 An unavailable store fails closed (`503 key_rate_limit_unavailable` /
-`key_budget_unavailable`). The reservation is settled synchronously when the
-call finishes on every path (success, upstream error, exception, capacity
-rejection, stream end or client disconnect): it is released and the actual cost
-(unknown cost counts as 0) is added. A reservation whose holder died expires
-after 15 minutes. Overshoot is bounded by concurrent in-flight calls times
-(actual cost - reservation). The recorded `routing_summary` includes `key_id`
-and `subject`.
+`key_budget_unavailable`). Settlement runs on a bounded background queue.
+For the key-only reservation, a successful call with unknown cost books the
+reservation. A failed call with unknown cost books zero. A lost reservation
+releases after 15 minutes and reported actual cost can exceed the estimate.
+The recorded `routing_summary` includes `key_id` and `subject`.
 
-Because the scoped route lookup is uncached and carries the key digest, a key
-revoked in the control plane is refused on its very next request even while the
-key resolution itself is still cached.
+A published route can also include `limits.shared_budget`:
+
+```json
+{
+  "scope": "search",
+  "monthly_budget_usd": "100.00",
+  "max_call_cost_usd": "0.25",
+  "guidance": "Contact your administrator for more capacity.",
+  "help_url": "https://example.org/limits"
+}
+```
+
+Keys in the same tenant and UTC month share spend when their scope IDs match.
+Use a stable ID even when changing the limit. Each route resolution supplies the
+current limit and ceiling. The lookup is uncached, so revocations and limit
+changes apply to the next resolution. Enable shared scopes after every ingress
+replica supports the field. Use decimal strings to transmit exact
+amounts with up to 12 fractional digits. A zero limit rejects all calls.
+
+The publisher must supply a positive ceiling covering the entire request,
+including fallbacks and any auxiliary calls. The ingress charges that ceiling
+against the scope and any key/group limit in one transaction. On exhaustion,
+the ingress returns `402 shared_budget_exhausted` or `402 key_budget_exhausted`.
+The shared error includes the optional `guidance` and `help_url`.
+
+A known actual cost replaces the precharge on settlement. A request rejected
+before forwarding settles at zero. Unknown cost and lost settlement leave the
+full precharge in place, even after expiration. Reconciliation records become
+eligible for pruning one day after expiry. An actual cost above the published
+ceiling is logged and charged in full, so a publisher that supplies a ceiling
+below actual upstream spend can exceed its configured budget.
 
 Reconciliation endpoints (same shared secret; `caller` and the complete
 project/environment pair behave as for `/internal/usage`, filtering before

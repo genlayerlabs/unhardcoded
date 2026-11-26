@@ -662,3 +662,87 @@ def test_provider_daily_spend_operator_api(host_store_clean, spend_host, monkeyp
     assert paused.status_code == 200
     assert not paused.json()["can_admit"]
     assert client.put(url, headers=headers, json={"override_usd": None}).json()["can_admit"]
+
+
+def _run_budget_replica(tenant, replica, barrier, results):
+    from concurrent.futures import ThreadPoolExecutor
+    from decimal import Decimal
+
+    def call(index):
+        reservation = f"{replica}-{index}"
+        rejected, ok, _ = host_store.reserve_scoped_budget(
+            tenant, f"k:{replica + 1}", "2030-01", Decimal("20"),
+            "common", Decimal("1.00"), Decimal("0.05"), reservation, 900)
+        if not ok or rejected:
+            return ok, rejected, False
+        return ok, rejected, host_store.settle_subject_budget(reservation, 0.04) == (True, True)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        barrier.wait(timeout=20)
+        outcomes = list(pool.map(call, range(40)))
+    host_store._get_pool().close()
+    results.put(outcomes)
+
+
+def test_shared_budget_actual_spend_under_parallel_replicas(host_store_clean):
+    from multiprocessing import get_context
+
+    ctx = get_context("spawn")
+    results = ctx.Queue()
+    barrier = ctx.Barrier(2)
+    replicas = [ctx.Process(target=_run_budget_replica, args=(81, replica, barrier, results))
+                for replica in range(2)]
+    for replica in replicas:
+        replica.start()
+    try:
+        outcomes = results.get(timeout=30) + results.get(timeout=30)
+    finally:
+        for replica in replicas:
+            replica.join(timeout=5)
+            if replica.is_alive():
+                replica.terminate()
+                replica.join()
+    assert [replica.exitcode for replica in replicas] == [0, 0]
+    assert all(ok and (settled or rejected == "s:common") for ok, rejected, settled in outcomes)
+    count = sum(settled for _, _, settled in outcomes)
+    keys = ["k:1", "k:2", "s:common"]
+    by_replica = host_store_clean.subject_budgets(81, "2030-01", keys)
+    assert 20 <= count <= 24
+    assert by_replica[2]["spent_usd"] == pytest.approx(count * 0.04)
+    assert by_replica[2]["spent_usd"] == pytest.approx(sum(row["spent_usd"] for row in by_replica[:2]))
+    assert all(row["reserved_usd"] == 0 for row in by_replica)
+
+
+def test_shared_budget_retains_ceiling_without_settlement(host_store_clean, monkeypatch):
+    from decimal import Decimal
+
+    store = host_store_clean
+    now = time.time()
+    monkeypatch.setattr(store.time, "time", lambda: now)
+    args = (81, "g:1", "2030-01", Decimal("0.10"), "common", Decimal("0.05"), Decimal("0.05"))
+    assert store.reserve_scoped_budget(*args, "lost", 1)[:2] == (None, True)
+    now += 2
+    assert store.reserve_scoped_budget(*args, "expired", 1)[:2] == ("s:common", True)
+    now += 86400
+    store._prune()
+    assert store.settle_subject_budget("lost", 0) == (False, True)
+    assert store.reserve_scoped_budget(*args, "pruned", 1)[:2] == ("s:common", True)
+    budgets = store.subject_budgets(81, "2030-01", ["g:1", "s:common"])
+    assert [row["spent_usd"] for row in budgets] == [0.05, 0.05]
+
+
+def test_shared_budget_records_full_cost_if_published_ceiling_is_low(host_store_clean):
+    from decimal import Decimal
+
+    store = host_store_clean
+    period = "2030-01"
+    assert store.reserve_scoped_budget(
+        81, "k:1", period, Decimal("1"), "common", Decimal("0.10"),
+        Decimal("0.05"), "cost-overrun", 900)[:2] == (None, True)
+    assert store.settle_subject_budget("cost-overrun", 0.07) == (True, True)
+    assert store.settle_subject_budget("cost-overrun", 0.07) == (False, True)
+    assert store.reserve_scoped_budget(
+        81, "k:2", period, Decimal("1"), "common", Decimal("0.10"),
+        Decimal("0.05"), "after-overrun", 900)[:2] == ("s:common", True)
+    budgets = store.subject_budgets(81, period, ["k:1", "k:2", "s:common"])
+    assert [row["spent_usd"] for row in budgets] == [0.07, 0.0, 0.07]
