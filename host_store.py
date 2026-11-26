@@ -170,6 +170,8 @@ _SCHEMA_STATEMENTS = [
     # tautological; 'subscription' = $0). Lets the cost-accuracy panel flag only
     # rows with real signal instead of training the operator to ignore drift.
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS cost_basis TEXT",
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS input_usd_per_million DOUBLE PRECISION",
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS output_usd_per_million DOUBLE PRECISION",
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS routing_summary JSONB",
     # Per-ATTEMPT route observations (one row per provider call the engine made,
     # including failed fallback tries — a grain `calls` does NOT have: `calls` is
@@ -550,6 +552,7 @@ def insert_call(row: dict[str, Any]) -> None:
             row.get("served_by"),
             row.get("cost_basis"),   # how cost_usd was determined (reported/computed/…)
             json.dumps(routing_summary(row.get("decision_trace"))),
+            row.get("input_usd_per_million"), row.get("output_usd_per_million"),
         )
         with _get_pool().connection() as conn:   # one transaction, auto commit/rollback
             conn.execute(
@@ -557,8 +560,8 @@ def insert_call(row: dict[str, Any]) -> None:
                 " caller, route_key, provider_id, model_family, served_model_id,"
                 " requested_model, status, error_type, latency_ms, tokens_in,"
                 " tokens_out, tokens_total, tokens_cached, cost_usd, served_by,"
-                " cost_basis, routing_summary)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)", values)
+                " cost_basis, routing_summary, input_usd_per_million, output_usd_per_million)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s)", values)
             caller = row.get("caller")
             cost = row.get("cost_usd")
             if caller and isinstance(cost, (int, float)) and float(cost) > 0:
