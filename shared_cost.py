@@ -34,9 +34,12 @@ def amount(value, *, reported=False) -> Decimal:
 
 
 def supported_payload(payload):
+    automatic = payload.get("_auto_contract")
     return (payload.get("stream", False) is False
+            and (automatic is None or (isinstance(automatic, dict)
+                                       and isinstance(automatic.get("automatic"), dict)))
             and all(payload.get(field) is None for field in (
-                "flow_ir", "_auto_contract", "tools", "tool_choice", "response_format",
+                "flow_ir", "tools", "tool_choice", "response_format",
                 "reasoning", "reasoning_effort"))
             and (payload.get("max_tokens") is None
                  or (type(payload["max_tokens"]) is int and payload["max_tokens"] > 0))
@@ -53,7 +56,7 @@ def valid_messages(messages):
 @dataclass(frozen=True)
 class AttemptLimit:
     max_input_bytes: int
-    max_output_tokens: int
+    max_output_tokens: int | None
     max_cost_usd: Decimal
 
 
@@ -63,12 +66,17 @@ def load_limits():
     for row in json.loads(os.getenv("SHARED_COST_ATTEMPT_LIMITS", "[]")):
         provider, base_url, model = (row[key] for key in ("provider", "base_url", "model"))
         url = urlsplit(base_url)
-        key = (provider, base_url, model)
-        input_bytes, output_tokens = row["max_input_bytes"], row["max_output_tokens"]
-        if (url.scheme != "https" or not url.hostname or url.username is not None
+        protocol, peer = row.get("protocol", "chat"), row.get("peer_id")
+        key = (protocol, provider, base_url, model, peer)
+        input_bytes, output_tokens = row["max_input_bytes"], row.get("max_output_tokens")
+        if (protocol not in ("chat", "decisions")
+                or (peer is not None and (protocol != "chat" or not isinstance(peer, str)
+                                          or not peer or not peer.isascii() or not peer.isprintable()))
+                or url.scheme != "https" or not url.hostname or url.username is not None
                 or url.query or url.fragment or base_url.endswith("/") or key in limits
                 or type(input_bytes) is not int or not 0 < input_bytes <= MAX_BODY_BYTES
-                or type(output_tokens) is not int or output_tokens <= 0):
+                or (protocol == "chat" and (type(output_tokens) is not int or output_tokens <= 0))
+                or (protocol == "decisions" and output_tokens is not None)):
             raise ValueError("invalid shared cost attempt configuration")
         limits[key] = AttemptLimit(input_bytes, output_tokens, amount(row["max_cost_usd"]))
     return limits
@@ -85,37 +93,59 @@ class Allowance:
         self.denial = None
 
     def prepare(self, request):
-        key = (request.get("provider_id"), request.get("base_url"), request.get("served_model_id"))
+        offer = request.get("offer")
+        if offer is not None and not isinstance(offer, dict):
+            self.denial = "shared_cost_unbounded"
+            return None
+        offer = offer or {}
+        model = offer.get("wire_model_id") if offer else request.get("served_model_id")
+        endpoint, peer = request.get("base_url"), offer.get("peer_id")
+        if (not isinstance(model, str) or not model or not isinstance(endpoint, str)
+                or (peer is not None and not isinstance(peer, str))
+                or (offer and offer.get("seller_endpoint") != endpoint)):
+            self.denial = "shared_cost_unbounded"
+            return None
+        key = ("chat", request.get("provider_id"), endpoint, model, peer)
         limit = self.limits.get(key)
         messages = request.get("messages")
         tokens = request.get("max_tokens")
         if (limit is None or request.get("api_kind") != "openai_compatible"
-                or request.get("offer") or request.get("protocol") not in (None, "chat")
+                or request.get("protocol") not in (None, "chat")
                 or not valid_messages(messages) or type(tokens) is not int
                 or not 0 < tokens <= min(limit.max_output_tokens, self.output_tokens)):
             self.denial = "shared_cost_unbounded"
             return None
-        body = {"model": key[2], "messages": messages, "max_tokens": tokens}
+        body = {"model": model, "messages": messages, "max_tokens": tokens}
         try:
             wire = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         except UnicodeError:
             self.denial = "shared_cost_unbounded"
             return None
-        if len(wire) > limit.max_input_bytes:
+        bound = self._check(limit, wire)
+        if bound is not None:
+            return endpoint + "/chat/completions", wire, bound
+        return None
+
+    def prepare_decision(self, provider, endpoint, model, wire):
+        return self._check(self.limits.get(("decisions", provider, endpoint, model, None)), wire)
+
+    def _check(self, limit, wire):
+        if limit is None or len(wire) > limit.max_input_bytes:
             self.denial = "shared_cost_unbounded"
             return None
         if self.violated or limit.max_cost_usd > self.remaining:
             self.denial = "shared_cost_ceiling_exceeded"
             return None
-        return key[1] + "/chat/completions", wire, limit.max_cost_usd
+        return limit.max_cost_usd
 
     def dispatch(self, bound):
-        self.remaining -= bound
-        self.charge += bound
+        with localcontext() as context:
+            context.prec = 32
+            self.remaining -= bound
+            self.charge += bound
         self.dispatched = True
 
-    def reconcile(self, result, bound):
-        reported = (result.get("response") or {}).get("cost_reported")
+    def reconcile(self, reported, bound):
         try:
             actual = amount(reported, reported=True)
         except ValueError:
@@ -123,4 +153,6 @@ class Allowance:
         if actual > bound:
             _log.error("Provider reported a charge above its configured shared cost attempt bound")
             self.violated = True
-        self.charge += actual - bound
+        with localcontext() as context:
+            context.prec = 32
+            self.charge += actual - bound

@@ -32,7 +32,7 @@ def _unique_object(pairs):
 
 class JevDecisionProvider:
     def __init__(self, api_key, *, transport="openrouter", model=None, max_retries=0,
-                 client=None):
+                 client=None, allowance=None):
         if transport not in ENDPOINTS or type(max_retries) is not int or not 0 <= max_retries <= 1:
             raise ValueError("Invalid decision transport configuration")
         self.api_key = api_key
@@ -40,6 +40,9 @@ class JevDecisionProvider:
         if not isinstance(self.model, str) or not self.model or "latest" in self.model or len(self.model) > 100:
             raise ValueError("Pin a decision model version")
         self.max_retries, self.client = max_retries, client
+        if allowance is not None and max_retries:
+            raise ValueError("Shared cost decisions allow one transport attempt")
+        self.allowance = allowance
 
     async def decide(self, request, *, deadline):
         request.validate()
@@ -55,9 +58,25 @@ class JevDecisionProvider:
         if deadline <= started:
             raise DecisionError("deadline", cost_usd=0)
         if self.client is not None:
-            return await self._run(self.client, body, request, deadline, started)
+            return await self._guarded_run(self.client, body, request, deadline, started)
         async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+            return await self._guarded_run(client, body, request, deadline, started)
+
+    async def _guarded_run(self, client, body, request, deadline, started):
+        allowance = self.allowance
+        if allowance is None:
             return await self._run(client, body, request, deadline, started)
+        bound = allowance.prepare_decision(self.transport, ENDPOINTS[self.transport], self.model, body)
+        if bound is None:
+            raise DecisionError(allowance.denial, cost_usd=0)
+        allowance.dispatch(bound)
+        try:
+            result = await self._run(client, body, request, deadline, started)
+        except DecisionError as exc:
+            allowance.reconcile(exc.cost_usd, bound)
+            raise
+        allowance.reconcile(result.cost_usd, bound)
+        return result
 
     async def _run(self, client, body, request, deadline, started):
         attempts = 0

@@ -1356,7 +1356,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         _session_from_header(req, request)
         try:
             async with asyncio.timeout_at(deadline):
-                reply = await _until_disconnect(request, _handle_chat, req, prepare_call=prepare_call)
+                reply = await _until_disconnect(request, _handle_chat, req, prepare_call=prepare_call,
+                                                shared_allowance=allowance)
         except TimeoutError:
             return _openai_error("Shared cost execution expired", "server_error", 504)
         if allowance.denial and not allowance.dispatched:
@@ -1364,7 +1365,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                                   "budget_error", 402, code=allowance.denial)
         if isinstance(reply, dict):
             reply = JSONResponse(reply)
-        reply.headers[shared_cost.CHARGE_HEADER] = str(allowance.charge.normalize())
+        reply.headers[shared_cost.CHARGE_HEADER] = format(allowance.charge, "f")
         return reply
 
     @app.post("/v1/decisions")
@@ -1558,7 +1559,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 yield ev
         return _ActiveStreamResponse(gen_running(), task, media_type="text/event-stream")
 
-    async def _handle_chat(req: ChatRequest, profile_name: str | None = None, *, prepare_call=None):
+    async def _handle_chat(req: ChatRequest, profile_name: str | None = None, *,
+                           prepare_call=None, shared_allowance=None):
         if profile_name is None and (msg := _policy_model_without_ir(req)):
             return _bad_policy_selector_response(msg)
         contract = _request_to_contract(req, default_profile, default_max_tokens)
@@ -1611,7 +1613,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             # Async driver: the Lua VM is touched only between awaits, so one
             # shared LuaRuntime overlaps many concurrent requests on one loop.
             try:
-                execute = (host.execute_async(contract, prepare_call=prepare_call)
+                execute = (host.execute_async(contract, prepare_call=prepare_call,
+                                              shared_allowance=shared_allowance)
                            if prepare_call is not None else host.execute_async(contract))
                 result = await _execute_with_deadline(execute)
             except Exception as exc:
