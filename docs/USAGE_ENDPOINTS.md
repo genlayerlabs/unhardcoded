@@ -147,6 +147,8 @@ Each row from `GET /internal/usage/export` includes `cost_source` alongside the 
 - `estimated` means an amount is available from a router calculation or default, a composite total, or a legacy row whose provider provenance is unknown.
 - `none` means the row has no recorded amount.
 
+After automatic fallback, `winning_inference_cost_usd` records the successful attempt's cost when available, and `winning_inference_cost_basis` gives its provenance (`reported`, `computed`, or `subscription`). The request total remains `null` with `cost_basis: unknown_total` when a failed attempt has unknown cost. Rows without a recorded winning attempt cost have `null` in both new fields.
+
 ## Dashboard lookup
 
 ```http

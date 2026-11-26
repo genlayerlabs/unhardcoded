@@ -37,13 +37,19 @@ def test_background_ledger_preserves_cost_provenance(host_store_clean, monkeypat
     for offset, (cost, basis, provider, _) in enumerate(rows):
         store.insert_call_async({"caller": "cost-test", "ts": now + offset,
                                  "cost_usd": cost, "cost_basis": basis, "provider": provider})
+    store.insert_call_async({"caller": "cost-test", "ts": now + len(rows),
+                             "cost_basis": "unknown_total", "provider": "codex",
+                             "winning_inference_cost_usd": 0.0,
+                             "winning_inference_cost_basis": "subscription"})
     store._write_q.join()
     usage = store.usage_rows(caller="cost-test")
     assert [(row["cost_usd"], row["cost_source"]) for row in usage] == [
-        (cost, source) for cost, _, _, source in rows]
+        (cost, source) for cost, _, _, source in rows] + [(None, "none")]
     exported = store.usage_export("cost-test", now=now + 3600)["rows"]
     assert [(row["cost_usd"], row["cost_basis"], row["cost_source"]) for row in exported] == [
-        (cost, basis, source) for cost, basis, _, source in rows]
+        (cost, basis, source) for cost, basis, _, source in rows] + [(None, "unknown_total", "none")]
+    assert exported[-1]["winning_inference_cost_usd"] == 0.0
+    assert exported[-1]["winning_inference_cost_basis"] == "subscription"
 
 
 def test_background_ledger_preserves_applied_rates(host_store_clean, monkeypatch):

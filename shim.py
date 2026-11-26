@@ -2116,6 +2116,7 @@ def _build_x_router(result: dict, subscription_providers=frozenset(),
         if any(step.get("event") == "attempted" and step.get("error_kind")
                for step in (result.get("trace") or {}).get("decision_path", []) if isinstance(step, dict)):
             x_router["winning_inference_cost_usd"] = inference_cost
+            x_router["winning_inference_cost_basis"] = basis if inference_cost is not None else None
             inference_cost = None
         x_router.update(inference_cost_usd=inference_cost, decision_cost_usd=decision_cost,
                         cost_usd=(inference_cost + decision_cost

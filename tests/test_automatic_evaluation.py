@@ -54,3 +54,4 @@ def test_failed_attempts_leave_total_unknown_even_when_winner_and_decision_are_p
     report = _build_x_router(result)
     assert report['cost_usd'] is None and report['cost_basis'] == 'unknown_total'
     assert report['decision_cost_usd'] == .001 and report['winning_inference_cost_usd'] == .01
+    assert report["winning_inference_cost_basis"] == "reported"
