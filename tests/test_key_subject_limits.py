@@ -481,7 +481,7 @@ def test_routing_summary_keeps_key_identity():
 
 # ---- /internal/usage group_by + until_ts ---------------------------------------
 
-def _seed_usage(now):
+def _seed_usage(now, **call_fields):
     rows = [  # (caller, key, project, env, ts, tokens_in, cost, status)
         ("acme", "a" * 64, 1, 10, now - 7200, 10, 0.01, 200),
         ("acme", "a" * 64, 1, 10, now - 60, 20, 0.02, 200),
@@ -495,7 +495,8 @@ def _seed_usage(now):
                                 "model_family": "fam", "requested_model": "route:production",
                                 "decision_trace": {"route": "route:production", "project_id": project,
                                                    "environment_id": env, "subject": "g:7",
-                                                   "key_id": 42}})
+                                                   "key_id": 42},
+                                **call_fields})
 
 
 def test_usage_group_by_key_is_scoped_before_aggregation():
@@ -577,7 +578,7 @@ def test_export_cursor_pages_in_id_order_with_watermark(monkeypatch):
     require_host_store()
     monkeypatch.setenv("LEDGER_WATERMARK_LAG_S", "0")
     now = int(time.time())
-    _seed_usage(now)
+    _seed_usage(now, served_model_id="provider/model-v2", latency_ms=12.5)
     client = TestClient(auth_proxy.app)
     scope = {"caller": "acme", "project_id": 1, "environment_id": 10}
     page = client.get("/internal/usage/export", params={**scope, "limit": 2}, headers=SECRET).json()
@@ -586,8 +587,11 @@ def test_export_cursor_pages_in_id_order_with_watermark(monkeypatch):
     assert set(row) == {"id", "ts", "key_sha256", "subject", "route", "model_family", "provider",
                         "status", "tokens_in", "tokens_out", "tokens_cached", "tokens_total",
                         "cost_usd", "cost_basis", "cost_source",
-                        "winning_inference_cost_usd", "winning_inference_cost_basis"}
+                        "winning_inference_cost_usd", "winning_inference_cost_basis",
+                        "served_model_id", "latency_ms"}
     assert row["key_sha256"] == "a" * 64 and row["subject"] == "g:7" and row["route"] == "route:production"
+    assert row["served_model_id"] == "provider/model-v2"
+    assert row["latency_ms"] == 12.5
     assert row["winning_inference_cost_usd"] is None
     assert row["winning_inference_cost_basis"] is None
     # The third scoped row (ts now-120) is not delivered yet, so the watermark
@@ -596,6 +600,8 @@ def test_export_cursor_pages_in_id_order_with_watermark(monkeypatch):
     page2 = client.get("/internal/usage/export", params={
         **scope, "after_id": page["next_after_id"], "limit": 2}, headers=SECRET).json()
     assert [r["tokens_in"] for r in page2["rows"]] == [40]
+    assert page2["rows"][0]["served_model_id"] == "provider/model-v2"
+    assert page2["rows"][0]["latency_ms"] == 12.5
     assert page2["rows"][0]["id"] > page["next_after_id"]
     assert page2["watermark_ts"] >= now - 1
     page3 = client.get("/internal/usage/export", params={

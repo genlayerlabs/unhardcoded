@@ -1979,7 +1979,8 @@ def usage_groups(group_by: str, since_ts: "int | None" = None, caller: "str | No
 _EXPORT_COLS = ("id", "ts", "key_sha256", "subject", "route", "model_family", "provider",
                 "status", "tokens_in", "tokens_out", "tokens_cached", "tokens_total",
                 "cost_usd", "cost_basis", "cost_source",
-                "winning_inference_cost_usd", "winning_inference_cost_basis")
+                "winning_inference_cost_usd", "winning_inference_cost_basis",
+                "served_model_id", "latency_ms")
 
 
 def usage_export(caller: str, after_id: int = 0, limit: int = 1000, *, project_id=None,
@@ -2001,7 +2002,8 @@ def usage_export(caller: str, after_id: int = 0, limit: int = 1000, *, project_i
            " COALESCE(NULLIF(routing_summary->>'route',''),requested_model),"
            " model_family, provider_id, status, tokens_in, tokens_out, tokens_cached,"
            f" {_TOKENS_TOTAL_SQL}, cost_usd, cost_basis, {_COST_SOURCE_SQL},"
-           f" winning_inference_cost_usd, winning_inference_cost_basis FROM calls{where}"
+           " winning_inference_cost_usd, winning_inference_cost_basis,"
+           f" served_model_id, latency_ms FROM calls{where}"
            " AND id > %s AND COALESCE(recorded_at,0) <= %s ORDER BY id LIMIT %s")
     with _get_pool().connection() as conn:
         _set_dashboard_statement_timeout(conn)
