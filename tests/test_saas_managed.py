@@ -4,10 +4,15 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
+
+import control_plane_client as cp
 
 from llm_router_host import LLMRouterHost
 from provider_connections import connections, credential_names
 from saas_routes import choices, compile_intent, preview
+from shim import create_app
+from test_control_plane_client import _FakeResp, _install
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -87,3 +92,66 @@ def test_antseed_to_native_bedrock_fallback_uses_real_adapters(managed_host):
     assert result['ok'], result
     assert result['response']['text'] == 'Bedrock fallback'
     assert seen == [('buyer','peer-one'),('aws','aws.profile.model')]
+
+
+@pytest.fixture
+def scope_client(managed_host, monkeypatch):
+    monkeypatch.setattr(cp, 'CONTROL_PLANE_URL', 'http://cp.test')
+    monkeypatch.setattr(cp, 'CONTROL_PLANE_INTERNAL_SECRET', 'test-secret')
+    tenant_headers = {'x-llm-router-tenant': '7', 'x-internal-secret': 'test-secret'}
+    headers = {**tenant_headers, 'x-unhardcoded-scope-version': '2',
+               'x-unhardcoded-project': '4', 'x-unhardcoded-environment': '9'}
+    payload = {'scope_version': 2, 'tenant_id': 7, 'project_id': 4, 'environment_id': 9, 'env': {}}
+    return TestClient(create_app(managed_host)), headers, tenant_headers, payload
+
+
+@pytest.mark.parametrize('authorization', [
+    {'managed_providers': None},
+    {'managed_providers': 'custom_cloud'},
+    {'managed_providers': [{'id': 'custom_cloud'}]},
+    {'managed_providers': ['custom_cloud', 'custom_cloud']},
+    {'managed_providers': ['custom_cloud'] * 129},
+    {'managed_providers': ['custom_cloud', 'unknown']},
+    {'managed_providers': ['bedrock']},
+    {'managed_providers': ['bedrock_market'], 'environment_id': 10},
+    {'managed_providers': ['custom_cloud', 'bedrock_market'], 'env': {'CUSTOM_CLOUD_SECRET': 'tenant'}},
+    {'managed_providers': ['custom_cloud'], 'connections': {'bedrock': {'region': 'test'}}},
+])
+def test_scope_rejects_invalid_managed_grants(scope_client, monkeypatch, authorization):
+    client, headers, _, payload = scope_client
+    monkeypatch.setenv('SAAS_SHARED_PROVIDERS', 'custom_cloud,bedrock_market,unknown')
+    fake = _install(monkeypatch, [_FakeResp(200, {**payload, **authorization})])
+    response = client.get('/x/saas/catalog', headers=headers)
+    assert response.status_code == 503
+    assert len(fake.calls) == 1
+
+
+def test_scoped_request_executes_with_managed_credentials_until_grant_removed(
+        managed_host, scope_client, monkeypatch):
+    client, headers, tenant_headers, payload = scope_client
+    monkeypatch.setenv('SAAS_SHARED_PROVIDERS', 'custom_cloud,bedrock')
+    managed_host.set_env('CUSTOM_CLOUD_SECRET', 'operator-test-key')
+    granted = {**payload, 'managed_providers': ['custom_cloud']}
+    fake = _install(monkeypatch, [
+        _FakeResp(200, granted), _FakeResp(200, granted), _FakeResp(200, payload), _FakeResp(200, granted),
+    ])
+    calls = []
+
+    async def provider(request):
+        calls.append((request['provider_id'], cp.env_get('CUSTOM_CLOUD_SECRET')))
+        return {'ok': True, 'latency_ms': 1, 'response': {'text': 'done', 'tokens_in': 1, 'tokens_out': 1}}
+
+    managed_host.set_async_call_hook(provider)
+    catalog = client.get('/x/saas/catalog', headers=headers)
+    assert catalog.status_code == 200
+    assert {model['provider'] for model in catalog.json()['models']} == {'custom_cloud'}
+    response = client.post('/x/saas/test', headers=headers, json={
+        'intent': {'targets': ['custom_cloud|shared-model']}, 'prompt': 'Hello',
+    })
+    assert response.status_code == 200, response.text
+    assert calls == [('custom_cloud', 'operator-test-key')]
+    assert client.get('/x/saas/catalog', headers=headers).json()['models'] == []
+    assert client.get('/x/saas/catalog', headers=tenant_headers).json()['models'] == []
+    assert [call['url'].split('/internal/')[1] for call in fake.calls] == [
+        'tenants/7/projects/4/environments/9/provider-env',
+    ] * 3 + ['tenants/7/provider-env']

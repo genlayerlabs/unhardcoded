@@ -35,6 +35,43 @@ def test_real_engine_preview_and_identity(tenant_host):
     assert all(r['provider'] != 'platform_only' for r in choices(tenant_host))
 
 
+def test_quality_ranks_all_eligible_models_and_keeps_unbenchmarked_models(tenant_host):
+    out = preview(tenant_host, intent(targets='all', goal='quality'))
+    assert [r['family'] for r in out['ranked']] == ['backup', 'primary', 'basic']
+    assert out['excluded'] == []
+    assert any('benchmark' in warning for warning in out['warnings'])
+
+    out = preview(tenant_host, intent(targets=['openai|basic', 'openai|primary'], goal='quality'))
+    assert [r['family'] for r in out['ranked']] == ['primary', 'basic']
+
+
+def test_all_models_preserves_workload_and_price_gates_for_preferences(tenant_host):
+    out = preview(tenant_host, intent(targets='all', workload='agent', max_price_in=3,
+                                     allowed_preferences=['cost', 'speed', 'reliability', 'quality']))
+    assert [r['family'] for r in out['ranked']] == ['backup']
+    assert [p['eligible'] for p in out['task_previews']] == [1, 1, 1, 1]
+    assert [p['preference'] for p in out['task_previews']] == ['cost', 'speed', 'reliability', 'quality']
+
+
+@pytest.mark.parametrize('failure, expected', [('server_error', ['backup', 'primary']),
+                                               ('refusal', ['backup'])])
+def test_unrestricted_quality_only_falls_back_on_retryable_errors(tenant_host, failure, expected):
+    calls = []
+
+    async def provider(request):
+        calls.append(request['model_family'])
+        if request['model_family'] == 'backup':
+            return {'ok': False, 'error': failure, 'error_kind': failure}
+        return {'ok': True, 'latency_ms': 10, 'response': {'text': 'fallback', 'tokens_in': 2, 'tokens_out': 2}}
+
+    tenant_host.set_async_call_hook(provider)
+    out = preview(tenant_host, intent(targets='all', goal='quality'))
+    result = asyncio.run(tenant_host.execute_async({'policy_ir': out['policy_ir'],
+                         'messages': [{'role': 'user', 'content': 'hello'}]}))
+    assert calls == expected
+    assert result['ok'] == (failure == 'server_error')
+
+
 def test_cost_and_hard_price_limits(tenant_host):
     assert preview(tenant_host, intent(goal='cost'))['ranked'][0]['family'] == 'backup'
     out = preview(tenant_host, intent(max_price_in=3))
@@ -101,7 +138,8 @@ def test_real_failover_stays_within_approved_set(tenant_host):
     assert calls == ['openai', 'anthropic']
 
 
-@pytest.mark.parametrize('change', [{'targets': []}, {'targets': ['invalid/provider|forbidden']},
+@pytest.mark.parametrize('change', [{'targets': []}, {'targets': None}, {'targets': ['all']},
+                                    {'targets': ['invalid/provider|forbidden']},
                                     {'timeout_seconds': 0}, {'max_price_in': float('nan')},
                                     {'targets': ['openai|primary'] * 2}])
 def test_invalid_intents_refused(change):

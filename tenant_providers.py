@@ -201,6 +201,7 @@ async def prepare(host):
         tasks.append(one('bedrock', _aws, ids))
     if configs.get('antseed') and host._env.get('ANTSEED_BYO_URL'):
         tasks.append(one('antseed', _buyer, ['antseed']))
-    if host._env.get('OPENROUTER_API_KEY') and 'openrouter_market' in (host._tenant_allowed or ()):
+    if ('OPENROUTER_API_KEY' in getattr(host, '_tenant_byo_auth', ())
+            and 'openrouter_market' in (host._tenant_allowed or ())):
         tasks.append(_openrouter(host))
     await asyncio.gather(*tasks)

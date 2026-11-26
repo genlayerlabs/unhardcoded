@@ -170,3 +170,14 @@ def test_batch_endpoints_are_not_offered_and_prices_are_rounded(base, openrouter
     assert not any(i.endswith(":batch") for i in rows)
     opus = rows["openrouter_market|claude-opus-5.5"]
     assert (opus["price_in"], opus["price_out"]) == (0.2, 1.2)
+
+
+def test_managed_openrouter_uses_operator_discovery(base, openrouter, monkeypatch):
+    monkeypatch.setenv('SAAS_SHARED_PROVIDERS', 'openrouter_market')
+    base.set_env('OPENROUTER_API_KEY', 'sk-or-operator')
+    child = base.for_tenant(7, {}, ['openrouter_market'], project_id=4, environment_id=9)
+
+    asyncio.run(tp.prepare(child))
+
+    assert not openrouter['paths']
+    assert child._tenant_offers == {}

@@ -130,6 +130,10 @@ def _secret_configured(value: str | None) -> bool:
     return value.strip().upper() not in _SECRET_PLACEHOLDERS
 
 
+class ManagedProviderUnavailable(ValueError):
+    """A scoped grant names a provider the operator does not share."""
+
+
 class FlowAdmissionError(ValueError):
     """A Σ_flow term rejected at admission (flow.check). The message is prefixed
     'flow: ' so the shim can classify it to 400 invalid_flow without importing
@@ -344,7 +348,10 @@ end
                                connections=None, *, project_id=None, environment_id=None):
         """Resolve the same tenant credential scope for traffic and diagnostics."""
         from provider_connections import auth_env, shared_provider_ids
-        managed = set(managed_providers).intersection(shared_provider_ids(catalog))
+        requested = set(managed_providers)
+        managed = requested.intersection(shared_provider_ids(catalog))
+        if project_id is not None and managed != requested:
+            raise ManagedProviderUnavailable("Scoped provider grant unavailable.")
         scoped_env = dict(env)
         scoped_env.pop(_PROVIDER_FACT_MAX_AGE_ENV, None)
         if _PROVIDER_FACT_MAX_AGE_ENV in self._env:
