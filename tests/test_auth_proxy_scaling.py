@@ -52,6 +52,20 @@ def test_background_ledger_preserves_cost_provenance(host_store_clean, monkeypat
     assert exported[-1]["winning_inference_cost_basis"] == "subscription"
 
 
+def test_background_ledger_exports_served_model_and_latency(host_store_clean, monkeypatch):
+    store = host_store_clean
+    monkeypatch.setattr(store, "_SYNC_WRITES", False)
+    store.insert_call_async({"caller": "metadata-test", "requested_model": "route:default",
+                             "served_model_id": "provider/model-v2", "latency_ms": 0.0})
+    store.insert_call_async({"caller": "metadata-test", "requested_model": "route:default",
+                             "status": 500})
+    store._write_q.join()
+
+    rows = store.usage_export("metadata-test", now=time.time() + 3600)["rows"]
+    assert [(row["served_model_id"], row["latency_ms"]) for row in rows] == [
+        ("provider/model-v2", 0.0), (None, None)]
+
+
 def test_background_ledger_preserves_applied_rates(host_store_clean, monkeypatch):
     store = host_store_clean
     monkeypatch.setattr(store, "_SYNC_WRITES", False)
