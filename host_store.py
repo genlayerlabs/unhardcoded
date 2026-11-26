@@ -284,6 +284,16 @@ _SCHEMA_STATEMENTS = [
         name TEXT PRIMARY KEY, covered_from BIGINT, covered_until BIGINT,
         updated_at BIGINT NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS scoped_usage_hours (
+        caller TEXT NOT NULL, project_id TEXT NOT NULL, environment_id TEXT NOT NULL,
+        bucket_start BIGINT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL,
+        requests BIGINT NOT NULL, errors BIGINT NOT NULL, cost_usd DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY(caller, project_id, environment_id, bucket_start, kind, label)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_scoped_usage_bucket ON scoped_usage_hours(bucket_start)",
+    """CREATE TABLE IF NOT EXISTS scoped_usage_coverage (
+        bucket_start BIGINT PRIMARY KEY, updated_at BIGINT NOT NULL
+    )""",
     # The antseed marketplace book. One RAW row per (peer, advertised service) —
     # the seller's announced prices/caps/reputation, stored as columns, not
     # interpreted: ranking/admission stays in sources/antseed.offers_sync (host)
@@ -536,6 +546,9 @@ def insert_call(row: dict[str, Any]) -> None:
         family = row.get("model_family")
         served = row.get("served_model_id")
         sha = row.get("key_sha256")
+        summary = routing_summary(row.get("decision_trace"))
+        if summary and row.get("no_candidates") is True:
+            summary["no_candidates"] = True
         values = (
             int(row.get("ts") or time.time()),
             row.get("usage_event_id"), row.get("session"),
@@ -553,7 +566,7 @@ def insert_call(row: dict[str, Any]) -> None:
             # route stats from. Raw here; combining into a route key is a later step.
             row.get("served_by"),
             row.get("cost_basis"),   # how cost_usd was determined (reported/computed/…)
-            json.dumps(routing_summary(row.get("decision_trace"))),
+            json.dumps(summary),
             row.get("input_usd_per_million"), row.get("output_usd_per_million"),
             row.get("winning_inference_cost_usd"), row.get("winning_inference_cost_basis"),
         )
@@ -2319,6 +2332,98 @@ def policy_backtest_groups(since_ts: "int | None" = None,
 
 _ANALYTICS_LOCK_KEY = 0x616E616C_79746963
 _ANALYTICS_STATE_NAME = "hourly-v2-cache"
+SCOPED_USAGE_MAX_DAYS = 30
+_SCOPED_USAGE_GROUP_LIMIT = 500
+
+
+def scoped_usage_floor(now: int) -> int:
+    retention_start = now - min(_RETENTION_DAYS, SCOPED_USAGE_MAX_DAYS) * 86400
+    return (retention_start + 3599) // 3600 * 3600
+
+
+def _rollup_scoped_usage(conn, start: int, end: int, now: int) -> None:
+    floor = scoped_usage_floor(now)
+    conn.execute("DELETE FROM scoped_usage_hours WHERE bucket_start < %s", [floor])
+    conn.execute("DELETE FROM scoped_usage_coverage WHERE bucket_start < %s", [floor])
+    start = max(start, floor)
+    end = min(end, now // 3600 * 3600)
+    if end <= start:
+        return
+    conn.execute("DELETE FROM scoped_usage_hours WHERE bucket_start >= %s AND bucket_start < %s",
+                 [start, end])
+    conn.execute(
+        """
+        INSERT INTO scoped_usage_hours
+        SELECT caller, routing_summary->>'project_id', routing_summary->>'environment_id',
+               (ts/3600)*3600, kind, label, count(*),
+               count(*) FILTER (WHERE status >= 400 OR routing_summary @> '{"no_candidates":true}'),
+               sum(GREATEST(cost_usd, 0))
+        FROM calls
+        CROSS JOIN LATERAL (
+            VALUES ('provider', COALESCE(NULLIF(provider_id,''), 'unknown')),
+                   ('route', CASE WHEN routing_summary @> '{"no_candidates":true}'
+                                  THEN routing_summary->>'route' END)
+        ) AS groups(kind, label)
+        WHERE ts >= %s AND ts < %s AND caller <> '' AND label IS NOT NULL
+          AND routing_summary->>'project_id' IS NOT NULL
+          AND routing_summary->>'environment_id' IS NOT NULL
+        GROUP BY 1,2,3,4,5,6
+        """, [start, end])
+    conn.execute(
+        "INSERT INTO scoped_usage_coverage SELECT generate_series(%s::bigint, %s::bigint, 3600), %s"
+        " ON CONFLICT(bucket_start) DO UPDATE SET updated_at=EXCLUDED.updated_at",
+        [start, end - 3600, now])
+
+
+def scoped_usage_report(caller: str, project_id: int, environment_id: int,
+                        since_ts: int, until_ts: int) -> dict[str, Any]:
+    with _get_pool().connection() as conn:
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        _set_dashboard_statement_timeout(conn)
+        covered, updated_at = conn.execute(
+            "SELECT count(*), min(updated_at) FROM scoped_usage_coverage"
+            " WHERE bucket_start >= %s AND bucket_start < %s", [since_ts, until_ts]).fetchone()
+        rows = conn.execute(
+            """
+            WITH grouped AS (
+                SELECT kind, label, sum(requests) AS requests, sum(errors) AS errors,
+                       sum(cost_usd) AS cost_usd
+                FROM scoped_usage_hours
+                WHERE caller = %s AND project_id = %s AND environment_id = %s
+                  AND bucket_start >= %s AND bucket_start < %s
+                GROUP BY GROUPING SETS ((kind, label), (kind))
+            )
+            SELECT kind, label, requests, errors, round(cost_usd::numeric, 6)::float8
+            FROM (
+                (SELECT * FROM grouped WHERE kind = 'provider'
+                 ORDER BY label NULLS FIRST LIMIT %s)
+                UNION ALL
+                (SELECT * FROM grouped WHERE kind = 'route' AND label IS NOT NULL
+                 ORDER BY label LIMIT %s)
+            ) AS limited
+            ORDER BY kind, label NULLS FIRST
+            """, [caller, str(project_id), str(environment_id), since_ts, until_ts,
+                  _SCOPED_USAGE_GROUP_LIMIT + 2, _SCOPED_USAGE_GROUP_LIMIT + 1]).fetchall()
+    totals = {"requests": 0, "errors": 0, "cost_usd": 0.0}
+    providers, routes = [], []
+    for kind, label, requests, errors, cost in rows:
+        if kind == "route":
+            routes.append({"route": label, "no_candidates": int(requests)})
+        else:
+            measures = {"requests": int(requests), "errors": int(errors), "cost_usd": cost}
+            if label is None:
+                totals = measures
+            else:
+                providers.append({"provider_id": label, **measures})
+    return {
+        **totals,
+        "by_provider": providers[:_SCOPED_USAGE_GROUP_LIMIT],
+        "no_candidates_by_route": routes[:_SCOPED_USAGE_GROUP_LIMIT],
+        "providers_truncated": len(providers) > _SCOPED_USAGE_GROUP_LIMIT,
+        "routes_truncated": len(routes) > _SCOPED_USAGE_GROUP_LIMIT,
+        "covered_hours": covered,
+        "oldest_refresh_ts": updated_at,
+    }
 
 
 def rollup_analytics(start_ts: int, end_ts: int) -> dict[str, Any]:
@@ -2356,6 +2461,7 @@ def rollup_analytics(start_ts: int, end_ts: int) -> dict[str, Any]:
             [start, end])
         rows = cur.rowcount
         now = int(time.time())
+        _rollup_scoped_usage(conn, start, end, now)
         conn.execute(
             "INSERT INTO analytics_rollup_state(name,covered_from,covered_until,updated_at)"
             " VALUES(%s,%s,%s,%s) ON CONFLICT(name) DO UPDATE SET"
@@ -3030,7 +3136,8 @@ def truncate_all_for_tests() -> None:
                      " provider_facts, provider_relays,"
                      " consumer_keys, consumer_key_digests, consumer_rate_buckets, connection_check_limits,"
                      " peer_concurrency_leases,"
-                     " consumer_budget_usage, analytics_hourly, analytics_rollup_state, peer_offers, buyer_status, route_observations,"
+                     " consumer_budget_usage, analytics_hourly, analytics_rollup_state,"
+                     " scoped_usage_hours, scoped_usage_coverage, peer_offers, buyer_status, route_observations,"
                      " login_history, provider_prices, wallet_ops,"
                      " subject_budget_usage, subject_budget_reservations,"
                      " request_allowance_periods, request_allowance_reservations")

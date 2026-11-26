@@ -530,3 +530,48 @@ def test_automatic_key_resolves_default_route_without_caller_policy(monkeypatch,
     sent = json.loads(upstream.requests[0]['body'])
     assert sent['model'] == 'route:bound' and 'flow_ir' not in sent
     assert sent['_auto_contract'] == {'automatic': {'trusted': True}, 'automatic_mode': 'shadow'}
+
+
+def test_scoped_usage_report_records_published_no_candidates(monkeypatch, host_store_clean):
+    caller = {"active": True, "consumer": "acme", "tenant_id": 7,
+              "scope_version": 2, "project_id": 8, "environment_id": 9}
+    _cp(monkeypatch, [caller, {**caller, "env": {}}])
+    async def resolve(*args, **kwargs):
+        return {"route": "route:production", "revision": 1, "policy_id": "a" * 64,
+                "policy_ir": ["policy"], "execution": {}}
+
+    monkeypatch.setattr(cpc, "resolve_route", resolve)
+    upstream = _upstream(monkeypatch)
+
+    class NoCandidates(_FakeUpstreamResp):
+        status_code = 503
+
+        async def aread(self):
+            return b'{"error":{"type":"upstream_error","code":"exhausted: no_candidates"}}'
+
+    async def send(req, stream=True):
+        return NoCandidates()
+
+    monkeypatch.setattr(upstream, "send", send)
+    client = TestClient(auth_proxy.app)
+    result = _post_chat(client, "report-test-key")
+    assert result.status_code == 503, result.text
+    assert result.json()["error"]["code"] == "exhausted: no_candidates", result.text
+    host_store_clean._write_q.join()
+    start = int(time.time()) // 3600 * 3600 - 3600
+    with host_store_clean._get_pool().connection() as conn:
+        conn.execute("UPDATE calls SET ts = %s WHERE caller = 'acme'", [start])
+    host_store_clean.rollup_analytics(start, start + 3600)
+
+    headers = {"x-internal-secret": "s3cret"}
+    params = {"caller": "acme", "project_id": 8, "environment_id": 9,
+              "since_ts": start, "until_ts": start + 3600}
+    path = "/internal/usage/report"
+    response = client.get(path, params=params, headers=headers)
+    assert response.status_code == 200, response.text
+    report = response.json()
+    assert (report["requests"], report["errors"], report["cost_usd"], report["covered_hours"]) == (1, 1, 0, 1)
+    assert report["no_candidates_by_route"] == [{"route": "route:production", "no_candidates": 1}]
+    assert client.get(path, params=params).status_code == 403
+    assert client.get(path, params={**params, "project_id": 0}, headers=headers).status_code == 400
+    assert client.get(path, params={**params, "since_ts": start + 1}, headers=headers).status_code == 400

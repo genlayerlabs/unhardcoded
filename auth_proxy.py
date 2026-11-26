@@ -4467,8 +4467,11 @@ async def proxy(path: str, request: Request) -> Response:
                     decision_trace.update(project_id=auth['project_id'], environment_id=auth['environment_id'])
                 if key_identity:
                     decision_trace.update(key_id=key_identity['id'], subject=key_identity['subject'])
+            no_candidates = False
             if published_route:
                 route_error, route_trace = responses_stream_outcome or (error_code, decision_trace)
+                no_candidates = not proxy_timeout and route_error in (
+                    "no_candidates", "exhausted: no_candidates")
                 outcome, fallback = _published_route_outcome(
                     status, error_type, "timeout" if proxy_timeout else route_error,
                     route_trace, incomplete_stream)
@@ -4488,7 +4491,7 @@ async def proxy(path: str, request: Request) -> Response:
                 input_usd_per_million=input_usd_per_million,
                 output_usd_per_million=output_usd_per_million, decision_trace=decision_trace,
                 error_type=error_type, error_code=error_code, error_message=error_message,
-                key_sha256=auth.get("digest"))
+                key_sha256=auth.get("digest"), no_candidates=no_candidates)
             _metric_request(status, latency_ms)
             _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
         finally:

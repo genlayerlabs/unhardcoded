@@ -7,6 +7,8 @@ the surface does not exist on operator-only deployments.
 
   GET /internal/usage?caller=<slug>&since_ts=<epoch>[&until_ts=<epoch>]
       [&bucket=day][&group_by=key|model|route|day|hour]
+  GET /internal/usage/report?caller=<slug>&project_id=<id>&environment_id=<id>
+      &since_ts=<hour>&until_ts=<hour>
   GET /internal/usage/recent?caller=<slug>&limit=<n<=500>
   GET /internal/usage/route-outcomes?tenant_id=<id>&route=route:<slug>
       &since_ts=<hour>&until_ts=<hour>[&environment_id=<id>]
@@ -226,6 +228,34 @@ async def internal_usage(request: Request, caller: str = "",
         out["group_by"] = group_by
         out["groups"] = groups
     return JSONResponse(out)
+
+
+@router.get("/internal/usage/report")
+async def internal_usage_report(request: Request, caller: str = "",
+                                project_id: int | None = None, environment_id: int | None = None,
+                                since_ts: int | None = None, until_ts: int | None = None) -> JSONResponse:
+    denied = _gate(request)
+    if denied is not None:
+        return denied
+    scope = _scope(project_id, environment_id)
+    if not scope:
+        return JSONResponse({"error": "invalid_scope"}, status_code=400)
+    caller = caller.strip()
+    if not caller:
+        return JSONResponse({"error": "caller_required"}, status_code=400)
+    now = int(time.time())
+    if (since_ts is None or until_ts is None or since_ts % 3600 or until_ts % 3600
+            or not host_store.scoped_usage_floor(now) <= since_ts < until_ts <= now):
+        return JSONResponse({"error": "invalid_window"}, status_code=400)
+    try:
+        report = await asyncio.to_thread(
+            host_store.scoped_usage_report, caller, **scope, since_ts=since_ts, until_ts=until_ts)
+    except Exception:
+        return JSONResponse({"error": "ledger_unavailable"}, status_code=503)
+    return JSONResponse({
+        "caller": caller, "scope_version": 2, **scope,
+        "window": {"since_ts": since_ts, "until_ts": until_ts}, **report,
+    })
 
 
 @router.get("/internal/usage/refusals")

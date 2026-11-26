@@ -402,3 +402,54 @@ async def test_connection_check_limit_is_atomic_across_database_sessions(host_st
     assert await asyncio.to_thread(reserve, 91, 12)
     with host_store_clean._get_pool().connection() as conn:
         assert conn.execute("SELECT tenant_id FROM connection_check_limits").fetchall() == [(91,)]
+
+
+def test_scoped_usage_report_against_one_million_calls(host_store_clean):
+    store = host_store_clean
+    start = int(time.time()) // 3600 * 3600 - 7200
+    end = start + 3600
+    with store._get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO calls(ts, caller, provider_id, status, cost_usd, routing_summary)
+            SELECT %s + i %% 3600,
+                   CASE WHEN i <= 800000 THEN 'report' ELSE 'other-' || (i %% 1000) END,
+                   CASE WHEN i %% 10 <> 0 THEN 'provider-a' END,
+                   CASE WHEN i %% 10 = 0 THEN 503 ELSE 200 END,
+                   CASE WHEN i %% 10 <> 0 THEN 0.000125 END,
+                   CASE WHEN i %% 10 = 0
+                        THEN '{"project_id":"1","environment_id":"2","route":"route:default","no_candidates":true}'::jsonb
+                        ELSE '{"project_id":"1","environment_id":"2"}'::jsonb END
+            FROM generate_series(1, 1000000) AS rows(i)
+            """, [start])
+    store.insert_call({"ts": start, "caller": "report", "cost_usd": 12,
+                       "decision_trace": {"project_id": 9, "environment_id": 2}})
+    store.insert_call({"ts": start, "caller": "report", "cost_usd": 12,
+                       "decision_trace": {"project_id": 1, "environment_id": 9}})
+    store.insert_call({"ts": end, "caller": "report", "cost_usd": 12,
+                       "decision_trace": {"project_id": 1, "environment_id": 2}})
+    store.rollup_analytics(start, end)
+
+    with store._get_pool().connection() as conn:
+        conn.execute("ANALYZE scoped_usage_hours")
+        plan = conn.execute(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM scoped_usage_hours"
+            " WHERE caller = %s AND project_id = %s AND environment_id = %s"
+            " AND bucket_start >= %s AND bucket_start < %s",
+            ["report", "1", "2", start, end]).fetchone()[0][0]["Plan"]
+    assert "scoped_usage_hours_pkey" in str(plan)
+    assert plan["Actual Rows"] == 3
+
+    report = store.scoped_usage_report("report", 1, 2, start, end)
+    assert (report["requests"], report["errors"], report["cost_usd"]) == (800000, 80000, 90.0)
+    assert report["by_provider"] == [
+        {"provider_id": "provider-a", "requests": 720000, "errors": 0, "cost_usd": 90.0},
+        {"provider_id": "unknown", "requests": 80000, "errors": 80000, "cost_usd": 0.0},
+    ]
+    assert report["no_candidates_by_route"] == [{"route": "route:default", "no_candidates": 80000}]
+    assert report["covered_hours"] == 1
+    assert store.scoped_usage_report("report", 1, 2, start, end + 3600)["covered_hours"] == 1
+
+    store.rollup_analytics(start, end)
+    rerun = store.scoped_usage_report("report", 1, 2, start, end)
+    assert {**rerun, "oldest_refresh_ts": report["oldest_refresh_ts"]} == report

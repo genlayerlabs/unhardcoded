@@ -207,3 +207,29 @@ The proxy records per-key counters in memory alongside existing per-consumer sta
 - `key_owner`
 
 The usage endpoints rebuild windowed totals from recent in-memory events plus persistent history, de-duplicating by `usage_event_id`.
+
+## Internal scoped reporting
+
+`GET /internal/usage/report` uses the internal shared-secret header. Supply
+`caller`, positive `project_id` and `environment_id`, plus `since_ts` and
+`until_ts` as Unix timestamps aligned to UTC hour boundaries. The half-open
+window must contain completed hours within the last 30 days and within ledger
+retention.
+
+The report returns `requests`, `errors` and `cost_usd` for the selected scope.
+`by_provider` contains the same measures per provider ID, with `unknown` for
+calls without a provider. Errors include HTTP statuses of 400 or higher and
+recorded no-candidate outcomes, including those delivered within a stream.
+`no_candidates_by_route` counts those outcomes per published route. Each
+breakdown returns up to 500 groups ordered by identifier and has a truncation
+flag. The totals cover all groups.
+
+Run `scripts/rollup_analytics.py` on a schedule outside request-serving
+processes. Use `--backfill-days 30` to initialize historical coverage when
+upgrading an existing analytics job. `covered_hours` counts refreshed hours
+in the requested window, including hours with zero calls. For a complete
+window it equals `(until_ts - since_ts) / 3600`. `oldest_refresh_ts` is the
+oldest refresh of those hours, or null when none are covered. Refreshing
+recent hours captures late ledger writes. Historical calls contribute to
+usage totals when they have scope data. Published-route no-candidate counts
+begin when ingress starts recording the outcome in the ledger.
