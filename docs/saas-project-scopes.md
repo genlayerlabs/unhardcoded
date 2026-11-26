@@ -40,6 +40,14 @@ control-plane failures reject scoped requests; no legacy credential fallback is
 allowed. Sessions and provider-discovery caches include the environment identity.
 The bounded routing summary records project/environment IDs, not secrets.
 
+The version 2 credential response may include a `managed_providers` array of
+up to 128 distinct, exact provider IDs. Each ID must exist in the router catalog
+and be configured in `SAAS_SHARED_PROVIDERS`. A nonempty array requires an empty
+`env` object and empty or omitted `connections`. Invalid grants reject the entire
+scoped request with 503. Missing or empty grants preserve tenant credential
+routing. Legacy tenant-wide responses cannot grant operator access. The router
+checks grants on each credential lookup, so removal applies to the next request.
+
 ## Rollout boundary
 
 This protocol is only one delivery block. The cloud must also enforce project

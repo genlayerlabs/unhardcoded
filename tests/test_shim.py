@@ -681,6 +681,25 @@ def test_cost_basis_tiers():
     assert _cost_basis({"chosen": {"provider_id": "x"}, "response": {}}) is None
 
 
+@pytest.mark.parametrize(("chosen", "response", "subscriptions", "expected"), [
+    ({"price_in": 1.0, "price_out": 5.0, "raw_price_in": 2.0, "raw_price_out": 10.0},
+     {}, frozenset(), (2.0, 10.0)),
+    ({"price_in": 1.0, "price_out": 5.0, "price_multiplier": 0.5},
+     {}, frozenset(), (2.0, 10.0)),
+    ({"price_in": 0.0}, {}, frozenset(), (0.0, None)),
+    ({"price_in": -1.0}, {}, frozenset(), (None, None)),
+    ({"price_in": 2.0, "price_out": 10.0}, {"cost_reported": 0.0},
+     frozenset(), (None, None)),
+    ({"price_in": 2.0, "price_out": 10.0}, {}, frozenset({"p"}), (None, None)),
+])
+def test_x_router_records_applied_base_token_rates(chosen, response, subscriptions, expected):
+    from shim import _build_x_router
+
+    xr = _build_x_router({"chosen": {"provider_id": "p", **chosen}, "response": response},
+                         subscriptions)
+    assert (xr.get("input_usd_per_million"), xr.get("output_usd_per_million")) == expected
+
+
 def test_x_router_carries_executed_cost(client, host):
     for prov, fam in _all_pairs(host):
         host.set_mock_response(prov, fam, _ok_response("ok"))

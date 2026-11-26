@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 import control_plane_client as cp
 
+from llm_router_host import ManagedProviderUnavailable
 from provider_connections import connections, credential_names, label
 
 _GOALS = ("reliability", "cost", "speed", "quality")
@@ -242,10 +243,12 @@ def install(app, scoped, handle_chat, chat_request):
         # Read current credentials for each request: revocation/rotation is immediate.
         # The bounded request-local VM cannot retain stale tenant secrets/health.
         try:
-            env, connections_config = await cp.tenant_connections(tenant_id, credential_names(scoped.base.catalog()), **scope)
-        except cp.RouteUnavailable:
+            env, connections_config, managed = await cp.tenant_connections(
+                tenant_id, credential_names(scoped.base.catalog()), **scope)
+            child = await asyncio.to_thread(
+                scoped.base.for_tenant, tenant_id, env, managed, connections_config, **scope)
+        except (cp.RouteUnavailable, ManagedProviderUnavailable):
             return JSONResponse({"error": {"message": "Scoped credentials unavailable"}}, status_code=503)
-        child = await asyncio.to_thread(scoped.base.for_tenant, tenant_id, env, (), connections_config, **scope)
         if request.url.path != '/x/saas/connections':
             from tenant_providers import prepare
             await prepare(child)
