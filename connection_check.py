@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 import control_plane_client as cp
 import host_store
 from internal_api import CONNECTION_CHECK_PATH, _gate, connection_check_scope
+from llm_router_host import ManagedProviderUnavailable
 from provider_adapters.anthropic import _anthropic_request
 from provider_adapters.aws_credentials import client as aws_client
 from provider_adapters.common import auth_token
@@ -210,10 +211,12 @@ async def _probe(host, tenant_id, provider_id, scope):
     provider = catalog.get("providers", {}).get(provider_id)
     if provider is None:
         raise ProbeFailure("unknown")
-    env, connections = await cp.tenant_connections(
+    env, connections, managed = await cp.tenant_connections(
         tenant_id, credential_names(catalog), **scope, require_fresh=True,
     )
-    env, allowed, _ = host.tenant_provider_config(catalog, tenant_id, env, connections=connections, **scope)
+    env, allowed, _ = host.tenant_provider_config(
+        catalog, tenant_id, env, managed, connections, **scope,
+    )
     if provider_id not in allowed:
         raise ProbeFailure("bad_credential")
     if provider.get("api_kind") == "bedrock":
@@ -262,7 +265,7 @@ def install(app, host):
                     count = await _probe(host, int(tenant_id), provider_id, scope)
             except ProbeFailure as exc:
                 reason, message = exc.reason, exc.message
-            except (httpx.RequestError, TimeoutError, cp.RouteUnavailable):
+            except (httpx.RequestError, TimeoutError, cp.RouteUnavailable, ManagedProviderUnavailable):
                 reason, message = "unreachable", _MESSAGES["unreachable"]
             except Exception:
                 reason, message = "unknown", _MESSAGES["unknown"]
