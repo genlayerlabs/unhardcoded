@@ -14,6 +14,8 @@ import control_plane_client as cp
 from llm_router_host import ManagedProviderUnavailable
 from provider_connections import connections, credential_names, label
 
+_GOALS = ("reliability", "cost", "speed", "quality")
+
 _active = contextvars.ContextVar("saas_host", default=None)
 _revision = contextvars.ContextVar("saas_revision", default=None)
 _automatic = contextvars.ContextVar("saas_automatic", default=None)
@@ -85,34 +87,39 @@ def finite(value):
 
 
 def compile_intent(intent):
+    """Compile explicit provider/model targets or the opt-in "all" target scope."""
     if not isinstance(intent, dict):
         raise ValueError("Choose a route configuration.")
     goal = intent.get("goal", "reliability")
     preferences = intent.get('allowed_preferences', [])
-    if (not isinstance(preferences, list) or len(preferences) > 3
-            or any(p not in ('cost', 'speed', 'reliability') for p in preferences)):
+    if (not isinstance(preferences, list) or len(preferences) > len(_GOALS)
+            or any(p not in _GOALS for p in preferences)):
         raise ValueError('Choose supported task preferences.')
     workload = intent.get("workload", "chat")
-    if goal not in {"reliability", "cost", "speed"} or workload not in {"chat", "agent", "extraction"}:
+    if goal not in _GOALS or workload not in {"chat", "agent", "extraction"}:
         raise ValueError("Choose a supported task and goal.")
     targets = intent.get("targets")
-    if not isinstance(targets, list) or not 1 <= len(targets) <= 4:
-        raise ValueError("Choose a primary model and up to three alternatives.")
-    pairs = []
-    for value in targets:
-        if not isinstance(value, str) or len(value) > 240 or value.count("|") != 1:
-            raise ValueError("Choose models from your connected providers.")
-        provider, family = value.split("|", 1)
-        if not re.fullmatch(r'[a-zA-Z0-9_-]{1,100}', provider) or not family:
-            raise ValueError("Choose a valid provider and model from the dataplane catalog.")
-        pairs.append({"provider": provider, "model": family})
-    if len(set(targets)) != len(targets):
-        raise ValueError("Choose each model only once.")
+    gates = ["and", ["meets_req"], ["not", ["is", "disabled"]]]
+    scorer, selector = ["zero"], ["ordered"]
+    if targets != "all":
+        if not isinstance(targets, list) or not 1 <= len(targets) <= 4:
+            raise ValueError("Choose all eligible models, or a primary model and up to three alternatives.")
+        pairs = []
+        for value in targets:
+            if not isinstance(value, str) or len(value) > 240 or value.count("|") != 1:
+                raise ValueError("Choose models from your connected providers.")
+            provider, family = value.split("|", 1)
+            if not re.fullmatch(r'[a-zA-Z0-9_-]{1,100}', provider) or not family:
+                raise ValueError("Choose a valid provider and model from the dataplane catalog.")
+            pairs.append({"provider": provider, "model": family})
+        if len(set(targets)) != len(targets):
+            raise ValueError("Choose each model only once.")
+        predicates = [["and", ["provider_eq", p["provider"]], ["family_eq", p["model"]]] for p in pairs]
+        gates.append(["or", *predicates])
+        selector = ["chain", pairs]
     timeout = intent.get("timeout_seconds", 8)
     if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 20:
         raise ValueError("Response timeout must be between 1 and 20 seconds.")
-    predicates = [["and", ["provider_eq", p["provider"]], ["family_eq", p["model"]]] for p in pairs]
-    gates = ["and", ["meets_req"], ["not", ["is", "disabled"]], ["or", *predicates]]
     if workload == "agent":
         gates.append(["has_cap", "supports_tools"])
     if workload == "extraction":
@@ -123,7 +130,6 @@ def compile_intent(intent):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 < value <= 1000:
                 raise ValueError("Price limits must be positive numbers up to $1,000 per million tokens.")
             gates.append(["cmp", field, "le", value])
-    scorer, selector = ["zero"], ["chain", pairs]
     if goal == "cost":
         # Token-price estimate for a stated 80% input / 20% output mix.
         scorer = ["neg", ["normalize", ["add",
@@ -133,6 +139,9 @@ def compile_intent(intent):
         selector = ["argmax"]
     elif goal == "speed":
         scorer = ["neg", ["normalize", ["field", "latency_ms"]]]
+        selector = ["argmax"]
+    elif goal == "quality":
+        scorer = ["field", "bench_intelligence"]
         selector = ["argmax"]
     # Never retry refusals, invalid requests or a stream already delivered.
     failure = ["always", {"action": "abort"}]
@@ -158,10 +167,13 @@ def preview(host, intent):
                      "label": f"{c['model_family']} · {label(c['provider_id'])}",
                      "price_in": finite(c.get("raw_price_in", c.get("price_in"))),
                      "price_out": finite(c.get("raw_price_out", c.get("price_out")))})
-    selected = set(intent["targets"])
-    reasons = {f"{r.get('provider')}|{r.get('model', r.get('model_family'))}": r.get("reason", "requirements") for r in rejected}
+    excluded_targets = set()
+    if intent["targets"] != "all":
+        excluded_targets = set(intent["targets"]) - {r["id"] for r in rows}
+    reasons = {f"{r.get('provider')}|{r.get('model', r.get('model_family'))}": r.get("reason", "requirements")
+               for r in rejected} if excluded_targets else {}
     exclusions = []
-    for target in selected - {r["id"] for r in rows}:
+    for target in excluded_targets:
         reason = reasons.get(target, "not_available")
         if "price" in reason:
             explanation = "Above your price limit, or its price is unknown."
@@ -180,6 +192,8 @@ def preview(host, intent):
         warnings.append("Speed uses observed response latency. New models may have no measurements yet; this is not a latency guarantee.")
     if intent.get("goal") == "cost":
         warnings.append("Price ranking assumes 80% input and 20% output tokens. Your actual token mix and provider discounts can change the cost.")
+    if intent.get("goal") == "quality":
+        warnings.append("Quality uses the model intelligence benchmark. Models without a benchmark remain eligible.")
     task_policies, task_previews = {}, []
     for preference in intent.get('allowed_preferences', []):
         variant = host.normalize_policy(compile_intent({**intent, 'goal': preference,
