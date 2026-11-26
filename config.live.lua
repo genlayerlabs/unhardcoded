@@ -45,6 +45,12 @@ local DEFAULT_MAX_PRICE_OUT = 25.0
 local DEFAULT_QUALITY_TOP_N = 5
 local DEFAULT_COST_WEIGHT = 0.75
 local DEFAULT_INTELLIGENCE_WEIGHT = 0.25
+-- A route that sends nothing for this long falls through to the next
+-- candidate.  Only the wait for the first output is bounded: a slow generation
+-- that is already streaming keeps the engine's 30 s attempt budget, while a
+-- silent route no longer leaves the next candidate too little of the 50 s
+-- request deadline to answer before the caller gets a timeout.
+local DEFAULT_FIRST_TOKEN_TIMEOUT_MS = 15000
 
 -- Quality-first defaults for long-running tool agents.  Unlike the vanilla
 -- chat policy, each provider attempt is bounded inside the policy itself so a
@@ -188,7 +194,7 @@ local function default_policy_ir()
             },
         },
         selector,
-        { "id" },
+        { "set_param", "first_token_timeout_ms", DEFAULT_FIRST_TOKEN_TIMEOUT_MS },
         fail_plan(BALANCED_RETRY),
     }
 end

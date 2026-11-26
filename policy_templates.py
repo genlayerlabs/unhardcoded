@@ -40,6 +40,10 @@ DEFAULT_MAX_PRICE_OUT = 25.0
 DEFAULT_QUALITY_TOP_N = 5
 DEFAULT_COST_WEIGHT = 0.75
 DEFAULT_INTELLIGENCE_WEIGHT = 0.25
+# Bound only the wait for first output, so a silent route falls through while
+# the request deadline still has room for the fallback cascade.  Generations
+# that are already streaming keep the full attempt budget.
+DEFAULT_FIRST_TOKEN_TIMEOUT_MS = 15_000
 
 # Long-running tool agents need a different posture from vanilla chat.  Keep
 # the quality floor hard, put subscription/direct routes ahead of gateways and
@@ -214,8 +218,9 @@ def template_catalog() -> list[dict[str, Any]]:
             "description": (
                 "Safe policy used by OpenAI-compatible callers that send no "
                 "policy: Codex, AntSeed, Bedrock, then OpenRouter; prefer a "
-                "top-five intelligence model and use a cost-dominant value "
-                "score inside each provider."
+                "top-five intelligence model, use a cost-dominant value "
+                "score inside each provider, and fall through a route that "
+                "sends no output within 15 seconds."
             ),
             "required": [],
             "defaults": {
@@ -226,6 +231,7 @@ def template_catalog() -> list[dict[str, Any]]:
                 "max_price_out": DEFAULT_MAX_PRICE_OUT,
                 "cost_weight": DEFAULT_COST_WEIGHT,
                 "intelligence_weight": DEFAULT_INTELLIGENCE_WEIGHT,
+                "first_token_timeout_ms": DEFAULT_FIRST_TOKEN_TIMEOUT_MS,
                 "provider_order": [list(group) for group in DEFAULT_PROVIDER_ORDER],
             },
         },
@@ -484,6 +490,7 @@ def _default() -> tuple[list, dict[str, Any]]:
         "top_n": DEFAULT_QUALITY_TOP_N,
         "cost_weight": DEFAULT_COST_WEIGHT,
         "intelligence_weight": DEFAULT_INTELLIGENCE_WEIGHT,
+        "first_token_timeout_ms": DEFAULT_FIRST_TOKEN_TIMEOUT_MS,
         "provider_order": [list(group) for group in provider_order],
     })
     value_score = [
@@ -495,7 +502,8 @@ def _default() -> tuple[list, dict[str, Any]]:
             ["normalize", ["field", "bench_intelligence"]],
         ],
     ]
-    return _policy(_and(parts), value_score, selector), intent
+    xform = ["set_param", "first_token_timeout_ms", DEFAULT_FIRST_TOKEN_TIMEOUT_MS]
+    return _policy(_and(parts), value_score, selector, xform), intent
 
 
 def _trusted_antseed_gate() -> list:
