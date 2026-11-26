@@ -154,6 +154,56 @@ async def test_capacity_queue_is_bounded_and_releases(monkeypatch):
     assert auth_proxy._pending_requests == 0
 
 
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/v1/usage"),
+    ("GET", "/v1/session/example"),
+    ("POST", "/v1/chat/completions"),
+])
+@pytest.mark.parametrize("with_guidance", [False, True])
+def test_caller_rate_limit_reuses_resolved_metadata(monkeypatch, method, path, with_guidance):
+    resolver = auth_proxy.control_plane_client
+    monkeypatch.setattr(resolver, "enabled", lambda: True)
+    monkeypatch.setattr(auth_proxy, "_caller_auth", lambda token: {"ok": False})
+    monkeypatch.setattr(auth_proxy, "_consumer_meta", lambda caller: {"status": "active"})
+    monkeypatch.setattr(auth_proxy, "CALLER_KEYS", {})
+    monkeypatch.setattr(auth_proxy, "CALLER_KEY_HASHES", {})
+    monkeypatch.setattr(auth_proxy, "_client", object())
+    monkeypatch.setattr(auth_proxy, "_record_reject", lambda **kwargs: None)
+    payload = {"active": True, "consumer": "limited", "tenant_id": 7,
+               "rate_per_min": 60, "burst": 10}
+    expected = {"message": "caller rate limit exceeded", "type": "rate_limit_error",
+                "code": "caller_rate_limit"}
+    if with_guidance:
+        payload.update(rate_limit_guidance="Reduce request frequency.",
+                       rate_limit_help_url="https://example.com/limits")
+        expected.update(guidance="Reduce request frequency.", help_url="https://example.com/limits")
+
+    lookups = []
+
+    async def resolve(digest):
+        lookups.append(digest)
+        return resolver._parse_resolved(payload)
+
+    async def resolve_route(tenant_id, slug):
+        return {"policy_ir": []}
+
+    def consume(caller, rate, burst):
+        assert (caller, rate, burst) == (f"{auth_proxy.CONTROL_PLANE_CALLER_PREFIX}limited", 60, 10)
+        return False, True, 1.25
+
+    monkeypatch.setattr(resolver, "resolve_key", resolve)
+    monkeypatch.setattr(resolver, "resolve_route", resolve_route)
+    monkeypatch.setattr(host_store, "consume_rate_token", consume)
+    body = {"json": {"model": "route:production"}} if method == "POST" else {}
+    response = TestClient(auth_proxy.app).request(
+        method, path, headers={"Authorization": "Bearer limited"}, **body)
+
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "2"
+    assert response.json() == {"error": expected}
+    assert lookups == [hashlib.sha256(b"limited").hexdigest()]
+
+
 def test_proxy_sheds_excess_load_with_retry_after(monkeypatch):
     monkeypatch.setattr(auth_proxy, "_caller_auth", lambda _token: {
         "ok": True, "caller": "load", "digest": "a" * 64,
