@@ -148,7 +148,7 @@ def constrain_request(contract, limits):
     return contract
 
 
-async def select_policy(host, contract, execution, *, provider=None, trace=None):
+async def select_policy(host, contract, execution, *, provider=None, trace=None, allowance=None):
     """Return a constrained ordinary contract and bounded decision metadata."""
     config = execution["automatic"]
     limits = await asyncio.to_thread(validate_config, host, config)
@@ -187,7 +187,8 @@ async def select_policy(host, contract, execution, *, provider=None, trace=None)
         trace["cost_usd"] = None  # a timeout/cancellation may still be billable
         try:
             if provider is None:
-                provider = JevDecisionProvider(decision_credential(host), model=config["model"])
+                bound_options = {"allowance": allowance} if allowance is not None else {}
+                provider = JevDecisionProvider(decision_credential(host), model=config["model"], **bound_options)
             request = DecisionRequest(decision_id, INSTRUCTION, project_task(contract, config["use_case"]),
                 tuple(DecisionChoice(name, policies[name]["description"]) for name in legal))
             # Wrap even injected providers so the application, not a provider,

@@ -151,12 +151,20 @@ Set `SHARED_COST_ATTEMPT_LIMITS` on the router to a JSON array such as:
     "max_input_bytes": 65536,
     "max_output_tokens": 1024,
     "max_cost_usd": "0.05"
+  },
+  {
+    "provider": "openrouter",
+    "protocol": "decisions",
+    "base_url": "https://openrouter.ai/api/alpha/decisions",
+    "model": "typesafe/jev-1.13",
+    "max_input_bytes": 16000,
+    "max_cost_usd": "0.01"
   }
 ]
 ```
 
-Each entry attests an upper bound for one POST to the exact HTTPS endpoint and
-wire model using the operator's shared provider credentials. The limit covers
+Each chat entry attests an upper bound for one POST to the exact HTTPS endpoint
+and wire model using the operator's shared provider credentials. The limit covers
 every accepted serialized JSON body up to `max_input_bytes` and all billable
 output up to the enforced `max_tokens` limit. Include protocol overhead,
 reasoning tokens if applicable, and any other charges in the bound. Configure
@@ -165,12 +173,24 @@ when present, and charge within the bound even on failed or canceled calls.
 Update the bound before changing the endpoint's charging or token semantics.
 Keep configuration consistent on all router replicas.
 
-Shared scopes support buffered text chat with explicitly bounded,
-OpenAI-compatible endpoints. Streaming, multimodal input, tools, automatic
-selection and flow execution require their own enforceable bounds before they
-can be enabled here. The route's first-token deadline applies to completion of
-the buffered provider call. The default configuration allows no provider
-attempts for shared scopes.
+Marketplace offers must match the configured provider, HTTPS seller endpoint
+and wire model. Peer offers also require an exact `peer_id` match and a gateway
+that honors that pin and enforces the attested bound. Peer attempts retain the
+full bound at settlement because the seller can control the reported usage.
+Discovery prices are used by ranking. They never authorize dispatch.
+
+For an automatic route, a `decisions` entry attests the total charge for one
+selection POST, including all output and overhead. Its `base_url` is the full
+decision endpoint. The selector still requires the tenant's decision credential.
+If the decision cannot be dispatched, the ordinary general-policy fallback runs
+under the same guard. Selection and inference consume the same request allowance.
+Reported costs can reduce settlement. The sum of the dispatch bounds must still
+fit the original request ceiling.
+
+Shared scopes support buffered text chat. Streaming, multimodal input, tools and
+flow execution remain outside the supported request shape. The route's
+first-token deadline applies to completion of the buffered provider call.
+The default configuration allows no provider attempts for shared scopes.
 
 During a UTC month rollover, a scope waits for the previous month's live
 commitments to settle or expire. Admission uses PostgreSQL's UTC clock and a

@@ -180,9 +180,7 @@ def _prepare_openai_call(
             auth_headers = {}
 
     headers = {"Content-Type": "application/json", **auth_headers, **extra}
-    if provider_id.startswith("antseed") and os.getenv("ANTSEED_PROXY_TOKEN"):
-        # The operator's funded buyer proxy (antseed/public-proxy.js) requires it.
-        headers["Authorization"] = "Bearer " + os.environ["ANTSEED_PROXY_TOKEN"]
+    _apply_buyer_auth(headers, provider_id)
     from byo_http import is_byo_buyer
     if is_byo_buyer(request, env_get):
         # Never trust an offer's endpoint to choose where a tenant secret goes.
@@ -193,6 +191,12 @@ def _prepare_openai_call(
         headers["x-antseed-pin-peer"] = peer_id
     timeout = (request.get("timeout_ms") or int(timeout_s * 1000)) / 1000.0
     return (url, body, headers, timeout), None
+
+
+def _apply_buyer_auth(headers, provider_id):
+    if provider_id.startswith("antseed") and os.getenv("ANTSEED_PROXY_TOKEN"):
+        # The operator's funded buyer proxy (antseed/public-proxy.js) requires it.
+        headers["Authorization"] = "Bearer " + os.environ["ANTSEED_PROXY_TOKEN"]
 
 
 def make_http_call_provider(
@@ -845,12 +849,21 @@ async def call_with_cost_allowance(request, allowance, client, env_get, prepared
     headers, err = _resolve_auth_headers(request, env_get)
     if err is not None:
         return err
-    allowance.dispatch(bound)
+    offer = request.get("offer") or {}
+    peer_id = offer.get("peer_id")
+    _apply_buyer_auth(headers, request.get("provider_id") or "")
+    if peer_id:
+        headers["x-antseed-pin-peer"] = peer_id
     started = time.monotonic()
     timeout = min(request.get("timeout_ms") or 30_000,
                   request.get("first_token_timeout_ms") or 30_000) / 1000
+    slot = None
     try:
         async with asyncio.timeout(timeout):
+            slot, gate_error = await _acquire_peer_capacity(request, timeout, env_get)
+            if gate_error:
+                return _peer_capacity_error(peer_id, offer["max_concurrency"], gate_error, started)
+            allowance.dispatch(bound)
             response = await _post_bounded(client, url, content=body,
                                            headers={**headers, "Content-Type": "application/json"},
                                            follow_redirects=False)
@@ -861,5 +874,10 @@ async def call_with_cost_allowance(request, allowance, client, env_get, prepared
         return _err("network_error", 0, _elapsed_ms(started), "provider request failed")
     except ResponseTooLarge:
         return _err("bad_response", 0, _elapsed_ms(started), "provider response exceeded cap")
-    allowance.reconcile(result, bound)
+    finally:
+        if slot is not None:
+            await slot.release()
+    # Peer gateways can relay seller-controlled usage.
+    if not peer_id:
+        allowance.reconcile((result.get("response") or {}).get("cost_reported"), bound)
     return result

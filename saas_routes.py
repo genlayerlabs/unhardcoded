@@ -5,6 +5,7 @@ import asyncio
 import contextvars
 import math
 import re
+from functools import cache
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -36,7 +37,7 @@ class ScopedHost:
     def __getattr__(self, name):
         return getattr(_active.get() or self.base, name)
 
-    async def execute_async(self, contract, **kwargs):
+    async def execute_async(self, contract, *, shared_allowance=None, **kwargs):
         host = _active.get() or self.base
         if host._tenant_id is not None and contract.get("session"):
             scope_id = host._env.get('SAAS_TENANT_SCOPE', str(host._tenant_id))
@@ -44,8 +45,13 @@ class ScopedHost:
         if execution := _automatic.get():
             from decision_providers import DecisionError
             from policy_selection import select_policy
+            if shared_allowance is not None and host._discover_hook is not None:
+                # The first eligibility rank runs off-loop. Reuse that request's
+                # discovery snapshot, including misses, for rechecks and inference.
+                host._discover_hook = cache(host._discover_hook)
             try:
-                contract, _ = await select_policy(host, contract, execution, trace=_decision_trace.get())
+                contract, _ = await select_policy(host, contract, execution, trace=_decision_trace.get(),
+                                                  allowance=shared_allowance)
             except (ValueError, DecisionError):
                 return {"ok": False, "error": "no_candidates", "trace": automatic_trace()}
         result = await host.execute_async(contract, **kwargs)
@@ -257,7 +263,7 @@ def install(app, scoped, handle_chat, chat_request):
         try:
             host_token = _active.set(child)
             auto_payload = None
-            if request.url.path in ("/v1/chat/completions", "/v1/responses"):
+            if request.url.path in ("/v1/chat/completions", "/v1/responses", shared_cost.PATH):
                 try:
                     payload = await request.json()
                     auto_payload = payload.get("_auto_contract") if isinstance(payload, dict) else None
