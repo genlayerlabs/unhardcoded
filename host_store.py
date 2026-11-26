@@ -41,7 +41,7 @@ import time
 import uuid
 from bisect import bisect_left
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -416,23 +416,41 @@ _SCHEMA_STATEMENTS = [
         tenant_id    BIGINT NOT NULL,
         subject      TEXT NOT NULL,
         period       TEXT NOT NULL,
-        spent_usd    DOUBLE PRECISION NOT NULL DEFAULT 0,
-        reserved_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+        spent_usd    NUMERIC(30,12) NOT NULL DEFAULT 0,
+        reserved_usd NUMERIC(30,12) NOT NULL DEFAULT 0,
         updated_at   BIGINT NOT NULL,
         PRIMARY KEY (tenant_id, subject, period)
     )""",
     # One row per in-flight call. `released` = swept after expiry (the holder
     # died): it no longer counts as reserved, but the row survives so a late
-    # settle still books the actual cost exactly once.
+    # settle still books the actual cost exactly once. Scoped calls precharge
+    # the ceiling to spent_usd and start released, so expiry preserves spend.
     """CREATE TABLE IF NOT EXISTS subject_budget_reservations (
         id         TEXT PRIMARY KEY,
         tenant_id  BIGINT NOT NULL,
         subject    TEXT NOT NULL,
         period     TEXT NOT NULL,
-        amount_usd DOUBLE PRECISION NOT NULL,
+        amount_usd NUMERIC(30,12) NOT NULL,
         expires_at DOUBLE PRECISION NOT NULL,
-        released   BOOLEAN NOT NULL DEFAULT FALSE
+        released   BOOLEAN NOT NULL DEFAULT FALSE,
+        precharged BOOLEAN NOT NULL DEFAULT FALSE
     )""",
+    """DO $$ BEGIN
+        IF EXISTS (SELECT 1 FROM pg_attribute
+                   WHERE attrelid = 'subject_budget_usage'::regclass
+                     AND attname = 'spent_usd' AND atttypid = 'float8'::regtype) THEN
+            ALTER TABLE subject_budget_usage
+                ALTER COLUMN spent_usd TYPE NUMERIC(30,12),
+                ALTER COLUMN reserved_usd TYPE NUMERIC(30,12);
+            ALTER TABLE subject_budget_reservations
+                ALTER COLUMN amount_usd TYPE NUMERIC(30,12),
+                ADD COLUMN IF NOT EXISTS precharged BOOLEAN NOT NULL DEFAULT FALSE;
+        END IF;
+    END $$""",
+    "CREATE INDEX IF NOT EXISTS idx_subject_budget_live"
+    " ON subject_budget_reservations(tenant_id, subject, period, expires_at) WHERE NOT released",
+    "CREATE INDEX IF NOT EXISTS idx_subject_budget_released"
+    " ON subject_budget_reservations(expires_at) WHERE released",
     "CREATE INDEX IF NOT EXISTS idx_subject_budget_reservations_subject"
     " ON subject_budget_reservations(tenant_id, subject, period, expires_at)",
 ]
@@ -629,7 +647,8 @@ def _prune() -> None:
                          (_hourly_retention_floor(int(now)),))
             conn.execute("DELETE FROM provider_daily_spend WHERE utc_day <"
                          " (statement_timestamp() AT TIME ZONE 'UTC')::date - 1")
-            # Swept reservations only wait for a late settle; a day is plenty.
+            # Swept and precharged reservations allow reconciliation through
+            # one day after expiry. Pruning a precharge leaves its spend intact.
             conn.execute("DELETE FROM subject_budget_reservations"
                          " WHERE released AND expires_at < %s", (now - 86400,))
             conn.execute("DELETE FROM request_allowance_periods WHERE period_end <= %s",
@@ -2196,88 +2215,130 @@ def settle_request_allowance_async(reservation_id: str, success: bool) -> None:
 # ---- per-subject monthly budgets (control-plane key limits) ---------------------
 
 
+_BUDGET_UNIT = Decimal("0.000000000001")
+
+
+def _budget_cost(value: float | Decimal | None) -> Decimal | None:
+    if value is None:
+        return None
+    cost = Decimal(str(value))
+    if not cost.is_finite() or cost < 0:
+        return None
+    return cost.quantize(_BUDGET_UNIT, rounding=ROUND_CEILING)
+
+
 def reserve_subject_budget(tenant_id: int, subject: str, period: str, limit_usd: float,
                            amount_usd: float, reservation_id: str, ttl_s: float = 900.0, *,
-                           now: "float | None" = None) -> "tuple[bool, bool, float, float]":
-    """Atomically admit one in-flight call against a subject's monthly budget.
+                           now: float | None = None) -> tuple[bool, bool, float, float]:
+    """Legacy single-subject admission. Returns allowed, store status, spent, reserved."""
+    rejected, ok, spent, reserved = _reserve_budgets(
+        tenant_id, [(subject, limit_usd, reservation_id)], period, amount_usd, ttl_s,
+        precharge=False, now=now)
+    return rejected is None and ok, ok, float(spent), float(reserved)
 
-    Returns ``(allowed, store_ok, spent_usd, reserved_usd)`` (reserved as seen
-    after this call). The subject's usage row is locked for one short
-    transaction, so concurrent replicas serialize: expired reservations are
-    swept first (their holder died), then the call is admitted only if
-    spent + live reservations + amount <= limit."""
+
+def reserve_scoped_budget(tenant_id: int, subject: str, period: str, key_limit: Decimal | None,
+                          scope: str, scope_limit: Decimal, ceiling: Decimal,
+                          reservation_id: str, ttl_s: float) -> tuple[str | None, bool, Decimal]:
+    """Admit against both limits in one transaction, precharging the ceiling."""
+    budgets = [(f"s:{scope}", scope_limit, f"{reservation_id}:scope")]
+    if key_limit is not None:
+        budgets.insert(0, (subject, key_limit, reservation_id))
+    rejected, ok, spent, _ = _reserve_budgets(
+        tenant_id, budgets, period, ceiling, ttl_s, precharge=True)
+    return rejected, ok, spent
+
+
+def _reserve_budgets(tenant_id, budgets, period, amount_usd, ttl_s, *, precharge, now=None):
     try:
         stamp = float(time.time() if now is None else now)
-        key = (int(tenant_id), str(subject), str(period))
-        with _get_pool().connection() as conn:
-            conn.execute(
-                "INSERT INTO subject_budget_usage(tenant_id,subject,period,updated_at)"
-                " VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING", key + (int(stamp),))
-            spent = float(conn.execute(
-                "SELECT spent_usd FROM subject_budget_usage"
-                " WHERE tenant_id=%s AND subject=%s AND period=%s FOR UPDATE", key).fetchone()[0])
-            conn.execute(
-                "UPDATE subject_budget_reservations SET released=TRUE"
-                " WHERE tenant_id=%s AND subject=%s AND period=%s AND NOT released"
-                " AND expires_at <= %s", key + (stamp,))
-            # Recomputed from the live rows (not the counter) so float drift or a
-            # lost update can never under-count what is in flight.
-            reserved = float(conn.execute(
-                "SELECT COALESCE(sum(amount_usd),0) FROM subject_budget_reservations"
-                " WHERE tenant_id=%s AND subject=%s AND period=%s AND NOT released",
-                key).fetchone()[0])
-            amount = max(0.0, float(amount_usd))
-            allowed = spent + reserved + amount <= float(limit_usd) + 1e-9
-            if allowed:
-                conn.execute(
-                    "INSERT INTO subject_budget_reservations"
-                    "(id,tenant_id,subject,period,amount_usd,expires_at) VALUES (%s,%s,%s,%s,%s,%s)",
-                    (str(reservation_id),) + key + (amount, stamp + float(ttl_s)))
-                reserved += amount
-            conn.execute(
-                "UPDATE subject_budget_usage SET reserved_usd=%s, updated_at=%s"
-                " WHERE tenant_id=%s AND subject=%s AND period=%s",
-                (reserved, int(stamp)) + key)
-        return allowed, True, spent, reserved
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("host_store reserve_subject_budget failed: %s", exc)
-        return False, False, 0.0, 0.0
-
-
-def settle_subject_budget(reservation_id: str, cost_usd: "float | None") -> "tuple[bool, bool]":
-    """Release a reservation and book the call's actual cost (unknown or
-    negative -> 0). Idempotent: the reservation row is consumed, so a second
-    settle finds nothing and books nothing. A reservation already swept after
-    expiry still books its cost once. Returns ``(settled, store_ok)``.
-
-    Called synchronously on the request's exit path, so the connection wait
-    and statement are bounded: on a store outage the reservation simply
-    expires instead of stalling the event loop."""
-    try:
-        cost = float(cost_usd) if cost_usd is not None else 0.0
-        if not math.isfinite(cost) or cost < 0:
-            cost = 0.0
+        amount = _budget_cost(amount_usd) or Decimal(0)
+        accepted = []
         with _get_pool().connection(timeout=2.0) as conn:
             conn.execute("SELECT set_config('statement_timeout', '2000', true)")
-            found = conn.execute(
-                "SELECT tenant_id,subject,period FROM subject_budget_reservations WHERE id=%s",
-                (str(reservation_id),)).fetchone()
-            if found is None:
+            # All callers lock the key/group before the shared scope.
+            for subject, limit, reservation_id in budgets:
+                key = (tenant_id, subject, period)
+                conn.execute(
+                    "INSERT INTO subject_budget_usage(tenant_id,subject,period,updated_at)"
+                    " VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING", key + (int(stamp),))
+                spent = conn.execute(
+                    "SELECT spent_usd FROM subject_budget_usage"
+                    " WHERE tenant_id=%s AND subject=%s AND period=%s FOR UPDATE", key).fetchone()[0]
+                reserved = Decimal(0)
+                if not subject.startswith("s:"):
+                    conn.execute(
+                        "UPDATE subject_budget_reservations SET released=TRUE"
+                        " WHERE tenant_id=%s AND subject=%s AND period=%s AND NOT released"
+                        " AND expires_at <= %s", key + (stamp,))
+                    reserved = conn.execute(
+                        "SELECT COALESCE(sum(amount_usd),0) FROM subject_budget_reservations"
+                        " WHERE tenant_id=%s AND subject=%s AND period=%s AND NOT released",
+                        key).fetchone()[0]
+                limit = Decimal(str(limit))
+                if not limit or spent + reserved + amount > limit:
+                    return subject, True, spent, reserved
+                accepted.append((key, reservation_id, reserved))
+
+            for key, reservation_id, reserved in accepted:
+                conn.execute(
+                    "INSERT INTO subject_budget_reservations"
+                    "(id,tenant_id,subject,period,amount_usd,expires_at,released,precharged)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (reservation_id,) + key + (amount, stamp + ttl_s, precharge, precharge))
+                updated_reserved = reserved if precharge else reserved + amount
+                conn.execute(
+                    "UPDATE subject_budget_usage SET reserved_usd=%s, updated_at=%s,"
+                    " spent_usd=spent_usd+%s WHERE tenant_id=%s AND subject=%s AND period=%s",
+                    (updated_reserved, int(stamp), amount if precharge else 0) + key)
+        return None, True, spent, updated_reserved
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("host_store budget admission failed: %s", exc)
+        return None, False, Decimal(0), Decimal(0)
+
+
+def settle_subject_budget(reservation_id: str, cost_usd: float | Decimal | None) -> tuple[bool, bool]:
+    """Reconcile actual spend once, atomically across all reserved subjects.
+
+    Unknown cost keeps the precharge on scoped calls. A failed settlement, or
+    an expired reservation pruned after a grace day, also keeps the precharge.
+    Legacy reservations continue to release on expiry.
+    """
+    try:
+        cost = _budget_cost(cost_usd)
+        with _get_pool().connection(timeout=2.0) as conn:
+            conn.execute("SELECT set_config('statement_timeout', '2000', true)")
+            rows = conn.execute(
+                "SELECT id,tenant_id,subject,period FROM subject_budget_reservations"
+                " WHERE id IN (%s,%s) ORDER BY id COLLATE \"C\"",
+                (reservation_id, f"{reservation_id}:scope")).fetchall()
+            if not rows:
                 return False, True
-            key = tuple(found)
-            # Lock order matches reserve (usage row, then reservation).
-            conn.execute("SELECT 1 FROM subject_budget_usage WHERE tenant_id=%s AND subject=%s"
-                         " AND period=%s FOR UPDATE", key)
-            if conn.execute("DELETE FROM subject_budget_reservations WHERE id=%s RETURNING id",
-                            (str(reservation_id),)).fetchone() is None:
-                return False, True   # a concurrent settle won
-            conn.execute(
-                "UPDATE subject_budget_usage SET spent_usd=spent_usd+%s,"
-                " reserved_usd=(SELECT COALESCE(sum(amount_usd),0) FROM subject_budget_reservations r"
-                "  WHERE r.tenant_id=%s AND r.subject=%s AND r.period=%s AND NOT r.released),"
-                " updated_at=%s WHERE tenant_id=%s AND subject=%s AND period=%s",
-                (cost,) + key + (int(time.time()),) + key)
-        return True, True
+            for _, tenant_id, subject, period in rows:
+                conn.execute("SELECT 1 FROM subject_budget_usage WHERE tenant_id=%s AND subject=%s"
+                             " AND period=%s FOR UPDATE", (tenant_id, subject, period))
+            settled = conn.execute(
+                "DELETE FROM subject_budget_reservations WHERE id IN (%s,%s)"
+                " RETURNING id,tenant_id,subject,period,amount_usd,precharged",
+                (reservation_id, f"{reservation_id}:scope")).fetchall()
+            for row_id, tenant_id, subject, period, amount, precharged in settled:
+                key = (tenant_id, subject, period)
+                delta = (cost - amount if cost is not None else 0) if precharged else (cost or 0)
+                if precharged and delta > 0 and row_id.endswith(":scope"):
+                    _log.warning("shared budget actual cost exceeded the published call ceiling")
+                if precharged:
+                    conn.execute(
+                        "UPDATE subject_budget_usage SET spent_usd=spent_usd+%s, updated_at=%s"
+                        " WHERE tenant_id=%s AND subject=%s AND period=%s",
+                        (delta, int(time.time())) + key)
+                else:
+                    conn.execute(
+                        "UPDATE subject_budget_usage SET spent_usd=spent_usd+%s,"
+                        " reserved_usd=(SELECT COALESCE(sum(amount_usd),0) FROM subject_budget_reservations r"
+                        "  WHERE r.tenant_id=%s AND r.subject=%s AND r.period=%s AND NOT r.released),"
+                        " updated_at=%s WHERE tenant_id=%s AND subject=%s AND period=%s",
+                        (delta,) + key + (int(time.time()),) + key)
+        return bool(settled), True
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store settle_subject_budget failed: %s", exc)
         return False, False

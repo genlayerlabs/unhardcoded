@@ -14,6 +14,7 @@ import os
 import sys
 import threading
 import time
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -33,6 +34,7 @@ import host_store  # noqa: E402
 
 from conftest import require_host_store  # noqa: E402
 
+_ORIGINAL_RESOLVE_ROUTE = cpc.resolve_route
 SECRET = {"x-internal-secret": "s3cret"}
 ROUTE = {"route": "route:production", "revision": 2, "policy_id": "a" * 64,
          "policy_ir": ["policy"], "execution": {}}
@@ -156,6 +158,34 @@ def test_resolve_route_parses_key_limits(monkeypatch):
     assert data["limits"] == {"monthly_budget_usd": 2.5, "rate_per_min": None, "burst": None}
 
 
+def test_shared_budget_contract_keeps_zero_and_exact_amounts(monkeypatch):
+    data = _resolve_with(monkeypatch, {"key": KEY, "limits": {
+        "monthly_budget_usd": 0, "shared_budget": {
+            "scope": "team-1", "monthly_budget_usd": "0",
+            "max_call_cost_usd": "0.000000000001", "help_url": "javascript:bad",
+        }}})
+    limits = data["limits"]
+    assert limits["monthly_budget_usd"] == Decimal(0)
+    assert limits["shared_budget"] == {
+        "scope": "team-1", "monthly_budget_usd": Decimal(0),
+        "max_call_cost_usd": Decimal("0.000000000001"),
+        "guidance": None, "help_url": None,
+    }
+
+
+@pytest.mark.parametrize("overrides", [
+    {"scope": "g:7"}, {"monthly_budget_usd": -1}, {"monthly_budget_usd": True},
+    {"monthly_budget_usd": "0.0000000000001"}, {"max_call_cost_usd": None},
+    {"max_call_cost_usd": 0},
+])
+def test_shared_budget_invalid_contract_fails_closed(monkeypatch, overrides):
+    with pytest.raises(cpc.RouteUnavailable):
+        _resolve_with(monkeypatch, {"key": KEY, "limits": {"shared_budget": {
+            "scope": "team", "monthly_budget_usd": "1", "max_call_cost_usd": "0.05",
+            **overrides,
+        }}})
+
+
 def test_resolve_route_without_key_limits_is_unlimited(monkeypatch):
     data = _resolve_with(monkeypatch, {})
     assert data["key"] is None and data["limits"] is None
@@ -172,11 +202,9 @@ def test_resolve_route_without_key_limits_is_unlimited(monkeypatch):
     {"key": {**KEY, "labels": {"a": 1}}, "limits": {}},
     {"key": {**KEY, "labels": {f"k{i}": "v" for i in range(33)}}, "limits": {}},
     {"key": {**KEY, "labels": {"k": "v" * 257}}, "limits": {}},
-    {"key": KEY, "limits": {"monthly_budget_usd": "0"}},
     {"key": KEY, "limits": {"monthly_budget_usd": "-1"}},
     {"key": KEY, "limits": {"monthly_budget_usd": "1e3"}},
     {"key": KEY, "limits": {"monthly_budget_usd": True}},
-    {"key": KEY, "limits": {"monthly_budget_usd": 0}},
     {"key": KEY, "limits": {"rate_per_min": 0}},
     {"key": KEY, "limits": {"rate_per_min": 1.5}},
     {"key": KEY, "limits": {"burst": "10"}},
@@ -264,6 +292,53 @@ def test_budget_exhausted_is_402_without_forwarding(monkeypatch):
     _saas(monkeypatch, limits={"monthly_budget_usd": "0.10", "rate_per_min": None, "burst": None},
           upstream=up, tenant=6)
     assert _post(client).status_code == 200
+
+
+def test_shared_budget_composes_and_updates_on_next_resolve(monkeypatch):
+    require_host_store()
+    up = _saas(monkeypatch, limits={})
+    shared = {"scope": "team", "monthly_budget_usd": "0.10", "max_call_cost_usd": "0.05",
+              "guidance": "Contact your administrator.", "help_url": "https://example.org/limits"}
+    key_limit = "0"
+    route_reads = []
+
+    def handler(request):
+        route_reads.append(request.url)
+        return httpx.Response(200, json={**ROUTE, "key": KEY, "limits": {
+            "monthly_budget_usd": key_limit, "shared_budget": shared}})
+    monkeypatch.setattr(cpc, "resolve_route", _ORIGINAL_RESOLVE_ROUTE)
+    monkeypatch.setattr(cpc, "_client", httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    client = TestClient(auth_proxy.app)
+
+    assert _post(client).json()["error"]["code"] == "key_budget_exhausted"
+    assert not up.requests
+    assert _budget("s:team")["spent_usd"] == 0
+
+    key_limit = "0.10"
+    assert _post(client).status_code == 200
+    assert _budget("s:team")["spent_usd"] == _budget()["spent_usd"] == 0.02
+
+    shared["monthly_budget_usd"] = "0"
+    response = _post(client)
+    assert response.status_code == 402
+    assert response.json()["error"] == {
+        "message": "shared budget exhausted", "type": "budget_error",
+        "code": "shared_budget_exhausted", "budget_usd": 0.0, "spent_usd": 0.02,
+        "guidance": shared["guidance"], "help_url": shared["help_url"],
+    }
+    assert _budget()["spent_usd"] == 0.02
+    assert len(route_reads) == 3 and len(up.requests) == 1
+
+
+@pytest.mark.parametrize("cost,status,expected", [(None, 200, 0.05), (None, 500, 0.05), (0.0, 200, 0.0)])
+def test_shared_budget_unknown_cost_keeps_ceiling(monkeypatch, cost, status, expected):
+    require_host_store()
+    _saas(monkeypatch, limits={"shared_budget": {
+        "scope": "team", "monthly_budget_usd": Decimal("0.10"),
+        "max_call_cost_usd": Decimal("0.05"),
+    }}, upstream=_Upstream(lambda: _JsonResp(cost=cost, status_code=status)))
+    assert _post(TestClient(auth_proxy.app)).status_code == status
+    assert _budget("s:team")["spent_usd"] == expected
 
 
 def test_budget_store_unavailable_is_503(monkeypatch):
@@ -452,7 +527,7 @@ def test_expired_reservations_are_swept_and_still_settle_once(host_store_clean):
     with hs._get_pool().connection() as conn:
         spent, reserved = conn.execute("SELECT spent_usd, reserved_usd FROM subject_budget_usage"
                                        " WHERE tenant_id=2").fetchone()
-    assert spent == pytest.approx(0.01) and reserved == pytest.approx(0.05)
+    assert (spent, reserved) == (Decimal("0.01"), Decimal("0.05"))
 
 
 def test_concurrent_reservations_never_exceed_limit(host_store_clean):
