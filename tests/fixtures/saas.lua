@@ -1,3 +1,5 @@
+local intelligence = {primary=0.4, backup=0.8, forbidden=1}
+
 return {
  providers = {
   openai = {discovery='static', base_url='http://provider.test', api_kind='openai_compatible', auth_env='OPENAI_API_KEY', tier='partner'},
@@ -9,6 +11,9 @@ return {
   backup = {served_by={{provider='anthropic'}}, capabilities={context=128000,supports_tools=true,supports_json_mode=true}},
   basic = {served_by={{provider='openai'}}, capabilities={context=128000,supports_tools=false,supports_json_mode=false}},
   forbidden = {served_by={{provider='platform_only'}}, capabilities={context=128000}},
+ },
+ fields = {
+  bench_intelligence = {sort='Num', default=0, get=function(c) return intelligence[c.model_family] end},
  },
  profiles = {default={scorer={'zero'}}},
  policy_envelope = {'and', {'meets_req'}, {'not', {'is','disabled'}}},
