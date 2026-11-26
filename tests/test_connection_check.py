@@ -218,7 +218,7 @@ async def test_endpoint_auth_validation_and_rate_limit(router, monkeypatch):
         assert client.post(path, headers=SECRET, params={"project_id": 8}).status_code == 400
         assert (await ingress.post(path, headers=SECRET, params={"project_id": 8})).status_code == 400
         host_store.reserve_connection_check.return_value = False
-        limited = await ingress.post(path, headers=SECRET)
+        limited = await ingress.post(path, headers=SECRET, params={"connection_ref": "saved"})
         assert limited.status_code == 429
         assert limited.headers["retry-after"] == str(connection_check.INTERVAL)
         host_store.reserve_connection_check.assert_called_once_with(7, connection_check.INTERVAL)
@@ -260,3 +260,79 @@ def test_scoped_check_obeys_managed_grants(router, monkeypatch, grants, reason):
     assert result["working"] is (reason == "ok")
     assert seen == (["https://relay.invalid/v1/models"] if reason == "ok" else [])
     credentials.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("identity_override", "status", "reason"), [
+    ({}, 200, "ok"),
+    ({"tenant_id": 8}, 200, "unreachable"),
+    ({"provider_id": "anthropic"}, 200, "unreachable"),
+    ({"connection_ref": "different"}, 200, "unreachable"),
+    ({}, 404, "unreachable"),
+    ({"env": {}, "managed_providers": ["openai"]}, 200, "bad_credential"),
+])
+async def test_saved_connection_uses_only_exact_credentials(
+    router, monkeypatch, identity_override, status, reason,
+):
+    client, host, legacy_credentials = router
+    monkeypatch.setenv("SAAS_SHARED_PROVIDERS", "openai")
+    host.set_env("OPENAI_API_KEY", TOKEN)
+    host.set_provider_relays({"openai": "https://relay.invalid/v1"})
+    identity = {"provider_id": "openai", "connection_ref": "saved_ABC-42"}
+    control_requests = []
+    provider_requests = []
+
+    def control(request):
+        control_requests.append(request)
+        return httpx.Response(status, json={
+            "tenant_id": 7, **identity,
+            "env": {"OPENAI_API_KEY": "selected-token"},
+            "connections": {"antseed": {"gateway_url": "https://ignored.invalid", "token": TOKEN}},
+            "base_url": "https://ignored.invalid",
+            **identity_override,
+        })
+
+    def upstream(request):
+        provider_requests.append(request)
+        return httpx.Response(200, json={"data": []})
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(control)) as control_client,
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app)) as shim_client,
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=auth_proxy.app),
+                          base_url="http://ingress.test") as ingress,
+    ):
+        monkeypatch.setattr(cp, "_client", control_client)
+        monkeypatch.setattr(auth_proxy, "_connection_check_client", shim_client)
+        fake_http(monkeypatch, upstream)
+        response = await ingress.post(PATH.format("openai"), headers=SECRET,
+                                      params={"connection_ref": identity["connection_ref"]})
+
+    assert response.status_code == 200
+    assert response.json()["reason"] == reason
+    assert "selected-token" not in response.text
+    legacy_credentials.assert_not_awaited()
+    request, = control_requests
+    assert request.method == "POST"
+    assert request.url.path == "/internal/tenants/7/provider-connections/probe-credentials"
+    assert request.headers["x-internal-secret"] == SECRET["x-internal-secret"]
+    assert json.loads(request.content) == identity
+    if reason == "ok":
+        provider_request, = provider_requests
+        assert str(provider_request.url) == "https://relay.invalid/v1/models"
+        assert provider_request.headers["authorization"] == "Bearer selected-token"
+    else:
+        assert provider_requests == []
+
+
+@pytest.mark.parametrize("params", [
+    [("connection_ref", "")],
+    [("connection_ref", "a/b")],
+    [("connection_ref", "a" * 129)],
+    [("connection_ref", "one"), ("connection_ref", "two")],
+    [("connection_ref", "one"), ("project_id", "8"), ("environment_id", "9")],
+])
+def test_invalid_saved_connection_scope_rejected_before_reservation(router, params):
+    client, _, _ = router
+    assert client.post(PATH.format("openai"), headers=SECRET, params=params).status_code == 400
+    host_store.reserve_connection_check.assert_not_called()

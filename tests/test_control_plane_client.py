@@ -43,6 +43,10 @@ class _FakeClient:
         self.responses = list(responses)
         self.calls: list[dict] = []
 
+    async def post(self, url, json, headers=None):
+        self.calls.append({"url": url, "json": json, "headers": headers})
+        return self.responses.pop(0)
+
     async def get(self, url, params=None, headers=None):
         self.calls.append({"url": url, "params": params, "headers": headers})
         item = self.responses.pop(0)
@@ -314,3 +318,16 @@ def test_plaintext_control_plane_sends_no_secret(monkeypatch):
         asyncio.run(cpc.tenant_connections(1, set(), project_id=2, environment_id=3))
     with pytest.raises(cpc.RouteUnavailable):
         asyncio.run(cpc.resolve_route(1, 'assistant', project_id=2, environment_id=3, key_digest='a' * 64))
+
+
+def test_saved_structured_probe_uses_only_selected_connection(monkeypatch):
+    bedrock = {"access_key_id": "sample", "secret_access_key": "sample", "region": "eu-west-1"}
+    _install(monkeypatch, [_FakeResp(200, {
+        "tenant_id": 7, "provider_id": "bedrock_market", "connection_ref": "saved",
+        "env": {"OPENAI_API_KEY": "unrelated"},
+        "connections": {"bedrock": bedrock, "antseed": {"token": "unrelated"}},
+    })])
+    result = asyncio.run(cpc.probe_connection(
+        7, "bedrock_market", "saved", auth_env=None, structured="bedrock",
+    ))
+    assert result == ({}, {"bedrock": bedrock})

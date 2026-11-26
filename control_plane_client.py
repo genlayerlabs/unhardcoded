@@ -58,6 +58,8 @@ ENV_ALLOWLIST = {
     if name.strip()
 }
 
+CONNECTION_REF_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
 _RESOLVE_CACHE_MAX = 4096
 _TIMEOUT = httpx.Timeout(3.0, connect=1.5)
 
@@ -326,6 +328,35 @@ async def tenant_connections(
         if scoped or require_fresh:
             raise RouteUnavailable("Scoped credentials unavailable.") from exc
         return {}, {}, ()
+
+
+async def probe_connection(tenant_id: int, provider_id: str, connection_ref: str, *,
+                           auth_env: str | None, structured: str | None) -> tuple[dict, dict]:
+    """Fetch one saved connection for an explicit probe without caching or fallback."""
+    if not enabled():
+        raise RouteUnavailable("Saved connection unavailable.")
+    identity = {"provider_id": provider_id, "connection_ref": connection_ref}
+    try:
+        response = await _get_client().post(
+            f"{CONTROL_PLANE_URL}/internal/tenants/{int(tenant_id)}/provider-connections/probe-credentials",
+            json=identity, headers={"x-internal-secret": CONTROL_PLANE_INTERNAL_SECRET},
+        )
+        response.raise_for_status()
+        data = response.json()
+        if (not isinstance(data, dict) or type(data.get("tenant_id")) is not int
+                or data["tenant_id"] != tenant_id
+                or any(data.get(k) != v for k, v in identity.items())):
+            raise ValueError("Mismatched saved connection")
+        raw, connections = data.get("env"), data.get("connections", {})
+        if not isinstance(raw, dict) or not isinstance(connections, dict):
+            raise ValueError("Invalid saved connection credentials")
+        if structured is not None:
+            credential = connections.get(structured)
+            return {}, {structured: credential} if isinstance(credential, dict) else {}
+        token = raw.get(auth_env)
+        return {auth_env: token} if auth_env and isinstance(token, str) and token else {}, {}
+    except (httpx.HTTPError, ValueError) as exc:
+        raise RouteUnavailable("Saved connection unavailable.") from exc
 
 
 def activate_tenant_env(env: dict[str, str] | None) -> contextvars.Token:

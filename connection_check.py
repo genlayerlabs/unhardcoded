@@ -21,7 +21,7 @@ from provider_adapters.aws_credentials import client as aws_client
 from provider_adapters.common import auth_token
 from provider_adapters.google import _google_request
 from provider_adapters.openai_compatible import _prepare_openai_call
-from provider_connections import credential_names
+from provider_connections import auth_env, credential_names
 from sources.openrouter import BASE_URL as OPENROUTER_URL
 from tenant_providers import buyer_snapshot
 
@@ -211,9 +211,21 @@ async def _probe(host, tenant_id, provider_id, scope):
     provider = catalog.get("providers", {}).get(provider_id)
     if provider is None:
         raise ProbeFailure("unknown")
-    env, connections, managed = await cp.tenant_connections(
-        tenant_id, credential_names(catalog), **scope, require_fresh=True,
-    )
+    connection_ref = scope.get("connection_ref")
+    if connection_ref is None:
+        env, connections, managed = await cp.tenant_connections(
+            tenant_id, credential_names(catalog), **scope, require_fresh=True,
+        )
+    else:
+        structured = "bedrock" if provider.get("api_kind") == "bedrock" else None
+        if provider_id == "antseed":
+            structured = "antseed"
+        env, connections = await cp.probe_connection(
+            tenant_id, provider_id, connection_ref,
+            auth_env=auth_env(provider), structured=structured,
+        )
+        scope = {}
+        managed = ()
     env, allowed, _ = host.tenant_provider_config(
         catalog, tenant_id, env, managed, connections, **scope,
     )
