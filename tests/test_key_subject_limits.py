@@ -346,6 +346,36 @@ def test_shared_budget_unknown_cost_keeps_ceiling(monkeypatch, cost, status, exp
     assert _budget("s:team")["spent_usd"] == expected
 
 
+def test_shared_allowance_endpoint_and_ingress(monkeypatch):
+    require_host_store()
+    upstream = _saas(monkeypatch, limits={"shared_budget": {
+        "scope": "team", "monthly_budget_usd": Decimal("1"),
+        "max_call_cost_usd": Decimal("0.05"), "guidance": "Contact your administrator.",
+    }}, tenant=5)
+    monkeypatch.setattr(cpc, "CONTROL_PLANE_INTERNAL_SECRET", "test-secret")
+    client = TestClient(auth_proxy.app)
+    path = "/internal/budgets/shared/5/team"
+    headers = {"x-internal-secret": "test-secret"}
+    change = {"revision": 0, "allowance_usd": "0.05", "correction_usd": "0"}
+
+    assert client.get(path).status_code == 403
+    assert client.put(path, json=change).status_code == 403
+    assert client.get(path, headers=headers).json()["revision"] == 0
+    assert client.put(path, headers=headers, json={**change, "allowance_usd": 0.05}).status_code == 400
+    assert client.put(path, headers=headers, json=change).status_code == 200
+    assert client.put(path, headers=headers, json=change).status_code == 409
+    assert _post(client).status_code == 200
+    denied = _post(client)
+    assert denied.status_code == 402
+    assert denied.json()["error"]["code"] == "shared_allowance_exhausted"
+    assert denied.json()["error"]["guidance"] == "Contact your administrator."
+    assert len(upstream.requests) == 1
+    auth_proxy.drain_settles()
+    state = client.get(path, headers=headers).json()
+    assert state["settled_usd"] == state["committed_usd"] == "0.020000000000"
+    assert state["precharged_usd"] == state["replaced_usd"] == "0.050000000000"
+
+
 def test_budget_store_unavailable_is_503(monkeypatch):
     require_host_store()
     up = _Upstream()

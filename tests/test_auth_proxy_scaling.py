@@ -731,6 +731,79 @@ def test_shared_budget_retains_ceiling_without_settlement(host_store_clean, monk
     assert [row["spent_usd"] for row in budgets] == [0.05, 0.05]
 
 
+def test_shared_allowance_reconciles_across_months(host_store_clean, monkeypatch):
+    from decimal import Decimal
+
+    store = host_store_clean
+    ceiling = Decimal("0.040000000001")
+    change = (0, ceiling * 3, Decimal("0"))
+    store.shared_budget_account(81, "common", change=change)
+
+    def reserve(period, reservation):
+        return store.reserve_scoped_budget(
+            81, "k:1", period, ceiling * 2, "common", Decimal("1"),
+            ceiling, reservation, 900)[:2]
+
+    assert reserve("2030-12", "known") == (None, True)
+    assert reserve("2030-12", "unknown") == (None, True)
+    assert reserve("2030-12", "key-full") == ("k:1", True)
+    assert reserve("2031-01", "lost") == (None, True)
+    assert store.settle_subject_budget("unknown", None) == (True, True)
+    assert reserve("2031-01", "scope-full") == (store.SHARED_ALLOWANCE_EXHAUSTED, True)
+    assert store.settle_subject_budget("known", Decimal("0.000000000001")) == (True, True)
+    assert store.settle_subject_budget("known", Decimal("0")) == (False, True)
+
+    after_grace = time.time() + 900 + 86401
+    monkeypatch.setattr(store.time, "time", lambda: after_grace)
+    store._prune()
+    assert store.settle_subject_budget("lost", Decimal("0")) == (False, True)
+    state = store.shared_budget_account(81, "common")
+    assert Decimal(state["precharged_usd"]) == ceiling * 3
+    assert Decimal(state["replaced_usd"]) == ceiling
+    assert Decimal(state["settled_usd"]) == Decimal("0.000000000001")
+    assert Decimal(state["committed_usd"]) == Decimal("0.080000000003")
+    change = (state["revision"], ceiling * 3, Decimal("-0.000000000001"))
+    assert Decimal(store.shared_budget_account(81, "common", change=change)["committed_usd"]) == ceiling * 2
+    assert store.shared_budget_account(81, "common", change=change) is None
+    assert reserve("2031-01", "after-correction") == (None, True)
+    assert Decimal(store.shared_budget_account(82, "common")["committed_usd"]) == 0
+
+
+def test_shared_allowance_changes_and_admission_serialize(host_store_clean):
+    from concurrent.futures import ThreadPoolExecutor
+    from decimal import Decimal
+    from threading import Barrier
+
+    store = host_store_clean
+    store.shared_budget_account(81, "common", change=(0, Decimal("1"), Decimal("0")))
+    ready = Barrier(3)
+
+    def pause(correction):
+        ready.wait(timeout=5)
+        return store.shared_budget_account(81, "common",
+                                           change=(1, Decimal("0"), correction))
+
+    def reserve():
+        ready.wait(timeout=5)
+        return store.reserve_scoped_budget(
+            81, "k:1", "2031-01", None, "common", Decimal("1"),
+            Decimal("0.10"), "racing", 900)
+
+    with ThreadPoolExecutor(3) as replicas:
+        first = replicas.submit(pause, Decimal("0.01"))
+        second = replicas.submit(pause, Decimal("0.02"))
+        admission = replicas.submit(reserve)
+        updates = [result for result in (first.result(), second.result()) if result]
+        rejected, ok, _ = admission.result()
+    assert len(updates) == 1
+    assert ok and rejected in (None, store.SHARED_ALLOWANCE_EXHAUSTED)
+    admitted = Decimal("0.10") if rejected is None else Decimal("0")
+    state = store.shared_budget_account(81, "common")
+    assert state["revision"] == 2
+    assert Decimal(updates[0]["precharged_usd"]) == Decimal(state["precharged_usd"]) == admitted
+    assert Decimal(state["committed_usd"]) == admitted + Decimal(state["correction_usd"])
+
+
 def test_shared_budget_records_full_cost_if_published_ceiling_is_low(host_store_clean):
     from decimal import Decimal
 

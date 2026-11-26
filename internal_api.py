@@ -15,6 +15,8 @@ the surface does not exist on operator-only deployments.
   GET /internal/usage/refusals?tenant_id=<id>&since_ts=<hour>&until_ts=<hour>
   GET /internal/usage/export?caller=<slug>&after_id=<id>&limit=<n<=5000>
   GET /internal/budgets?tenant_id=<id>&period=YYYY-MM&subject=<g:N|k:N>...
+  GET /internal/budgets/shared/{tenant_id}/{scope}
+  PUT /internal/budgets/shared/{tenant_id}/{scope}
 
   GET /internal/provider-facts/{provider_id}/{name}
   PUT /internal/provider-facts/{provider_id}/{name}
@@ -43,6 +45,7 @@ from __future__ import annotations
 import re
 import time
 import asyncio
+from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -392,6 +395,45 @@ async def internal_budgets(request: Request, tenant_id: int | None = None,
     except Exception:
         return JSONResponse({"error": "budget_store_unavailable"}, status_code=503)
     return JSONResponse({"tenant_id": tenant_id, "period": period, "subjects": rows})
+
+
+_ALLOWANCE_AMOUNT = re.compile(r"[0-9]{1,18}(?:\.[0-9]{1,12})?")
+_CORRECTION_AMOUNT = re.compile(r"-?[0-9]{1,18}(?:\.[0-9]{1,12})?")
+
+
+@router.get("/internal/budgets/shared/{tenant_id}/{scope}")
+@router.put("/internal/budgets/shared/{tenant_id}/{scope}")
+async def internal_shared_budget(request: Request, tenant_id: str, scope: str) -> JSONResponse:
+    denied = _gate(request)
+    if denied is not None:
+        return denied
+    if (not _POSITIVE_ID.fullmatch(tenant_id)
+            or not control_plane_client.CONNECTION_REF_RE.fullmatch(scope)):
+        return JSONResponse({"error": "invalid_scope"}, status_code=400)
+    change = None
+    if request.method == "PUT":
+        try:
+            body = await request.json()
+            revision = body["revision"]
+            allowance = body["allowance_usd"]
+            correction = body["correction_usd"]
+            if (type(revision) is not int or not 0 <= revision < 2**63 - 1
+                    or (allowance is not None and
+                        (not isinstance(allowance, str) or not _ALLOWANCE_AMOUNT.fullmatch(allowance)))
+                    or not isinstance(correction, str) or not _CORRECTION_AMOUNT.fullmatch(correction)):
+                raise ValueError("invalid settings")
+            change = (revision, Decimal(allowance) if allowance is not None else None,
+                      Decimal(correction))
+        except (ValueError, TypeError, KeyError):
+            return JSONResponse({"error": "invalid_allowance"}, status_code=400)
+    try:
+        state = await asyncio.to_thread(host_store.shared_budget_account, int(tenant_id), scope,
+                                        change=change)
+    except Exception:
+        return JSONResponse({"error": "budget_store_unavailable"}, status_code=503)
+    if state is None:
+        return JSONResponse({"error": "revision_conflict"}, status_code=409)
+    return JSONResponse({"tenant_id": int(tenant_id), "scope": scope, **state})
 
 
 router.include_router(fact_router)
