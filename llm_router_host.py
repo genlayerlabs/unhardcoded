@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 import host_store
+import provider_spend
 from provider_facts import ProviderFacts
 import route_reliability as _route_reliability
 from byo_http import is_byo_buyer
@@ -56,6 +58,7 @@ import lupa
 from lupa import LuaRuntime
 
 _PROVIDER_FACT_MAX_AGE_ENV = "ROUTER_PROVIDER_FACT_MAX_AGE_S"
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "LLMRouterHost",
@@ -169,6 +172,7 @@ class LLMRouterHost:
         logger: Logger | None = None,
         enforce_provider_auth: bool | None = None,
         provider_facts: ProviderFacts | None = None,
+        provider_spend_config: provider_spend.SpendConfig | None = None,
     ):
         self._source_paths = (router_path, config_path, metrics_path)
         self._tenant_id = None
@@ -183,6 +187,9 @@ class LLMRouterHost:
         self._async_call_hook: AsyncCallProviderHook | None = call_provider_async
         self._discover_hook: DiscoverHook | None = discover
         self._env: dict[str, str] = env if env is not None else dict(os.environ)
+        self._provider_spend_config = (provider_spend_config if provider_spend_config is not None
+            else provider_spend.load(self._env.get("ROUTER_PROVIDER_DAILY_SPEND", "{}")))
+        self._provider_spend_limits, self._provider_spend_ids = self._provider_spend_config
         self.provider_facts = provider_facts if provider_facts is not None else ProviderFacts()
         try:
             fact_max_age_s = int(self._env.get(_PROVIDER_FACT_MAX_AGE_ENV, "300"))
@@ -392,7 +399,8 @@ end
         child = type(self)(*self._source_paths, env=scoped_env, now_ms=self._now_ms,
                            call_provider_async=self._async_call_hook,
                            call_provider=self._call_hook, discover=self._discover_hook,
-                           enforce_provider_auth=True, provider_facts=self.provider_facts)
+                           enforce_provider_auth=True, provider_facts=self.provider_facts,
+                           provider_spend_config=self._provider_spend_config)
         # Include runtime-added providers/models, not just the initial files.
         child.config.providers = _to_lua(child.lua, catalog.get('providers') or {})
         child.config.models = _to_lua(child.lua, catalog.get('models') or {})
@@ -736,6 +744,7 @@ end
         # local of this coroutine, so concurrent executes never share it.
         session = contract.get("session")
         provider_diagnostics = []
+        spend_denials = set()
         provider_attempt = 0
         engine_contract = contract
         if contract.get('protocol') == 'decisions':
@@ -768,7 +777,28 @@ end
                 if (contract.get("first_token_timeout_ms") is not None
                         and req.get("first_token_timeout_ms") is None):
                     req["first_token_timeout_ms"] = contract["first_token_timeout_ms"]
+                identity = self._provider_spend_identity(req)
+                day = None
+                if identity is not None:
+                    spend = self._provider_spend_limits[identity]
+                    if identity not in spend_denials:
+                        try:
+                            day = await asyncio.wait_for(asyncio.to_thread(
+                                host_store.reserve_provider_spend, identity, *spend), timeout=1.5)
+                        except Exception as exc:
+                            _log.warning("Provider spend admission unavailable (%s)", type(exc).__name__)
+                    if day is None:
+                        spend_denials.add(identity)
+                        self._skip_spend_denial(handle, req)
+                        step = self.router.execute_step(handle, None, None)
+                        continue
                 resp = await self._resolve_call_async(req, call_override, session=session)
+                if day is not None:
+                    actual = provider_spend.actual_cost(resp)
+                    if actual is not None:
+                        if actual > spend[1]:
+                            _log.warning("Reported cost exceeds the configured attempt bound for %s", identity)
+                        host_store.settle_provider_spend_async(identity, day, actual - spend[1])
                 diagnostic = bounded_diagnostics(resp.get("diagnostics"))
                 if diagnostic and len(provider_diagnostics) < 32:
                     diagnostic.update(bounded_diagnostics({
@@ -787,6 +817,32 @@ end
                 step = self.router.execute_step(handle, None, None)
             else:
                 return {"ok": False, "error": f"internal: bad step status {status}", "trace": {}}
+
+    def provider_spend_limit(self, identity):
+        return self._provider_spend_limits.get(identity)
+
+    def _provider_spend_identity(self, request):
+        provider_id = request.get("provider_id")
+        identity = self._provider_spend_ids.get(provider_id)
+        if identity is not None and (self._tenant_id is None or (
+                provider_id in self._tenant_managed and not is_byo_buyer(request, self._env.get))):
+            return identity
+        return None
+
+    def _skip_spend_denial(self, handle, request):
+        # The pinned engine's resumable driver advances when no response is
+        # pending. Advance the same cursor as next_candidate without recording
+        # an upstream failure or letting a caller's failure plan override admission.
+        path = handle["trace"]["decision_path"]
+        path[len(path) + 1] = _to_lua(self.lua, {
+            "event": "skipped", "reason": "provider_spend_denied",
+            "provider_id": request.get("provider_id"), "model_family": request.get("model_family"),
+        })
+        handle["last_error_kind"] = "provider_spend_denied"
+        handle["pending_cand"] = None
+        handle["awaiting"] = None
+        handle["cursor"] += 1
+        handle["attempts"] = 0
 
     def _pin_route(self, req: dict) -> dict:
         """Where a call goes and which credential it carries come from the
@@ -1002,6 +1058,9 @@ end
 
     def _h_call_provider(self, request):
         py_req = self._pin_route(_to_py(request) or {})
+        if self._provider_spend_identity(py_req) is not None:
+            # The synchronous embedding has no async admission path.
+            return _to_lua(self.lua, {"ok": False, "error_kind": "provider_spend_denied"})
         provider = py_req.get("provider_id")
         model = py_req.get("model_family")
         if (provider, model) in self._mock_responses:
