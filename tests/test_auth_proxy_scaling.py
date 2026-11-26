@@ -503,3 +503,162 @@ def test_scoped_usage_report_against_one_million_calls(host_store_clean):
     store.rollup_analytics(start, end)
     rerun = store.scoped_usage_report("report", 1, 2, start, end)
     assert {**rerun, "oldest_refresh_ts": report["oldest_refresh_ts"]} == report
+
+
+def test_provider_daily_spend_serializes_and_rolls_over(host_store_clean, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from decimal import Decimal
+    from threading import Barrier
+
+    store = host_store_clean
+    cap, amount = Decimal("0.30"), Decimal("0.10")
+    monkeypatch.setattr(store, "_PROVIDER_SPEND_DAY", "DATE '2026-01-01'")
+    ready = Barrier(8)
+
+    def reserve():
+        ready.wait(timeout=5)
+        return store.reserve_provider_spend("shared", cap, amount)
+
+    with ThreadPoolExecutor(8) as replicas:
+        admitted = [day for day in replicas.map(lambda _: reserve(), range(8)) if day]
+    assert len(admitted) == 3
+    assert not store.provider_spend_state("shared", cap, amount)["can_admit"]
+    assert store.reserve_provider_spend("other", cap, amount)
+    store.settle_provider_spend_async("shared", admitted[0], -amount)
+    assert store.reserve_provider_spend("shared", cap, amount)
+
+    state = store.provider_spend_state("shared", cap, amount, override=(Decimal("0.40"),))
+    assert state["can_admit"]
+    assert state["resets_at"] == "2026-01-02T00:00:00Z"
+    assert store.reserve_provider_spend("shared", cap, amount)
+    assert not store.provider_spend_state("shared", cap, amount, override=(None,))["can_admit"]
+
+    store.provider_spend_state("shared", cap, amount, override=(Decimal("0"),))
+    monkeypatch.setattr(store, "_PROVIDER_SPEND_DAY", "DATE '2026-01-02'")
+    assert store.reserve_provider_spend("shared", cap, amount)
+    store.settle_provider_spend_async("shared", admitted[0], -amount)
+    state = store.provider_spend_state("shared", cap, amount)
+    assert state["override_usd"] is None
+    assert Decimal(state["committed_usd"]) == amount
+
+
+@pytest.fixture
+def spend_host(monkeypatch):
+    from llm_router_host import LLMRouterHost
+
+    monkeypatch.setenv("SAAS_SHARED_PROVIDERS", "bedrock")
+    host = LLMRouterHost(ROOT / "core/router.lua", ROOT / "tests/fixtures/managed.lua", env={
+        "CUSTOM_CLOUD_SECRET": "fixture",
+        "ROUTER_PROVIDER_DAILY_SPEND": (
+            '{"bedrock":{"daily_usd":"0.10","max_attempt_usd":"0.10",'
+            '"provider_ids":["bedrock","custom_cloud"]}}'),
+    })
+    host.init()
+    return host
+
+
+@pytest.mark.asyncio
+async def test_provider_daily_spend_covers_concurrent_streams_and_tenant_calls(
+        host_store_clean, spend_host, monkeypatch):
+    from decimal import Decimal
+    from saas_routes import compile_intent
+
+    dispatches = []
+    started, finish = asyncio.Event(), asyncio.Event()
+    monkeypatch.setattr("llm_router_host._fold_route_outcome", lambda *args, **kwargs: None)
+
+    async def stream(request):
+        dispatches.append(request["provider_id"])
+        assert request["provider_id"] == "bedrock"
+        started.set()
+        await finish.wait()
+        return {"ok": True, "response": {"text": "streamed", "cost_reported": 0.025}}
+
+    async def buffered(request):
+        dispatches.append(request["provider_id"])
+        return {"ok": True, "response": {"text": "fallback"}}
+
+    spend_host.set_async_call_hook(buffered)
+    tenants = [spend_host.for_tenant(tenant_id, {"CUSTOM_CLOUD_SECRET": "fixture"}, ["bedrock"])
+               for tenant_id in (1, 2)]
+    contract = {"policy_ir": compile_intent({
+        "targets": ["bedrock|shared-model", "custom_cloud|shared-model"]}),
+        "messages": [{"role": "user", "content": "test"}]}
+    first = asyncio.create_task(tenants[0].execute_async(contract, call_override=stream))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        # Both aliases on the operator account share the open stream's charge.
+        operator = await spend_host.execute_async(contract)
+        assert operator["error"] == "exhausted: provider_spend_denied"
+        assert dispatches == ["bedrock"]
+        # The second tenant's own credential can still serve the fallback.
+        second = await tenants[1].execute_async(contract)
+        assert second["chosen"]["provider_id"] == "custom_cloud"
+        assert any(event.get("reason") == "provider_spend_denied"
+                   for event in second["trace"]["decision_path"])
+        assert dispatches == ["bedrock", "custom_cloud"]
+    finally:
+        finish.set()
+        result = await first
+    assert result["ok"]
+    state = host_store_clean.provider_spend_state("bedrock", *spend_host.provider_spend_limit("bedrock"))
+    assert Decimal(state["committed_usd"]) == Decimal("0.025")
+
+
+@pytest.mark.asyncio
+async def test_provider_daily_spend_keeps_charge_on_cancel(host_store_clean, spend_host):
+    from saas_routes import compile_intent
+
+    started = asyncio.Event()
+
+    async def stream(_request):
+        started.set()
+        await asyncio.Future()
+
+    contract = {"policy_ir": compile_intent({"targets": ["bedrock|shared-model"]})}
+    task = asyncio.create_task(spend_host.execute_async(contract, call_override=stream))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    denied = await spend_host.execute_async(contract, call_override=stream)
+    assert denied["error"] == "exhausted: provider_spend_denied"
+
+
+@pytest.mark.asyncio
+async def test_provider_daily_spend_falls_back_when_store_is_unavailable(spend_host, monkeypatch):
+    from saas_routes import compile_intent
+
+    def unavailable(*args):
+        raise RuntimeError("store offline")
+
+    async def buffered(request):
+        assert request["provider_id"] == "custom_cloud"
+        return {"ok": True, "response": {"text": "fallback"}}
+
+    monkeypatch.setattr(host_store, "reserve_provider_spend", unavailable)
+    spend_host.set_async_call_hook(buffered)
+    tenant = spend_host.for_tenant(1, {"CUSTOM_CLOUD_SECRET": "fixture"}, ["bedrock"])
+    result = await tenant.execute_async({"policy_ir": compile_intent({
+        "targets": ["bedrock|shared-model", "custom_cloud|shared-model"]})})
+    assert result["chosen"]["provider_id"] == "custom_cloud"
+
+
+def test_provider_daily_spend_operator_api(host_store_clean, spend_host, monkeypatch):
+    import control_plane_client
+    from shim import create_app
+
+    monkeypatch.setattr(control_plane_client, "CONTROL_PLANE_INTERNAL_SECRET", "fixture")
+    client = TestClient(create_app(spend_host))
+    url = "/x/providers/bedrock/daily-spend"
+    headers = {"x-internal-secret": "fixture"}
+    assert client.get(url).status_code == 403
+    assert client.put(url, json={"override_usd": 3}).status_code == 403
+    assert client.get(url, headers=headers).json()["can_admit"]
+    assert client.put(url, headers=headers, json={"override_usd": True}).status_code == 400
+    paused = client.put(url, headers=headers, json={"override_usd": "0"})
+    assert paused.status_code == 200
+    assert not paused.json()["can_admit"]
+    assert client.put(url, headers=headers, json={"override_usd": None}).json()["can_admit"]

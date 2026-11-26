@@ -40,6 +40,8 @@ import threading
 import time
 import uuid
 from bisect import bisect_left
+from datetime import date, timedelta
+from decimal import Decimal
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -404,6 +406,12 @@ _SCHEMA_STATEMENTS = [
     # settled actual cost; `reserved_usd` mirrors the sum of live reservations
     # (admission recomputes it from the rows, so it cannot drift). Money state:
     # never pruned by the retention sweep.
+    """CREATE TABLE IF NOT EXISTS provider_daily_spend (
+        provider_id TEXT PRIMARY KEY,
+        utc_day DATE NOT NULL,
+        committed_usd NUMERIC NOT NULL DEFAULT 0 CHECK (committed_usd >= 0),
+        override_usd NUMERIC
+    )""",
     """CREATE TABLE IF NOT EXISTS subject_budget_usage (
         tenant_id    BIGINT NOT NULL,
         subject      TEXT NOT NULL,
@@ -619,6 +627,8 @@ def _prune() -> None:
                          (_hourly_retention_floor(int(now)),))
             conn.execute("DELETE FROM route_outcome_hours WHERE hour_ts < %s",
                          (_hourly_retention_floor(int(now)),))
+            conn.execute("DELETE FROM provider_daily_spend WHERE utc_day <"
+                         " (statement_timestamp() AT TIME ZONE 'UTC')::date - 1")
             # Swept reservations only wait for a late settle; a day is plenty.
             conn.execute("DELETE FROM subject_budget_reservations"
                          " WHERE released AND expires_at < %s", (now - 86400,))
@@ -1178,6 +1188,76 @@ def consumer_for_digest(digest: str) -> "tuple[str | None, bool]":
     except Exception as exc:  # noqa: BLE001
         _log.warning("host_store consumer_for_digest failed: %s", exc)
         return None, False
+
+
+_PROVIDER_SPEND_DAY = "(transaction_timestamp() AT TIME ZONE 'UTC')::date"
+
+
+def reserve_provider_spend(provider_id: str, limit: Decimal, amount: Decimal) -> date | None:
+    """Atomically charge the maximum attempt cost before upstream dispatch."""
+    with _get_pool().connection(timeout=0.3) as conn:
+        conn.execute("SET LOCAL statement_timeout = '500ms'")
+        conn.execute(f"""
+            INSERT INTO provider_daily_spend (utc_day, provider_id)
+            VALUES ({_PROVIDER_SPEND_DAY}, %s)
+            ON CONFLICT (provider_id) DO UPDATE
+            SET utc_day = EXCLUDED.utc_day, committed_usd = 0, override_usd = NULL
+            WHERE provider_daily_spend.utc_day < EXCLUDED.utc_day
+        """, (provider_id,))
+        row = conn.execute(f"""
+            UPDATE provider_daily_spend
+            SET committed_usd = committed_usd + %s
+            WHERE utc_day = {_PROVIDER_SPEND_DAY} AND provider_id = %s
+              AND committed_usd + %s <= COALESCE(override_usd, %s)
+            RETURNING utc_day
+        """, (amount, provider_id, amount, limit)).fetchone()
+    return row[0] if row else None
+
+
+def settle_provider_spend_async(provider_id: str, day: date, adjustment: Decimal) -> None:
+    """Adjust the original day's charge once. Dropped refunds keep the charge."""
+    def settle():
+        with _get_pool().connection(timeout=0.3) as conn:
+            conn.execute("SET LOCAL statement_timeout = '500ms'")
+            conn.execute("""
+                UPDATE provider_daily_spend SET committed_usd = committed_usd + %s
+                WHERE utc_day = %s AND provider_id = %s
+            """, (adjustment, day, provider_id))
+    if adjustment:
+        _enqueue(settle)
+
+
+def provider_spend_state(provider_id: str, limit: Decimal, amount: Decimal,
+                         override: tuple[Decimal | None] | None = None) -> dict:
+    """Read today's ceiling, or set/clear today's override and return its state."""
+    with _get_pool().connection(timeout=0.3) as conn:
+        conn.execute("SET LOCAL statement_timeout = '500ms'")
+        if override is not None:
+            conn.execute(f"""
+                INSERT INTO provider_daily_spend (utc_day, provider_id, override_usd)
+                VALUES ({_PROVIDER_SPEND_DAY}, %s, %s)
+                ON CONFLICT (provider_id) DO UPDATE SET
+                    utc_day = EXCLUDED.utc_day,
+                    committed_usd = CASE WHEN provider_daily_spend.utc_day = EXCLUDED.utc_day
+                        THEN provider_daily_spend.committed_usd ELSE 0 END,
+                    override_usd = EXCLUDED.override_usd
+                WHERE provider_daily_spend.utc_day <= EXCLUDED.utc_day
+            """, (provider_id, override[0]))
+        day, committed, overridden = conn.execute(f"""
+            SELECT today.utc_day, COALESCE(spend.committed_usd, 0), spend.override_usd
+            FROM (SELECT {_PROVIDER_SPEND_DAY} AS utc_day) today
+            LEFT JOIN provider_daily_spend spend
+              ON spend.utc_day = today.utc_day AND spend.provider_id = %s
+        """, (provider_id,)).fetchone()
+    ceiling = limit if overridden is None else overridden
+    return {
+        "provider_id": provider_id, "utc_day": day.isoformat(),
+        "resets_at": f"{day + timedelta(days=1)}T00:00:00Z",
+        "daily_usd": str(limit), "max_attempt_usd": str(amount),
+        "ceiling_usd": str(ceiling), "committed_usd": str(committed),
+        "override_usd": str(overridden) if overridden is not None else None,
+        "can_admit": committed + amount <= ceiling,
+    }
 
 
 def reserve_connection_check(tenant_id: int, interval: int) -> bool:
@@ -3135,6 +3215,7 @@ def truncate_all_for_tests() -> None:
         conn.execute("TRUNCATE calls, ingress_refusals, route_outcome_hours, settings_overrides, provider_overlays,"
                      " provider_facts, provider_relays,"
                      " consumer_keys, consumer_key_digests, consumer_rate_buckets, connection_check_limits,"
+                     " provider_daily_spend,"
                      " peer_concurrency_leases,"
                      " consumer_budget_usage, analytics_hourly, analytics_rollup_state,"
                      " scoped_usage_hours, scoped_usage_coverage, peer_offers, buyer_status, route_observations,"

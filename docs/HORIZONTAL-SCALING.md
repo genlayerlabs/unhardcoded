@@ -73,6 +73,39 @@ queue fills. Keep at least two replicas and add CPU as a secondary trigger.
 Autoscaling does not create upstream quota. Consumer rate limits and provider
 fallbacks remain the hard admission controls even when KEDA allows more pods.
 
+## Daily upstream spend ceilings
+
+Set the same `ROUTER_PROVIDER_DAILY_SPEND` JSON on every router replica. Each key
+is a stable upstream account identifier. By default it also names a catalog
+provider. Use `provider_ids` to specify multiple catalog IDs for the account.
+For example:
+
+```json
+{"example-provider":{"daily_usd":"50.00","max_attempt_usd":"0.25","provider_ids":["example-provider","example-provider_market"]}}
+```
+
+Set `max_attempt_usd` to an upper bound on the price of any allowed attempt,
+including its maximum input and output, upstream retries, and all extras the
+provider can charge. Use upstream request and account limits to establish that
+bound. A zero `daily_usd` pauses dispatch by default. Amounts have up to 12
+decimal places. The ceiling applies to routed inference using operator
+credentials, including shared tenant routes. Tenant-supplied credentials have
+their own upstream accounts.
+
+Each admitted attempt commits its upper bound against the UTC day it starts,
+before sending anything upstream. A confirmed provider-reported cost on a
+successful response replaces the bound. Unmetered failures, cancellation,
+missing usage, and dropped settlement writes keep the full charge. Requests
+that cannot reserve take the next ranked candidate. The synchronous embedding
+requires the async driver to use capped providers.
+
+On the private router admin listener,
+`GET /x/providers/{upstream_account}/daily-spend` returns today's effective ceiling,
+committed spend (including in-flight charges), and reset time. Use `PUT` on the
+same path with `{"override_usd":"75.00"}` to replace today's ceiling across
+replicas or `{"override_usd":null}` to restore its configured value. The
+override preserves all charges and expires at 00:00 UTC.
+
 ## Zero-downtime migration
 
 1. Deploy the compatible application release to the existing single replica.

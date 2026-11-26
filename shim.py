@@ -46,6 +46,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import control_plane_client
 from env_coerce import env_int
 import host_store
+import provider_spend
 from policy_templates import (
     PolicyTemplateError,
     build_policy_template,
@@ -980,6 +981,31 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             }
             break
         return {"families": families, "wallet": wallet, "ts": int(time.time())}
+
+    @app.get("/x/providers/{provider_id}/daily-spend")
+    def get_provider_daily_spend(provider_id: str):
+        return provider_daily_spend(provider_id)
+
+    @app.put("/x/providers/{provider_id}/daily-spend")
+    def set_provider_daily_spend(provider_id: str, body: dict):
+        if set(body) != {"override_usd"}:
+            return JSONResponse(status_code=400, content={"error": "Expected override_usd"})
+        raw = body["override_usd"]
+        try:
+            override = None if raw is None else provider_spend.usd(raw)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        return provider_daily_spend(provider_id, (override,))
+
+    def provider_daily_spend(provider_id, override=None):
+        limit = host.base.provider_spend_limit(provider_id)
+        if limit is None:
+            return JSONResponse(status_code=404, content={"error": "Provider spend ceiling is not configured"})
+        try:
+            return host_store.provider_spend_state(provider_id, *limit, override=override)
+        except Exception as exc:
+            _log.warning("Provider spend state unavailable (%s)", type(exc).__name__)
+            return JSONResponse(status_code=503, content={"error": "Provider spend state is unavailable"})
 
     @app.put("/x/providers/{provider_id}/relay")
     def set_provider_relay(provider_id: str, body: dict):
@@ -2213,7 +2239,7 @@ def _openai_error_from_router(result: dict) -> JSONResponse:
 
     if "not initialized" in error_kind:
         status = 500
-    elif kind == "no_candidates":
+    elif kind in {"no_candidates", "provider_spend_denied"}:
         status = 503
     elif kind == "auth_error":
         status = 401
