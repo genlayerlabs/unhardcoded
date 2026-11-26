@@ -4433,6 +4433,7 @@ async def proxy(path: str, request: Request) -> Response:
     tokens_cached = None
     cost_usd = None
     cost_basis = None
+    winning_inference_cost_usd = winning_inference_cost_basis = None
     input_usd_per_million = output_usd_per_million = None
     decision_trace = None
     error_type = error_code = error_message = None
@@ -4482,7 +4483,9 @@ async def proxy(path: str, request: Request) -> Response:
                 served_model_id=served_model_id, served_by=served_by, requested_model=requested_model,
                 session=session_id, tokens_in=tokens_in, tokens_out=tokens_out,
                 tokens_total=tokens_total, tokens_cached=tokens_cached, cost_usd=cost_usd,
-                cost_basis=cost_basis, input_usd_per_million=input_usd_per_million,
+                cost_basis=cost_basis, winning_inference_cost_usd=winning_inference_cost_usd,
+                winning_inference_cost_basis=winning_inference_cost_basis,
+                input_usd_per_million=input_usd_per_million,
                 output_usd_per_million=output_usd_per_million, decision_trace=decision_trace,
                 error_type=error_type, error_code=error_code, error_message=error_message,
                 key_sha256=auth.get("digest"))
@@ -4574,6 +4577,7 @@ async def proxy(path: str, request: Request) -> Response:
                     tokens_in, tokens_out, tokens_total, tokens_cached, cost_usd, \
                     cost_basis, input_usd_per_million, output_usd_per_million, \
                     decision_trace, error_type, error_code, error_message
+                nonlocal winning_inference_cost_usd, winning_inference_cost_basis
                 nonlocal first_token_ms, incomplete_stream, responses_stream_outcome, upstream_error
                 try:
                     meta = _parse_stream_tail(tail)
@@ -4595,6 +4599,8 @@ async def proxy(path: str, request: Request) -> Response:
                         if isinstance(xr.get("cost_usd"), (int, float)):
                             cost_usd = float(xr["cost_usd"])
                         cost_basis = xr.get("cost_basis")
+                        winning_inference_cost_usd = xr.get("winning_inference_cost_usd")
+                        winning_inference_cost_basis = xr.get("winning_inference_cost_basis")
                         input_usd_per_million = xr.get("input_usd_per_million")
                         output_usd_per_million = xr.get("output_usd_per_million")
                         if isinstance(xr.get("tokens_cached"), int):
@@ -4611,7 +4617,8 @@ async def proxy(path: str, request: Request) -> Response:
                         error_message = err.get("message")
                 except Exception:
                     pass
-                if client_gone_at is not None and not drain_complete and cost_usd is None and status < 400:
+                if (client_gone_at is not None and not drain_complete and cost_usd is None
+                        and cost_basis != "unknown_total" and status < 400):
                     # Cut off before the usage event: never book a served call
                     # as free. Same floor Cloud key budgets reserve per call.
                     cost_usd, cost_basis = CLOUD_BUDGET_RESERVATION_USD, "estimated_disconnect"
@@ -4702,6 +4709,8 @@ async def proxy(path: str, request: Request) -> Response:
                     if isinstance(xr.get("cost_usd"), (int, float)):
                         cost_usd = float(xr["cost_usd"])
                     cost_basis = xr.get("cost_basis")
+                    winning_inference_cost_usd = xr.get("winning_inference_cost_usd")
+                    winning_inference_cost_basis = xr.get("winning_inference_cost_basis")
                     input_usd_per_million = xr.get("input_usd_per_million")
                     output_usd_per_million = xr.get("output_usd_per_million")
                     if isinstance(xr.get("tokens_cached"), int):

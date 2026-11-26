@@ -170,6 +170,8 @@ _SCHEMA_STATEMENTS = [
     # tautological; 'subscription' = $0). Lets the cost-accuracy panel flag only
     # rows with real signal instead of training the operator to ignore drift.
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS cost_basis TEXT",
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS winning_inference_cost_usd DOUBLE PRECISION",
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS winning_inference_cost_basis TEXT",
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS input_usd_per_million DOUBLE PRECISION",
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS output_usd_per_million DOUBLE PRECISION",
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS routing_summary JSONB",
@@ -553,6 +555,7 @@ def insert_call(row: dict[str, Any]) -> None:
             row.get("cost_basis"),   # how cost_usd was determined (reported/computed/…)
             json.dumps(routing_summary(row.get("decision_trace"))),
             row.get("input_usd_per_million"), row.get("output_usd_per_million"),
+            row.get("winning_inference_cost_usd"), row.get("winning_inference_cost_basis"),
         )
         with _get_pool().connection() as conn:   # one transaction, auto commit/rollback
             conn.execute(
@@ -560,8 +563,9 @@ def insert_call(row: dict[str, Any]) -> None:
                 " caller, route_key, provider_id, model_family, served_model_id,"
                 " requested_model, status, error_type, latency_ms, tokens_in,"
                 " tokens_out, tokens_total, tokens_cached, cost_usd, served_by,"
-                " cost_basis, routing_summary, input_usd_per_million, output_usd_per_million)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s)", values)
+                " cost_basis, routing_summary, input_usd_per_million, output_usd_per_million,"
+                " winning_inference_cost_usd, winning_inference_cost_basis)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s)", values)
             caller = row.get("caller")
             cost = row.get("cost_usd")
             if caller and isinstance(cost, (int, float)) and float(cost) > 0:
@@ -1974,7 +1978,8 @@ def usage_groups(group_by: str, since_ts: "int | None" = None, caller: "str | No
 
 _EXPORT_COLS = ("id", "ts", "key_sha256", "subject", "route", "model_family", "provider",
                 "status", "tokens_in", "tokens_out", "tokens_cached", "tokens_total",
-                "cost_usd", "cost_basis", "cost_source")
+                "cost_usd", "cost_basis", "cost_source",
+                "winning_inference_cost_usd", "winning_inference_cost_basis")
 
 
 def usage_export(caller: str, after_id: int = 0, limit: int = 1000, *, project_id=None,
@@ -1995,7 +2000,8 @@ def usage_export(caller: str, after_id: int = 0, limit: int = 1000, *, project_i
     sql = ("SELECT id, ts, consumer_sha, routing_summary->>'subject',"
            " COALESCE(NULLIF(routing_summary->>'route',''),requested_model),"
            " model_family, provider_id, status, tokens_in, tokens_out, tokens_cached,"
-           f" {_TOKENS_TOTAL_SQL}, cost_usd, cost_basis, {_COST_SOURCE_SQL} FROM calls{where}"
+           f" {_TOKENS_TOTAL_SQL}, cost_usd, cost_basis, {_COST_SOURCE_SQL},"
+           f" winning_inference_cost_usd, winning_inference_cost_basis FROM calls{where}"
            " AND id > %s AND COALESCE(recorded_at,0) <= %s ORDER BY id LIMIT %s")
     with _get_pool().connection() as conn:
         _set_dashboard_statement_timeout(conn)

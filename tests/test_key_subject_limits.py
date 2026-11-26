@@ -585,8 +585,11 @@ def test_export_cursor_pages_in_id_order_with_watermark(monkeypatch):
     row = page["rows"][0]
     assert set(row) == {"id", "ts", "key_sha256", "subject", "route", "model_family", "provider",
                         "status", "tokens_in", "tokens_out", "tokens_cached", "tokens_total",
-                        "cost_usd", "cost_basis", "cost_source"}
+                        "cost_usd", "cost_basis", "cost_source",
+                        "winning_inference_cost_usd", "winning_inference_cost_basis"}
     assert row["key_sha256"] == "a" * 64 and row["subject"] == "g:7" and row["route"] == "route:production"
+    assert row["winning_inference_cost_usd"] is None
+    assert row["winning_inference_cost_basis"] is None
     # The third scoped row (ts now-120) is not delivered yet, so the watermark
     # cannot pass it even though the lag is zero.
     assert page["watermark_ts"] <= now - 120
@@ -909,3 +912,62 @@ def test_route_outcomes_and_usage_for_responses_stream(monkeypatch, host_store_c
     (usage,) = host_store.usage_export("app-a", now=time.time() + 3600)["rows"]
     assert (usage["tokens_in"], usage["tokens_out"]) == (2, 3)
     assert (usage["cost_usd"], usage["cost_source"]) == (0.02, "reported")
+
+
+@pytest.mark.parametrize("surface", ["json", "chat_stream", "responses_stream"])
+def test_scoped_export_preserves_winning_cost_after_automatic_fallback(
+        monkeypatch, host_store_clean, surface):
+    from shim import _build_x_router
+
+    scope = {"project_id": 8, "environment_id": 9}
+
+    def resolve(request):
+        scoped = {"scope_version": 2, "tenant_id": 5, **scope}
+        if request.url.path == "/internal/keys/resolve":
+            return httpx.Response(200, json={"active": True, "consumer": "app-a", **scoped})
+        return httpx.Response(200, json={**ROUTE, "key": KEY, **scoped})
+
+    metadata = _build_x_router({
+        "chosen": {"provider_id": "openrouter"},
+        "response": {"cost_reported": 0.01},
+        "trace": {"automatic": {"cost_usd": 0.001}, "decision_path": [
+            {"event": "attempted", "attempt": 1, "error_kind": "timeout"},
+            {"event": "attempted", "attempt": 2},
+        ]},
+    })
+
+    class Stream(_StreamResp):
+        async def aiter_raw(self):
+            payload = {"x_router": metadata}
+            if surface == "responses_stream":
+                payload = {"type": "response.completed", "response": payload}
+            yield f"data: {json.dumps(payload)}\n\n".encode()
+
+    upstream = _JsonResp()
+    upstream._body = json.dumps({"x_router": metadata}).encode()
+    if surface != "json":
+        upstream = Stream()
+    monkeypatch.setattr(cpc, "_client", httpx.AsyncClient(transport=httpx.MockTransport(resolve)))
+    monkeypatch.setattr(auth_proxy, "_client", _Upstream(lambda: upstream))
+    monkeypatch.setattr(host_store_clean, "_SYNC_WRITES", False)
+    monkeypatch.setenv("LEDGER_WATERMARK_LAG_S", "0")
+
+    endpoint = "/v1/responses" if surface == "responses_stream" else "/v1/chat/completions"
+    request = {"input": "hello"} if surface == "responses_stream" else {"messages": []}
+    client = TestClient(auth_proxy.app)
+    response = client.post(endpoint, headers={"Authorization": "Bearer tok-a"}, json={
+        **request, "model": ROUTE["route"], "stream": surface != "json",
+    })
+    assert response.status_code == 200
+    host_store_clean._write_q.join()
+    export = client.get("/internal/usage/export", headers=SECRET,
+                        params={"caller": "app-a", **scope})
+    assert export.status_code == 200
+    row, = export.json()["rows"]
+    assert row["subject"] == KEY["subject"]
+    assert row["provider"] == "openrouter"
+    assert row["cost_usd"] is None
+    assert row["cost_basis"] == "unknown_total"
+    assert row["cost_source"] == "none"
+    assert row["winning_inference_cost_usd"] == 0.01
+    assert row["winning_inference_cost_basis"] == "reported"
