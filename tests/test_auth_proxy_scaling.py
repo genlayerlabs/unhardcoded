@@ -746,3 +746,27 @@ def test_shared_budget_records_full_cost_if_published_ceiling_is_low(host_store_
         Decimal("0.05"), "after-overrun", 900)[:2] == ("s:common", True)
     budgets = store.subject_budgets(81, period, ["k:1", "k:2", "s:common"])
     assert [row["spent_usd"] for row in budgets] == [0.07, 0.0, 0.07]
+
+
+@pytest.mark.parametrize("settled", [True, False])
+def test_shared_budget_handoff_blocks_until_previous_commitment_is_retired(
+        host_store_clean, monkeypatch, settled):
+    from decimal import Decimal
+
+    store = host_store_clean
+
+    def reserve(period, reservation):
+        return store.reserve_scoped_budget(
+            86, "k:1", period, None, "common", Decimal("0.10"),
+            Decimal("0.05"), reservation, 900)[:2]
+
+    assert reserve("2030-12", "old") == (None, True)
+    assert reserve("2031-01", "new") == ("s:common", True)
+    if settled:
+        assert store.settle_subject_budget("old", Decimal("0.03")) == (True, True)
+    else:
+        expired = time.time() + 901
+        monkeypatch.setattr(store.time, "time", lambda: expired)
+    assert reserve("2031-01", "new") == (None, True)
+    previous = store.subject_budgets(86, "2030-12", ["s:common"])[0]
+    assert previous["spent_usd"] == (0.03 if settled else 0.05)

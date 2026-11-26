@@ -47,6 +47,7 @@ import control_plane_client
 from env_coerce import env_int
 import host_store
 import provider_spend
+import shared_cost
 from policy_templates import (
     PolicyTemplateError,
     build_policy_template,
@@ -280,6 +281,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                streaming_call=None,
                default_max_tokens: int | None = DEFAULT_MAX_TOKENS_FALLBACK,
                codex_store=None,
+               shared_cost_http=None,
                request_deadline_ms: int | None = None,
                ) -> FastAPI:
     """Build a FastAPI app wired to a pre-initialized LLMRouterHost.
@@ -300,6 +302,8 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
     import asyncio
 
     import streaming as _streaming
+
+    shared_cost_limits = shared_cost.load_limits()
 
     if request_deadline_ms is None:
         request_deadline_ms = env_int(
@@ -1313,6 +1317,56 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
         await _activate_tenant(request)
         return await _until_disconnect(request, _handle_chat, req)
 
+    @app.post(shared_cost.PATH)
+    async def bounded_chat(req: ChatRequest, request: Request):
+        if not control_plane_client.internal_secret_ok(request.headers) or host._tenant_id is None:
+            return _openai_error("Trusted tenant context required", "auth_error", 403)
+        try:
+            ceiling = shared_cost.amount(request.headers.get(shared_cost.LIMIT_HEADER))
+            expiry = float(request.headers.get(shared_cost.EXPIRY_HEADER, ""))
+            remaining = expiry - time.time()
+            if not math.isfinite(remaining) or remaining <= 0:
+                raise ValueError()
+        except ValueError:
+            return _openai_error("Invalid shared cost reservation", "budget_error", 402)
+        deadline = asyncio.get_running_loop().time() + min(remaining, shared_cost.MAX_EXECUTION_S)
+        payload = await request.json()
+        output_tokens = req.max_tokens if req.max_tokens is not None else default_max_tokens
+        if (not shared_cost.supported_payload(payload) or not output_tokens or output_tokens < 0
+                or len(await request.body()) > shared_cost.MAX_BODY_BYTES or shared_cost_http is None):
+            return _openai_error("A cost bound is unavailable for this request shape",
+                                 "invalid_request_error", 400, code="shared_cost_unbounded")
+        allowance = shared_cost.Allowance(ceiling, shared_cost_limits, output_tokens)
+
+        def prepare_call(attempt):
+            from provider_adapters.openai_compatible import call_with_cost_allowance
+
+            if attempt.get("provider_id") not in host._tenant_managed:
+                allowance.denial = "shared_cost_unbounded"
+                return None
+            prepared = allowance.prepare(attempt)
+            if prepared is None:
+                return None
+
+            async def call(request):
+                return await call_with_cost_allowance(
+                    request, allowance, shared_cost_http, host._env.get, prepared)
+            return call
+
+        _session_from_header(req, request)
+        try:
+            async with asyncio.timeout_at(deadline):
+                reply = await _until_disconnect(request, _handle_chat, req, prepare_call=prepare_call)
+        except TimeoutError:
+            return _openai_error("Shared cost execution expired", "server_error", 504)
+        if allowance.denial and not allowance.dispatched:
+            reply = _openai_error("No provider attempt fits the shared cost envelope",
+                                  "budget_error", 402, code=allowance.denial)
+        if isinstance(reply, dict):
+            reply = JSONResponse(reply)
+        reply.headers[shared_cost.CHARGE_HEADER] = str(allowance.charge.normalize())
+        return reply
+
     @app.post("/v1/decisions")
     @app.post("/v1/systemone")
     async def decisions(req: DecisionsRequest, request: Request):
@@ -1504,7 +1558,7 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
                 yield ev
         return _ActiveStreamResponse(gen_running(), task, media_type="text/event-stream")
 
-    async def _handle_chat(req: ChatRequest, profile_name: str | None = None):
+    async def _handle_chat(req: ChatRequest, profile_name: str | None = None, *, prepare_call=None):
         if profile_name is None and (msg := _policy_model_without_ir(req)):
             return _bad_policy_selector_response(msg)
         contract = _request_to_contract(req, default_profile, default_max_tokens)
@@ -1557,7 +1611,9 @@ def create_app(host, default_profile: str = DEFAULT_PROFILE_FALLBACK,
             # Async driver: the Lua VM is touched only between awaits, so one
             # shared LuaRuntime overlaps many concurrent requests on one loop.
             try:
-                result = await _execute_with_deadline(host.execute_async(contract))
+                execute = (host.execute_async(contract, prepare_call=prepare_call)
+                           if prepare_call is not None else host.execute_async(contract))
+                result = await _execute_with_deadline(execute)
             except Exception as exc:
                 admission = _policy_admission_error(exc)
                 if admission is None:
@@ -2239,6 +2295,8 @@ def _openai_error_from_router(result: dict) -> JSONResponse:
 
     if "not initialized" in error_kind:
         status = 500
+    elif kind == "shared_cost_denied":
+        status = 402
     elif kind in {"no_candidates", "provider_spend_denied"}:
         status = 503
     elif kind == "auth_error":
@@ -2284,8 +2342,8 @@ def _openai_error_from_router(result: dict) -> JSONResponse:
     )
 
 
-def _openai_error(message: str, type_: str, status: int) -> JSONResponse:
+def _openai_error(message: str, type_: str, status: int, *, code=None) -> JSONResponse:
     return JSONResponse(
         status_code=status,
-        content={"error": {"message": message, "type": type_, "code": None}},
+        content={"error": {"message": message, "type": type_, "code": code}},
     )

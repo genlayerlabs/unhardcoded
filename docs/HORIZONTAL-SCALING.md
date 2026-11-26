@@ -129,3 +129,55 @@ backward-compatible, so rollback does not require restoring storage.
 All cluster resources, selectors, secrets, and scaling thresholds belong in the
 GitOps/Terraform repositories. Do not patch the live Deployment or create the
 broker token manually.
+
+## Shared-scope request cost
+
+The ingress reserves the published per-request ceiling in PostgreSQL before
+forwarding a shared-scope request. The router deducts the configured worst-case
+cost of each physical provider attempt from that request's remaining allowance
+before dispatch. A retry or fallback must fit the same remaining allowance.
+Unknown attempt costs retain their full bound. The trusted router returns the
+aggregate charge for background settlement. A missing result keeps the ingress
+precharge.
+
+Set `SHARED_COST_ATTEMPT_LIMITS` on the router to a JSON array such as:
+
+```json
+[
+  {
+    "provider": "direct",
+    "base_url": "https://inference.example/v1",
+    "model": "text-model-version",
+    "max_input_bytes": 65536,
+    "max_output_tokens": 1024,
+    "max_cost_usd": "0.05"
+  }
+]
+```
+
+Each entry attests an upper bound for one POST to the exact HTTPS endpoint and
+wire model using the operator's shared provider credentials. The limit covers
+every accepted serialized JSON body up to `max_input_bytes` and all billable
+output up to the enforced `max_tokens` limit. Include protocol overhead,
+reasoning tokens if applicable, and any other charges in the bound. Configure
+only endpoints that enforce the output limit, return trustworthy usage costs
+when present, and charge within the bound even on failed or canceled calls.
+Update the bound before changing the endpoint's charging or token semantics.
+Keep configuration consistent on all router replicas.
+
+Shared scopes support buffered text chat with explicitly bounded,
+OpenAI-compatible endpoints. Streaming, multimodal input, tools, automatic
+selection and flow execution require their own enforceable bounds before they
+can be enabled here. The route's first-token deadline applies to completion of
+the buffered provider call. The default configuration allows no provider
+attempts for shared scopes.
+
+During a UTC month rollover, a scope waits for the previous month's live
+commitments to settle or expire. Admission uses PostgreSQL's UTC clock and a
+transaction lock on the stable scope identity. A lost settlement retains the
+precharge in the original month. The trusted bridge expires a request by the
+reservation deadline and limits execution to 120 seconds.
+
+Enable shared scopes only after ingress and router replicas run the version
+with guarded dispatch. An upgraded ingress uses a dedicated internal endpoint
+so a router that predates the guard returns an error.

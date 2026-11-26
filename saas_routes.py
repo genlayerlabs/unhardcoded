@@ -10,6 +10,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 import control_plane_client as cp
+import shared_cost
 
 from llm_router_host import ManagedProviderUnavailable
 from provider_connections import connections, credential_names, label
@@ -237,7 +238,7 @@ def install(app, scoped, handle_chat, chat_request):
                     raise ValueError()
             except (ValueError, TypeError):
                 return JSONResponse({"error": {"message": "Invalid project/environment scope"}}, status_code=400)
-        allowed = {"/v1/chat/completions", "/v1/responses", "/x/saas/catalog", "/x/saas/preview", "/x/saas/test", "/x/saas/connections"}
+        allowed = {shared_cost.PATH, "/v1/chat/completions", "/v1/responses", "/x/saas/catalog", "/x/saas/preview", "/x/saas/test", "/x/saas/connections"}
         if request.url.path not in allowed:
             return JSONResponse({"error": {"message": "Unsupported tenant endpoint"}}, status_code=404)
         # Read current credentials for each request: revocation/rotation is immediate.
@@ -249,7 +250,7 @@ def install(app, scoped, handle_chat, chat_request):
                 scoped.base.for_tenant, tenant_id, env, managed, connections_config, **scope)
         except (cp.RouteUnavailable, ManagedProviderUnavailable):
             return JSONResponse({"error": {"message": "Scoped credentials unavailable"}}, status_code=503)
-        if request.url.path != '/x/saas/connections':
+        if request.url.path not in {'/x/saas/connections', shared_cost.PATH}:
             from tenant_providers import prepare
             await prepare(child)
         env_token = cp.activate_tenant_env(child._env)

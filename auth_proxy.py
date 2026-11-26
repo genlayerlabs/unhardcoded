@@ -29,6 +29,7 @@ from starlette.background import BackgroundTask
 import control_plane_client
 import host_store
 import internal_api
+import shared_cost
 from env_secrets import load_env_secrets
 from policy_templates import template_catalog
 from shim import _CACHE_READ_FACTOR   # the billing cache-read discount — one source
@@ -4365,21 +4366,27 @@ async def proxy(path: str, request: Request) -> Response:
     reservation: dict[str, Any] | None = None
     budget_limit = key_limits.get("monthly_budget_usd")
     shared_budget = key_limits.get("shared_budget")
+    if shared_budget and (path != "v1/chat/completions" or len(body) > shared_cost.MAX_BODY_BYTES
+                          or not shared_cost.supported_payload(payload)):
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "A cost bound is unavailable for this request shape",
+            "type": "invalid_request_error", "code": "shared_cost_unbounded"}})
     if budget_limit is not None or shared_budget is not None:
-        period = time.strftime("%Y-%m", time.gmtime())
         amount = (shared_budget["max_call_cost_usd"] if shared_budget else
                   min(CLOUD_BUDGET_RESERVATION_USD, float(budget_limit)))
         reservation = {"id": secrets.token_hex(16), "done": False, "amount": amount}
         shared_exhausted = False
         if shared_budget:
+            shared_expiry = time.time() + KEY_BUDGET_RESERVATION_TTL_S
             scope = shared_budget["scope"]
             rejected, store_ok, spent_usd = await asyncio.to_thread(
                 host_store.reserve_scoped_budget, int(auth["tenant_id"]), key_identity["subject"],
-                period, budget_limit, scope, shared_budget["monthly_budget_usd"], amount,
+                None, budget_limit, scope, shared_budget["monthly_budget_usd"], amount,
                 reservation["id"], KEY_BUDGET_RESERVATION_TTL_S)
             allowed = rejected is None
             shared_exhausted = rejected == f"s:{scope}"
         else:
+            period = time.strftime("%Y-%m", time.gmtime())
             allowed, store_ok, spent_usd, _reserved = await asyncio.to_thread(
                 host_store.reserve_subject_budget, int(auth["tenant_id"]), key_identity["subject"],
                 period, budget_limit, amount, reservation["id"], KEY_BUDGET_RESERVATION_TTL_S)
@@ -4461,6 +4468,7 @@ async def proxy(path: str, request: Request) -> Response:
 
     response_served = False
     upstream_error = False
+    shared_charge = None
 
     status = 502
     provider = None
@@ -4538,9 +4546,8 @@ async def proxy(path: str, request: Request) -> Response:
         finally:
             try:
                 if shared_budget:
-                    # Once forwarded, missing usage is ambiguous even on errors.
-                    _settle_reservation(0.0 if not upstream_started else
-                                        None if cost_basis == "unknown_total" else cost_usd)
+                    # Missing accounting after forwarding keeps the precharge.
+                    _settle_reservation(shared_charge if upstream_started else 0.0)
                 else:
                     _settle_reservation(cost_usd if cost_usd is not None or status >= 400
                                         else reservation["amount"] if reservation else None)
@@ -4553,14 +4560,15 @@ async def proxy(path: str, request: Request) -> Response:
     try:
         # Built inside the try so a failure here still reaches _finish, which
         # releases the capacity permit and the budget reservation.
-        upstream_url = f"{UPSTREAM}/{path}"
-        if request.url.query:
+        upstream_url = UPSTREAM + (shared_cost.PATH if shared_budget else f"/{path}")
+        if request.url.query and not shared_budget:
             upstream_url += f"?{request.url.query}"
 
         headers = {
             k: v for k, v in request.headers.items()
             if k.lower() not in {"authorization", "host", "connection", "content-length",
                                  "x-llm-router-tenant", "x-internal-secret",
+                                 shared_cost.LIMIT_HEADER, shared_cost.EXPIRY_HEADER, shared_cost.CHARGE_HEADER,
                                  "x-unhardcoded-scope-version", "x-unhardcoded-project", "x-unhardcoded-environment",
                                  "x-unhardcoded-route", "x-unhardcoded-revision", "x-unhardcoded-policy-id", "x-unhardcoded-preference"}
         }
@@ -4588,10 +4596,18 @@ async def proxy(path: str, request: Request) -> Response:
                         session_id = str(parsed_body.get("session"))
             except Exception:
                 pass
+        if shared_budget:
+            headers[shared_cost.LIMIT_HEADER] = str(reservation["amount"])
+            headers[shared_cost.EXPIRY_HEADER] = str(shared_expiry)
         upstream_req = _client.build_request(request.method, upstream_url, content=body, headers=headers)
         upstream_started = True
         r = await _client.send(upstream_req, stream=True)
         status = r.status_code
+        if shared_budget:
+            try:
+                shared_charge = shared_cost.amount(r.headers.get(shared_cost.CHARGE_HEADER))
+            except ValueError:
+                pass  # Missing accounting result: keep the precharge.
         content_type = r.headers.get("content-type", "application/json")
         if content_type.startswith("text/event-stream"):
             incomplete_stream = True

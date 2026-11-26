@@ -2237,10 +2237,10 @@ def reserve_subject_budget(tenant_id: int, subject: str, period: str, limit_usd:
     return rejected is None and ok, ok, float(spent), float(reserved)
 
 
-def reserve_scoped_budget(tenant_id: int, subject: str, period: str, key_limit: Decimal | None,
+def reserve_scoped_budget(tenant_id: int, subject: str, period: str | None, key_limit: Decimal | None,
                           scope: str, scope_limit: Decimal, ceiling: Decimal,
                           reservation_id: str, ttl_s: float) -> tuple[str | None, bool, Decimal]:
-    """Admit against both limits in one transaction, precharging the ceiling."""
+    """Precharge both limits, using PostgreSQL UTC time when period is omitted."""
     budgets = [(f"s:{scope}", scope_limit, f"{reservation_id}:scope")]
     if key_limit is not None:
         budgets.insert(0, (subject, key_limit, reservation_id))
@@ -2256,6 +2256,25 @@ def _reserve_budgets(tenant_id, budgets, period, amount_usd, ttl_s, *, precharge
         accepted = []
         with _get_pool().connection(timeout=2.0) as conn:
             conn.execute("SELECT set_config('statement_timeout', '2000', true)")
+            if precharge:
+                scope_subject = budgets[-1][0]
+                # Serialize admissions across the month boundary, before choosing a
+                # period. A hash collision can only serialize unrelated scopes.
+                conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 86))",
+                             (f"{tenant_id}:{scope_subject}",))
+                if period is None:
+                    period, stamp = conn.execute(
+                        "SELECT to_char(statement_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM'),"
+                        " EXTRACT(EPOCH FROM statement_timestamp())::float8").fetchone()
+                # The reservation lifetime is shorter than any UTC month.
+                pending = conn.execute(
+                    "SELECT 1 FROM subject_budget_reservations"
+                    " WHERE tenant_id=%s AND subject=%s"
+                    " AND period=to_char(to_date(%s,'YYYY-MM') - interval '1 month','YYYY-MM')"
+                    " AND precharged AND expires_at > %s LIMIT 1",
+                    (tenant_id, scope_subject, period, stamp)).fetchone()
+                if pending:
+                    return scope_subject, True, Decimal(0), Decimal(0)
             # All callers lock the key/group before the shared scope.
             for subject, limit, reservation_id in budgets:
                 key = (tenant_id, subject, period)
