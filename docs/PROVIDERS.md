@@ -198,6 +198,34 @@ docker compose --profile antseed up -d --build antseed
 The `model` field we send is the offer's wire id (the peer's service name),
 forwarded verbatim; AntSeed translates protocols and serves it.
 
+### Private daily buyer spend
+
+Enable the sidecar's read-only listener with `ANTSEED_SPEND_TOKEN` (a dedicated
+secret of at least 32 characters), `ANTSEED_SPEND_BUYER` (the public wallet
+address), and `ANTSEED_SPEND_RPC_URL` (a trusted RPC with finalized block
+headers and historical logs). The listener defaults to `127.0.0.1:8381` and
+Compose makes it reachable on its internal network. For a remote monitoring
+client, expose only this port on the private network with transport encryption.
+The client sends its token in `X-Antseed-Spend-Token`. The default source is
+the AntSeed Channels contract on Base mainnet. Set `ANTSEED_SPEND_CHAIN_ID`
+and `ANTSEED_SPEND_CHANNELS` for a compatible deployment on another chain.
+
+Request `GET /daily-spend?date=YYYY-MM-DD` for one UTC day up to and including
+today. The feed sums each finalized `ChannelSettled` event's incremental
+charge, including its protocol fee, using the settlement block's timestamp.
+If an earlier authorization is settled after midnight, its charge belongs
+to the later settlement day. When a block finalizes late, rereading its
+settlement date includes the event on that date.
+
+The response identifies the buyer, chain, contract, and date.
+`spend_micro_usdc` is an exact base-10 integer string.
+`finalized_through` is the RPC's finalized block timestamp and `observed_at`
+is when the feed returned the snapshot. `complete` becomes true once the
+finalized head reaches the next UTC midnight and all log reads succeed.
+Completeness applies to finalized settlements on the configured contract for
+the configured buyer. An RPC failure returns HTTP 502. The listener serves
+one scan at a time and returns HTTP 429 for overlapping reads.
+
 ## OpenAI via ChatGPT subscription (Codex proxy)
 
 See [`docs/OPENAI-CODEX.md`](./OPENAI-CODEX.md). **Unofficial and ToS-risky** —

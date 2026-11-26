@@ -41,6 +41,10 @@ def test_antseed_byo_gateway():
     _run_node_test('antseed/byo-gateway.test.js')
 
 
+def test_antseed_buyer_daily_spend():
+    _run_node_test('antseed/buyer-spend.test.js')
+
+
 def test_antseed_market_protocol_writer():
     _run_node_test('antseed/write-market.test.js')
 

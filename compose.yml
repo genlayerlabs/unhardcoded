@@ -172,6 +172,13 @@ services:
       ANTSEED_CONTROL_TOKEN: ${ANTSEED_CONTROL_TOKEN:-}
       # >= 32 chars; the router sends it as a bearer (see router env).
       ANTSEED_PROXY_TOKEN: ${ANTSEED_PROXY_TOKEN:-}
+      # Separate private read-only feed on the compose network.
+      ANTSEED_SPEND_HOST: 0.0.0.0
+      ANTSEED_SPEND_TOKEN: ${ANTSEED_SPEND_TOKEN:-}
+      ANTSEED_SPEND_BUYER: ${ANTSEED_SPEND_BUYER:-}
+      ANTSEED_SPEND_RPC_URL: ${ANTSEED_SPEND_RPC_URL:-}
+      ANTSEED_SPEND_CHAIN_ID: ${ANTSEED_SPEND_CHAIN_ID:-8453}
+      ANTSEED_SPEND_CHANNELS: ${ANTSEED_SPEND_CHANNELS:-}
       # The sidecar writes the marketplace book (peer_offers) into the shared
       # host store; same DATABASE_URL as router/ingress. Prod = RDS.
       DATABASE_URL: ${DATABASE_URL:-postgresql://hoststore:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/hoststore}
