@@ -156,6 +156,45 @@ eligible for pruning one day after expiry. An actual cost above the published
 ceiling is logged and charged in full, so a publisher that supplies a ceiling
 below actual upstream spend can exceed its configured budget.
 
+### Shared allowances across months
+
+`GET /internal/budgets/shared/{tenant_id}/{scope}` returns durable totals for
+the published scope ID across UTC months. Both GET and PUT require
+`x-internal-secret`. The account tracks guarded admissions made by ingress
+replicas running this version. Upgrade every ingress replica before configuring
+an allowance. To carry a starting balance from earlier activity, provide a
+signed opening adjustment in `correction_usd`.
+
+`PUT` replaces the allowance and cumulative correction at the supplied
+settings revision. For example, the first write for a scope can use:
+
+```json
+{"revision": 0, "allowance_usd": "100.00", "correction_usd": "0"}
+```
+
+The response has the same shape as GET and advances `revision` by one.
+A stale revision returns HTTP 409. Read the current state before retrying a
+conflicting change. Admissions and settlements update the totals independently
+of the settings revision. Use decimal strings with up to 12 fractional digits.
+A null allowance disables the cross-month cap while preserving accounting.
+Zero pauses admissions. A positive cap applies in addition to the published
+monthly limits. An admission that would exceed the cap receives
+`402 shared_allowance_exhausted`. When the cap is active, new-month admissions
+can proceed with an earlier reservation still open because both charges count
+toward the cross-month cap.
+
+Monetary totals in the response are decimal strings. `precharged_usd` is the
+sum of admitted ceilings. `replaced_usd` is the portion of those ceilings with
+a known settlement, and `settled_usd` is the actual cost that replaced them.
+Their difference `precharged_usd - replaced_usd` includes open reservations,
+unknown costs and lost settlements. The total used for admission is
+`committed_usd = precharged_usd - replaced_usd + settled_usd + correction_usd`.
+The cumulative correction can be positive or negative and applies only to the
+cross-month total. A known settlement applies once, to the scope and original
+UTC month, while its reservation is retained. A correction can account for
+information that arrives after the reservation is gone. These totals survive
+reservation pruning and are separate from the ordinary usage export.
+
 Reconciliation endpoints (same shared secret; `caller` and the complete
 project/environment pair behave as for `/internal/usage`, filtering before
 aggregation or paging):

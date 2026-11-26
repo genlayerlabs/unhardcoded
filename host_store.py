@@ -447,6 +447,19 @@ _SCHEMA_STATEMENTS = [
                 ADD COLUMN IF NOT EXISTS precharged BOOLEAN NOT NULL DEFAULT FALSE;
         END IF;
     END $$""",
+    """CREATE TABLE IF NOT EXISTS shared_budget_accounts (
+        tenant_id BIGINT NOT NULL,
+        subject TEXT NOT NULL,
+        allowance_usd NUMERIC(30,12),
+        correction_usd NUMERIC(30,12) NOT NULL DEFAULT 0,
+        revision BIGINT NOT NULL DEFAULT 0,
+        precharged_usd NUMERIC NOT NULL DEFAULT 0,
+        replaced_usd NUMERIC NOT NULL DEFAULT 0,
+        settled_usd NUMERIC NOT NULL DEFAULT 0,
+        PRIMARY KEY (tenant_id, subject)
+    )""",
+    "ALTER TABLE subject_budget_reservations"
+    " ADD COLUMN IF NOT EXISTS tracked_scope BOOLEAN NOT NULL DEFAULT FALSE",
     "CREATE INDEX IF NOT EXISTS idx_subject_budget_live"
     " ON subject_budget_reservations(tenant_id, subject, period, expires_at) WHERE NOT released",
     "CREATE INDEX IF NOT EXISTS idx_subject_budget_released"
@@ -2249,6 +2262,53 @@ def reserve_scoped_budget(tenant_id: int, subject: str, period: str | None, key_
     return rejected, ok, spent
 
 
+SHARED_ALLOWANCE_EXHAUSTED = "shared_allowance"
+
+
+def _lock_shared_budget(conn, tenant_id, subject):
+    # A hash collision can only serialize unrelated scopes.
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 86))",
+                 (f"{tenant_id}:{subject}",))
+
+
+_SHARED_BUDGET_FIELDS = (
+    "revision", "allowance_usd", "correction_usd", "precharged_usd",
+    "replaced_usd", "settled_usd", "committed_usd",
+)
+_SHARED_COMMITTED = "precharged_usd - replaced_usd + settled_usd + correction_usd"
+_SHARED_BUDGET_SELECT = f"""
+    SELECT revision, allowance_usd, correction_usd, precharged_usd,
+           replaced_usd, settled_usd, {_SHARED_COMMITTED}
+    FROM shared_budget_accounts WHERE tenant_id=%s AND subject=%s
+"""
+
+
+def shared_budget_account(tenant_id, scope, *, change=None):
+    """Read exact totals, or atomically replace settings at the expected revision."""
+    key = (tenant_id, f"s:{scope}")
+    with _get_pool().connection(timeout=2.0) as conn:
+        conn.execute("SET LOCAL statement_timeout = 2000")
+        if change is not None:
+            revision, allowance, correction = change
+            _lock_shared_budget(conn, *key)
+            if revision == 0:
+                conn.execute(
+                    "INSERT INTO shared_budget_accounts (tenant_id, subject)"
+                    " VALUES (%s,%s) ON CONFLICT DO NOTHING", key)
+            updated = conn.execute(
+                "UPDATE shared_budget_accounts SET revision=revision+1,"
+                " allowance_usd=%s, correction_usd=%s"
+                " WHERE tenant_id=%s AND subject=%s AND revision=%s",
+                (allowance, correction) + key + (revision,)).rowcount
+            if not updated:
+                return None
+        row = conn.execute(_SHARED_BUDGET_SELECT, key).fetchone()
+    if row is None:
+        row = (0, None, Decimal(0), Decimal(0), Decimal(0), Decimal(0), Decimal(0))
+    return {field: format(value, "f") if isinstance(value, Decimal) else value
+            for field, value in zip(_SHARED_BUDGET_FIELDS, row)}
+
+
 def _reserve_budgets(tenant_id, budgets, period, amount_usd, ttl_s, *, precharge, now=None):
     try:
         stamp = float(time.time() if now is None else now)
@@ -2258,23 +2318,28 @@ def _reserve_budgets(tenant_id, budgets, period, amount_usd, ttl_s, *, precharge
             conn.execute("SELECT set_config('statement_timeout', '2000', true)")
             if precharge:
                 scope_subject = budgets[-1][0]
-                # Serialize admissions across the month boundary, before choosing a
-                # period. A hash collision can only serialize unrelated scopes.
-                conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 86))",
-                             (f"{tenant_id}:{scope_subject}",))
+                _lock_shared_budget(conn, tenant_id, scope_subject)
+                account = conn.execute(
+                    f"SELECT allowance_usd, {_SHARED_COMMITTED},"
+                    f" allowance_usd = 0 OR ({_SHARED_COMMITTED}) + %s > allowance_usd"
+                    " FROM shared_budget_accounts WHERE tenant_id=%s AND subject=%s",
+                    (amount, tenant_id, scope_subject)).fetchone()
+                if account and account[2]:
+                    return SHARED_ALLOWANCE_EXHAUSTED, True, account[1], Decimal(0)
                 if period is None:
                     period, stamp = conn.execute(
                         "SELECT to_char(statement_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM'),"
                         " EXTRACT(EPOCH FROM statement_timestamp())::float8").fetchone()
                 # The reservation lifetime is shorter than any UTC month.
-                pending = conn.execute(
-                    "SELECT 1 FROM subject_budget_reservations"
-                    " WHERE tenant_id=%s AND subject=%s"
-                    " AND period=to_char(to_date(%s,'YYYY-MM') - interval '1 month','YYYY-MM')"
-                    " AND precharged AND expires_at > %s LIMIT 1",
-                    (tenant_id, scope_subject, period, stamp)).fetchone()
-                if pending:
-                    return scope_subject, True, Decimal(0), Decimal(0)
+                if account is None or account[0] is None:
+                    pending = conn.execute(
+                        "SELECT 1 FROM subject_budget_reservations"
+                        " WHERE tenant_id=%s AND subject=%s"
+                        " AND period=to_char(to_date(%s,'YYYY-MM') - interval '1 month','YYYY-MM')"
+                        " AND precharged AND expires_at > %s LIMIT 1",
+                        (tenant_id, scope_subject, period, stamp)).fetchone()
+                    if pending:
+                        return scope_subject, True, Decimal(0), Decimal(0)
             # All callers lock the key/group before the shared scope.
             for subject, limit, reservation_id in budgets:
                 key = (tenant_id, subject, period)
@@ -2299,12 +2364,19 @@ def _reserve_budgets(tenant_id, budgets, period, amount_usd, ttl_s, *, precharge
                     return subject, True, spent, reserved
                 accepted.append((key, reservation_id, reserved))
 
+            if precharge:
+                conn.execute(
+                    "INSERT INTO shared_budget_accounts (tenant_id, subject, precharged_usd)"
+                    " VALUES (%s,%s,%s) ON CONFLICT (tenant_id, subject) DO UPDATE"
+                    " SET precharged_usd=shared_budget_accounts.precharged_usd+EXCLUDED.precharged_usd",
+                    (tenant_id, scope_subject, amount))
             for key, reservation_id, reserved in accepted:
+                tracked = precharge and key[1] == scope_subject
                 conn.execute(
                     "INSERT INTO subject_budget_reservations"
-                    "(id,tenant_id,subject,period,amount_usd,expires_at,released,precharged)"
-                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (reservation_id,) + key + (amount, stamp + ttl_s, precharge, precharge))
+                    "(id,tenant_id,subject,period,amount_usd,expires_at,released,precharged,tracked_scope)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (reservation_id,) + key + (amount, stamp + ttl_s, precharge, precharge, tracked))
                 updated_reserved = reserved if precharge else reserved + amount
                 conn.execute(
                     "UPDATE subject_budget_usage SET reserved_usd=%s, updated_at=%s,"
@@ -2328,21 +2400,29 @@ def settle_subject_budget(reservation_id: str, cost_usd: float | Decimal | None)
         with _get_pool().connection(timeout=2.0) as conn:
             conn.execute("SELECT set_config('statement_timeout', '2000', true)")
             rows = conn.execute(
-                "SELECT id,tenant_id,subject,period FROM subject_budget_reservations"
+                "SELECT id,tenant_id,subject,period,tracked_scope FROM subject_budget_reservations"
                 " WHERE id IN (%s,%s) ORDER BY id COLLATE \"C\"",
                 (reservation_id, f"{reservation_id}:scope")).fetchall()
             if not rows:
                 return False, True
-            for _, tenant_id, subject, period in rows:
+            for _, tenant_id, subject, _, tracked in rows:
+                if tracked:
+                    _lock_shared_budget(conn, tenant_id, subject)
+            for _, tenant_id, subject, period, _ in rows:
                 conn.execute("SELECT 1 FROM subject_budget_usage WHERE tenant_id=%s AND subject=%s"
                              " AND period=%s FOR UPDATE", (tenant_id, subject, period))
             settled = conn.execute(
                 "DELETE FROM subject_budget_reservations WHERE id IN (%s,%s)"
-                " RETURNING id,tenant_id,subject,period,amount_usd,precharged",
+                " RETURNING id,tenant_id,subject,period,amount_usd,precharged,tracked_scope",
                 (reservation_id, f"{reservation_id}:scope")).fetchall()
-            for row_id, tenant_id, subject, period, amount, precharged in settled:
+            for row_id, tenant_id, subject, period, amount, precharged, tracked in settled:
                 key = (tenant_id, subject, period)
                 delta = (cost - amount if cost is not None else 0) if precharged else (cost or 0)
+                if tracked and cost is not None:
+                    conn.execute(
+                        "UPDATE shared_budget_accounts SET replaced_usd=replaced_usd+%s,"
+                        " settled_usd=settled_usd+%s WHERE tenant_id=%s AND subject=%s",
+                        (amount, cost, tenant_id, subject))
                 if precharged and delta > 0 and row_id.endswith(":scope"):
                     _log.warning("shared budget actual cost exceeded the published call ceiling")
                 if precharged:
@@ -3300,7 +3380,7 @@ def truncate_all_for_tests() -> None:
                      " consumer_budget_usage, analytics_hourly, analytics_rollup_state,"
                      " scoped_usage_hours, scoped_usage_coverage, peer_offers, buyer_status, route_observations,"
                      " login_history, provider_prices, wallet_ops,"
-                     " subject_budget_usage, subject_budget_reservations,"
+                     " subject_budget_usage, subject_budget_reservations, shared_budget_accounts,"
                      " request_allowance_periods, request_allowance_reservations")
 
 

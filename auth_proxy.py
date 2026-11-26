@@ -4375,7 +4375,7 @@ async def proxy(path: str, request: Request) -> Response:
         amount = (shared_budget["max_call_cost_usd"] if shared_budget else
                   min(CLOUD_BUDGET_RESERVATION_USD, float(budget_limit)))
         reservation = {"id": secrets.token_hex(16), "done": False, "amount": amount}
-        shared_exhausted = False
+        shared_exhausted = allowance_exhausted = False
         if shared_budget:
             shared_expiry = time.time() + KEY_BUDGET_RESERVATION_TTL_S
             scope = shared_budget["scope"]
@@ -4384,7 +4384,8 @@ async def proxy(path: str, request: Request) -> Response:
                 None, budget_limit, scope, shared_budget["monthly_budget_usd"], amount,
                 reservation["id"], KEY_BUDGET_RESERVATION_TTL_S)
             allowed = rejected is None
-            shared_exhausted = rejected == f"s:{scope}"
+            allowance_exhausted = rejected == host_store.SHARED_ALLOWANCE_EXHAUSTED
+            shared_exhausted = allowance_exhausted or rejected == f"s:{scope}"
         else:
             period = time.strftime("%Y-%m", time.gmtime())
             allowed, store_ok, spent_usd, _reserved = await asyncio.to_thread(
@@ -4403,6 +4404,10 @@ async def proxy(path: str, request: Request) -> Response:
             limit = shared_budget["monthly_budget_usd"] if shared_exhausted else budget_limit
             error = {"message": f"{kind} budget exhausted", "type": "budget_error", "code": code,
                      "budget_usd": float(limit), "spent_usd": round(float(spent_usd), 6)}
+            if allowance_exhausted:
+                code = "shared_allowance_exhausted"
+                error = {"message": "shared allowance exhausted", "type": "budget_error",
+                         "code": code, "spent_usd": format(spent_usd, "f")}
             if shared_exhausted:
                 for field in ("guidance", "help_url"):
                     if value := shared_budget.get(field):
