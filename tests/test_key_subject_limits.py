@@ -485,9 +485,9 @@ def _seed_usage(now):
     rows = [  # (caller, key, project, env, ts, tokens_in, cost, status)
         ("acme", "a" * 64, 1, 10, now - 7200, 10, 0.01, 200),
         ("acme", "a" * 64, 1, 10, now - 60, 20, 0.02, 200),
-        ("acme", "b" * 64, 1, 10, now - 60, 40, 0.04, 500),
-        ("acme", "b" * 64, 1, 11, now - 60, 800, 0.8, 200),     # other environment
-        ("other", "a" * 64, 1, 10, now - 60, 900, 0.9, 200),   # other caller
+        ("acme", "b" * 64, 1, 10, now - 120, 40, 0.04, 500),
+        ("acme", "b" * 64, 1, 11, now - 30, 800, 0.8, 200),   # other environment
+        ("other", "a" * 64, 1, 10, now - 20, 900, 0.9, 200),  # other caller
     ]
     for caller, key, project, env, ts, tin, cost, status in rows:
         host_store.insert_call({"ts": ts, "caller": caller, "key_sha256": key, "status": status,
@@ -502,6 +502,8 @@ def test_usage_group_by_key_is_scoped_before_aggregation():
     require_host_store()
     now = int(time.time())
     _seed_usage(now)
+    host_store.insert_call({"ts": now - 10, "caller": "acme", "key_sha256": "a" * 64,
+                            "decision_trace": {"project_id": 2, "environment_id": 10}})
     client = TestClient(auth_proxy.app)
     params = {"caller": "acme", "project_id": 1, "environment_id": 10, "group_by": "key"}
     data = client.get("/internal/usage", params=params, headers=SECRET).json()
@@ -509,15 +511,17 @@ def test_usage_group_by_key_is_scoped_before_aggregation():
     groups = {g["key"]: g for g in data["groups"]}
     assert set(groups) == {"a" * 64, "b" * 64}                 # full digests
     assert groups["a" * 64]["runs"] == 2 and groups["a" * 64]["cost_usd"] == pytest.approx(0.03)
+    assert groups["a" * 64]["last_call_ts"] == now - 60
     assert groups["b" * 64] == {"key": "b" * 64, "runs": 1, "errors": 1, "tokens_in": 40,
                                 "tokens_out": 1, "tokens_cached": 0, "tokens_total": 41,
-                                "cost_usd": 0.04}
+                                "cost_usd": 0.04, "last_call_ts": now - 120}
     # until_ts is exclusive and applies to totals and groups alike.
-    data = client.get("/internal/usage", params={**params, "until_ts": now - 60}, headers=SECRET).json()
+    data = client.get("/internal/usage", params={**params, "until_ts": now - 120}, headers=SECRET).json()
     assert data["runs"] == 1 and [g["runs"] for g in data["groups"]] == [1]
-    assert data["window"]["until_ts"] == now - 60
+    assert data["groups"][0]["last_call_ts"] == now - 7200
+    assert data["window"]["until_ts"] == now - 120
     # since_ts is inclusive: the boundary row at exactly since_ts counts.
-    data = client.get("/internal/usage", params={**params, "since_ts": now - 60}, headers=SECRET).json()
+    data = client.get("/internal/usage", params={**params, "since_ts": now - 120}, headers=SECRET).json()
     assert data["runs"] == 2
 
 
@@ -546,6 +550,7 @@ def test_usage_group_by_model_and_route(group_by, expected):
         "caller": "acme", "group_by": group_by}, headers=SECRET).json()
     assert {g["key"] for g in data["groups"]} == expected
     assert sum(g["runs"] for g in data["groups"]) == 4
+    assert all("last_call_ts" not in g for g in data["groups"])
 
 
 def test_usage_group_by_day_and_hour_are_utc_buckets():
@@ -555,7 +560,8 @@ def test_usage_group_by_day_and_hour_are_utc_buckets():
     client = TestClient(auth_proxy.app)
     hours = client.get("/internal/usage", params={"caller": "acme", "group_by": "hour"},
                        headers=SECRET).json()["groups"]
-    expect = {time.strftime("%Y-%m-%dT%H:00:00Z", time.gmtime(ts)) for ts in (now - 7200, now - 60)}
+    expect = {time.strftime("%Y-%m-%dT%H:00:00Z", time.gmtime(ts))
+              for ts in (now - 7200, now - 120, now - 60, now - 30)}
     assert {g["key"] for g in hours} == expect
     days = client.get("/internal/usage", params={"caller": "acme", "group_by": "day"},
                       headers=SECRET).json()["groups"]
@@ -581,9 +587,9 @@ def test_export_cursor_pages_in_id_order_with_watermark(monkeypatch):
                         "status", "tokens_in", "tokens_out", "tokens_cached", "tokens_total",
                         "cost_usd", "cost_basis", "cost_source"}
     assert row["key_sha256"] == "a" * 64 and row["subject"] == "g:7" and row["route"] == "route:production"
-    # The third scoped row (ts now-60) is not delivered yet, so the watermark
+    # The third scoped row (ts now-120) is not delivered yet, so the watermark
     # cannot pass it even though the lag is zero.
-    assert page["watermark_ts"] <= now - 60
+    assert page["watermark_ts"] <= now - 120
     page2 = client.get("/internal/usage/export", params={
         **scope, "after_id": page["next_after_id"], "limit": 2}, headers=SECRET).json()
     assert [r["tokens_in"] for r in page2["rows"]] == [40]

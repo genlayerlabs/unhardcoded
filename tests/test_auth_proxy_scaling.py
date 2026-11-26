@@ -61,6 +61,20 @@ def test_background_ledger_preserves_applied_rates(host_store_clean, monkeypatch
     assert all(unknown[field] is None for field in rates)
 
 
+def test_usage_key_groups_respect_retention_before_pruning(host_store_clean, monkeypatch):
+    store = host_store_clean
+    now = int(time.time())
+    expired_key = "a" * 64
+    retained_key = "b" * 64
+    store.insert_call({"caller": "retention", "ts": now - 86460, "key_sha256": expired_key})
+    store.insert_call({"caller": "retention", "ts": now - 60, "key_sha256": retained_key})
+
+    monkeypatch.setattr(store, "_RETENTION_DAYS", 1)
+    groups = store.usage_groups("key", caller="retention")
+    assert [(group["key"], group["last_call_ts"]) for group in groups] == [
+        (retained_key, now - 60)]
+
+
 def test_dashboard_issued_digest_resolves_without_local_key(host_store_clean):
     token = "only-known-by-the-shared-store"
     digest = hashlib.sha256(token.encode()).hexdigest()
