@@ -9,7 +9,11 @@ particular control-plane implementation.
 Contract (all requests carry the shared secret in `x-internal-secret`):
   GET {CONTROL_PLANE_URL}/internal/keys/resolve?sha256=<64hex>
       -> {"active": bool, "consumer": str, "tenant_id": int,
-          "rate_per_min": int|null, "burst": int|null}
+          "rate_per_min": int|null, "burst": int|null,
+          "rate_limit_guidance"?: str, "rate_limit_help_url"?: str}
+      Optional guidance (up to 512 characters) and help URL (absolute HTTP(S),
+      up to 2048 characters) become `error.guidance` and `error.help_url` on
+      caller_rate_limit responses. Supply only caller-facing content.
   GET {CONTROL_PLANE_URL}/internal/tenants/<id>/provider-env
       -> {"env": {ENV_NAME: secret, ...}}
   GET {CONTROL_PLANE_URL}/internal/tenants/<t>[/projects/<p>/environments/<e>]/routes/<slug>
@@ -93,6 +97,8 @@ class ResolvedKey:
     scope_version: int = 1
     project_id: int | None = None
     environment_id: int | None = None
+    rate_limit_guidance: str | None = None
+    rate_limit_help_url: str | None = None
 
 
 _resolve_cache: dict[str, ResolvedKey] = {}  # sha256 hex -> entry (positive AND negative)
@@ -144,6 +150,27 @@ def _evict_if_full() -> None:
         _resolve_cache.clear()
 
 
+def _optional_public_text(value: Any, max_length: int) -> str | None:
+    if not isinstance(value, str) or len(value) > max_length:
+        return None
+    value = value.strip()
+    return value if value and value.isprintable() else None
+
+
+def _rate_limit_help_url(value: Any) -> str | None:
+    url = _optional_public_text(value, 2048)
+    if url is None or any(char.isspace() or char == "\\" for char in url):
+        return None
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme in ("http", "https") and parsed.hostname
+                and parsed.username is None and parsed.password is None):
+            return url
+    except ValueError:
+        pass
+    return None
+
+
 def _parse_resolved(data: Any) -> ResolvedKey:
     if not isinstance(data, dict):
         data = {}
@@ -176,6 +203,8 @@ def _parse_resolved(data: Any) -> ResolvedKey:
         scope_version=version if active else 1,
         project_id=project_id if active and version == 2 else None,
         environment_id=environment_id if active and version == 2 else None,
+        rate_limit_guidance=_optional_public_text(data.get("rate_limit_guidance"), 512) if active else None,
+        rate_limit_help_url=_rate_limit_help_url(data.get("rate_limit_help_url")) if active else None,
     )
 
 

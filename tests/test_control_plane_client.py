@@ -88,6 +88,21 @@ def test_feature_off_returns_none_without_http(monkeypatch):
     assert fake.calls == []
 
 
+@pytest.mark.parametrize("guidance,url,expected", [
+    ("  Reduce request frequency.  ", None, ("Reduce request frequency.", None)),
+    (None, " https://example.com/limits ", (None, "https://example.com/limits")),
+    ("", "javascript:alert(1)", (None, None)),
+    ("a" * 513, "https://example.com/" + "a" * 2048, (None, None)),
+    ("bad\ud800", "https://user:pass@example.com/limits", (None, None)),
+    ({"text": "unexpected"}, "https://[invalid", (None, None)),
+])
+def test_resolve_validates_optional_rate_limit_guidance(guidance, url, expected):
+    entry = cpc._parse_resolved({**_active(), "rate_limit_guidance": guidance,
+                                 "rate_limit_help_url": url})
+    assert entry.active
+    assert (entry.rate_limit_guidance, entry.rate_limit_help_url) == expected
+
+
 def test_resolve_fetches_then_serves_from_cache(monkeypatch):
     fake = _install(monkeypatch, [_FakeResp(200, _active(rate=60, burst=20))])
     first = asyncio.run(cpc.resolve_key(DIGEST))

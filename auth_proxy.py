@@ -892,6 +892,10 @@ async def _caller_auth_async(token: str | None) -> dict[str, Any]:
         meta["rate_per_min"] = resolved.rate_per_min
     if meta.get("burst") is None:
         meta["burst"] = resolved.burst
+    if resolved.rate_limit_guidance is not None:
+        meta["rate_limit_guidance"] = resolved.rate_limit_guidance
+    if resolved.rate_limit_help_url is not None:
+        meta["rate_limit_help_url"] = resolved.rate_limit_help_url
     out = {"ok": True, "caller": caller, "digest": digest,
            "storage": "control_plane", "meta": meta}
     if resolved.tenant_id is not None:
@@ -907,6 +911,17 @@ def _rate_ok(caller: str, meta: dict[str, Any] | None = None) \
     rate_per_min = int(meta.get("rate_per_min") or RATE_PER_MIN)
     burst = int(meta.get("burst") or BURST)
     return host_store.consume_rate_token(caller, rate_per_min, burst)
+
+
+def _caller_rate_limit_response(meta: dict[str, Any], retry_after_s: float) -> JSONResponse:
+    error = {"message": "caller rate limit exceeded", "type": "rate_limit_error",
+             "code": "caller_rate_limit"}
+    if guidance := meta.get("rate_limit_guidance"):
+        error["guidance"] = guidance
+    if help_url := meta.get("rate_limit_help_url"):
+        error["help_url"] = help_url
+    return JSONResponse(status_code=429, headers={"Retry-After": str(max(1, math.ceil(retry_after_s)))},
+                        content={"error": error})
 
 
 # Settles run off the event loop: a slow store must not stall every request on
@@ -2958,7 +2973,8 @@ _SESSION_ID_RE = re.compile(r"[A-Za-z0-9_:-][A-Za-z0-9_.:-]{0,127}")
 async def _consumer_rate_limited(caller: str, auth: dict[str, Any]) -> JSONResponse | None:
     """The caller's request rate limit, shared with proxied traffic, for the
     consumer read endpoints (/v1/usage, /v1/session)."""
-    result = await asyncio.to_thread(_rate_ok, caller, auth.get("meta") or {})
+    meta = auth.get("meta") or {}
+    result = await asyncio.to_thread(_rate_ok, caller, meta)
     allowed, store_ok, retry_after_s = result if isinstance(result, tuple) else (bool(result), True, 0.0)
     if not store_ok:
         _metric_store_error("rate_limit")
@@ -2966,9 +2982,7 @@ async def _consumer_rate_limited(caller: str, auth: dict[str, Any]) -> JSONRespo
             "message": "caller rate-limit state is temporarily unavailable",
             "type": "server_error", "code": "caller_rate_limit_unavailable"}})
     if not allowed:
-        return JSONResponse(status_code=429, headers={"Retry-After": str(max(1, math.ceil(retry_after_s)))},
-                            content={"error": {"message": "caller rate limit exceeded",
-                                               "type": "rate_limit_error", "code": "caller_rate_limit"}})
+        return _caller_rate_limit_response(meta, retry_after_s)
     return None
 
 
@@ -4269,10 +4283,7 @@ async def proxy(path: str, request: Request) -> Response:
         _record_reject(reason="rate_limit", path="/" + path, caller=caller, status=429,
                        tenant_id=tenant_id, subject=subject, refusal_code="caller_rate_limit")
         _log({"event": "reject", "reason": "rate_limit", "caller": caller, "path": "/" + path})
-        return JSONResponse(
-            status_code=429,
-            headers={"Retry-After": str(max(1, math.ceil(retry_after_s)))},
-            content={"error": {"message": "caller rate limit exceeded", "type": "rate_limit_error", "code": "caller_rate_limit"}})
+        return _caller_rate_limit_response(consumer_meta, retry_after_s)
 
     # Control-plane key limits ride the (uncached) route resolution. A subject
     # (`g:<group>` / `k:<key>`) may span keys, so its bucket and budget are
