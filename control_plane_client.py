@@ -33,11 +33,11 @@ import hashlib
 import hmac
 import json
 import logging
-import math
 import os
 import re
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -420,6 +420,37 @@ _BUDGET_RE = re.compile(r"[0-9]{1,12}(\.[0-9]{1,12})?")
 _LABELS_MAX, _LABEL_KEY_MAX, _LABEL_VALUE_MAX = 32, 64, 256
 
 
+def _budget_amount(value: Any) -> Decimal:
+    if type(value) not in (str, int, float):
+        raise ValueError("invalid monetary amount")
+    text = str(value)
+    if type(value) is float and value == value and abs(value) < 10**12:
+        text = format(Decimal(text), "f")
+    if not _BUDGET_RE.fullmatch(text):
+        raise ValueError("invalid monetary amount")
+    return Decimal(text)
+
+
+def _parse_shared_budget(value: Any) -> dict | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("invalid shared budget")
+    scope = value.get("scope")
+    if not isinstance(scope, str) or not CONNECTION_REF_RE.fullmatch(scope):
+        raise ValueError("invalid budget scope")
+    ceiling = _budget_amount(value.get("max_call_cost_usd"))
+    if not ceiling:
+        raise ValueError("invalid call cost ceiling")
+    return {
+        "scope": scope,
+        "monthly_budget_usd": _budget_amount(value.get("monthly_budget_usd")),
+        "max_call_cost_usd": ceiling,
+        "guidance": _optional_public_text(value.get("guidance"), 512),
+        "help_url": _rate_limit_help_url(value.get("help_url")),
+    }
+
+
 def _positive_int_or_none(value: Any) -> int | None:
     if value is None:
         return None
@@ -455,18 +486,14 @@ def _parse_key_limits(data: dict) -> tuple[dict | None, dict | None]:
         raise ValueError("invalid key limits")
     budget = limits.get("monthly_budget_usd")
     if budget is not None:
-        # A decimal string ("40.00") or a JSON number; bool is an int subclass.
-        if isinstance(budget, str) and _BUDGET_RE.fullmatch(budget):
-            budget = float(budget)
-        elif type(budget) in (int, float) and math.isfinite(budget):
-            budget = float(budget)
-        else:
-            raise ValueError("invalid monthly budget")
-        if not budget > 0:
-            raise ValueError("invalid monthly budget")
+        budget = _budget_amount(budget)
     rate, burst = _positive_int_or_none(limits.get("rate_per_min")), _positive_int_or_none(limits.get("burst"))
-    return ({"id": key_id, "subject": subject, "labels": dict(labels)},
-            {"monthly_budget_usd": budget, "rate_per_min": rate, "burst": burst})
+    normalized = {"monthly_budget_usd": budget, "rate_per_min": rate, "burst": burst}
+    shared = _parse_shared_budget(limits.get("shared_budget"))
+    if shared is not None:
+        normalized["shared_budget"] = shared
+    return {"id": key_id, "subject": subject, "labels": dict(labels)}, normalized
+
 
 
 async def resolve_route(tenant_id: int, name: str, *, project_id=None, environment_id=None, key_digest=None) -> dict:
@@ -474,7 +501,7 @@ async def resolve_route(tenant_id: int, name: str, *, project_id=None, environme
 
     The response may carry the calling key's identity and limits (`key`:
     {id, subject, labels}; `limits`: {monthly_budget_usd, rate_per_min, burst});
-    they are returned normalized (budget as float, absent -> None) and enforced
+    they are returned normalized (budget as Decimal, absent -> None) and enforced
     by the ingress. Because this lookup is uncached and keyed by the digest, a
     revoked scoped key is refused on its very next request."""
     try:

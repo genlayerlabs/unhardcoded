@@ -17,7 +17,7 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock, RLock
+from threading import BoundedSemaphore, Lock, RLock
 from typing import Any, Dict
 from urllib.parse import quote
 
@@ -925,9 +925,9 @@ def _caller_rate_limit_response(meta: dict[str, Any], retry_after_s: float) -> J
 
 
 # Settles run off the event loop: a slow store must not stall every request on
-# this worker. Until a settle lands its reservation still counts, which only
-# errs toward rejecting; if it fails, the reservation expires (TTL).
+# this worker. Scoped calls retain their precharge if reconciliation is lost.
 _SETTLE_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="budget-settle")
+_settle_slots = BoundedSemaphore(256)
 _pending_settles: set[concurrent.futures.Future] = set()
 SETTLE_RETRY_DELAYS_S = (0.5, 2.0, 5.0, 15.0, 60.0)
 
@@ -943,9 +943,23 @@ def _submit_settle(reservation_id: str, cost: float | None, caller: str) -> None
             _metric_store_error("key_budget")
             time.sleep(delay)
         _log({"event": "key_budget_settle_failed", "caller": caller})
-    future = _SETTLE_POOL.submit(settle)
+    if not _settle_slots.acquire(blocking=False):
+        _metric_store_error("key_budget")
+        _log({"event": "key_budget_settle_queue_full", "caller": caller})
+        return
+    try:
+        future = _SETTLE_POOL.submit(settle)
+    except RuntimeError:
+        _settle_slots.release()
+        _metric_store_error("key_budget")
+        return
     _pending_settles.add(future)
-    future.add_done_callback(_pending_settles.discard)
+
+    def finished(done: concurrent.futures.Future) -> None:
+        _pending_settles.discard(done)
+        _settle_slots.release()
+
+    future.add_done_callback(finished)
 
 
 def drain_settles(timeout: float = 10.0) -> None:
@@ -4350,15 +4364,25 @@ async def proxy(path: str, request: Request) -> Response:
     # from here on every exit path must settle it (see _settle_reservation).
     reservation: dict[str, Any] | None = None
     budget_limit = key_limits.get("monthly_budget_usd")
-    if budget_limit is not None:
-        reservation = {"id": secrets.token_hex(16), "done": False,
-                       # A budget below one reservation still admits a first call.
-                       "amount": min(CLOUD_BUDGET_RESERVATION_USD, float(budget_limit))}
-        allowed, store_ok, spent_usd, _reserved = await asyncio.to_thread(
-            host_store.reserve_subject_budget, int(auth["tenant_id"]), key_identity["subject"],
-            time.strftime("%Y-%m", time.gmtime()), float(budget_limit),
-            reservation["amount"], reservation["id"],
-            KEY_BUDGET_RESERVATION_TTL_S)
+    shared_budget = key_limits.get("shared_budget")
+    if budget_limit is not None or shared_budget is not None:
+        period = time.strftime("%Y-%m", time.gmtime())
+        amount = (shared_budget["max_call_cost_usd"] if shared_budget else
+                  min(CLOUD_BUDGET_RESERVATION_USD, float(budget_limit)))
+        reservation = {"id": secrets.token_hex(16), "done": False, "amount": amount}
+        shared_exhausted = False
+        if shared_budget:
+            scope = shared_budget["scope"]
+            rejected, store_ok, spent_usd = await asyncio.to_thread(
+                host_store.reserve_scoped_budget, int(auth["tenant_id"]), key_identity["subject"],
+                period, budget_limit, scope, shared_budget["monthly_budget_usd"], amount,
+                reservation["id"], KEY_BUDGET_RESERVATION_TTL_S)
+            allowed = rejected is None
+            shared_exhausted = rejected == f"s:{scope}"
+        else:
+            allowed, store_ok, spent_usd, _reserved = await asyncio.to_thread(
+                host_store.reserve_subject_budget, int(auth["tenant_id"]), key_identity["subject"],
+                period, budget_limit, amount, reservation["id"], KEY_BUDGET_RESERVATION_TTL_S)
         if not store_ok:
             _metric_store_error("key_budget")
             _record_reject(reason="key_budget_unavailable", path="/" + path,
@@ -4367,17 +4391,21 @@ async def proxy(path: str, request: Request) -> Response:
                 "message": "key budget state is temporarily unavailable",
                 "type": "server_error", "code": "key_budget_unavailable"}})
         if not allowed:
-            _record_reject(reason="key_budget_exhausted", path="/" + path,
+            kind = "shared" if shared_exhausted else "key"
+            code = f"{kind}_budget_exhausted"
+            limit = shared_budget["monthly_budget_usd"] if shared_exhausted else budget_limit
+            error = {"message": f"{kind} budget exhausted", "type": "budget_error", "code": code,
+                     "budget_usd": float(limit), "spent_usd": round(float(spent_usd), 6)}
+            if shared_exhausted:
+                for field in ("guidance", "help_url"):
+                    if value := shared_budget.get(field):
+                        error[field] = value
+            _record_reject(reason=code, path="/" + path,
                            caller=caller, status=402, route=requested_route,
-                           tenant_id=tenant_id, subject=subject, refusal_code="key_budget_exhausted")
-            return JSONResponse(status_code=402, content={"error": {
-                "message": "key budget exhausted", "type": "budget_error",
-                "code": "key_budget_exhausted",
-                "budget_usd": float(budget_limit), "spent_usd": round(spent_usd, 6)}})
+                           tenant_id=tenant_id, subject=subject, refusal_code=code)
+            return JSONResponse(status_code=402, content={"error": error})
 
     def _settle_reservation(cost: float | None) -> None:
-        # Idempotent per request; the store is idempotent per reservation too.
-        # A failed settle leaves the reservation to expire (TTL), never to leak.
         if reservation is None or reservation["done"]:
             return
         reservation["done"] = True
@@ -4386,10 +4414,10 @@ async def proxy(path: str, request: Request) -> Response:
     try:
         acquired = await _capacity_acquire()
     except BaseException:
-        _settle_reservation(None)
+        _settle_reservation(0.0)
         raise
     if not acquired:
-        _settle_reservation(None)
+        _settle_reservation(0.0)
         _record_reject(reason="router_overloaded", path="/" + path,
                        caller=caller, status=503, route=requested_route)
         return JSONResponse(
@@ -4411,7 +4439,7 @@ async def proxy(path: str, request: Request) -> Response:
             _metric_store_error("request_allowance")
             rejection = (503, "request_allowance_unavailable", "Request allowance is unavailable")
         except BaseException:
-            _settle_reservation(None)
+            _settle_reservation(0.0)
             _capacity_release()
             raise
         else:
@@ -4420,7 +4448,7 @@ async def proxy(path: str, request: Request) -> Response:
                 rejection = (429, "request_allowance_exhausted", "Tenant request allowance exhausted")
                 headers = {"Retry-After": str(max(1, math.ceil(period_end - time.time())))}
         if rejection:
-            _settle_reservation(None)
+            _settle_reservation(0.0)
             _capacity_release()
             reject_status, code, message = rejection
             _record_reject(reason=code, path="/" + path, caller=caller, status=reject_status,
@@ -4461,6 +4489,8 @@ async def proxy(path: str, request: Request) -> Response:
     # an explicit body `session` wins (szc sends it there); the
     # X-Unhardcoded-Session header covers header-only clients (opencode plugin).
     session_id = request.headers.get("x-unhardcoded-session")
+
+    upstream_started = False
 
     def _finish():
         nonlocal capacity_released, decision_trace
@@ -4507,12 +4537,13 @@ async def proxy(path: str, request: Request) -> Response:
             _log({"event": "request", "caller": caller, "method": request.method, "path": "/" + path, "status": status, "latency_ms": latency_ms, "provider": provider, "model_family": model_family})
         finally:
             try:
-                # Not the droppable ledger queue: a dedicated settle, retried.
-                # A successful call whose cost is unknown (a stream the client
-                # closed before its usage chunk, or an unpriced model) books the
-                # reservation, never $0; failed calls book only what they report.
-                _settle_reservation(cost_usd if cost_usd is not None or status >= 400
-                                    else reservation["amount"] if reservation else None)
+                if shared_budget:
+                    # Once forwarded, missing usage is ambiguous even on errors.
+                    _settle_reservation(0.0 if not upstream_started else
+                                        None if cost_basis == "unknown_total" else cost_usd)
+                else:
+                    _settle_reservation(cost_usd if cost_usd is not None or status >= 400
+                                        else reservation["amount"] if reservation else None)
             finally:
                 if allowance_id is not None:
                     host_store.settle_request_allowance_async(
@@ -4558,6 +4589,7 @@ async def proxy(path: str, request: Request) -> Response:
             except Exception:
                 pass
         upstream_req = _client.build_request(request.method, upstream_url, content=body, headers=headers)
+        upstream_started = True
         r = await _client.send(upstream_req, stream=True)
         status = r.status_code
         content_type = r.headers.get("content-type", "application/json")
@@ -4632,7 +4664,7 @@ async def proxy(path: str, request: Request) -> Response:
                 except Exception:
                     pass
                 if (client_gone_at is not None and not drain_complete and cost_usd is None
-                        and cost_basis != "unknown_total" and status < 400):
+                        and cost_basis != "unknown_total" and status < 400 and not shared_budget):
                     # Cut off before the usage event: never book a served call
                     # as free. Same floor Cloud key budgets reserve per call.
                     cost_usd, cost_basis = CLOUD_BUDGET_RESERVATION_USD, "estimated_disconnect"
