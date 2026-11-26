@@ -1,0 +1,51 @@
+name: Router load check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: python3 -m unittest discover -s scripts/router-load
+      - run: docker build -t unhardcoded:load .
+      - run: docker pull postgres:16
+      - run: docker pull nginx:alpine
+      - name: Single run and two same-image comparisons
+        run: |
+          status=0
+          python3 scripts/router-load-check.py unhardcoded:load > load-single.json || status=1
+          python3 scripts/router-load-check.py unhardcoded:load --compare unhardcoded:load > load-repeat-1.json || status=1
+          python3 scripts/router-load-check.py unhardcoded:load --compare unhardcoded:load > load-repeat-2.json || status=1
+          exit "$status"
+      - name: Check same-image spread in both directions
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from runpy import run_path
+
+          compare = run_path("scripts/router-load-check.py")["compare"]
+          failed = False
+          for path in sorted(Path.cwd().glob("load-repeat-*.json")):
+              report = json.loads(path.read_text())
+              baseline, candidate = report["runs"]
+              margin = report["settings"]["margin_pct"]
+              regressions = compare(baseline, candidate, margin) + compare(candidate, baseline, margin)
+              if regressions:
+                  failed = True
+                  print(f"{path.name}: {regressions}")
+          raise SystemExit(int(failed))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: router-load
+          path: load-*.json
